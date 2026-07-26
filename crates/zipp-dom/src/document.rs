@@ -412,6 +412,9 @@ impl BaseDocument {
                 font_ctx
                     .collection
                     .register_fonts(Blob::new(Arc::new(crate::BULLET_FONT) as _), None);
+                // A document built without a caller-supplied font context still
+                // needs a guaranteed `serif`/`sans-serif`/`monospace`.
+                crate::register_embedded_fonts(&mut font_ctx.collection);
                 font_ctx
             });
         let font_ctx = Arc::new(Mutex::new(font_ctx));

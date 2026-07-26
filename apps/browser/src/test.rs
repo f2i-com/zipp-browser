@@ -19,21 +19,9 @@ fn main() {
     // Create font context and manually register Arial
     let mut font_ctx = FontContext::default();
 
-    // Load Arial font from disk
-    let font_path = r"C:\Windows\Fonts\arial.ttf";
-    if let Ok(font_data) = std::fs::read(font_path) {
-        eprintln!("[FONT] Loaded {} bytes from {}", font_data.len(), font_path);
-        let blob = Blob::new(Arc::new(font_data) as _);
-        font_ctx.collection.register_fonts(blob, None);
-        eprintln!("[FONT] Registered Arial");
-    }
-
-    // Also load bold
-    if let Ok(font_data) = std::fs::read(r"C:\Windows\Fonts\arialbd.ttf") {
-        let blob = Blob::new(Arc::new(font_data) as _);
-        font_ctx.collection.register_fonts(blob, None);
-        eprintln!("[FONT] Registered Arial Bold");
-    }
+    // Fonts are compiled in — no `C:\Windows\Fonts` paths, so this runs the
+    // same way on any machine and any platform.
+    zipp_dom::register_embedded_fonts(&mut font_ctx.collection);
 
     // Register bullet font
     font_ctx.collection.register_fonts(

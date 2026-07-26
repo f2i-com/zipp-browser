@@ -60,6 +60,18 @@ zipp-browser --test-compat                        # language compatibility suite
 you tell a CSS problem from a DOM problem. Build with `--release`: a debug build
 runs the JS engine and rasterizer unoptimized and is far slower.
 
+## Fonts
+
+The Liberation faces are compiled into the binary, so `serif`, `sans-serif` and
+`monospace` always resolve and nothing is read from a system font directory.
+They are metric-compatible with Arial, Times New Roman and Courier New, so
+substituting them keeps advances and line breaks where the page expected them.
+
+Installed system fonts are still discovered and take priority, so a page asking
+for a font you actually have gets the real one. `ZIPP_EMBEDDED_FONTS_ONLY=1`
+flips that, making rendering independent of the host — use it when comparing
+screenshots taken on different machines.
+
 ## How JavaScript works
 
 zipp-vm deliberately exposes no host surface of its own, so the browser supplies

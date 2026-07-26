@@ -386,48 +386,11 @@ fn prerender_linked_pages(html: &str, base_url: &str) {
 fn load_fonts() -> FontContext {
     let mut font_ctx = FontContext::default();
 
-    let font_files = [
-        r"C:\Windows\Fonts\arial.ttf",
-        r"C:\Windows\Fonts\arialbd.ttf",
-        r"C:\Windows\Fonts\ariali.ttf",
-        r"C:\Windows\Fonts\arialbi.ttf",
-        r"C:\Windows\Fonts\segoeui.ttf",
-        r"C:\Windows\Fonts\segoeuib.ttf",
-        r"C:\Windows\Fonts\segoeuil.ttf",
-        r"C:\Windows\Fonts\times.ttf",
-        r"C:\Windows\Fonts\timesbd.ttf",
-        r"C:\Windows\Fonts\cour.ttf",
-        r"C:\Windows\Fonts\courbd.ttf",
-        r"C:\Windows\Fonts\verdana.ttf",
-        r"C:\Windows\Fonts\verdanab.ttf",
-        r"C:\Windows\Fonts\tahoma.ttf",
-        r"C:\Windows\Fonts\tahomabd.ttf",
-        r"C:\Windows\Fonts\calibri.ttf",
-        r"C:\Windows\Fonts\calibrib.ttf",
-        r"C:\Windows\Fonts\calibrii.ttf",
-        r"C:\Windows\Fonts\georgia.ttf",
-        r"C:\Windows\Fonts\georgiab.ttf",
-        r"C:\Windows\Fonts\trebuc.ttf",
-        r"C:\Windows\Fonts\trebucbd.ttf",
-        r"C:\Windows\Fonts\impact.ttf",
-        r"C:\Windows\Fonts\comic.ttf",
-        r"C:\Windows\Fonts\consola.ttf",
-        r"C:\Windows\Fonts\consolab.ttf",
-        r"C:\Windows\Fonts\pala.ttf",
-        r"C:\Windows\Fonts\Roboto-Regular.ttf",
-        r"C:\Windows\Fonts\Roboto-Bold.ttf",
-        r"C:\Windows\Fonts\Roboto-Light.ttf",
-    ];
-
-    let mut loaded = 0;
-    for path in &font_files {
-        if let Ok(data) = std::fs::read(path) {
-            let blob = Blob::new(Arc::new(data) as _);
-            font_ctx.collection.register_fonts(blob, None);
-            loaded += 1;
-        }
-    }
-    eprintln!("[FONT] Loaded {loaded} fonts");
+    // Fonts are compiled in, not read from disk. This used to be a hardcoded
+    // list of `C:\Windows\Fonts\*.ttf` paths, which tied text rendering to
+    // whichever fonts a given Windows install happened to ship and rendered
+    // nothing at all on any other platform. See `zipp_dom::fonts`.
+    zipp_dom::register_embedded_fonts(&mut font_ctx.collection);
 
     font_ctx
         .collection

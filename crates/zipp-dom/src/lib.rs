@@ -36,6 +36,9 @@ pub const DEFAULT_CSS: &str = include_str!("../assets/default.css");
 /// A fallback bullet font bundled with the engine for list markers.
 pub const BULLET_FONT: &[u8] = include_bytes!("../assets/moz-bullet-font.otf");
 
+pub mod fonts;
+pub use fonts::register_embedded_fonts;
+
 // -----------------------------------------------
 // Incremental layout feature flags
 // -----------------------------------------------
