@@ -1,0 +1,64 @@
+[package]
+name = "zipp-shell"
+description = "Application shell, windowing, and networking for Zipp Browser"
+version = "0.1.0"
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+default = ["clipboard", "file_dialog", "tracing"]
+accessibility = []
+clipboard = ["dep:arboard"]
+tracing = ["dep:tracing", "zipp-dom/tracing"]
+file_dialog = ["dep:rfd"]
+# Enables a data-uri-only NetProvider. Only needed if you aren't using the regular NetProvider
+data-uri = []
+# Net features (from blitz-net)
+http2 = ["reqwest/http2"]
+cookies = ["reqwest/cookies"]
+multipart = ["reqwest/multipart", "reqwest/stream"]
+cache = ["dep:reqwest-middleware", "dep:http-cache-reqwest", "dep:directories"]
+
+[dependencies]
+# In-repo
+zipp-dom = { workspace = true }
+zipp-renderer = { workspace = true }
+
+# AnyRender
+anyrender = { workspace = true }
+
+# Windowing & Input
+winit = { workspace = true }
+keyboard-types = { workspace = true }
+
+# Networking (merged from blitz-net)
+tokio = { workspace = true }
+reqwest = { workspace = true, features = ["charset", "rustls-tls"] }
+data-url = { workspace = true }
+
+# Caching (optional, from blitz-net)
+reqwest-middleware = { workspace = true, optional = true }
+http-cache-reqwest = { workspace = true, optional = true, features = ["manager-cacache"] }
+directories = { version = "6.0.0", optional = true }
+
+# Other dependencies
+tracing = { workspace = true, optional = true }
+futures-util = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { version = "0.6.0" }
+
+[target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
+arboard = { workspace = true, optional = true }
+
+[target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
+rfd = { workspace = true, optional = true, features = ["xdg-portal"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "0.4"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

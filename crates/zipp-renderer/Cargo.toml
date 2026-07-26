@@ -1,0 +1,48 @@
+[package]
+name = "zipp-renderer"
+description = "Paint engine and TinySkia software renderer for Zipp Browser"
+version = "0.1.0"
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+default = ["svg"]
+tracing = ["dep:tracing"]
+svg = ["dep:anyrender_svg", "dep:usvg", "zipp-dom/svg"]
+
+[dependencies]
+# In-repo
+zipp-dom = { workspace = true }
+
+# AnyRender
+anyrender = { workspace = true }
+anyrender_svg = { workspace = true, optional = true }
+
+# Servo dependencies
+style = { workspace = true }
+euclid = { workspace = true }
+
+# Taffy layout
+taffy = { workspace = true }
+
+# Linebender / Fontations (for paint + tinyskia)
+parley = { workspace = true }
+color = { workspace = true }
+peniko = { workspace = true }
+kurbo = { workspace = true }
+skrifa = { workspace = true }
+linebender_resource_handle = { workspace = true }
+
+# TinySkia software renderer (merged from anyrender_tinyskia)
+tiny-skia = { workspace = true }
+softbuffer = { workspace = true }
+read-fonts = { workspace = true }
+raw-window-handle = { workspace = true }
+
+# SVG (optional)
+usvg = { workspace = true, optional = true }
+
+# Tracing (optional)
+tracing = { workspace = true, optional = true }

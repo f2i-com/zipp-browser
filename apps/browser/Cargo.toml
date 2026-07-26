@@ -1,0 +1,65 @@
+[package]
+name = "zipp-browser"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "zipp-browser"
+path = "src/main.rs"
+
+[[bin]]
+name = "test-inline"
+path = "src/test.rs"
+
+[features]
+default = ["svg", "system_fonts", "grid", "tracing", "net", "floats"]
+svg = [
+    "zipp-dom/svg",
+    "zipp-renderer/svg",
+]
+system_fonts = ["zipp-dom/system_fonts"]
+grid = ["zipp-dom/grid"]
+tracing = [
+    "dep:tracing-subscriber",
+    "zipp-dom/tracing",
+    "zipp-renderer/tracing",
+    "zipp-shell/tracing",
+]
+net = ["dep:tokio", "dep:url"]
+floats = ["zipp-dom/floats"]
+cookies = ["zipp-shell/cookies"]
+cache = ["zipp-shell/cache"]
+http2 = ["zipp-shell/http2"]
+
+[dependencies]
+# In-repo workspace crates
+zipp-dom = { workspace = true, features = ["default", "woff-rust", "parallel-construct"] }
+zipp-renderer = { workspace = true, features = ["default"] }
+zipp-shell = { workspace = true, features = ["default", "http2"] }
+
+# Zipp JS engine — the zipp-lang register VM + x86-64 JIT, consumed through
+# its `embed` module (persistent VM: compile once, keep alive, eval + dispatch
+# event handlers into the same global context).
+zipp-vm = { path = "../../../zipp-lang/crates/zipp-vm" }
+
+# Linebender
+linebender_resource_handle = { workspace = true }
+
+# IO & Networking
+tokio = { workspace = true, features = ["rt-multi-thread"], optional = true }
+url = { workspace = true, features = ["serde"], optional = true }
+reqwest = { workspace = true, features = ["blocking", "rustls-tls"] }
+
+# Utilities
+base64 = "0.22"
+lazy_static = "1"
+stacker = "0.1"
+urlencoding = "2"
+
+# Tracing (optional)
+tracing-subscriber = { workspace = true, optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"], optional = true }

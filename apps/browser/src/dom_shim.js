@@ -1,0 +1,1078 @@
+// Zipp Browser DOM Shim - Class-based (ES6)
+// Polyfill Object methods that Zipp doesn't have natively
+if (typeof Object.defineProperty === "undefined") {
+    Object.defineProperty = function(obj, prop, desc) {
+        if (desc && typeof desc.value !== "undefined") {
+            obj[prop] = desc.value;
+        } else if (desc && typeof desc.get === "function") {
+            // Simulate getter by setting the current value
+            // (can't do real lazy getters without engine support)
+            try { obj[prop] = desc.get(); } catch(e) { obj[prop] = undefined; }
+        }
+        if (desc && typeof desc.set === "function") {
+            // Store setter for potential use
+        }
+        return obj;
+    };
+}
+if (typeof Object.getPrototypeOf === "undefined") {
+    Object.getPrototypeOf = function(obj) { return obj.__proto__ || null; };
+}
+if (typeof Object.getOwnPropertyDescriptor === "undefined") {
+    Object.getOwnPropertyDescriptor = function(obj, prop) {
+        if (obj && prop in obj) return {value: obj[prop], writable: true, enumerable: true, configurable: true};
+        return undefined;
+    };
+}
+if (typeof Object.getOwnPropertyNames === "undefined") {
+    Object.getOwnPropertyNames = function(obj) { return Object.keys(obj); };
+}
+if (typeof Object.freeze === "undefined") {
+    Object.freeze = function(obj) { return obj; };
+}
+if (typeof Object.isFrozen === "undefined") {
+    Object.isFrozen = function() { return false; };
+}
+if (typeof Object.prototype.hasOwnProperty === "undefined") {
+    Object.prototype.hasOwnProperty = function(prop) { return prop in this; };
+}
+if (typeof Object.defineProperties === "undefined") {
+    Object.defineProperties = function(obj, props) {
+        for (var key in props) {
+            if (Object.prototype.hasOwnProperty.call(props, key)) {
+                Object.defineProperty(obj, key, props[key]);
+            }
+        }
+        return obj;
+    };
+}
+if (typeof Object.assign === "undefined") {
+    Object.assign = function(target) {
+        for (var i = 1; i < arguments.length; i++) {
+            var src = arguments[i];
+            if (src != null) {
+                for (var key in src) {
+                    if (Object.prototype.hasOwnProperty.call(src, key)) {
+                        target[key] = src[key];
+                    }
+                }
+            }
+        }
+        return target;
+    };
+}
+if (typeof Object.getOwnPropertyDescriptors === "undefined") {
+    Object.getOwnPropertyDescriptors = function(obj) {
+        var result = {};
+        for (var key in obj) {
+            if (Object.prototype.hasOwnProperty.call(obj, key)) {
+                result[key] = { value: obj[key], writable: true, enumerable: true, configurable: true };
+            }
+        }
+        return result;
+    };
+}
+
+// Symbol polyfill using numeric values. React's typeof checks for
+// Symbol use 'function', which our polyfill satisfies. The .for()
+// method returns unique numeric IDs matching React's fallback constants.
+var __symCounter = 0;
+var __symRegistry = {};
+var Symbol = function(desc) {
+    return 0xfff0 + __symCounter++;
+};
+Symbol._counter = 0;
+Symbol._registry = __symRegistry;
+Symbol.for = function(key) {
+    if (__symRegistry[key] !== undefined) return __symRegistry[key];
+    var id = 0xfff0 + __symCounter++;
+    __symRegistry[key] = id;
+    return id;
+};
+Symbol.iterator = Symbol("Symbol.iterator");
+Symbol.hasInstance = Symbol("Symbol.hasInstance");
+Symbol.toPrimitive = Symbol("Symbol.toPrimitive");
+Symbol.toStringTag = Symbol("Symbol.toStringTag");
+
+// Set up console using Zipp's env bridge (env.log is the builtin)
+var console = {
+    log: function(a,b,c,d) { env.log("info", "" + (a!==undefined?a:"") + (b!==undefined?" "+b:"") + (c!==undefined?" "+c:"") + (d!==undefined?" "+d:"")); },
+    warn: function(a,b,c,d) { env.log("warn", "" + (a!==undefined?a:"") + (b!==undefined?" "+b:"") + (c!==undefined?" "+c:"") + (d!==undefined?" "+d:"")); },
+    error: function(a,b,c,d) { env.log("error", "" + (a!==undefined?a:"") + (b!==undefined?" "+b:"") + (c!==undefined?" "+c:"") + (d!==undefined?" "+d:"")); },
+    info: function(a,b) { env.log("info", "" + (a!==undefined?a:"") + (b!==undefined?" "+b:"")); },
+    debug: function() {},
+    trace: function() {},
+    dir: function() {},
+    table: function() {},
+    group: function() {},
+    groupEnd: function() {},
+    time: function() {},
+    timeEnd: function() {},
+    assert: function(cond, msg) { if (!cond) env.log("error", "Assertion failed: " + (msg||"")); }
+};
+
+// All definitions at top level (no IIFE) so they become globals in Zipp
+var __fl_strict = true;
+
+if (typeof WeakMap === "undefined") {
+    var _wid = 0;
+    class WeakMap { constructor() { this._id = "_wm_" + (_wid++); this._s = {}; } set(k,v) { if(k&&typeof k==="object") k[this._id]=v; else this._s[""+k]=v; return this; } get(k) { if(k&&typeof k==="object") return k[this._id]; return this._s[""+k]; } has(k) { if(k&&typeof k==="object") return this._id in k; return (""+k) in this._s; } delete(k) { if(k&&typeof k==="object") delete k[this._id]; else delete this._s[""+k]; return true; } }
+    self.WeakMap = WeakMap;
+}
+if (typeof WeakSet === "undefined") {
+    class WeakSet { constructor() { this._m = new WeakMap(); } add(v) { this._m.set(v,true); return this; } has(v) { return this._m.has(v); } delete(v) { return this._m.delete(v); } }
+    self.WeakSet = WeakSet;
+}
+if (typeof Symbol === "undefined") {
+    var _sc = 0, _sr = {};
+    function Symbol(d) { return "@@sym_" + (_sc++) + "_" + (d||""); }
+    Symbol.for = function(k) { if(!_sr[k]) _sr[k] = Symbol(k); return _sr[k]; };
+    Symbol.iterator = Symbol("iterator");
+    Symbol.hasInstance = Symbol("hasInstance");
+    Symbol.toPrimitive = Symbol("toPrimitive");
+    Symbol.toStringTag = Symbol("toStringTag");
+    self.Symbol = Symbol;
+}
+
+var _nid = 1;
+
+// Event handler registry for the Live DOM Bridge (Phase 1).
+// Maps JS node _id -> { eventType -> [handlerFn, ...] }
+// Populated by addEventListener, read by Rust after SSR to wire up event dispatch.
+var __eventHandlers = {};
+
+class ClassList {
+    constructor(el) { this._el = el; }
+    _list() { return (this._el.className||"").split(/\s+/).filter(function(x){return x;}); }
+    get length() { return this._list().length; }
+    item(index) { var l=this._list(); return index>=0&&index<l.length?l[index]:null; }
+    add() { var c=this._list(); for(var i=0;i<arguments.length;i++) if(c.indexOf(arguments[i])<0) c.push(arguments[i]); this._el.className=c.join(" "); }
+    remove() { var c=this._list(); for(var i=0;i<arguments.length;i++){var j=c.indexOf(arguments[i]);if(j>=0)c.splice(j,1);} this._el.className=c.join(" "); }
+    contains(v) { return (" "+(this._el.className||"")+" ").indexOf(" "+v+" ")>=0; }
+    toggle(v,f) { if(f!==undefined){f?this.add(v):this.remove(v);return !!f;} if(this.contains(v)){this.remove(v);return false;} this.add(v);return true; }
+    replace(oldCls,newCls) { var c=this._list(); var i=c.indexOf(oldCls); if(i<0) return false; c[i]=newCls; this._el.className=c.join(" "); return true; }
+    get value() { return this._el.className||""; }
+    toString() { return this._el.className||""; }
+    forEach(fn) { this._list().forEach(fn); }
+}
+
+class DOMNode {
+    constructor(nodeType, nodeName) {
+        this._id = _nid++;
+        this.nodeType = nodeType;
+        this.nodeName = nodeName || "";
+        this.childNodes = [];
+        this.parentNode = null;
+        // Use _id-based lookup since VM indexOf may fail on object references
+        this._findChild = function(target) {
+            for (var i = 0; i < this.childNodes.length; i++) {
+                if (this.childNodes[i] === target || (this.childNodes[i] && target && this.childNodes[i]._id === target._id)) return i;
+            }
+            return -1;
+        };
+        this.ownerDocument = null;
+        this._listeners = {};
+    }
+    get firstChild() { return this.childNodes[0] || null; }
+    get lastChild() { return this.childNodes[this.childNodes.length-1] || null; }
+    get nextSibling() { if(!this.parentNode) return null; var i=this.parentNode._findChild(this); return this.parentNode.childNodes[i+1]||null; }
+    get previousSibling() { if(!this.parentNode) return null; var i=this.parentNode._findChild(this); return i>0?this.parentNode.childNodes[i-1]:null; }
+    get parentElement() { return this.parentNode&&this.parentNode.nodeType===1?this.parentNode:null; }
+    appendChild(child) {
+        if(!child) return child;
+        if(child.nodeType===11) { var k=child.childNodes.slice(); for(var i=0;i<k.length;i++) this.appendChild(k[i]); return child; }
+        if(child.parentNode) child.parentNode.removeChild(child);
+        child.parentNode=this; child.ownerDocument=this.ownerDocument||this;
+        this.childNodes.push(child);
+        __domMutations++;
+
+
+        return child;
+    }
+    removeChild(child) { for(var i=0;i<this.childNodes.length;i++){if(this.childNodes[i]===child){this.childNodes.splice(i,1);child.parentNode=null;break;}} return child; }
+    insertBefore(n,ref) {
+        __domMutations++;
+
+
+        if(!ref) return this.appendChild(n);
+        if(n.nodeType===11){var k=n.childNodes.slice();for(var i=0;i<k.length;i++)this.insertBefore(k[i],ref);return n;}
+        if(n.parentNode) n.parentNode.removeChild(n);
+        var i=this._findChild(ref); if(i>=0) this.childNodes.splice(i,0,n); else this.childNodes.push(n);
+        n.parentNode=this; n.ownerDocument=this.ownerDocument||this; return n;
+    }
+    replaceChild(n,old) { var i=this._findChild(old); if(i>=0){if(n.parentNode)n.parentNode.removeChild(n);this.childNodes[i]=n;n.parentNode=this;old.parentNode=null;} return old; }
+    contains(o) { if(this===o)return true; for(var i=0;i<this.childNodes.length;i++) if(this.childNodes[i].contains(o))return true; return false; }
+    cloneNode(deep) { var c=new DOMNode(this.nodeType,this.nodeName); if(deep) for(var i=0;i<this.childNodes.length;i++) c.appendChild(this.childNodes[i].cloneNode(true)); return c; }
+    addEventListener(t,fn) { if(!this._listeners[t]) this._listeners[t]=[]; this._listeners[t].push(fn); if(!__eventHandlers[this._id]) __eventHandlers[this._id]={}; if(!__eventHandlers[this._id][t]) __eventHandlers[this._id][t]=[]; __eventHandlers[this._id][t].push(fn); }
+    removeEventListener(t,fn) { if(this._listeners[t]) this._listeners[t]=this._listeners[t].filter(function(f){return f!==fn;}); }
+    dispatchEvent(ev) { ev.target=this; var h=this._listeners[ev.type]||[]; for(var i=0;i<h.length;i++) try{h[i].call(this,ev);}catch(e){} return true; }
+    get isConnected() { var n=this; while(n){if(n.nodeType===9)return true; n=n.parentNode;} return false; }
+    getRootNode() { var n=this; while(n.parentNode) n=n.parentNode; return n; }
+    hasChildNodes() { return this.childNodes.length>0; }
+    normalize() {}
+}
+
+// Dataset helper: maps camelCase property access to data-* attributes
+function _makeDataset(el) {
+    var ds = {};
+    ds._el = el;
+    ds._toAttr = function(k) { return "data-" + k.replace(/[A-Z]/g, function(m){return "-"+m.toLowerCase();}); };
+    ds._toKey = function(a) { return a.slice(5).replace(/-([a-z])/g, function(_,c){return c.toUpperCase();}); };
+    return ds;
+}
+
+class Element extends DOMNode {
+    constructor(tag,ns) {
+        super(1, tag.toUpperCase());
+        this.tagName = tag.toUpperCase();
+        this.localName = tag.toLowerCase();
+        this.namespaceURI = ns || "http://www.w3.org/1999/xhtml";
+        this.attributes = {};
+        this.style = {};
+        this.className = "";
+        this.id = "";
+        this.dataset = _makeDataset(this);
+        this.classList = new ClassList(this);
+        this.offsetWidth = 0; this.offsetHeight = 0; this.offsetTop = 0; this.offsetLeft = 0;
+        this.scrollWidth = 0; this.scrollHeight = 0; this.scrollTop = 0; this.scrollLeft = 0;
+        this.clientWidth = 0; this.clientHeight = 0; this.clientTop = 0; this.clientLeft = 0;
+    }
+    get textContent() { var t=""; for(var i=0;i<this.childNodes.length;i++){var c=this.childNodes[i]; if(c.nodeType===3)t+=c.data; else if(c.nodeType===1)t+=c.textContent;} return t; }
+    set textContent(v) { this.childNodes=[]; if(v) this.appendChild(new Text(String(v))); }
+    get innerHTML() { return __sc(this); }
+    set innerHTML(v) { this.childNodes=[]; if(v) this.appendChild(new Text(String(v))); }
+    get outerHTML() { return __sn(this); }
+    get children() { return this.childNodes.filter(function(c){return c.nodeType===1;}); }
+    setAttribute(n,v) { v=String(v); this.attributes[n]=v; if(n==="class")this.className=v; if(n==="id")this.id=v; if(n==="style")this._ps(v); if(n.indexOf("data-")===0)this.dataset[n.slice(5)]=v; }
+    getAttribute(n) { if(n==="class")return this.className||null; if(n==="id")return this.id||null; return this.attributes[n]!==undefined?this.attributes[n]:null; }
+    removeAttribute(n) { delete this.attributes[n]; }
+    hasAttribute(n) { return n in this.attributes||(n==="class"&&this.className)||(n==="id"&&this.id); }
+    setAttributeNS(ns,n,v) { this.setAttribute(n,v); }
+    getAttributeNS(ns,n) { return this.getAttribute(n); }
+    hasAttributeNS(ns,n) { return this.hasAttribute(n); }
+    removeAttributeNS(ns,n) { this.removeAttribute(n); }
+    getElementsByTagName(tag) { var r=[]; tag=tag.toUpperCase(); function w(n){for(var i=0;i<n.childNodes.length;i++){var c=n.childNodes[i];if(c.nodeType===1&&(tag==="*"||c.tagName===tag))r.push(c);if(c.nodeType===1)w(c);}} w(this); return r; }
+    getElementsByClassName(cls) { var r=[]; function w(n){for(var i=0;i<n.childNodes.length;i++){var c=n.childNodes[i];if(c.nodeType===1&&c.classList&&c.classList.contains(cls))r.push(c);if(c.nodeType===1)w(c);}} w(this); return r; }
+    querySelector(sel) { return _qs(this,sel,false); }
+    querySelectorAll(sel) { return _qs(this,sel,true); }
+    getBoundingClientRect() { return {top:0,left:0,right:0,bottom:0,width:0,height:0,x:0,y:0}; }
+    matches(sel) { return _sm(this,sel); }
+    closest(sel) { var el=this; while(el){if(el.nodeType===1&&el.matches(sel))return el; el=el.parentNode;} return null; }
+    cloneNode(deep) { var c=new Element(this.localName); c.className=this.className; c.id=this.id; for(var k in this.attributes) c.attributes[k]=this.attributes[k]; if(deep) for(var i=0;i<this.childNodes.length;i++) c.appendChild(this.childNodes[i].cloneNode(true)); return c; }
+    _ps(s) { var p=s.split(";"); for(var i=0;i<p.length;i++){var kv=p[i].split(":"); if(kv.length===2) this.style[kv[0].trim()]=kv[1].trim();} }
+    get isConnected() { var n=this; while(n){if(n.nodeType===9)return true; n=n.parentNode;} return false; }
+    focus() {}
+    blur() {}
+    remove() { if(this.parentNode) this.parentNode.removeChild(this); }
+    replaceWith(node) { if(this.parentNode) { this.parentNode.insertBefore(node,this); this.parentNode.removeChild(this); } }
+    before() { if(!this.parentNode) return; for(var i=0;i<arguments.length;i++) this.parentNode.insertBefore(arguments[i],this); }
+    after() { if(!this.parentNode) return; var ref=this.nextSibling; for(var i=0;i<arguments.length;i++){if(ref)this.parentNode.insertBefore(arguments[i],ref);else this.parentNode.appendChild(arguments[i]);} }
+    insertAdjacentElement(pos,el) { if(!el)return null; if(pos==="beforebegin"&&this.parentNode) this.parentNode.insertBefore(el,this); else if(pos==="afterbegin") this.insertBefore(el,this.firstChild); else if(pos==="beforeend") this.appendChild(el); else if(pos==="afterend"&&this.parentNode){var ns=this.nextSibling;if(ns)this.parentNode.insertBefore(el,ns);else this.parentNode.appendChild(el);} return el; }
+    insertAdjacentHTML(pos,html) { var t=new Text(html); this.insertAdjacentElement(pos,t); }
+    getAttributeNames() { return Object.keys(this.attributes); }
+    toggleAttribute(name,force) { if(force!==undefined){if(force)this.setAttribute(name,"");else this.removeAttribute(name);return force;} if(this.hasAttribute(name)){this.removeAttribute(name);return false;} this.setAttribute(name,""); return true; }
+}
+
+class Text extends DOMNode {
+    constructor(d) { super(3,"#text"); this.data=String(d||""); this.textContent=this.data; this.nodeValue=this.data; }
+    cloneNode() { return new Text(this.data); }
+}
+class Comment extends DOMNode {
+    constructor(d) { super(8,"#comment"); this.data=String(d||""); }
+}
+class DocumentFragment extends DOMNode {
+    constructor() { super(11,"#document-fragment"); }
+}
+
+class Event {
+    constructor(type,opts) { opts=opts||{}; this.type=type; this.bubbles=!!opts.bubbles; this.cancelable=!!opts.cancelable; this.target=null; this.currentTarget=null; this.defaultPrevented=false; this._stopped=false; }
+    preventDefault() { this.defaultPrevented=true; }
+    stopPropagation() { this._stopped=true; }
+    stopImmediatePropagation() { this._stopped=true; }
+}
+class CustomEvent extends Event {
+    constructor(type,opts) { super(type,opts); this.detail=opts?opts.detail:null; }
+}
+
+class MutationObserver {
+    constructor(cb) { this._cb=cb; }
+    observe() {}
+    disconnect() {}
+    takeRecords() { return []; }
+}
+
+function _sm(el,sel) { if(!el||el.nodeType!==1)return false; sel=sel.trim(); if(sel.charAt(0)==="#")return el.id===sel.slice(1); if(sel.charAt(0)===".")return el.classList.contains(sel.slice(1)); if(sel==="*")return true; return el.tagName===sel.toUpperCase(); }
+function _qs(root,sel,all) {
+    var r=[]; function w(n){for(var i=0;i<n.childNodes.length;i++){var c=n.childNodes[i];if(c.nodeType===1&&_sm(c,sel)){r.push(c);if(!all)return;}if(c.childNodes&&c.childNodes.length)w(c);}} w(root);
+    if(!all) return r[0]||null;
+    // NodeList-like: add forEach, item, entries, keys, values
+    r.forEach = r.forEach || Array.prototype.forEach;
+    r.item = function(i) { return r[i]||null; };
+    r.entries = function() { return Array.prototype.entries.call(r); };
+    r.keys = function() { return Array.prototype.keys.call(r); };
+    r.values = function() { return Array.prototype.values.call(r); };
+    return r;
+}
+
+function __sn(node) {
+    if(node.nodeType===3) return __eh(node.data||"");
+    if(node.nodeType===8) return "<!--"+(node.data||"")+"-->";
+    if(node.nodeType!==1) return __sc(node);
+    var tag=(node.tagName||node.nodeName||"div").toLowerCase();
+    var h="<"+tag;
+    if(node.id) h+=" id=\""+__ea(node.id)+"\"";
+    if(node.className) h+=" class=\""+__ea(node.className)+"\"";
+    for(var k in node.attributes) { if(k==="id"||k==="class") continue; h+=" "+k+"=\""+__ea(node.attributes[k])+"\""; }
+    var sk=[]; for(var p in node.style) { if(typeof node.style[p]==="string"&&p!=="setProperty"&&p!=="getPropertyValue"&&p!=="removeProperty"&&p!=="cssText"&&p.indexOf("_")!==0) sk.push(p); }
+    if(sk.length>0) { h+=" style=\""; for(var i=0;i<sk.length;i++) { var kk=sk[i].replace(/[A-Z]/g,function(m){return "-"+m.toLowerCase();}); h+=kk+":"+node.style[sk[i]]+";"; } h+="\""; }
+    if(__eventHandlers[node._id]) h+=" data-flid=\""+node._id+"\"";
+    h+=">";
+    var voids=["area","base","br","col","embed","hr","img","input","link","meta","param","source","track","wbr"];
+    if(voids.indexOf(tag)>=0) return h;
+    h+=__sc(node);
+    h+="</"+tag+">";
+    return h;
+}
+function __sc(node) { var h=""; for(var i=0;i<node.childNodes.length;i++) h+=__sn(node.childNodes[i]); return h; }
+function __eh(s) { return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function __ea(s) { return String(s).replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+
+// Create document
+var doc = new DOMNode(9, "#document");
+doc.documentElement = new Element("html");
+doc.head = new Element("head");
+doc.body = new Element("body");
+doc.documentElement.ownerDocument = doc;
+doc.head.ownerDocument = doc;
+doc.body.ownerDocument = doc;
+
+
+doc.documentElement.appendChild(doc.head);
+doc.documentElement.appendChild(doc.body);
+doc.appendChild(doc.documentElement);
+doc.readyState = "loading";
+doc.compatMode = "CSS1Compat";
+doc.characterSet = "UTF-8";
+doc.contentType = "text/html";
+
+var __createElement_count = 0;
+var __domMutations = 0;
+doc.createElement = function(tag) { __createElement_count++; var el=new Element(tag); el.ownerDocument=doc; return el; };
+doc.createElementNS = function(ns,tag) { var el=new Element(tag,ns); el.ownerDocument=doc; return el; };
+doc.createTextNode = function(d) { var t=new Text(d); t.ownerDocument=doc; return t; };
+doc.createComment = function(d) { var c=new Comment(d); c.ownerDocument=doc; return c; };
+doc.createDocumentFragment = function() { var f=new DocumentFragment(); f.ownerDocument=doc; return f; };
+doc.createEvent = function() { return new Event(""); };
+doc.getElementById = function(id) { function w(n){if(n.nodeType===1&&n.id===id)return n;for(var i=0;i<n.childNodes.length;i++){var f=w(n.childNodes[i]);if(f)return f;}return null;} return w(doc); };
+doc.getElementsByTagName = function(t) { return doc.documentElement.getElementsByTagName(t); };
+doc.getElementsByClassName = function(c) { return doc.documentElement.getElementsByClassName(c); };
+doc.querySelector = function(s) { return _qs(doc,s,false); };
+doc.querySelectorAll = function(s) { return _qs(doc,s,true); };
+
+// Document missing methods/properties
+var __cookieStore = "";
+Object.defineProperty(doc, 'cookie', {
+    get: function() { return __cookieStore; },
+    set: function(v) { __cookieStore = String(v); }
+});
+doc.readyState = "complete";
+doc.createTreeWalker = function(root,what,filter) { return { currentNode:root, nextNode:function(){return null;}, previousNode:function(){return null;}, firstChild:function(){return null;}, lastChild:function(){return null;}, nextSibling:function(){return null;}, previousSibling:function(){return null;}, parentNode:function(){return null;} }; };
+doc.createRange = function() { return { setStart:function(){}, setEnd:function(){}, collapse:function(){}, cloneRange:function(){return doc.createRange();}, selectNode:function(){}, selectNodeContents:function(){}, getBoundingClientRect:function(){return{top:0,left:0,right:0,bottom:0,width:0,height:0};}, createContextualFragment:function(html){var f=doc.createDocumentFragment();f.appendChild(doc.createTextNode(html));return f;} }; };
+doc.scripts = [];
+doc.forms = [];
+doc.images = [];
+doc.links = [];
+doc.styleSheets = [];
+Object.defineProperty(doc, 'activeElement', { get: function() { return doc.body; } });
+doc.hasFocus = function() { return true; };
+doc.createNodeIterator = function(root) { return { nextNode:function(){return null;}, previousNode:function(){return null;} }; };
+doc.adoptNode = function(node) { node.ownerDocument=doc; return node; };
+doc.importNode = function(node,deep) { return node.cloneNode(deep); };
+doc.title = "";
+
+// Setup initial body from page HTML
+var _rootDiv = doc.createElement("div");
+_rootDiv.id = "root";
+doc.body.appendChild(_rootDiv);
+
+// Performance.now: return a slowly incrementing counter so React's scheduler
+// thinks minimal time is passing (prevents immediate yielding in sync mode).
+// React yields after 5ms; incrementing by 0.1ms per call means ~50 calls before yield.
+var _perfCounter = 0;
+var performance = { now: function(){return _perfCounter+=0.01;}, mark:function(){}, measure:function(){}, getEntriesByName:function(){return [];}, getEntriesByType:function(){return [];} };
+var navigator = {
+    userAgent:"ZippBrowser/0.2", language:"en-US", languages:["en-US","en"],
+    platform:"Win32", vendor:"", onLine:true,
+    cookieEnabled:true, hardwareConcurrency:4, maxTouchPoints:0,
+    clipboard:{ writeText:function(){return Promise.resolve();}, readText:function(){return Promise.resolve("");} },
+    permissions:{ query:function(){return Promise.resolve({state:"granted"});} },
+    sendBeacon:function(){return true;},
+    serviceWorker:{ ready:Promise.resolve({active:null}), register:function(){return Promise.resolve();}, getRegistrations:function(){return Promise.resolve([]);} },
+    mediaDevices:{ getUserMedia:function(){return Promise.reject(new Error("not supported"));} },
+    geolocation:{ getCurrentPosition:function(s,e){if(e)e(new Error("not supported"));} }
+};
+
+// Parse __PAGE_URL__ to populate location fields
+var __pageUrl = "__PAGE_URL__";
+// Inline URL parsing (don't use new URL() — hoisting issues with compile_script)
+var __locUrl = {};
+(function() {
+    var href = __pageUrl;
+    var protoEnd = href.indexOf("://");
+    if (protoEnd > 0) {
+        __locUrl.protocol = href.substring(0, protoEnd + 1);
+        href = href.substring(protoEnd + 3);
+    } else {
+        __locUrl.protocol = "https:";
+    }
+    var pathStart = href.indexOf("/");
+    if (pathStart < 0) pathStart = href.length;
+    var hostPort = href.substring(0, pathStart);
+    href = href.substring(pathStart) || "/";
+    var portIdx = hostPort.indexOf(":");
+    if (portIdx >= 0) {
+        __locUrl.hostname = hostPort.substring(0, portIdx);
+        __locUrl.port = hostPort.substring(portIdx + 1);
+    } else {
+        __locUrl.hostname = hostPort;
+        __locUrl.port = "";
+    }
+    var hashIdx = href.indexOf("#");
+    if (hashIdx >= 0) { __locUrl.hash = href.substring(hashIdx); href = href.substring(0, hashIdx); } else { __locUrl.hash = ""; }
+    var searchIdx = href.indexOf("?");
+    if (searchIdx >= 0) { __locUrl.search = href.substring(searchIdx); __locUrl.pathname = href.substring(0, searchIdx); } else { __locUrl.search = ""; __locUrl.pathname = href; }
+    __locUrl.origin = __locUrl.protocol + "//" + __locUrl.hostname + (__locUrl.port ? ":" + __locUrl.port : "");
+    __locUrl.href = __pageUrl;
+})();
+// DOM_SHIM URL parsed: pathname available for React Router
+var loc = {
+    href: __pageUrl,
+    protocol: __locUrl.protocol || "https:",
+    host: __locUrl.hostname + (__locUrl.port ? ":" + __locUrl.port : ""),
+    hostname: __locUrl.hostname || "",
+    port: __locUrl.port || "",
+    pathname: __locUrl.pathname || "/",
+    search: __locUrl.search || "",
+    hash: __locUrl.hash || "",
+    origin: __locUrl.origin || (__locUrl.protocol + "//" + __locUrl.hostname + (__locUrl.port ? ":" + __locUrl.port : "")),
+    assign: function(url) { this.href = url; },
+    replace: function(url) { this.href = url; },
+    reload: function() {},
+    toString: function() { return this.href; }
+};
+
+var _rafId=0, _tid=1000;
+var __timerQueue = [];
+
+// MessageChannel - React's scheduler uses this for async work.
+// We simulate it with an iterative task queue to avoid infinite recursion
+// (React's scheduler calls postMessage from within onmessage handlers).
+var __mcQueue = [];
+var __mcDraining = false;
+var __mcMaxIter = 5000; // Safety limit for task queue iterations
+
+class MessageChannel {
+    constructor() {
+        var _this = this;
+        this.port1 = { onmessage: null };
+        this.port2 = {
+            postMessage: function(data) {
+                // Queue MC callback for async execution (React scheduler expects this)
+                var port = _this.port1;
+                __mcQueue.push(function() {
+                    if(port.onmessage) {
+                        try { port.onmessage({data:data}); }
+                        catch(e) { console.error("MC callback threw: " + e); }
+                    }
+                });
+            }
+        };
+    }
+}
+
+// --- Promise polyfill ---
+var Promise = function(executor) {
+    this._state = 'pending';
+    this._value = undefined;
+    this._callbacks = [];
+    var self = this;
+    function resolve(value) {
+        if (self._state !== 'pending') return;
+        self._state = 'fulfilled';
+        self._value = value;
+        self._callbacks.forEach(function(cb) { if (cb.onFulfilled) cb.onFulfilled(value); });
+    }
+    function reject(reason) {
+        if (self._state !== 'pending') return;
+        self._state = 'rejected';
+        self._value = reason;
+        self._callbacks.forEach(function(cb) { if (cb.onRejected) cb.onRejected(reason); });
+    }
+    try { executor(resolve, reject); } catch(e) { reject(e); }
+};
+Promise.prototype.then = function(onFulfilled, onRejected) {
+    var self = this;
+    return new Promise(function(resolve, reject) {
+        function handle(cb, fallback) {
+            return function(value) {
+                try {
+                    if (typeof cb === 'function') {
+                        var result = cb(value);
+                        if (result && typeof result.then === 'function') {
+                            result.then(resolve, reject);
+                        } else {
+                            resolve(result);
+                        }
+                    } else {
+                        fallback(value);
+                    }
+                } catch(e) { reject(e); }
+            };
+        }
+        if (self._state === 'fulfilled') { handle(onFulfilled, resolve)(self._value); }
+        else if (self._state === 'rejected') { handle(onRejected, reject)(self._value); }
+        else { self._callbacks.push({ onFulfilled: handle(onFulfilled, resolve), onRejected: handle(onRejected, reject) }); }
+    });
+};
+Promise.prototype.catch = function(onRejected) { return this.then(null, onRejected); };
+Promise.prototype.finally = function(fn) { return this.then(function(v) { fn(); return v; }, function(e) { fn(); throw e; }); };
+Promise.resolve = function(v) { return new Promise(function(r) { r(v); }); };
+Promise.reject = function(e) { return new Promise(function(_, r) { r(e); }); };
+Promise.all = function(arr) {
+    // Synchronous implementation: resolve all immediately since our Promises are sync
+    var results = [];
+    var len = arr.length;
+    if (len === 0) return Promise.resolve(results);
+    for (var i = 0; i < len; i++) {
+        var p = arr[i];
+        if (p && p._state === 'fulfilled') {
+            results.push(p._value);
+        } else if (p && typeof p.then === 'function') {
+            // Thenable: resolve synchronously
+            var resolved = false;
+            p.then(function(v) { results.push(v); resolved = true; });
+            if (!resolved) results.push(undefined);
+        } else {
+            results.push(p);
+        }
+    }
+    return Promise.resolve(results);
+};
+Promise.race = function(arr) {
+    // Synchronous: return the first resolved/rejected promise's value
+    for (var i = 0; i < arr.length; i++) {
+        var p = arr[i];
+        if (p && p._state === 'fulfilled') return Promise.resolve(p._value);
+        if (p && p._state === 'rejected') return Promise.reject(p._value);
+    }
+    // If none settled, resolve with first value
+    return arr.length > 0 ? Promise.resolve(arr[0]) : Promise.resolve(undefined);
+};
+Promise.allSettled = function(arr) {
+    return Promise.all(arr.map(function(p) {
+        return Promise.resolve(p).then(
+            function(v) { return {status:'fulfilled',value:v}; },
+            function(e) { return {status:'rejected',reason:e}; }
+        );
+    }));
+};
+
+// --- Error type polyfills ---
+var TypeError = function(msg) { this.message = msg || ''; this.name = 'TypeError'; this.stack = ''; };
+TypeError.prototype = Object.create(Error.prototype);
+var ReferenceError = function(msg) { this.message = msg || ''; this.name = 'ReferenceError'; this.stack = ''; };
+ReferenceError.prototype = Object.create(Error.prototype);
+var SyntaxError = function(msg) { this.message = msg || ''; this.name = 'SyntaxError'; this.stack = ''; };
+SyntaxError.prototype = Object.create(Error.prototype);
+var RangeError = function(msg) { this.message = msg || ''; this.name = 'RangeError'; this.stack = ''; };
+RangeError.prototype = Object.create(Error.prototype);
+var URIError = function(msg) { this.message = msg || ''; this.name = 'URIError'; this.stack = ''; };
+URIError.prototype = Object.create(Error.prototype);
+
+// --- Number static methods ---
+if (typeof Number.isFinite === 'undefined') Number.isFinite = function(v) { return typeof v === 'number' && isFinite(v); };
+if (typeof Number.isNaN === 'undefined') Number.isNaN = function(v) { return typeof v === 'number' && isNaN(v); };
+if (typeof Number.isInteger === 'undefined') Number.isInteger = function(v) { return typeof v === 'number' && isFinite(v) && Math.floor(v) === v; };
+if (typeof Number.parseInt === 'undefined') Number.parseInt = parseInt;
+if (typeof Number.parseFloat === 'undefined') Number.parseFloat = parseFloat;
+Number.MAX_SAFE_INTEGER = 9007199254740991;
+Number.MIN_SAFE_INTEGER = -9007199254740991;
+Number.EPSILON = 2.220446049250313e-16;
+Number.isSafeInteger = function(v) { return Number.isInteger(v) && Math.abs(v) <= Number.MAX_SAFE_INTEGER; };
+
+// --- Map/Set iterator extensions ---
+if (typeof Map !== "undefined") {
+    Map.prototype.entries = function() { var arr = []; this.forEach(function(v,k){ arr.push([k,v]); }); var i = 0; return { next: function() { return i < arr.length ? {value:arr[i++],done:false} : {done:true}; } }; };
+    Map.prototype.keys = function() { var arr = []; this.forEach(function(v,k){ arr.push(k); }); var i = 0; return { next: function() { return i < arr.length ? {value:arr[i++],done:false} : {done:true}; } }; };
+    Map.prototype.values = function() { var arr = []; this.forEach(function(v,k){ arr.push(v); }); var i = 0; return { next: function() { return i < arr.length ? {value:arr[i++],done:false} : {done:true}; } }; };
+}
+if (typeof Set !== "undefined" && !Set.prototype.entries) {
+    Set.prototype.entries = function() { var arr = []; this.forEach(function(v){ arr.push([v,v]); }); var i = 0; return { next: function() { return i < arr.length ? {value:arr[i++],done:false} : {done:true}; } }; };
+    Set.prototype.keys = function() { var arr = []; this.forEach(function(v){ arr.push(v); }); var i = 0; return { next: function() { return i < arr.length ? {value:arr[i++],done:false} : {done:true}; } }; };
+    Set.prototype.values = Set.prototype.keys;
+}
+
+// --- String prototype extensions ---
+if (!String.prototype.endsWith) String.prototype.endsWith = function(s, len) { if (len === undefined || len > this.length) len = this.length; return this.substring(len - s.length, len) === s; };
+if (!String.prototype.repeat) String.prototype.repeat = function(n) { var s = '', t = this; while (n > 0) { if (n & 1) s += t; n >>= 1; t += t; } return s; };
+if (!String.prototype.padStart) String.prototype.padStart = function(len, fill) { fill = fill || ' '; var s = this; while (s.length < len) s = fill + s; return s.substring(0, Math.max(len, this.length)); };
+if (!String.prototype.padEnd) String.prototype.padEnd = function(len, fill) { fill = fill || ' '; var s = this; while (s.length < len) s = s + fill; return s.substring(0, Math.max(len, this.length)); };
+if (!String.prototype.trimStart) String.prototype.trimStart = function() { return this.replace(/^\s+/, ''); };
+if (!String.prototype.trimEnd) String.prototype.trimEnd = function() { return this.replace(/\s+$/, ''); };
+if (!String.prototype.replaceAll) String.prototype.replaceAll = function(search, replace) { return this.split(search).join(replace); };
+if (!String.prototype.at) String.prototype.at = function(i) { if (i < 0) i = this.length + i; return this[i]; };
+
+// --- URLSearchParams polyfill ---
+var URLSearchParams = function(init) {
+    this._params = [];
+    if (typeof init === 'string') {
+        var s = init.charAt(0) === '?' ? init.substring(1) : init;
+        var pairs = s.split('&');
+        for (var i = 0; i < pairs.length; i++) {
+            var eq = pairs[i].indexOf('=');
+            if (eq >= 0) this._params.push([decodeURIComponent(pairs[i].substring(0,eq)), decodeURIComponent(pairs[i].substring(eq+1))]);
+            else if (pairs[i]) this._params.push([decodeURIComponent(pairs[i]), '']);
+        }
+    }
+};
+URLSearchParams.prototype.get = function(name) { for (var i = 0; i < this._params.length; i++) if (this._params[i][0] === name) return this._params[i][1]; return null; };
+URLSearchParams.prototype.set = function(name, value) { var found = false; for (var i = 0; i < this._params.length; i++) if (this._params[i][0] === name) { this._params[i][1] = value; found = true; break; } if (!found) this._params.push([name, value]); };
+URLSearchParams.prototype.has = function(name) { for (var i = 0; i < this._params.length; i++) if (this._params[i][0] === name) return true; return false; };
+URLSearchParams.prototype.delete = function(name) { this._params = this._params.filter(function(p) { return p[0] !== name; }); };
+URLSearchParams.prototype.append = function(name, value) { this._params.push([name, value]); };
+URLSearchParams.prototype.toString = function() { return this._params.map(function(p) { return encodeURIComponent(p[0]) + '=' + encodeURIComponent(p[1]); }).join('&'); };
+URLSearchParams.prototype.forEach = function(fn) { for (var i = 0; i < this._params.length; i++) fn(this._params[i][1], this._params[i][0]); };
+URLSearchParams.prototype.entries = function() { return this._params; };
+URLSearchParams.prototype.keys = function() { return this._params.map(function(p) { return p[0]; }); };
+URLSearchParams.prototype.values = function() { return this._params.map(function(p) { return p[1]; }); };
+
+// --- TextEncoder/TextDecoder polyfill ---
+var TextEncoder = function() {};
+TextEncoder.prototype.encode = function(str) {
+    var arr = [];
+    for (var i = 0; i < str.length; i++) {
+        var c = str.charCodeAt(i);
+        if (c < 128) arr.push(c);
+        else if (c < 2048) { arr.push(192 | (c >> 6)); arr.push(128 | (c & 63)); }
+        else { arr.push(224 | (c >> 12)); arr.push(128 | ((c >> 6) & 63)); arr.push(128 | (c & 63)); }
+    }
+    return arr;
+};
+var TextDecoder = function() {};
+TextDecoder.prototype.decode = function(arr) {
+    var str = '', i = 0;
+    while (i < arr.length) {
+        var c = arr[i];
+        if (c < 128) { str += String.fromCharCode(c); i++; }
+        else if (c < 224) { str += String.fromCharCode(((c & 31) << 6) | (arr[i+1] & 63)); i += 2; }
+        else { str += String.fromCharCode(((c & 15) << 12) | ((arr[i+1] & 63) << 6) | (arr[i+2] & 63)); i += 3; }
+    }
+    return str;
+};
+
+// --- AbortController/AbortSignal polyfill ---
+var AbortController = function() { this.signal = { aborted: false, addEventListener: function(){}, removeEventListener: function(){} }; };
+AbortController.prototype.abort = function() { this.signal.aborted = true; };
+
+// --- Array.prototype extras ---
+if (!Array.prototype.at) Array.prototype.at = function(i) { if (i < 0) i = this.length + i; return this[i]; };
+if (!Array.prototype.entries) Array.prototype.entries = function() { var i = 0, self = this; return { next: function() { return i < self.length ? {value:[i,self[i++]],done:false} : {done:true}; } }; };
+if (!Array.prototype.values) Array.prototype.values = function() { var i = 0, self = this; return { next: function() { return i < self.length ? {value:self[i++],done:false} : {done:true}; } }; };
+if (!Array.prototype.keys) Array.prototype.keys = function() { var i = 0, self = this; return { next: function() { return i < this.length ? {value:i++,done:false} : {done:true}; } }; };
+
+// --- sessionStorage polyfill ---
+var sessionStorage = { _data: {}, getItem: function(k) { return this._data[k] || null; }, setItem: function(k,v) { this._data[k] = String(v); }, removeItem: function(k) { delete this._data[k]; }, clear: function() { this._data = {}; } };
+// Also define localStorage as alias
+var localStorage = { _data: {}, getItem: function(k) { return this._data[k] || null; }, setItem: function(k,v) { this._data[k] = String(v); }, removeItem: function(k) { delete this._data[k]; }, clear: function() { this._data = {}; } };
+
+var __b64chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+function __btoa(s) {
+    s=String(s); var o="",i=0;
+    while(i<s.length){var a=s.charCodeAt(i++),b=i<s.length?s.charCodeAt(i++):NaN,c=i<s.length?s.charCodeAt(i++):NaN;
+    var d1=a>>2,d2=((a&3)<<4)|(isNaN(b)?0:b>>4),d3=isNaN(b)?64:((b&15)<<2)|(isNaN(c)?0:c>>6),d4=isNaN(c)?64:c&63;
+    o+=__b64chars[d1]+__b64chars[d2]+(d3===64?"=":__b64chars[d3])+(d4===64?"=":__b64chars[d4]);}
+    return o;
+}
+function __atob(s) {
+    s=String(s); while(s.length>0&&s[s.length-1]==="=")s=s.substring(0,s.length-1); var o="",i=0;
+    while(i<s.length){var a=__b64chars.indexOf(s[i++]),b=__b64chars.indexOf(s[i++]),c=__b64chars.indexOf(s[i++]),d=__b64chars.indexOf(s[i++]);
+    o+=String.fromCharCode((a<<2)|(b>>4)); if(c>=0)o+=String.fromCharCode(((b&15)<<4)|(c>>2)); if(d>=0)o+=String.fromCharCode(((c&3)<<6)|d);}
+    return o;
+}
+
+// XMLHttpRequest polyfill using http bridge
+var XMLHttpRequest = function() {
+    this.readyState = 0;
+    this.status = 0;
+    this.statusText = "";
+    this.responseText = "";
+    this.response = "";
+    this.responseType = "";
+    this._headers = {};
+    this._method = "GET";
+    this._url = "";
+    this._async = true;
+    this.onreadystatechange = null;
+    this.onload = null;
+    this.onerror = null;
+    this.onprogress = null;
+    this.ontimeout = null;
+    this.withCredentials = false;
+    this.timeout = 0;
+};
+XMLHttpRequest.prototype.open = function(method, url, isAsync) {
+    this._method = method;
+    this._url = url;
+    this._async = isAsync !== false;
+    this.readyState = 1;
+    if (this.onreadystatechange) this.onreadystatechange();
+};
+XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+    this._headers[name] = value;
+};
+XMLHttpRequest.prototype.getResponseHeader = function(name) {
+    return null;
+};
+XMLHttpRequest.prototype.getAllResponseHeaders = function() { return ""; };
+XMLHttpRequest.prototype.send = function(body) {
+    var self = this;
+    try {
+        var r;
+        if (self._method === "POST") r = http.post(self._url, String(body || ""), self._headers["Content-Type"] || "");
+        else if (self._method === "PUT") r = http.put(self._url, String(body || ""), self._headers["Content-Type"] || "");
+        else if (self._method === "DELETE") r = http.delete(self._url);
+        else r = http.get(self._url);
+        self.status = r.status;
+        self.statusText = r.ok ? "OK" : "Error";
+        self.responseText = r.body;
+        self.response = self.responseType === "json" ? JSON.parse(r.body) : r.body;
+        self.readyState = 4;
+        if (self.onreadystatechange) self.onreadystatechange();
+        if (self.onload) self.onload();
+    } catch(e) {
+        self.readyState = 4;
+        self.status = 0;
+        if (self.onerror) self.onerror(e);
+    }
+};
+XMLHttpRequest.prototype.abort = function() { this.readyState = 0; };
+XMLHttpRequest.prototype.addEventListener = function(t, fn) { this["on" + t] = fn; };
+XMLHttpRequest.prototype.removeEventListener = function() {};
+XMLHttpRequest.UNSENT = 0; XMLHttpRequest.OPENED = 1; XMLHttpRequest.HEADERS_RECEIVED = 2;
+XMLHttpRequest.LOADING = 3; XMLHttpRequest.DONE = 4;
+
+// --- WeakRef polyfill (basic - stores value, deref returns it) ---
+var WeakRef = function(target) { this._target = target; };
+WeakRef.prototype.deref = function() { return this._target; };
+
+// --- FinalizationRegistry polyfill (no-op) ---
+var FinalizationRegistry = function(callback) { this._callback = callback; };
+FinalizationRegistry.prototype.register = function() {};
+FinalizationRegistry.prototype.unregister = function() {};
+
+// --- Proxy polyfill (basic - wraps target, forwards gets/sets) ---
+var Proxy = function(target, handler) {
+    // Basic proxy: copy target properties, apply handler traps
+    var p = {};
+    for (var k in target) {
+        if (handler && handler.get) {
+            Object.defineProperty(p, k, {
+                get: (function(key) { return function() { return handler.get(target, key, p); }; })(k),
+                set: (function(key) { return function(v) { if (handler.set) handler.set(target, key, v, p); else target[key] = v; }; })(k),
+                enumerable: true, configurable: true
+            });
+        } else {
+            p[k] = target[k];
+        }
+    }
+    return p;
+};
+Proxy.revocable = function(target, handler) { var p = new Proxy(target, handler); return { proxy: p, revoke: function() {} }; };
+
+// --- Reflect polyfill ---
+var Reflect = {
+    apply: function(target, thisArg, args) { return target.apply(thisArg, args); },
+    construct: function(target, args) { return new (Function.prototype.bind.apply(target, [null].concat(args))); },
+    defineProperty: function(obj, prop, desc) { Object.defineProperty(obj, prop, desc); return true; },
+    deleteProperty: function(obj, prop) { delete obj[prop]; return true; },
+    get: function(obj, prop) { return obj[prop]; },
+    getOwnPropertyDescriptor: function(obj, prop) { return Object.getOwnPropertyDescriptor(obj, prop); },
+    getPrototypeOf: function(obj) { return Object.getPrototypeOf(obj); },
+    has: function(obj, prop) { return prop in obj; },
+    isExtensible: function(obj) { return true; },
+    ownKeys: function(obj) { return Object.keys(obj); },
+    preventExtensions: function(obj) { return true; },
+    set: function(obj, prop, value) { obj[prop] = value; return true; },
+    setPrototypeOf: function(obj, proto) { return true; }
+};
+
+// --- String.matchAll polyfill ---
+if (!String.prototype.matchAll) {
+    String.prototype.matchAll = function(re) {
+        var s = this, matches = [], m;
+        if (typeof re === "string") re = new RegExp(re, "g");
+        while ((m = re.exec(s)) !== null) { matches.push(m); if (!re.global) break; }
+        var i = 0;
+        return { next: function() { return i < matches.length ? {value:matches[i++],done:false} : {done:true}; } };
+    };
+}
+
+// --- String.raw polyfill ---
+if (!String.raw) {
+    String.raw = function(strs) {
+        var result = "";
+        for (var i = 0; i < strs.raw.length; i++) {
+            result += strs.raw[i];
+            if (i < arguments.length - 1) result += arguments[i + 1];
+        }
+        return result;
+    };
+}
+
+// --- Headers class (for fetch API) ---
+var Headers = function(init) {
+    this._headers = {};
+    if (init) for (var k in init) this._headers[k.toLowerCase()] = init[k];
+};
+Headers.prototype.get = function(name) { return this._headers[name.toLowerCase()] || null; };
+Headers.prototype.set = function(name, value) { this._headers[name.toLowerCase()] = value; };
+Headers.prototype.has = function(name) { return name.toLowerCase() in this._headers; };
+Headers.prototype.delete = function(name) { delete this._headers[name.toLowerCase()]; };
+Headers.prototype.forEach = function(fn) { for (var k in this._headers) fn(this._headers[k], k); };
+
+// --- FormData class (basic) ---
+var FormData = function() { this._data = []; };
+FormData.prototype.append = function(name, value) { this._data.push([name, value]); };
+FormData.prototype.get = function(name) { for (var i = 0; i < this._data.length; i++) if (this._data[i][0] === name) return this._data[i][1]; return null; };
+FormData.prototype.has = function(name) { return this.get(name) !== null; };
+FormData.prototype.delete = function(name) { this._data = this._data.filter(function(e) { return e[0] !== name; }); };
+FormData.prototype.forEach = function(fn) { for (var i = 0; i < this._data.length; i++) fn(this._data[i][1], this._data[i][0]); };
+
+// --- Blob class (basic) ---
+var Blob = function(parts, options) { this._parts = parts || []; this.type = (options && options.type) || ""; this.size = 0; for (var i = 0; i < this._parts.length; i++) this.size += String(this._parts[i]).length; };
+Blob.prototype.text = function() { return Promise.resolve(this._parts.join("")); };
+Blob.prototype.arrayBuffer = function() { return Promise.resolve(this._parts.join("")); };
+
+var window = {
+    document:doc, location:loc, navigator:navigator, performance:performance,
+    innerWidth:__VIEWPORT_W__, innerHeight:__VIEWPORT_H__, devicePixelRatio:1,
+    outerWidth:__VIEWPORT_W__, outerHeight:__VIEWPORT_H__,
+    scrollX:0, scrollY:0, pageXOffset:0, pageYOffset:0,
+    screenX:0, screenY:0, screenLeft:0, screenTop:0,
+    screen:{ width:__VIEWPORT_W__, height:__VIEWPORT_H__, availWidth:__VIEWPORT_W__, availHeight:__VIEWPORT_H__, colorDepth:24, pixelDepth:24, orientation:{type:"landscape-primary",angle:0} },
+    MessageChannel:MessageChannel,
+    MutationObserver:MutationObserver, Event:Event, CustomEvent:CustomEvent,
+    Node:{ELEMENT_NODE:1,TEXT_NODE:3,COMMENT_NODE:8,DOCUMENT_NODE:9,DOCUMENT_FRAGMENT_NODE:11},
+    HTMLElement:Element, DocumentFragment:DocumentFragment,
+    Promise:Promise, TypeError:TypeError, ReferenceError:ReferenceError, SyntaxError:SyntaxError, RangeError:RangeError, URIError:URIError,
+    URLSearchParams:URLSearchParams, TextEncoder:TextEncoder, TextDecoder:TextDecoder,
+    AbortController:AbortController,
+    sessionStorage:sessionStorage, localStorage:localStorage,
+    getComputedStyle:function(el){return el.style||{};},
+    requestAnimationFrame:function(fn){if(typeof fn==="function")fn(performance.now());return ++_rafId;},
+    cancelAnimationFrame:function(){},
+    // Queue timer callbacks for post-script execution (calling them synchronously
+    // causes the IIFE dispatch loop to exit prematurely from deeply nested throws)
+    setTimeout:function(fn,ms){_tid++;if(typeof fn==="function")__timerQueue.push(fn);return _tid;},
+    clearTimeout:function(){},
+    setInterval:function(fn,ms){return _tid++;}, clearInterval:function(){},
+    addEventListener:function(t,fn){doc.addEventListener(t,fn);},
+    removeEventListener:function(t,fn){doc.removeEventListener(t,fn);},
+    dispatchEvent:function(ev){return doc.dispatchEvent(ev);},
+    matchMedia:function(q){return {matches:false,media:q,addEventListener:function(){},removeEventListener:function(){},addListener:function(){},removeListener:function(){}};},
+    scrollTo:function(){}, scroll:function(){}, scrollBy:function(){},
+    history:{state:null,pushState:function(s,t,u){this.state=s;if(u)loc.pathname=u;},replaceState:function(s,t,u){this.state=s;if(u)loc.pathname=u;},back:function(){},forward:function(){},go:function(n){},length:1},
+    self:null, top:null, parent:null,
+    getSelection:function(){return {removeAllRanges:function(){},addRange:function(){},getRangeAt:function(){return doc.createRange();}};},
+    ResizeObserver:function(){this.observe=function(){};this.unobserve=function(){};this.disconnect=function(){};},
+    IntersectionObserver:function(){this.observe=function(){};this.unobserve=function(){};this.disconnect=function(){};},
+    queueMicrotask:function(fn){if(typeof fn==="function")__mcQueue.push(fn);},
+    btoa:__btoa, atob:__atob,
+    open:function(){return null;}, close:function(){},
+    postMessage:function(){},
+    alert:function(){}, confirm:function(){return false;}, prompt:function(){return null;},
+    focus:function(){}, blur:function(){}, print:function(){},
+    requestIdleCallback:function(fn){fn({timeRemaining:function(){return 50;},didTimeout:false});return ++_tid;},
+    cancelIdleCallback:function(){},
+    crypto:{
+        getRandomValues:function(arr){for(var i=0;i<arr.length;i++)arr[i]=Math.floor(Math.random()*256);return arr;},
+        randomUUID:function(){var h="0123456789abcdef",s="",i;for(i=0;i<36;i++){if(i===8||i===13||i===18||i===23)s+="-";else if(i===14)s+="4";else if(i===19)s+=h[8+(Math.random()*4|0)];else s+=h[Math.random()*16|0];}return s;}
+    },
+    isSecureContext:true,
+    structuredClone:function(v){return JSON.parse(JSON.stringify(v));},
+    fetch:function(url, opts) {
+        opts = opts || {};
+        var method = (opts.method || "GET").toUpperCase();
+        var body = opts.body || null;
+        var headers = opts.headers || {};
+        return new Promise(function(resolve, reject) {
+            try {
+                var r;
+                if (method === "POST") {
+                    r = http.post(String(url), String(body || ""), headers["Content-Type"] || "application/json");
+                } else if (method === "PUT") {
+                    r = http.put(String(url), String(body || ""), headers["Content-Type"] || "application/json");
+                } else if (method === "DELETE") {
+                    r = http.delete(String(url));
+                } else {
+                    r = http.get(String(url));
+                }
+                var responseBody = r.body;
+                resolve({
+                    ok: r.ok,
+                    status: r.status,
+                    statusText: r.ok ? "OK" : "Error",
+                    url: String(url),
+                    headers: { get: function(name) { return null; }, has: function(name) { return false; }, forEach: function() {} },
+                    text: function() { return Promise.resolve(responseBody); },
+                    json: function() { return Promise.resolve(JSON.parse(responseBody)); },
+                    blob: function() { return Promise.resolve(responseBody); },
+                    arrayBuffer: function() { return Promise.resolve(responseBody); },
+                    clone: function() { return this; },
+                    redirected: false,
+                    type: "basic"
+                });
+            } catch(e) {
+                reject(e);
+            }
+        });
+    },
+    XMLHttpRequest:XMLHttpRequest,
+    WeakRef:WeakRef, FinalizationRegistry:FinalizationRegistry,
+    Proxy:Proxy, Reflect:Reflect,
+    Headers:Headers, FormData:FormData, Blob:Blob
+};
+window.self=window; window.top=window; window.parent=window;
+// URL polyfill (improved - supports relative URL resolution)
+if (typeof URL === "undefined" || !URL.prototype) {
+    var URL = function(url, base) {
+        if (base) {
+            // Simple relative URL resolution
+            if (!url.match(/^https?:\/\//)) {
+                if (url.startsWith("/")) url = base.replace(/^(https?:\/\/[^/]+).*/, "$1") + url;
+                else url = base.replace(/[^/]*$/, "") + url;
+            }
+        }
+        this.href = url;
+        var m = url.match(/^(https?):\/\/([^/:]+)(:\d+)?(\/[^?#]*)(\?[^#]*)?(#.*)?$/);
+        if (m) {
+            this.protocol = m[1] + ":";
+            this.hostname = m[2];
+            this.port = m[3] ? m[3].substring(1) : "";
+            this.pathname = m[4] || "/";
+            this.search = m[5] || "";
+            this.hash = m[6] || "";
+            this.host = this.hostname + (this.port ? ":" + this.port : "");
+            this.origin = this.protocol + "//" + this.host;
+        } else {
+            this.protocol = ""; this.hostname = ""; this.port = ""; this.pathname = url;
+            this.search = ""; this.hash = ""; this.host = ""; this.origin = "";
+        }
+        this.searchParams = new URLSearchParams(this.search);
+    };
+    URL.prototype.toString = function() { return this.href; };
+    URL.createObjectURL = function() { return "blob:null"; };
+    URL.revokeObjectURL = function() {};
+}
+window.URL = URL;
+doc.defaultView=window;
+
+var document = doc;
+var setTimeout = window.setTimeout;
+var clearTimeout = window.clearTimeout;
+var setInterval = window.setInterval;
+var clearInterval = window.clearInterval;
+var requestAnimationFrame = window.requestAnimationFrame;
+var cancelAnimationFrame = window.cancelAnimationFrame;
+var queueMicrotask = window.queueMicrotask;
+var Node = window.Node;
+var HTMLElement = Element;
+var structuredClone = window.structuredClone;
+var btoa = window.btoa;
+var atob = window.atob;
+var crypto = window.crypto;
+var screen = window.screen;
+var globalThis = window;
+var fetch = window.fetch;
+var location = loc;
+// NOTE: Do NOT define setImmediate - it causes infinite recursion in React's scheduler.
+// React will fall through to MessageChannel which has proper queue-draining.
+
+doc.readyState = "complete";
+
+// Intercept errors that React catches internally
+var _origConsoleError = console.error;
+var __reactErrors = [];
+console.error = function(a,b,c,d) {
+    var msg = "" + (a!==undefined?a:"") + (b!==undefined?" "+b:"") + (c!==undefined?" "+c:"") + (d!==undefined?" "+d:"");
+    __reactErrors.push(msg);
+    _origConsoleError(a,b,c,d);
+};
+
+// Global extraction
+var __fl_doc_ref = doc;
+function __serializeNode(node) {
+    if(node.nodeType===3) return node.data||"";
+    if(node.nodeType===8) return "";
+    if(node.nodeType!==1) {
+        var h="";
+        for(var i=0;i<node.childNodes.length;i++) h+=__serializeNode(node.childNodes[i]);
+        return h;
+    }
+    var tag=(node.tagName||node.nodeName||"div").toLowerCase();
+    var r="<"+tag;
+    if(node.id) r+=" id=\""+node.id+"\"";
+    if(node.className) r+=" class=\""+node.className+"\"";
+    for(var k in node.attributes){if(k==="id"||k==="class") continue; r+=" "+k+"=\""+node.attributes[k]+"\"";}
+    if(__eventHandlers[node._id]) r+=" data-flid=\""+node._id+"\"";
+    r+=">";
+    // Serialize SVG elements with their attributes for Rust-side SVG rendering
+    if(tag==="svg") {
+        var sw=node.getAttribute("width")||"24";
+        var sh=node.getAttribute("height")||"24";
+        var svgChildren="";
+        for(var i=0;i<node.childNodes.length;i++) {
+            var cn=node.childNodes[i];
+            if(cn.nodeType!==1) continue;
+            var ct=(cn.tagName||"").toLowerCase();
+            var ca="";
+            for(var ak in cn.attributes) ca+=" "+ak+"=\""+cn.attributes[ak]+"\"";
+            svgChildren+="<"+ct+ca+"/>";
+        }
+        var vb=node.getAttribute("viewBox")||("0 0 "+sw+" "+sh);
+        var fill=node.getAttribute("fill")||"none";
+        var stroke=node.getAttribute("stroke")||"currentColor";
+        var sw2=node.getAttribute("stroke-width")||"2";
+        var slc=node.getAttribute("stroke-linecap")||"round";
+        var slj=node.getAttribute("stroke-linejoin")||"round";
+        return "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\""+sw+"\" height=\""+sh+"\" viewBox=\""+vb+"\" fill=\""+fill+"\" stroke=\""+stroke+"\" stroke-width=\""+sw2+"\" stroke-linecap=\""+slc+"\" stroke-linejoin=\""+slj+"\" style=\"width:"+sw+"px;height:"+sh+"px;display:inline-block;flex-shrink:0\">"+svgChildren+"</svg>";
+    }
+    // Skip SVG child elements (they're serialized inline above)
+    if(node.namespaceURI && node.namespaceURI.indexOf("svg")>=0) return "";
+    var svg_skip=["path","line","circle","polyline","polygon","rect","ellipse","g","defs","clippath","use","lineargradient","radialgradient","stop","tspan","marker","mask","pattern","filter","fegaussianblur","feoffset","feblend"];
+    if(svg_skip.indexOf(tag)>=0) return "";
+    var v=["area","base","br","col","embed","hr","img","input","link","meta","param","source","track","wbr"];
+    if(v.indexOf(tag)>=0) return r;
+    for(var i=0;i<node.childNodes.length;i++) r+=__serializeNode(node.childNodes[i]);
+    r+="</"+tag+">";
+    return r;
+}
+
+function __getRenderedHTML() {
+    var root = doc.getElementById("root");
+    if(root && root.childNodes.length > 0) return __serializeNode(doc.body);
+    return null;
+}
+
+// Return a JSON string mapping JS node IDs to their event types.
+// Format: { "nid": ["click","mousedown",...], ... }
+// Used by the Rust event bridge to know which nodes have handlers.
+function __getEventMap() {
+    var map = {};
+    for (var nid in __eventHandlers) {
+        var types = [];
+        for (var t in __eventHandlers[nid]) types.push(t);
+        if (types.length > 0) map[nid] = types;
+    }
+    return JSON.stringify(map);
+}

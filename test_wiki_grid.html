@@ -1,0 +1,27 @@
+<!DOCTYPE html><html><head><title>Wiki Grid Test</title>
+<style>
+.page-container {
+    display: grid;
+    grid-template: min-content min-content 1fr / minmax(0, 60rem) min-content;
+    grid-template-areas: 'titlebar sidebar' 'content sidebar';
+    gap: 24px;
+    padding: 20px;
+}
+.titlebar { grid-area: titlebar; background: #eee; padding: 10px; }
+.sidebar { grid-area: sidebar; background: #f5f5f5; padding: 10px; width: 200px; }
+.content { grid-area: content; padding: 10px; }
+</style>
+</head>
+<body style="margin:0;font-family:sans-serif">
+<div class="page-container">
+  <div class="titlebar"><h1>Web browser</h1></div>
+  <div class="sidebar"><h3>Contents</h3><ul><li>History</li><li>Function</li><li>Features</li></ul></div>
+  <div class="content">
+    <p>A <b>web browser</b> is an application for accessing websites. When a user requests a web page from a particular website, the browser retrieves its files from a web server and then displays the page on the user's screen.</p>
+    <h2>History</h2>
+    <p>The first web browser, called WorldWideWeb, was created in 1990 by Tim Berners-Lee.</p>
+    <h2>Function</h2>
+    <p>The purpose of a web browser is to fetch content from the World Wide Web or from local storage and display it on the user's device.</p>
+  </div>
+</div>
+</body></html>
