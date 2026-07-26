@@ -980,6 +980,49 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
         }
     }
 
+    // `ZIPP_SCROLL=<pixels>` scrolls the page before painting, so the scrolled
+    // frame can be inspected without a window.
+    if let Some(dy) = std::env::var("ZIPP_SCROLL").ok().and_then(|v| v.parse::<f64>().ok()) {
+        use zipp_dom::Document;
+        use zipp_dom::traits_src::events::{
+            MouseEventButtons, PointerCoords, UiEvent, WheelDelta, WheelEvent,
+        };
+        // Move the pointer first: the wheel is delivered to the hovered node,
+        // and without a prior move there is no hover target.
+        {
+            use zipp_dom::traits_src::events::{
+                MouseEventButton, PointerDetails, PointerEvent, PointerId,
+            };
+            let c = PointerCoords {
+                screen_x: (width / 2) as f32, screen_y: (height / 2) as f32,
+                client_x: (width / 2) as f32, client_y: (height / 2) as f32,
+                page_x: (width / 2) as f32, page_y: (height / 2) as f32,
+            };
+            doc.handle_ui_event(UiEvent::PointerMove(PointerEvent {
+                id: PointerId::Mouse,
+                is_primary: true,
+                coords: c,
+                button: MouseEventButton::Main,
+                buttons: MouseEventButtons::empty(),
+                mods: Default::default(),
+                details: PointerDetails::default(),
+            }));
+        }
+        doc.handle_ui_event(UiEvent::Wheel(WheelEvent {
+            delta: WheelDelta::Pixels(0.0, -dy),
+            coords: PointerCoords {
+                screen_x: (width / 2) as f32, screen_y: (height / 2) as f32,
+                client_x: (width / 2) as f32, client_y: (height / 2) as f32,
+                page_x: (width / 2) as f32, page_y: (height / 2) as f32,
+            },
+            buttons: MouseEventButtons::empty(),
+            mods: Default::default(),
+        }));
+        doc.as_mut().resolve(ANIMATION_SETTLE_SECS);
+        let vs = doc.as_ref().viewport_scroll();
+        eprintln!("[SCROLL] requested {dy}px -> viewport_scroll.y={}", vs.y);
+    }
+
     // `ZIPP_DUMP_TREE=1` prints the resolved Taffy layout tree — the fastest way
     // to tell a cascade problem (wrong computed style) from a layout problem
     // (right style, wrong box).
@@ -1353,13 +1396,31 @@ pub(crate) fn rerender_body(rendered_body: &str, page_url: &str) -> String {
 
 /// The `<body>` contents: the browser chrome followed by the page.
 ///
+/// The wrapper uses `min-height:100vh`, NOT `height:100vh`. A fixed height pins
+/// `<html>` and `<body>` to the window while the page overflows them, which is
+/// not how any real document behaves — the root grows to its content. Two things
+/// broke because of it:
+///
+///  - the document had no scrollable range of its own (`content_size` lived on a
+///    descendant), so scrolling had to be faked by an element scroller; and
+///  - a page that sets `overflow-x:hidden` on `body` (common, and what
+///    lance.name does) turned `body` into a clipper whose box is only one
+///    viewport tall. Once that box scrolled up, it clipped everything below —
+///    the page appeared to stop rendering partway down.
+///
+/// The trade-off: the toolbar is in normal flow, so it scrolls away with the
+/// page (`position:sticky` is inert here — the Stylo→Taffy conversion maps
+/// Sticky to Relative). Real chrome belongs outside the document rather than
+/// injected into it; until that happens, a correctly-rendering page is worth
+/// more than a pinned URL bar.
+///
 /// Factored out because a JS re-render replaces the WHOLE body — it is the only
 /// element the event handler can address — so the chrome has to be rebuilt with
 /// it. Without this a single click removed the toolbar and dropped the page out
 /// of the flex column that gives it its height.
 fn toolbar_body(page_html: &str, current_url: &str) -> String {
     format!(
-        r#"<div style="display:flex;flex-direction:column;margin:0;padding:0;width:100%;height:100vh">
+        r#"<div style="display:flex;flex-direction:column;margin:0;padding:0;width:100%;min-height:100vh">
   <form action="{current_url}" method="GET" style="height:42px;min-height:42px;background:#f8f9fa;border-bottom:1px solid #dee2e6;display:flex;align-items:center;padding:4px 8px;gap:6px;font-family:Arial,sans-serif;box-sizing:border-box;width:100%;margin:0;flex-shrink:0">
     <span style="font-size:16px;color:#495057;padding:0 4px;cursor:pointer">◀</span>
     <span style="font-size:16px;color:#495057;padding:0 4px;cursor:pointer">▶</span>
