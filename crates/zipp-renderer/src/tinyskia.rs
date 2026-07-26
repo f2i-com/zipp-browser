@@ -659,6 +659,8 @@ pub trait BlurLayer {
     fn push_blur_layer(&mut self, radius_px: f32);
     /// Blur what was captured and composite it over the surface below.
     fn pop_blur_layer(&mut self);
+    /// Blur what is ALREADY painted within `rect` — `backdrop-filter`.
+    fn apply_backdrop_blur(&mut self, radius_px: f32, rect: (f32, f32, f32, f32));
 }
 
 /// Blur `pixmap` in place with three box passes.
@@ -761,6 +763,53 @@ impl BlurLayer for TinySkiaPainter {
             Pixmap::new(w.max(1), h.max(1)).unwrap(),
         );
         self.blur_stack.push((saved, radius_px));
+    }
+
+    fn apply_backdrop_blur(&mut self, radius_px: f32, rect: (f32, f32, f32, f32)) {
+        // `backdrop-filter` blurs the BACKDROP — what is already on the surface
+        // behind this element — not the element itself. Without it a frosted
+        // panel, whose own background is deliberately near-transparent because
+        // the blur is meant to supply the substance, just looks see-through.
+        let (x0, y0, x1, y1) = rect;
+        // Pad by the radius so the blur has real pixels to pull from at the
+        // edges rather than smearing the clamped border inward.
+        let pad = radius_px.ceil() as i32 + 1;
+        let px0 = (x0.floor() as i32 - pad).max(0);
+        let py0 = (y0.floor() as i32 - pad).max(0);
+        let px1 = (x1.ceil() as i32 + pad).min(self.pixmap.width() as i32);
+        let py1 = (y1.ceil() as i32 + pad).min(self.pixmap.height() as i32);
+        let (w, h) = ((px1 - px0).max(0) as u32, (py1 - py0).max(0) as u32);
+        if w == 0 || h == 0 {
+            return;
+        }
+        let Some(mut region) = Pixmap::new(w, h) else { return };
+        region.draw_pixmap(
+            -px0,
+            -py0,
+            self.pixmap.as_ref(),
+            &tiny_skia::PixmapPaint::default(),
+            tiny_skia::Transform::identity(),
+            None,
+        );
+        box_blur(&mut region, radius_px);
+        // Write back only the element's own box, so the padding used to feed
+        // the blur does not bleed over its neighbours.
+        let keep = tiny_skia::IntRect::from_ltrb(
+            x0.floor() as i32 - px0,
+            y0.floor() as i32 - py0,
+            x1.ceil() as i32 - px0,
+            y1.ceil() as i32 - py0,
+        );
+        let Some(keep) = keep else { return };
+        let Some(cropped) = region.clone_rect(keep) else { return };
+        self.pixmap.draw_pixmap(
+            x0.floor() as i32,
+            y0.floor() as i32,
+            cropped.as_ref(),
+            &tiny_skia::PixmapPaint::default(),
+            tiny_skia::Transform::identity(),
+            None,
+        );
     }
 
     fn pop_blur_layer(&mut self) {

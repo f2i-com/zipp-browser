@@ -320,6 +320,35 @@ impl<'dom> DocumentPainter<'dom> {
                 }
                 _ => None,
             });
+        // `backdrop-filter: blur()` — blur what is already behind this element
+        // before painting it. Done BEFORE `push_blur_layer` so the backdrop is
+        // read from the real surface rather than an empty offscreen one.
+        let backdrop_blur: Option<f32> = styles
+            .get_effects()
+            .backdrop_filter
+            .0
+            .iter()
+            .find_map(|f| match f {
+                style::values::computed::Filter::Blur(len) => {
+                    let px = len.0.px();
+                    (px >= 0.5).then_some(px * self.scale as f32)
+                }
+                _ => None,
+            });
+        if let Some(r) = backdrop_blur {
+            let x0 = (box_position.x * self.scale) as f32;
+            let y0 = ((box_position.y - self.initial_y) * self.scale) as f32;
+            scene.apply_backdrop_blur(
+                r,
+                (
+                    x0,
+                    y0,
+                    x0 + (size.width as f64 * self.scale) as f32,
+                    y0 + (size.height as f64 * self.scale) as f32,
+                ),
+            );
+        }
+
         if let Some(r) = blur_radius {
             scene.push_blur_layer(r);
         }
