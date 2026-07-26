@@ -267,32 +267,43 @@ fn add_fixed_widths_to_flex_children(html: &mut String) {
     let content_start = marker_pos + container_close_offset + 1;
 
     // Walk the DOM fragment to find direct child <div> tags (depth == 1).
+    //
+    // Scanned as BYTES, not `&str`. The `cursor += 1` fallback advances one byte
+    // at a time, so on real page text (typographic quotes, dashes, emoji) it
+    // lands inside a multi-byte character and `html[cursor..]` panics — every
+    // tag this looks for is ASCII, so bytes are the right unit. The recorded
+    // positions are all at `<` or `>`, which ARE char boundaries, so the string
+    // slicing and `insert_str` below stay valid.
     let mut child_tag_ends: Vec<usize> = Vec::new();
-    let mut cursor = content_start;
-    let mut depth: i32 = 1;
+    {
+        let bytes = html.as_bytes();
+        let mut cursor = content_start;
+        let mut depth: i32 = 1;
 
-    while cursor < html.len() && depth > 0 {
-        if html[cursor..].starts_with("</div") {
-            depth -= 1;
-            if depth == 0 {
-                break;
-            }
-            cursor += 6; // skip past "</div>"
-        } else if html[cursor..].starts_with("<div") {
-            if depth == 1 {
-                // Record the position of this child's closing `>`
-                if let Some(close_offset) = html[cursor..].find('>') {
-                    let tag_close = cursor + close_offset;
-                    if !html[cursor..tag_close].contains("style=\"") {
-                        child_tag_ends.push(tag_close);
+        while cursor < bytes.len() && depth > 0 {
+            if bytes[cursor..].starts_with(b"</div") {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+                cursor += 6; // skip past "</div>"
+            } else if bytes[cursor..].starts_with(b"<div") {
+                let close_offset = bytes[cursor..].iter().position(|&b| b == b'>');
+                if depth == 1 {
+                    // Record the position of this child's closing `>`
+                    if let Some(off) = close_offset {
+                        let tag_close = cursor + off;
+                        if !html[cursor..tag_close].contains("style=\"") {
+                            child_tag_ends.push(tag_close);
+                        }
                     }
                 }
+                depth += 1;
+                // Advance past the opening tag
+                cursor += close_offset.map_or(4, |o| o + 1);
+            } else {
+                cursor += 1;
             }
-            depth += 1;
-            // Advance past the opening tag
-            cursor += html[cursor..].find('>').map_or(4, |o| o + 1);
-        } else {
-            cursor += 1;
         }
     }
 

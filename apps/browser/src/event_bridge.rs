@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use zipp_vm::engine::ScriptState;
+use zipp_vm::embed::{JsValue, ScriptState};
 use zipp_dom::html_parser::HtmlDocument;
 use zipp_dom::traits_events::{DomEvent, EventState};
 use zipp_dom::{BaseDocument, Document, EventHandler, LocalName};
@@ -140,38 +140,41 @@ impl EventHandler for JsEventBridge {
                     let flid = self.reverse_flid.get(&node_id).copied();
 
                     if let (Some(flid), Some(state)) = (flid, &mut self.js_state) {
-                        // Build a JS call that invokes the first handler
-                        let call = format!(
-                            "(function(){{ \
-                                var h = __eventHandlers[{flid}]; \
-                                if(h && h[\"{event_name}\"] && h[\"{event_name}\"][0]) {{ \
-                                    h[\"{event_name}\"][0]({{ \
-                                        type:\"{event_name}\", \
-                                        target:null, \
-                                        currentTarget:null, \
-                                        preventDefault:function(){{}}, \
-                                        stopPropagation:function(){{}}, \
-                                        bubbles:true \
-                                    }}); \
-                                }} \
-                            }})()"
+                        // Call the prelude's dispatcher rather than assembling
+                        // JS source per event: `call_global` compiles nothing,
+                        // where an `eval_in_context` would compile a fresh
+                        // program on every click and intern it for the VM's
+                        // lifetime. It also means `event_name` is passed as a
+                        // value, so it cannot escape into the code being run.
+                        let dispatched = state.call_global(
+                            "__zippDispatchEvent",
+                            &[
+                                JsValue::Number(f64::from(flid)),
+                                JsValue::String(event_name.to_string()),
+                            ],
                         );
-                        let _ = state.eval_in_context(&call);
+                        if let Err(e) = &dispatched {
+                            eprintln!("[EVENT] handler for \"{event_name}\" failed: {e}");
+                        }
 
-                        // For click events: drain queues and check for DOM changes
+                        // For click events: settle the page, then see whether
+                        // the handler changed the DOM.
                         if event_name == "click" {
-                            // Drain microtask and timer queues (React setState is async)
-                            let _ = state.eval_in_context(
-                                "for(var __t=0;__t<50;__t++){if(__timerQueue.length===0&&__mcQueue.length===0)break;while(__timerQueue.length>0){try{__timerQueue.shift()()}catch(e){}}while(__mcQueue.length>0){try{__mcQueue.shift()()}catch(e){}}}"
+                            // React's setState is async — the handler has only
+                            // queued the re-render at this point.
+                            let _ = state.call_global(
+                                "__zippDrainQueues",
+                                &[JsValue::Number(50.0)],
                             );
-
-                            // Get updated HTML after handler + queue drain
-                            if let Ok(zipp_vm::object::Object::String(new_html)) =
-                                state.eval_in_context("__getRenderedHTML()")
+                            if let Ok(JsValue::String(new_html)) =
+                                state.call_global("__getRenderedHTML", &[])
                             {
                                 if !new_html.is_empty() {
-                                    self.pending_rerender = Some(new_html.to_string());
-                                    eprintln!("[EVENT] DOM updated after click ({} bytes)", self.pending_rerender.as_ref().unwrap().len());
+                                    eprintln!(
+                                        "[EVENT] DOM updated after click ({} bytes)",
+                                        new_html.len()
+                                    );
+                                    self.pending_rerender = Some(new_html);
                                 }
                             }
                         }

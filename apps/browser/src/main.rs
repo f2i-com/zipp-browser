@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use linebender_resource_handle::Blob;
 
 // -- internal (workspace) --
-use zipp_vm::engine::{ZippEngine, ScriptState};
+use zipp_vm::embed::{compile_script, JsValue, ScriptState};
 use zipp_dom::html_parser::{HtmlDocument, HtmlProvider};
 use zipp_dom::traits_src::navigation::{NavigationOptions, NavigationProvider};
 use zipp_dom::{DocumentConfig, FontContext};
@@ -56,18 +56,19 @@ const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 fn main() {
     let arg = std::env::args().nth(1).unwrap_or_default();
 
-    // Quick JS test mode: run test suite through VM and exit
+    // Quick JS test mode: run a suite through the VM and exit. Exit status
+    // reflects the result so these are usable from a script or CI.
     if arg == "--test-js" {
-        run_js_tests();
-        return;
+        let ok = run_js_suite("TEST", include_str!("js_tests.js"), 10);
+        std::process::exit(if ok { 0 } else { 1 });
     }
     if arg == "--test-vm" {
         run_vm_test();
         return;
     }
     if arg == "--test-compat" {
-        run_compat_tests();
-        return;
+        let ok = run_js_suite("COMPAT", include_str!("js_compat_tests.js"), 20);
+        std::process::exit(if ok { 0 } else { 1 });
     }
 
     let url = if arg.is_empty() { "https://lance.name".to_string() } else { arg };
@@ -77,16 +78,14 @@ fn main() {
     let html = fetch(&url)
         .unwrap_or_else(|e| format!("<html><body><h1>Error</h1><p>{e}</p></body></html>"));
 
-    // 2. Run Zipp JS if needed (React/SPA) -- run on main thread with
-    //    grown stack so that the ScriptState (which contains Rc and is !Send)
-    //    stays alive for later event dispatch.
+    // 2. Run Zipp JS if needed (React/SPA) -- on the main thread, so the
+    //    ScriptState (which is !Send) stays alive for later event dispatch.
+    //    `run_zipp_js` grows the stack itself.
     let (final_html, event_map_json, js_state) = if html.contains("<script") {
-        stacker::maybe_grow(64 * 1024 * 1024, 64 * 1024 * 1024, || {
-            match run_zipp_js(&html, &url) {
-                Some((rendered, emap, state)) => (rendered, Some(emap), Some(state)),
-                None => (html.clone(), None, None),
-            }
-        })
+        match run_zipp_js(&html, &url) {
+            Some((rendered, emap, state)) => (rendered, Some(emap), Some(state)),
+            None => (html.clone(), None, None),
+        }
     } else {
         (html, None, None)
     };
@@ -174,15 +173,28 @@ fn main() {
     app.add_window(window);
 
     eprintln!("[BROWSER] Window opened");
-    event_loop.run_app(app).unwrap();
+    // Run the whole event loop on a grown stack. Layout, hit-testing and paint
+    // all recurse over the DOM on the native stack, and a real page's tree is
+    // deep enough to overflow the default main-thread stack — a server-rendered
+    // React app nests far further than the hand-written test pages did. Growing
+    // here covers every callback the loop dispatches, including the re-render
+    // that follows a JS event handler.
+    stacker::maybe_grow(64 * 1024 * 1024, 256 * 1024 * 1024, || {
+        event_loop.run_app(app).unwrap();
+    });
 }
 
 // ---------------------------------------------------------------------------
 // Pre-rendering
 // ---------------------------------------------------------------------------
 
-/// Run the JS test suite through the Zipp VM with DOM shim and report results.
-fn run_js_tests() {
+/// Run one of the bundled JS suites against the DOM shim and report results.
+///
+/// Both suites follow the same protocol: run to completion, then read the
+/// pass/fail counters `_p`/`_f` and the failure descriptions in `_e`.
+/// `--test-js` exercises the DOM surface, `--test-compat` the language surface;
+/// only the source file and how many failures to print differ.
+fn run_js_suite(tag: &str, tests: &str, max_failures: usize) -> bool {
     let dom_shim = include_str!("dom_shim.js");
     let shim = dom_shim
         .replace("__PAGE_URL__", "http://localhost/test")
@@ -190,59 +202,36 @@ fn run_js_tests() {
         .replace("__VIEWPORT_H__", "800")
         .replace("__BODY_HTML__", "<div id=\\'root\\'></div>");
 
-    let tests = include_str!("js_tests.js");
-    let mut full = shim;
-    full.push_str(tests);
+    let full = format!("{HOST_PRELUDE_JS}\n{shim}{tests}");
+    eprintln!("[{tag}] Compiling {} bytes...", full.len());
+    let mut state = match compile_script(&full) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[{tag}] Compile error: {e}");
+            return false;
+        }
+    };
+    state.set_host_call(Box::new(browser_host_call));
+    eprintln!("[{tag}] Executing...");
+    if let Err(e) = state.run_init() {
+        eprintln!("[{tag}] Uncaught: {e}");
+    }
 
-    eprintln!("[TEST] Compiling {} bytes...", full.len());
-    let engine = ZippEngine::default();
-    match engine.compile_script(&full) {
-        Ok(mut state) => {
-            state.set_execution_limits(Some(50_000_000), Some(10_000));
-            eprintln!("[TEST] Executing...");
-            let _ = state.run_init();
-            // Also try eval to get test results
-            if let Ok(zipp_vm::object::Object::String(s)) = state.eval_in_context("_p + '/' + (_p+_f) + ' passed'") {
-                eprintln!("[TEST] {s}");
-            }
-            for i in 0..10 {
-                if let Ok(zipp_vm::object::Object::String(s)) = state.eval_in_context(&format!("_e[{i}] || ''")) {
-                    if !s.is_empty() { eprintln!("[TEST]   {s}"); }
-                }
+    let passed = state.eval_in_context("_p").ok();
+    let failed = state.eval_in_context("_f").ok();
+    let (Some(JsValue::Number(passed)), Some(JsValue::Number(failed))) = (passed, failed) else {
+        eprintln!("[{tag}] suite did not report counters (_p/_f)");
+        return false;
+    };
+    eprintln!("[{tag}] {passed}/{} passed", passed + failed);
+    for i in 0..max_failures {
+        if let Ok(JsValue::String(s)) = state.eval_in_context(&format!("_e[{i}] || ''")) {
+            if !s.is_empty() {
+                eprintln!("[{tag}]   {s}");
             }
         }
-        Err(e) => eprintln!("Compile error: {e:?}"),
     }
-}
-
-/// Run minimal VM test without DOM shim to isolate class method issues.
-fn run_compat_tests() {
-    let dom_shim = include_str!("dom_shim.js");
-    let shim = dom_shim
-        .replace("__PAGE_URL__", "http://localhost/test")
-        .replace("__VIEWPORT_W__", "1280")
-        .replace("__VIEWPORT_H__", "800")
-        .replace("__BODY_HTML__", "<div id=\\'root\\'></div>");
-    let tests = include_str!("js_compat_tests.js");
-    let mut full = shim;
-    full.push_str(tests);
-    eprintln!("[COMPAT] Compiling {} bytes...", full.len());
-    let engine = ZippEngine::default();
-    match engine.compile_script(&full) {
-        Ok(mut state) => {
-            state.set_execution_limits(Some(50_000_000), Some(10_000));
-            let _ = state.run_init();
-            if let Ok(zipp_vm::object::Object::String(s)) = state.eval_in_context("_p + '/' + (_p+_f) + ' passed'") {
-                eprintln!("[COMPAT] {s}");
-            }
-            for i in 0..20 {
-                if let Ok(zipp_vm::object::Object::String(s)) = state.eval_in_context(&format!("_e[{i}] || ''")) {
-                    if !s.is_empty() { eprintln!("[COMPAT]   {s}"); }
-                }
-            }
-        }
-        Err(e) => eprintln!("[COMPAT] Compile error: {e:?}"),
-    }
+    failed == 0.0
 }
 
 fn run_vm_test() {
@@ -305,21 +294,23 @@ var result = t1 + " | " + t2 + " | " + t3 + " | " + t4;
         .replace("__VIEWPORT_W__", "1280")
         .replace("__VIEWPORT_H__", "800")
         .replace("__BODY_HTML__", "<div id=\\'root\\'></div>");
-    let full = format!("{}\n{}", shim, js);
+    let full = format!("{HOST_PRELUDE_JS}\n{shim}\n{js}");
     eprintln!("[VM-TEST] Running with DOM shim ({} bytes)...", full.len());
-    let engine = ZippEngine::default();
-    match engine.compile_script(&full) {
-        Ok(mut state) => {
-            state.set_execution_limits(Some(10_000_000), Some(5_000));
-            let _ = state.run_init();
-            // Read results
-            if let Ok(zipp_vm::object::Object::String(s)) = state.eval_in_context("result") {
-                eprintln!("[VM-TEST] {s}");
-            } else {
-                eprintln!("[VM-TEST] Could not read result");
-            }
+    let mut state = match compile_script(&full) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[VM-TEST] Compile error: {e}");
+            return;
         }
-        Err(e) => eprintln!("[VM-TEST] Compile error: {e:?}"),
+    };
+    state.set_host_call(Box::new(browser_host_call));
+    if let Err(e) = state.run_init() {
+        eprintln!("[VM-TEST] Uncaught: {e}");
+    }
+    match state.eval_in_context("result") {
+        Ok(JsValue::String(s)) => eprintln!("[VM-TEST] {s}"),
+        Ok(other) => eprintln!("[VM-TEST] Unexpected result type: {other:?}"),
+        Err(e) => eprintln!("[VM-TEST] Could not read result: {e}"),
     }
 }
 
@@ -467,36 +458,165 @@ fn fetch(url: &str) -> Result<String, String> {
 // HTTP bridge for Zipp JS
 // ---------------------------------------------------------------------------
 
-struct BrowserHttpBridge;
-impl zipp_vm::http_bridge::HttpBridge for BrowserHttpBridge {
-    fn get(&self, url: &str) -> Result<zipp_vm::http_bridge::HttpResponse, String> {
-        let resp = HTTP_CLIENT.get(url).send().map_err(|e| e.to_string())?;
-        let status = resp.status().as_u16();
-        let ok = resp.status().is_success();
-        let body = resp.text().map_err(|e| e.to_string())?;
-        Ok(zipp_vm::http_bridge::HttpResponse { status, body, ok })
+/// The JS prelude prepended to every page's script bundle.
+///
+/// Two jobs. First, it turns the raw `__zippHostCall` trampoline into the
+/// `http` object the DOM shim's `fetch` is written against — the old engine
+/// exposed `http` as a native global, whereas zipp-vm deliberately has no host
+/// surface of its own, so the browser supplies one.
+///
+/// Second, it defines the entry points the Rust side calls back into
+/// (`__zippDispatchEvent`, `__zippDrainQueues`). Declaring them ONCE here,
+/// rather than assembling an equivalent source string per event, matters:
+/// `eval_in_context` compiles fresh each call and the compiled functions are
+/// interned for the VM's lifetime, so a per-click eval would grow memory for
+/// as long as the page is open. `call_global` compiles nothing.
+///
+/// These reference `__eventHandlers`, `__timerQueue` and `__mcQueue`, which
+/// `dom_shim.js` defines. That is fine even though the prelude comes first —
+/// the names are resolved when the functions run, not when they are declared.
+const HOST_PRELUDE_JS: &str = r#"
+// `env.log(level, message)` — the shim builds its `console` on top of this.
+// The old engine provided it as a native global; here it goes out through the
+// host channel to the browser's own stderr log, so page `console.log` shows up
+// next to [BROWSER]/[JS] diagnostics.
+//
+// It cannot be written in terms of `console`: dom_shim.js declares
+// `var console = {...}`, and because the shim and this prelude are concatenated
+// into ONE script that `var` hoists to the top of the whole program — so
+// `console` refers to the shim's object from the first line onward, and routing
+// env.log through it would be infinite recursion.
+var env = {
+    log: function (level, message) {
+        __zippHostCall("log", String(level), String(message));
     }
-    fn post(&self, url: &str, body: &str, content_type: &str) -> Result<zipp_vm::http_bridge::HttpResponse, String> {
-        let resp = HTTP_CLIENT.post(url).header("Content-Type", content_type).body(body.to_string()).send().map_err(|e| e.to_string())?;
-        let status = resp.status().as_u16();
-        let ok = resp.status().is_success();
-        let body = resp.text().map_err(|e| e.to_string())?;
-        Ok(zipp_vm::http_bridge::HttpResponse { status, body, ok })
+};
+
+var http = (function () {
+    function request(method, url, body, contentType) {
+        // Host contract: strings in, JSON string out. A transport failure is a
+        // JS throw (the host returns Err), which fetch()'s try/catch turns into
+        // a rejected promise — same shape as a real browser network error.
+        var raw = __zippHostCall(
+            "http", method, String(url),
+            body == null ? "" : String(body),
+            contentType == null ? "" : String(contentType)
+        );
+        var r = JSON.parse(raw);
+        return { status: r.status, ok: r.ok, body: r.body };
     }
-    fn put(&self, url: &str, body: &str, content_type: &str) -> Result<zipp_vm::http_bridge::HttpResponse, String> {
-        let resp = HTTP_CLIENT.put(url).header("Content-Type", content_type).body(body.to_string()).send().map_err(|e| e.to_string())?;
-        let status = resp.status().as_u16();
-        let ok = resp.status().is_success();
-        let body = resp.text().map_err(|e| e.to_string())?;
-        Ok(zipp_vm::http_bridge::HttpResponse { status, body, ok })
+    return {
+        get: function (url) { return request("GET", url, "", ""); },
+        post: function (url, body, ct) { return request("POST", url, body, ct); },
+        put: function (url, body, ct) { return request("PUT", url, body, ct); },
+        "delete": function (url) { return request("DELETE", url, "", ""); }
+    };
+})();
+
+// Run the shim's timer and microtask queues to quiescence, or until `rounds`
+// passes have gone by. React's setState is asynchronous, so a click handler
+// has typically only QUEUED the re-render when it returns; without this the
+// page would be read back before the update landed. Bounded because a page
+// can legitimately reschedule forever (a spinner, a poll loop).
+function __zippDrainQueues(rounds) {
+    for (var i = 0; i < rounds; i++) {
+        if (__timerQueue.length === 0 && __mcQueue.length === 0) break;
+        while (__timerQueue.length > 0) { try { __timerQueue.shift()(); } catch (e) {} }
+        while (__mcQueue.length > 0) { try { __mcQueue.shift()(); } catch (e) {} }
     }
-    fn delete(&self, url: &str) -> Result<zipp_vm::http_bridge::HttpResponse, String> {
-        let resp = HTTP_CLIENT.delete(url).send().map_err(|e| e.to_string())?;
-        let status = resp.status().as_u16();
-        let ok = resp.status().is_success();
-        let body = resp.text().map_err(|e| e.to_string())?;
-        Ok(zipp_vm::http_bridge::HttpResponse { status, body, ok })
+}
+
+// Invoke the handlers registered for (node id, event type). Returns whether
+// any ran. A handler that throws does not stop the others — that is what a
+// real dispatcher does, and one broken listener should not disable the rest.
+function __zippDispatchEvent(nid, type) {
+    var byType = __eventHandlers[nid];
+    if (!byType) return false;
+    var handlers = byType[type];
+    if (!handlers || handlers.length === 0) return false;
+    var ev = {
+        type: type,
+        target: null,
+        currentTarget: null,
+        preventDefault: function () {},
+        stopPropagation: function () {},
+        bubbles: true
+    };
+    for (var i = 0; i < handlers.length; i++) {
+        try { handlers[i](ev); } catch (e) {}
     }
+    return true;
+}
+"#;
+
+/// The Rust half of the host channel: blocking HTTP on behalf of page JS.
+///
+/// Blocking is deliberate and matches the previous engine — the DOM shim's
+/// `fetch` resolves its promise synchronously from this result, and the whole
+/// SSR pass runs to completion before anything is rendered, so there is no
+/// event loop to yield to yet.
+fn browser_host_call(kind: &str, args: &[String]) -> Result<String, String> {
+    match kind {
+        // Page `console.*`, via the shim's `env.log`.
+        "log" => {
+            let level = args.first().map(String::as_str).unwrap_or("info");
+            let message = args.get(1).map(String::as_str).unwrap_or("");
+            eprintln!("[JS:{level}] {message}");
+            Ok(String::new())
+        }
+        "http" => {
+            let method = args.first().map(String::as_str).unwrap_or("GET");
+            let url = args.get(1).map(String::as_str).unwrap_or_default();
+            let body = args.get(2).cloned().unwrap_or_default();
+            let content_type = args.get(3).map(String::as_str).unwrap_or("");
+            let content_type =
+                if content_type.is_empty() { "application/json" } else { content_type };
+
+            let req = match method {
+                "POST" => HTTP_CLIENT.post(url).header("Content-Type", content_type).body(body),
+                "PUT" => HTTP_CLIENT.put(url).header("Content-Type", content_type).body(body),
+                "DELETE" => HTTP_CLIENT.delete(url),
+                _ => HTTP_CLIENT.get(url),
+            };
+            // Errors carry the `Error: ` prefix so the script sees an ordinary
+            // JS error rather than a bare string.
+            let resp = req.send().map_err(|e| format!("Error: {method} {url}: {e}"))?;
+            let status = resp.status().as_u16();
+            let ok = resp.status().is_success();
+            let body = resp.text().map_err(|e| format!("Error: reading {url}: {e}"))?;
+            Ok(format!(
+                "{{\"status\":{status},\"ok\":{ok},\"body\":{}}}",
+                json_quote(&body)
+            ))
+        }
+        other => Err(format!("Error: unknown host call {other:?}")),
+    }
+}
+
+/// Minimal JSON string literal encoder — enough to carry an arbitrary response
+/// body through `JSON.parse` on the JS side. Hand-rolled for the same reason
+/// `event_bridge` hand-rolls its parser: one string field does not justify a
+/// serde dependency.
+fn json_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            // Control characters (and U+2028/29, which are newlines to a JS
+            // parser) must be escaped or the JSON is invalid.
+            c if (c as u32) < 0x20 || c == '\u{2028}' || c == '\u{2029}' => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -516,6 +636,18 @@ impl zipp_vm::http_bridge::HttpBridge for BrowserHttpBridge {
 /// main thread so that click (etc.) events can invoke actual JS handlers
 /// via `eval_in_context`.
 fn run_zipp_js(html: &str, page_url: &str) -> Option<(String, String, ScriptState)> {
+    // Grow the stack here rather than at each call site. JS recursion itself is
+    // safe — zipp-vm keeps JS frames in an explicit Vec, not the native stack —
+    // but PARSING and COMPILING a bundle is recursive over the AST on the native
+    // stack, and a real page's minified bundle nests deeply enough to blow a
+    // default thread stack. The prerender worker used to skip this and crashed
+    // the process a few pages in.
+    stacker::maybe_grow(64 * 1024 * 1024, 64 * 1024 * 1024, || {
+        run_zipp_js_inner(html, page_url)
+    })
+}
+
+fn run_zipp_js_inner(html: &str, page_url: &str) -> Option<(String, String, ScriptState)> {
     let mut external_scripts = Vec::new();
     let mut pos = 0;
     while let Some(start) = html[pos..].find("<script") {
@@ -541,6 +673,7 @@ fn run_zipp_js(html: &str, page_url: &str) -> Option<(String, String, ScriptStat
 
     let dom_shim = include_str!("dom_shim.js");
     let router_helpers = include_str!("router_helpers.js");
+    let dom_shim = &format!("{HOST_PRELUDE_JS}\n{dom_shim}");
     let shim = dom_shim.replace(
         "__PAGE_URL__",
         &page_url.replace('\\', "\\\\").replace('\'', "\\'"),
@@ -573,31 +706,39 @@ fn run_zipp_js(html: &str, page_url: &str) -> Option<(String, String, ScriptStat
         full.push_str(&patched);
         full.push('\n');
     }
-    // Drain timer and microtask queues
-    full.push_str("for(var __t=0;__t<100;__t++){if(__timerQueue.length===0&&__mcQueue.length===0)break;while(__timerQueue.length>0){try{__timerQueue.shift()()}catch(e){}}while(__mcQueue.length>0){try{__mcQueue.shift()()}catch(e){}}}\n");
-    full.push_str("for(var __r=0;__r<10;__r++){if(__mcQueue.length===0&&__timerQueue.length===0)break;while(__timerQueue.length>0){try{__timerQueue.shift()()}catch(e){}}while(__mcQueue.length>0){try{__mcQueue.shift()()}catch(e){}}}\n");
+    // Settle the page: run timers and microtasks until nothing is left to do,
+    // so the tree we serialise below is the one the page actually intended.
+    full.push_str("\n__zippDrainQueues(100);\n");
 
     eprintln!("[JS] Compiling {} bytes...", full.len());
-    let engine = ZippEngine::default();
-    let mut state = engine.compile_script(&full).ok()?;
-    state.set_execution_limits(Some(200_000_000), Some(30_000));
-    state.vm_mut().config.max_heap_objects = Some(2_000_000);
-    state.vm_mut().config.max_heap_bytes = Some(256 * 1024 * 1024);
-    state.vm_mut().http = Some(Box::new(BrowserHttpBridge));
-    let _ = state.run_init();
+    let mut state = match compile_script(&full) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[JS] Compile error: {e}");
+            return None;
+        }
+    };
+    state.set_host_call(Box::new(browser_host_call));
+    if let Err(e) = state.run_init() {
+        // An uncaught throw is not fatal: the shim may still have built enough
+        // of a tree to render, so fall through and check. This matches how a
+        // real browser treats a script error — the page is what it is.
+        eprintln!("[JS] Uncaught: {e}");
+    }
+    for line in state.take_output() {
+        eprintln!("[JS] {line}");
+    }
+    for line in state.take_errput() {
+        eprintln!("[JS] {line}");
+    }
 
-    if let Ok(zipp_vm::object::Object::String(s)) = state.eval_in_context("__getRenderedHTML()") {
-        let rendered = s.to_string();
+    if let Ok(JsValue::String(rendered)) = state.eval_in_context("__getRenderedHTML()") {
         if !rendered.is_empty() {
             // Extract the event handler map before we lose the state.
-            let event_map_json = state
-                .eval_in_context("__getEventMap()")
-                .ok()
-                .and_then(|v| match v {
-                    zipp_vm::object::Object::String(s) => Some(s.to_string()),
-                    _ => None,
-                })
-                .unwrap_or_else(|| "{}".to_string());
+            let event_map_json = match state.eval_in_context("__getEventMap()") {
+                Ok(JsValue::String(s)) => s,
+                _ => "{}".to_string(),
+            };
 
             let inner = rendered
                 .find("<body>")

@@ -404,14 +404,21 @@ impl PaintScene for TinySkiaPainter {
 
             if let Some((snapshot, alpha)) = entry.opacity_snapshot {
                 // Blend: for each pixel, result = snapshot + (current - snapshot) * alpha
-                let alpha_u8 = (alpha * 255.0).round().clamp(0.0, 255.0) as u16;
+                //
+                // `current - snapshot` is SIGNED — the layer darkens a pixel as
+                // often as it lightens one. Computed in u16 the negative case
+                // wraps to ~65535 and the following multiply overflows, which
+                // panicked on the first frame of any page using opacity. i32 is
+                // wide enough that no intermediate can overflow: the difference
+                // is within ±255 and the product within ±65025.
+                let alpha = (alpha * 255.0).round().clamp(0.0, 255.0) as i32;
                 let src = snapshot.data();
                 let dst = self.pixmap.data_mut();
                 // Both pixmaps have the same dimensions so byte counts match.
                 for (d, s) in dst.iter_mut().zip(src.iter()) {
-                    let old = *s as u16;
-                    let new = *d as u16;
-                    *d = (old + ((new.wrapping_sub(old)) * alpha_u8 / 255)) as u8;
+                    let snapshot = i32::from(*s);
+                    let current = i32::from(*d);
+                    *d = (snapshot + (current - snapshot) * alpha / 255) as u8;
                 }
             }
         }

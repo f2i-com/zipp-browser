@@ -284,6 +284,49 @@ class DocumentFragment extends DOMNode {
     constructor() { super(11,"#document-fragment"); }
 }
 
+// `Node` is the base of the node hierarchy, which here is DOMNode — Element,
+// Text, Comment and DocumentFragment all extend it. Exposing it as the class
+// (with the nodeType constants as statics, where the DOM puts them) is what
+// makes `x instanceof Node` work; defining Node as a bare object of constants
+// makes that expression throw "Right-hand side of 'instanceof' is not
+// callable", which is how React's scheduler used to die on the first microtask.
+DOMNode.ELEMENT_NODE = 1;
+DOMNode.ATTRIBUTE_NODE = 2;
+DOMNode.TEXT_NODE = 3;
+DOMNode.CDATA_SECTION_NODE = 4;
+DOMNode.PROCESSING_INSTRUCTION_NODE = 7;
+DOMNode.COMMENT_NODE = 8;
+DOMNode.DOCUMENT_NODE = 9;
+DOMNode.DOCUMENT_TYPE_NODE = 10;
+DOMNode.DOCUMENT_FRAGMENT_NODE = 11;
+
+// Element subclasses that libraries name in `instanceof` checks. They need to
+// exist as CONSTRUCTORS even though nothing here ever constructs one: React
+// DOM's focus tracking walks up through frames with
+// `while (t instanceof e.HTMLIFrameElement)`, and an undefined right-hand side
+// is a TypeError that kills the scheduler microtask, not a quiet `false`.
+// Subclassing Element means these answer `false` for ordinary elements, which
+// is the correct answer — this browser has no frames.
+class HTMLIFrameElement extends Element {}
+class HTMLInputElement extends Element {}
+class HTMLTextAreaElement extends Element {}
+class HTMLSelectElement extends Element {}
+class HTMLFormElement extends Element {}
+class HTMLAnchorElement extends Element {}
+class HTMLImageElement extends Element {}
+class HTMLCanvasElement extends Element {}
+class SVGElement extends Element {}
+
+// Thrown by DOM APIs; the router checks `err instanceof DOMException` in its
+// history.pushState fallback path.
+class DOMException extends Error {
+    constructor(message, name) {
+        super(message);
+        this.name = name || "Error";
+        this.message = message || "";
+    }
+}
+
 class Event {
     constructor(type,opts) { opts=opts||{}; this.type=type; this.bubbles=!!opts.bubbles; this.cancelable=!!opts.cancelable; this.target=null; this.currentTarget=null; this.defaultPrevented=false; this._stopped=false; }
     preventDefault() { this.defaultPrevented=true; }
@@ -482,7 +525,7 @@ class MessageChannel {
                 __mcQueue.push(function() {
                     if(port.onmessage) {
                         try { port.onmessage({data:data}); }
-                        catch(e) { console.error("MC callback threw: " + e); }
+                        catch(e) { console.error("MC callback threw: name=" + (e&&e.name) + " msg=" + (e&&e.message) + " stack=" + (e&&e.stack)); }
                     }
                 });
             }
@@ -862,8 +905,13 @@ var window = {
     screen:{ width:__VIEWPORT_W__, height:__VIEWPORT_H__, availWidth:__VIEWPORT_W__, availHeight:__VIEWPORT_H__, colorDepth:24, pixelDepth:24, orientation:{type:"landscape-primary",angle:0} },
     MessageChannel:MessageChannel,
     MutationObserver:MutationObserver, Event:Event, CustomEvent:CustomEvent,
-    Node:{ELEMENT_NODE:1,TEXT_NODE:3,COMMENT_NODE:8,DOCUMENT_NODE:9,DOCUMENT_FRAGMENT_NODE:11},
+    Node:DOMNode,
     HTMLElement:Element, DocumentFragment:DocumentFragment,
+    HTMLIFrameElement:HTMLIFrameElement, HTMLInputElement:HTMLInputElement,
+    HTMLTextAreaElement:HTMLTextAreaElement, HTMLSelectElement:HTMLSelectElement,
+    HTMLFormElement:HTMLFormElement, HTMLAnchorElement:HTMLAnchorElement,
+    HTMLImageElement:HTMLImageElement, HTMLCanvasElement:HTMLCanvasElement,
+    SVGElement:SVGElement, DOMException:DOMException,
     Promise:Promise, TypeError:TypeError, ReferenceError:ReferenceError, SyntaxError:SyntaxError, RangeError:RangeError, URIError:URIError,
     URLSearchParams:URLSearchParams, TextEncoder:TextEncoder, TextDecoder:TextDecoder,
     AbortController:AbortController,
