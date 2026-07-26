@@ -433,6 +433,18 @@ fn load_fonts() -> FontContext {
 // ---------------------------------------------------------------------------
 
 fn fetch(url: &str) -> Result<String, String> {
+    // `file://` — load from disk. Needed to render a local page at all, and it
+    // is what makes a local CSS test corpus possible: comparing against another
+    // browser on hand-written test cases is far more precise than only ever
+    // loading live sites.
+    if let Some(path) = url.strip_prefix("file://") {
+        // Accept file:///C:/x, file://C:/x and file:///c%3A/x alike.
+        let path = path.trim_start_matches('/');
+        let path = urlencoding::decode(path).unwrap_or(std::borrow::Cow::Borrowed(path));
+        return std::fs::read_to_string(path.as_ref())
+            .map_err(|e| format!("cannot read {path}: {e}"));
+    }
+
     let is_static = url.contains("/static/") || url.ends_with(".js") || url.ends_with(".css");
     // Check cache for static assets
     if is_static {
@@ -739,6 +751,13 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
     doc.as_mut().resolve(ANIMATION_SETTLE_SECS);
     let layout_ms = t_layout.elapsed().as_millis();
 
+    // `ZIPP_DUMP_TREE=1` prints the resolved Taffy layout tree — the fastest way
+    // to tell a cascade problem (wrong computed style) from a layout problem
+    // (right style, wrong box).
+    if std::env::var_os("ZIPP_DUMP_TREE").is_some() {
+        doc.as_ref().print_taffy_tree();
+    }
+
     let t_paint = std::time::Instant::now();
     let mut painter = zipp_renderer::tinyskia::TinySkiaPainter::new(width, height);
     zipp_renderer::paint_scene(&mut painter, doc.as_ref(), 1.0, width, height, 0, 0);
@@ -1009,75 +1028,28 @@ impl NavigationProvider for BrowserNavProvider {
 
 /// CSS injected into every page. Resets body constraints for the toolbar layout
 /// and provides Tailwind utility class fallbacks for sites with purged CSS.
+/// Styles for the injected browser chrome.
+///
+/// Deliberately TINY. The toolbar's own markup is styled entirely with inline
+/// `style` attributes, so nothing here is needed to draw it — and anything here
+/// leaks into the page, because the chrome is injected into the page's own
+/// document and therefore shares its CSS namespace.
+///
+/// This used to carry ~60 `!important` rules redefining generic Tailwind utility
+/// names (`.grid`, `.flex`, `.w-full`, `.text-4xl`, `.rounded-lg`, `.shadow`, …)
+/// under the heading "CSS Grid not fully supported in layout engine". That was
+/// the same false premise as the old `responsive` module: Taffy implements grid
+/// and it works. What the block actually did was override the design system of
+/// every Tailwind site with `!important` — `.grid{display:flex}` alone turned
+/// every CSS Grid on the page into a flex row, which is why lance.name's project
+/// cards stacked instead of sitting three across.
+///
+/// Rule of thumb for anything added here: if a page could plausibly use the same
+/// selector, it does not belong.
 const TOOLBAR_CSS: &str = r#"
+/* The chrome wrapper is a full-height flex column, so the root element must not
+   impose a width or centre itself. `body` is reset inline on the element. */
 html { max-width:none !important; width:100% !important; margin:0 !important; padding:0 !important; }
-body { max-width:none !important; width:100% !important; margin:0 !important; padding:0 !important; }
-/* Tailwind utility classes (fallback for purged CSS) */
-.h-100 { height: 250px !important; }
-.object-cover { object-fit: contain !important; }
-.w-full { width: 100% !important; }
-.w-48 { width: 12rem !important; }
-.h-48 { height: 12rem !important; }
-.flex { display: flex !important; }
-.flex-col { flex-direction: column !important; }
-.flex-grow { flex-grow: 1 !important; }
-.items-center { align-items: center !important; }
-.justify-between { justify-content: space-between !important; }
-.inline-flex { display: inline-flex !important; }
-/* Grid -> Flexbox fallback (CSS Grid not fully supported in layout engine) */
-.grid { display: flex !important; flex-wrap: wrap !important; }
-.grid-cols-1 > * { width: 100% !important; }
-.grid-cols-2 > * { width: 48% !important; }
-.grid-cols-3 > * { width: 30% !important; }
-.grid-cols-4 > * { width: 23% !important; }
-.grid-cols-5 > * { width: 18% !important; }
-.gap-6 { gap: 1.5rem !important; }
-.gap-8 { gap: 2rem !important; }
-/* Spacing */
-.p-4 { padding: 1rem !important; }
-.p-6 { padding: 1.5rem !important; }
-.px-4 { padding-left: 1rem !important; padding-right: 1rem !important; }
-.py-3 { padding-top: 0.75rem !important; padding-bottom: 0.75rem !important; }
-.py-8 { padding-top: 2rem !important; padding-bottom: 2rem !important; }
-.py-16 { padding-top: 4rem !important; padding-bottom: 4rem !important; }
-.mb-2 { margin-bottom: 0.5rem !important; }
-.mb-4 { margin-bottom: 1rem !important; }
-.mb-12 { margin-bottom: 3rem !important; }
-.mr-1 { margin-right: 0.25rem !important; }
-.mt-auto { margin-top: auto !important; }
-.mx-auto { margin-left: auto !important; margin-right: auto !important; }
-/* Typography */
-.text-center { text-align: center !important; }
-.text-2xl { font-size: 1.5rem !important; }
-.text-4xl { font-size: 2.25rem !important; }
-.font-bold { font-weight: 700 !important; }
-.font-semibold { font-weight: 600 !important; }
-.font-medium { font-weight: 500 !important; }
-.text-primary { color: #1e3a8a !important; }
-.text-secondary { color: #3b82f6 !important; }
-.text-gray-700 { color: #374151 !important; }
-.text-white { color: #ffffff !important; }
-.text-text { color: #111827 !important; }
-/* Card */
-.bg-white { background-color: #ffffff !important; }
-.bg-background { background-color: #f9fafb !important; }
-.border { border-width: 1px !important; border-style: solid !important; }
-.border-gray-200 { border-color: #e5e7eb !important; }
-.rounded-lg { border-radius: 0.5rem !important; }
-.rounded-full { border-radius: 50% !important; }
-.shadow { box-shadow: 0 1px 3px rgba(0,0,0,.1), 0 1px 2px rgba(0,0,0,.06) !important; }
-.shadow-md { box-shadow: 0 4px 6px -1px rgba(0,0,0,.1), 0 2px 4px -2px rgba(0,0,0,.1) !important; }
-.overflow-hidden { overflow: hidden !important; }
-.container { max-width: 1280px !important; width: 100% !important; }
-.min-h-screen { min-height: 100vh !important; }
-/* Layout helpers */
-.block { display: block !important; }
-.relative { position: relative !important; }
-.fixed { position: fixed !important; }
-.top-0 { top: 0 !important; }
-.left-0 { left: 0 !important; }
-.right-0 { right: 0 !important; }
-.z-50 { z-index: 50 !important; }
 "#;
 
 fn wrap_with_toolbar(html: &str, current_url: &str) -> String {
@@ -1279,8 +1251,13 @@ fn normalize_url(s: &str) -> String {
     if s.is_empty() {
         return "https://html.duckduckgo.com".to_string();
     }
-    if s.starts_with("http://") || s.starts_with("https://") {
+    if s.starts_with("http://") || s.starts_with("https://") || s.starts_with("file://") {
         return s.to_string();
+    }
+    // A local path, with or without a drive letter: treat it as a file URL
+    // rather than guessing it is a search term.
+    if std::path::Path::new(s).is_absolute() && std::path::Path::new(s).exists() {
+        return format!("file:///{}", s.replace('\\', "/"));
     }
     if s.contains('.') && !s.contains(' ') {
         let mut url = String::with_capacity(8 + s.len());

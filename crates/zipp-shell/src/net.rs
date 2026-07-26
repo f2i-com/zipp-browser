@@ -126,7 +126,20 @@ impl Provider {
                 (id, Bytes::from(decoded.0))
             }
             "file" => {
-                let file_content = std::fs::read(request.url.path())?;
+                // `url.path()` is the URL path, not a filesystem path: on Windows
+                // `file:///C:/x` gives `/C:/x`, which the OS rejects, and it stays
+                // percent-encoded. `to_file_path` does the platform-correct
+                // conversion (drive letters, UNC paths, %20 decoding).
+                let path = request
+                    .url
+                    .to_file_path()
+                    .map_err(|()| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("not a valid file URL: {}", request.url),
+                        )
+                    })?;
+                let file_content = std::fs::read(path)?;
                 (request.url.to_string(), Bytes::from(file_content))
             }
             _ => {
