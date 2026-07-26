@@ -162,6 +162,23 @@ fn make_brush_paint<'a>(
 // Coordinate and path conversion helpers
 // ============================================================================
 
+/// The transform a gradient shader should carry: the BRUSH transform only.
+///
+/// Gradient geometry is expressed in brush space (peniko emits a unit circle /
+/// unit line and puts the sizing in this transform), and `brush_transform` maps
+/// that into user space.
+///
+/// It must NOT be pre-composed with the shape transform: tiny-skia's
+/// `fill_path`/`stroke_path` already apply their own `transform` argument to the
+/// shader as well as the path (`painter.rs`: `paint.shader.transform(ts)`, which
+/// `post_concat`s it). Composing here too applied the shape transform twice —
+/// a unit-circle radial ended up scaled and translated far off-screen, which is
+/// why radial gradients painted nothing at all.
+#[inline]
+fn brush_space(brush_transform: Option<Affine>) -> Transform {
+    affine_to_transform(brush_transform.unwrap_or(Affine::IDENTITY))
+}
+
 /// Convert a kurbo [`Affine`] transform to a tiny-skia [`Transform`].
 #[inline]
 fn affine_to_transform(affine: Affine) -> Transform {
@@ -525,7 +542,7 @@ impl PaintScene for TinySkiaPainter {
         _style: Fill,
         transform: Affine,
         brush: impl Into<anyrender::PaintRef<'a>>,
-        _brush_transform: Option<Affine>,
+        brush_transform: Option<Affine>,
         shape: &impl Shape,
     ) {
         let paint_ref = brush.into();
@@ -537,7 +554,13 @@ impl PaintScene for TinySkiaPainter {
             _ => {
                 if let Some(path) = shape_to_path(shape) {
                     let ts = affine_to_transform(transform);
-                    let paint = make_brush_paint(&paint_ref, ts);
+                    // A gradient's geometry is expressed in BRUSH space, which
+                    // `brush_transform` maps into user space; the shape transform
+                    // then maps user space to the device. The shader therefore
+                    // needs both composed. Dropping the brush transform left
+                    // radial gradients with a ~1px radius at the origin — they
+                    // rendered as nothing at all.
+                    let paint = make_brush_paint(&paint_ref, brush_space(brush_transform));
                     let mask = self.active_clip_mask();
                     self.pixmap
                         .fill_path(&path, &paint, FillRule::Winding, ts, mask.as_ref());
@@ -552,7 +575,7 @@ impl PaintScene for TinySkiaPainter {
         style: &Stroke,
         transform: Affine,
         brush: impl Into<anyrender::PaintRef<'a>>,
-        _brush_transform: Option<Affine>,
+        brush_transform: Option<Affine>,
         shape: &impl Shape,
     ) {
         let paint_ref = brush.into();
@@ -564,7 +587,7 @@ impl PaintScene for TinySkiaPainter {
                 ..Default::default()
             };
             let ts = affine_to_transform(transform);
-            let paint = make_brush_paint(&paint_ref, ts);
+            let paint = make_brush_paint(&paint_ref, brush_space(brush_transform));
             let mask = self.active_clip_mask();
             self.pixmap
                 .stroke_path(&path, &paint, &stroke, ts, mask.as_ref());
@@ -825,6 +848,17 @@ impl TinySkiaPainter {
         let sample_ratio_x = image_width as f32 / dest_width;
         let sample_ratio_y = image_height as f32 / dest_height;
 
+        // Honour the active clip, exactly as `draw_image` does. Without this a
+        // background image ignored `overflow:hidden` and rounded corners and
+        // painted its full destination rect — the same class of bug as glyphs
+        // passing `None` for the mask. Computed before `data_mut()` takes the
+        // mutable borrow.
+        let clip_mask = self
+            .active_clip
+            .as_ref()
+            .and_then(|c| c.to_mask(framebuffer_width as u32, framebuffer_height as u32));
+        let clip_bbox = self.active_clip.as_ref().map(|c| c.bounding_box());
+
         let framebuffer = self.pixmap.data_mut();
 
         for row in 0..(dest_height as i32) {
@@ -837,6 +871,26 @@ impl TinySkiaPainter {
                 let pixel_x = dest_x as i32 + col;
                 if pixel_x < 0 || pixel_x >= framebuffer_width {
                     continue;
+                }
+
+                // Clip test: the rasterized mask when the clip has curves,
+                // otherwise a bounding-box rejection.
+                if let Some(ref mask) = clip_mask {
+                    let mask_index =
+                        (pixel_y as u32) * (framebuffer_width as u32) + (pixel_x as u32);
+                    if (mask_index as usize) < mask.data().len()
+                        && mask.data()[mask_index as usize] == 0
+                    {
+                        continue;
+                    }
+                } else if let Some(ref bbox) = clip_bbox {
+                    if (pixel_x as f64) < bbox.x0
+                        || (pixel_x as f64) > bbox.x1
+                        || (pixel_y as f64) < bbox.y0
+                        || (pixel_y as f64) > bbox.y1
+                    {
+                        continue;
+                    }
                 }
 
                 let src_col = ((col as f32 * sample_ratio_x) as u32).min(image_width - 1);

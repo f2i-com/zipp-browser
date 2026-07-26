@@ -8,20 +8,24 @@ use kurbo::{Affine, Shape};
 use peniko::Mix;
 use std::cell::Cell;
 
-/// Maximum number of compositing layers that may be active at once.
+/// Maximum NESTING DEPTH of compositing layers.
+///
+/// This bounds a recursive resource (each level costs stack and, on a GPU
+/// backend, a render target), which is why it is a depth limit and not a count
+/// of how many layers a frame draws in total. A long page legitimately pushes
+/// and pops many thousands of clips; it never nests them thousands deep.
 const LAYER_LIMIT: u32 = 1024;
 
 /// Tracks compositing-layer usage so the renderer can stay within GPU limits.
 #[derive(Default)]
 pub(crate) struct LayerManager {
-    /// Total number of layers that have been pushed (cumulative).
-    active_count: Cell<u32>,
-    /// Current nesting depth of pushed layers.
+    /// Current nesting depth of pushed layers — the value the budget tests.
     current_depth: Cell<u32>,
     /// Number of layers that were *requested* (including those denied by the cap).
     requested_count: Cell<u32>,
 
-    #[allow(unused)] // Only used for debugging. Enabled as required.
+    /// High-water mark of `current_depth`, for debugging.
+    #[allow(unused)]
     layer_depth_used: Cell<u32>,
 }
 
@@ -56,9 +60,16 @@ impl LayerManager {
         }
         self.requested_count.update(|x| x + 1);
 
-        // Check if clips are above limit
-        let layers_available = self.active_count.get() <= LAYER_LIMIT;
-        if !layers_available {
+        // Refuse only when nesting is genuinely too deep.
+        //
+        // This used to test `active_count`, which was incremented on push and
+        // never decremented on pop — a cumulative tally of every layer the frame
+        // had drawn. On any page with more than 1024 clipped boxes it latched
+        // false partway down, and from that point every clip was silently
+        // skipped for the rest of the frame: overflow:hidden stopped clipping,
+        // rounded corners stopped masking, and (now that text honours the clip)
+        // glyphs started escaping their boxes — all with no diagnostic.
+        if self.current_depth.get() >= LAYER_LIMIT {
             return false;
         }
 
@@ -70,9 +81,9 @@ impl LayerManager {
         };
 
         // Update accounting
-        self.active_count.update(|x| x + 1);
-        self.current_depth.update(|x| x + 1);
-        self.current_depth.update(|x| x.max(self.current_depth.get()));
+        let depth = self.current_depth.get() + 1;
+        self.current_depth.set(depth);
+        self.layer_depth_used.update(|hwm| hwm.max(depth));
 
         true
     }
@@ -81,7 +92,9 @@ impl LayerManager {
     pub(crate) fn maybe_pop_layer(&self, scene: &mut impl PaintScene, condition: bool) {
         if condition {
             scene.pop_layer();
-            self.current_depth.update(|x| x - 1);
+            // saturating: a stray pop must not wrap the depth to u32::MAX and
+            // wedge the budget closed for the rest of the frame.
+            self.current_depth.update(|x| x.saturating_sub(1));
         }
     }
 }

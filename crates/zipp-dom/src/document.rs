@@ -422,10 +422,17 @@ impl BaseDocument {
         style_config::set_pref!("layout.columns.enabled", true);
         style_config::set_pref!("layout.threads", -1);
         // Variable fonts. Google Fonts serves most modern faces as variable
-        // (Bricolage Grotesque ships an `opsz` axis, for one), so leaving this
-        // off makes `font-variation-settings` / `@font-face` axis ranges
-        // unparseable and the face falls back to a system font — which changes
-        // every glyph, advance and line break on the page.
+        // (Bricolage Grotesque ships an `opsz` axis, for one), so leaving these
+        // off makes `font-variation-settings` and the `@font-face` variation
+        // descriptors unparseable — the face is then dropped and a system font
+        // substituted, which changes every glyph, advance and line break.
+        //
+        // BOTH names are needed. stylo gates the longhands on its `servo_pref`
+        // (`layout.variable_fonts.enabled`, longhands.toml:1049) but `font_face.rs`
+        // reads the Gecko name directly (`layout.css.font-variations.enabled`,
+        // font_face.rs:579) regardless of build. Setting one leaves the other half
+        // of the feature disabled.
+        style_config::set_pref!("layout.variable_fonts.enabled", true);
         style_config::set_pref!("layout.css.font-variations.enabled", true);
 
         let viewport = config.viewport.unwrap_or_default();

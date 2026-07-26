@@ -604,8 +604,29 @@ impl ElementCx<'_> {
             }
         };
 
-        // FIXME: https://wpt.live/css/css-backgrounds/background-size/background-size-near-zero-gradient.html
-        if width_count * height_count > 500 {
+        // Guard against a DEGENERATE tile, which is the real hazard behind
+        // https://wpt.live/css/css-backgrounds/background-size/background-size-near-zero-gradient.html:
+        // a background-size rounding to zero makes the tile advance zero, and the
+        // tile count explode without ever covering the element.
+        //
+        // A flat `> 500 { return }` cap used to stand here, which silently dropped
+        // legitimate small-tile patterns: `background-size:24px 24px` over the
+        // hero is ~45x25 = 1125 tiles, so the entire dot-grid painted nothing.
+        // Tiles are tiny fills, so a large count is cheap; a zero-size one is not
+        // slow but infinite.
+        let advances_ok = width_gap.is_finite()
+            && height_gap.is_finite()
+            && (width_count == 1 || width_gap > 0.0)
+            && (height_count == 1 || height_gap > 0.0);
+        if !advances_ok {
+            return;
+        }
+        // Sanity bound far above any real pattern, so a pathological page cannot
+        // spend unbounded time here. Chosen to comfortably cover a full-page
+        // 1px-tiled background at 4K (about 8.3M) being refused, while every
+        // plausible decorative pattern passes.
+        const MAX_TILES: u32 = 100_000;
+        if width_count.saturating_mul(height_count) > MAX_TILES {
             return;
         }
 
