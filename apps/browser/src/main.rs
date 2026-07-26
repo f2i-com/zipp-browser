@@ -1365,8 +1365,15 @@ var __zippEsmDebug=true;
             if let Ok(path) = std::env::var("ZIPP_DUMP_ROOT") {
                 let _ = std::fs::write(&path, &inner);
             }
+            // Whatever the page put on <html> — the theme class above all.
+            // Its CSS is built on `:root.dark`, so this has to land on the real
+            // document element, not merely somewhere inside the body.
+            let html_attrs = match state.eval_in_context("__getHtmlClass()") {
+                Ok(JsValue::String(a)) if !a.trim().is_empty() => format!(" {a}"),
+                _ => String::new(),
+            };
             let html_out = format!(
-                "<!DOCTYPE html><html><head>{head}</head><body>{inner}</body></html>"
+                "<!DOCTYPE html><html{html_attrs}><head>{head}</head><body>{inner}</body></html>"
             );
             return Some((html_out, event_map_json, state));
         }
@@ -1544,12 +1551,23 @@ fn wrap_with_toolbar(html: &str, current_url: &str) -> String {
         html
     };
 
+    // Keep the source document's <html> attributes. This function rebuilds the
+    // document from its head and body, so emitting a bare <html> silently threw
+    // away the theme class that was just resolved.
+    let html_attrs = html
+        .find("<html")
+        .and_then(|i| html[i + 5..].find('>').map(|e| html[i + 5..i + 5 + e].trim().to_string()))
+        .filter(|a| !a.is_empty())
+        .map(|a| format!(" {a}"))
+        .unwrap_or_default();
+
     format!(
-        r#"<!DOCTYPE html><html><head>
+        r#"<!DOCTYPE html><html{html_attrs}><head>
 <meta charset="utf-8">
 {head_content}
 <style>{TOOLBAR_CSS}</style>
 </head><body style="margin:0 !important;padding:0 !important;max-width:none !important;width:100% !important">{body}</body></html>"#,
+        html_attrs = html_attrs,
         head_content = head_content,
         body = toolbar_body(body_content, current_url),
     )
@@ -1630,10 +1648,10 @@ fn toolbar_body_themed(page_html: &str, current_url: &str, html_class: &str) -> 
     };
     format!(
         r#"<div{class_attr} style="display:flex;flex-direction:column;margin:0;padding:0;width:100%;min-height:100vh">
-  <form action="{current_url}" method="GET" style="height:42px;min-height:42px;background:#f8f9fa;border-bottom:1px solid #dee2e6;display:flex;align-items:center;padding:4px 8px;gap:6px;font-family:Arial,sans-serif;box-sizing:border-box;width:100%;margin:0;flex-shrink:0">
+  <form action="{current_url}" method="GET" style="color:#212529;height:42px;min-height:42px;background:#f8f9fa;border-bottom:1px solid #dee2e6;display:flex;align-items:center;padding:4px 8px;gap:6px;font-family:Arial,sans-serif;box-sizing:border-box;width:100%;margin:0;flex-shrink:0">
     <span style="font-size:16px;color:#495057;padding:0 4px;cursor:pointer">◀</span>
     <span style="font-size:16px;color:#495057;padding:0 4px;cursor:pointer">▶</span>
-    <input type="text" name="__nav_url" value="{current_url}" style="width:90%;height:32px;padding:0 12px;border:1px solid #ced4da;border-radius:8px;font-size:14px;background:white;outline:none;box-sizing:border-box" />
+    <input type="text" name="__nav_url" value="{current_url}" style="width:90%;height:32px;padding:0 12px;border:1px solid #ced4da;border-radius:8px;font-size:14px;background:white;color:#212529;outline:none;box-sizing:border-box" />
   </form>
   {page_html}
 </div>"#

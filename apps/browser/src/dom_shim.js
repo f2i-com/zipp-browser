@@ -292,6 +292,26 @@ class Element extends DOMNode {
         this.offsetWidth = 0; this.offsetHeight = 0; this.offsetTop = 0; this.offsetLeft = 0;
         this.scrollWidth = 0; this.scrollHeight = 0; this.scrollTop = 0; this.scrollLeft = 0;
         this.clientWidth = 0; this.clientHeight = 0; this.clientTop = 0; this.clientLeft = 0;
+        // Form-control state. React reads `value`/`checked` back off the node
+        // when it commits a controlled input, and reconciles `<select>` through
+        // `element.options` — which is why a page with a select died in React's
+        // updateOptions with "Cannot read properties of undefined (reading
+        // 'length')" before this existed.
+        this.value = "";
+        this.checked = false;
+        this.defaultValue = "";
+        this.defaultChecked = false;
+        this.selected = false;
+        this.defaultSelected = false;
+        this.disabled = false;
+        this.selectedIndex = -1;
+        this.multiple = false;
+    }
+
+    /// The `<option>` elements under a `<select>`, in document order.
+    get options() {
+        if (this.tagName !== "SELECT") return undefined;
+        return this.getElementsByTagName("option");
     }
     get textContent() { var t=""; for(var i=0;i<this.childNodes.length;i++){var c=this.childNodes[i]; if(c.nodeType===3)t+=c.data; else if(c.nodeType===1)t+=c.textContent;} return t; }
     set textContent(v) { this.childNodes=[]; if(v) this.appendChild(new Text(String(v))); }
