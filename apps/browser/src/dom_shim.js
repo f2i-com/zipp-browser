@@ -933,7 +933,38 @@ var window = {
     self:null, top:null, parent:null,
     getSelection:function(){return {removeAllRanges:function(){},addRange:function(){},getRangeAt:function(){return doc.createRange();}};},
     ResizeObserver:function(){this.observe=function(){};this.unobserve=function(){};this.disconnect=function(){};},
-    IntersectionObserver:function(){this.observe=function(){};this.unobserve=function(){};this.disconnect=function(){};},
+    // A real IntersectionObserver delivers an initial observation for every
+    // observed element once layout is known. Stubbing `observe` as a no-op means
+    // the callback never runs — and the extremely common
+    // `.reveal{opacity:0} .reveal.is-visible{opacity:1}` scroll-reveal pattern
+    // then leaves the whole page invisible, which is what used to render
+    // lance.name as an empty document below the header.
+    //
+    // There is no scrolling during a one-shot render, so every observed element
+    // is reported as fully intersecting: that is the state the page reaches in a
+    // real browser once the user has scrolled through it, and it is much closer
+    // to Chrome than "permanently hidden".
+    IntersectionObserver:function(callback){
+        var self=this;
+        this.observe=function(el){
+            __mcQueue.push(function(){
+                try{
+                    callback([{
+                        target:el,
+                        isIntersecting:true,
+                        intersectionRatio:1,
+                        boundingClientRect:el&&el.getBoundingClientRect?el.getBoundingClientRect():{top:0,left:0,right:0,bottom:0,width:0,height:0},
+                        intersectionRect:{top:0,left:0,right:0,bottom:0,width:0,height:0},
+                        rootBounds:null,
+                        time:0
+                    }],self);
+                }catch(e){}
+            });
+        };
+        this.unobserve=function(){};
+        this.disconnect=function(){};
+        this.takeRecords=function(){return [];};
+    },
     queueMicrotask:function(fn){if(typeof fn==="function")__mcQueue.push(fn);},
     btoa:__btoa, atob:__atob,
     open:function(){return null;}, close:function(){},

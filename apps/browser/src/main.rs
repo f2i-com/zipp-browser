@@ -1,11 +1,20 @@
 //! Zipp Browser -- Stylo CSS + Taffy Layout + tiny-skia rendering + Zipp JS
 //!
-//! Pipeline: Fetch -> Zipp JS (React/SPA) -> inline CSS/images -> responsive transform
-//!           -> Zipp layout -> tiny-skia paint -> winit window
+//! Pipeline: Fetch -> Zipp JS (React/SPA) -> inline images -> Stylo cascade
+//!           -> Taffy layout -> tiny-skia paint -> winit window
 //!
-//! Responsive Tailwind classes (md:*, lg:*) are handled by the `responsive` module which
-//! converts them to inline styles. CSS `@media` blocks are unwrapped so all rules apply
-//! unconditionally at desktop width.
+//! CSS is handled by the real engine, not rewritten on the way in. There used to
+//! be a `responsive` module that unwrapped `@media` blocks, converted Tailwind
+//! `md:`/`lg:` classes to inline styles and rewrote CSS Grid containers into
+//! flexbox with hardcoded child widths — all on the premise that Stylo could not
+//! do media queries and Taffy could not do grid. Both premises were wrong:
+//! Stylo is Firefox's style engine and evaluates `@media` against the device
+//! built in `zipp_dom::document::make_device`, and Taffy's `grid` feature is on
+//! by default with `compute_grid_layout` wired up. Those rewrites only made the
+//! output diverge from a real browser, so they are gone.
+//!
+//! `--screenshot` renders a page headlessly to a PNG, which is how the output
+//! gets compared against Chrome.
 
 // -- std --
 use std::collections::HashMap;
@@ -23,7 +32,6 @@ use zipp_renderer::tinyskia::TinySkiaWindowRenderer;
 use zipp_shell::{create_default_event_loop, ZippApp, ShellProxy, WindowConfig};
 
 mod event_bridge;
-mod responsive;
 
 // ---------------------------------------------------------------------------
 // Global caches
@@ -45,6 +53,10 @@ lazy_static::lazy_static! {
         .build()
         .expect("failed to build HTTP client");
 }
+
+/// Seconds to advance the animation clock before a headless screenshot, so CSS
+/// entrance animations land on their final keyframe rather than frame zero.
+const ANIMATION_SETTLE_SECS: f64 = 5.0;
 
 /// Customisable User-Agent string. Change this to mimic different browsers.
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Zipp/1.0";
@@ -70,36 +82,26 @@ fn main() {
         let ok = run_js_suite("COMPAT", include_str!("js_compat_tests.js"), 20);
         std::process::exit(if ok { 0 } else { 1 });
     }
+    // Headless render: load a page, lay it out and paint it to a PNG without
+    // opening a window. This is how the rendering is checked against a real
+    // browser — a screenshot is the only honest way to compare CSS output.
+    //   zipp-browser --screenshot out.png [url] [width] [height]
+    if arg == "--screenshot" {
+        let mut rest = std::env::args().skip(2);
+        let out = rest.next().unwrap_or_else(|| "screenshot.png".to_string());
+        let url = rest.next().unwrap_or_else(|| "https://lance.name".to_string());
+        let width: u32 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(1280);
+        let height: u32 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(2000);
+        let ok = screenshot(&normalize_url(&url), &out, width, height);
+        std::process::exit(if ok { 0 } else { 1 });
+    }
 
     let url = if arg.is_empty() { "https://lance.name".to_string() } else { arg };
     eprintln!("[BROWSER] Loading {url}");
 
-    // 1. Fetch the page
-    let html = fetch(&url)
-        .unwrap_or_else(|e| format!("<html><body><h1>Error</h1><p>{e}</p></body></html>"));
-
-    // 2. Run Zipp JS if needed (React/SPA) -- on the main thread, so the
-    //    ScriptState (which is !Send) stays alive for later event dispatch.
-    //    `run_zipp_js` grows the stack itself.
-    let (final_html, event_map_json, js_state) = if html.contains("<script") {
-        match run_zipp_js(&html, &url) {
-            Some((rendered, emap, state)) => (rendered, Some(emap), Some(state)),
-            None => (html.clone(), None, None),
-        }
-    } else {
-        (html, None, None)
-    };
-
-    // 3. Post-process HTML
-    // Strip <noscript> blocks (our browser has JS support)
-    let final_html = strip_noscript(&final_html);
-    // Toggle JS detection classes: no-js → js, client-nojs → client-js
-    let final_html = final_html
-        .replace("class=\"no-js", "class=\"js")
-        .replace("class=\"client-nojs", "class=\"client-js");
-    let final_html = inline_images(&final_html, &url);
-    let final_html = responsive::apply_desktop_classes(&final_html);
-    let final_html = wrap_with_toolbar(&final_html, &url);
+    // 1-3. Fetch, run the page's JS, post-process. The ScriptState is !Send, so
+    //      this stays on the main thread to keep it alive for event dispatch.
+    let (final_html, event_map_json, js_state) = prepare_page(&url);
     eprintln!("[BROWSER] Ready ({} bytes)", final_html.len());
 
     // Cache the initial page for instant back-navigation
@@ -617,6 +619,145 @@ fn json_quote(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+// ---------------------------------------------------------------------------
+// Page pipeline
+// ---------------------------------------------------------------------------
+
+/// Fetch `url`, run its JS, and post-process into the HTML the renderer sees.
+///
+/// Shared by the window path and `--screenshot` so the two cannot drift — a
+/// screenshot that went through a different pipeline would be worthless for
+/// comparing against a real browser.
+///
+/// Returns the final HTML, the JS event map (when the page ran script), and the
+/// live `ScriptState` that keeps event handlers callable.
+fn prepare_page(url: &str) -> (String, Option<String>, Option<ScriptState>) {
+    let t_fetch = std::time::Instant::now();
+    let html = fetch(url)
+        .unwrap_or_else(|e| format!("<html><body><h1>Error</h1><p>{e}</p></body></html>"));
+    let fetch_ms = t_fetch.elapsed().as_millis();
+
+    let t_js = std::time::Instant::now();
+    let (rendered, event_map_json, js_state) = if html.contains("<script") {
+        match run_zipp_js(&html, url) {
+            Some((r, emap, state)) => (r, Some(emap), Some(state)),
+            None => (html.clone(), None, None),
+        }
+    } else {
+        (html, None, None)
+    };
+    let js_ms = t_js.elapsed().as_millis();
+
+    let t_post = std::time::Instant::now();
+    // Strip <noscript> blocks (our browser has JS support)
+    let out = strip_noscript(&rendered);
+    // Toggle JS detection classes: no-js → js, client-nojs → client-js
+    let out = out
+        .replace("class=\"no-js", "class=\"js")
+        .replace("class=\"client-nojs", "class=\"client-js");
+    let out = inline_images(&out, url);
+    let out = wrap_with_toolbar(&out, url);
+    let post_ms = t_post.elapsed().as_millis();
+
+    eprintln!(
+        "[PERF] Page: fetch={fetch_ms}ms js={js_ms}ms post={post_ms}ms ({} bytes)",
+        out.len()
+    );
+    (out, event_map_json, js_state)
+}
+
+// ---------------------------------------------------------------------------
+// Headless rendering
+// ---------------------------------------------------------------------------
+
+/// Load `url`, lay it out at `width`x`height` and paint it to a PNG.
+///
+/// No window, no event loop — just the same document pipeline the window uses,
+/// pointed at a software framebuffer. Returns whether it succeeded.
+fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
+    use zipp_dom::traits_src::shell::{ColorScheme, Viewport};
+
+    eprintln!("[SHOT] {url} -> {out_path} ({width}x{height})");
+    let (final_html, _event_map, _js_state) = prepare_page(url);
+    // Write the HTML the renderer sees alongside the image. When a screenshot
+    // looks wrong the first question is always "is this a CSS/layout problem or
+    // did the page's JS produce the wrong DOM?", and this answers it directly.
+    let html_path = format!("{out_path}.html");
+    if let Err(e) = std::fs::write(&html_path, &final_html) {
+        eprintln!("[SHOT] could not write {html_path}: {e}");
+    } else {
+        eprintln!("[SHOT] wrote {html_path}");
+    }
+
+    let font_ctx = load_fonts();
+    // The net provider fetches stylesheets and images. Those land asynchronously,
+    // so a tokio runtime has to be alive while the document resolves.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let _guard = rt.enter();
+
+    let net_provider = Arc::new(zipp_shell::net::Provider::new(None));
+    let config = DocumentConfig {
+        font_ctx: Some(font_ctx),
+        base_url: Some(url.to_string()),
+        net_provider: Some(net_provider.clone() as _),
+        html_parser_provider: Some(Arc::new(HtmlProvider) as _),
+        viewport: Some(Viewport::new(width, height, 1.0, ColorScheme::Light)),
+        ..Default::default()
+    };
+
+    let t_parse = std::time::Instant::now();
+    let mut doc = HtmlDocument::from_html(&final_html, config);
+    let parse_ms = t_parse.elapsed().as_millis();
+
+    // Let linked stylesheets and images arrive before layout: a screenshot taken
+    // before the CSS lands would be measuring nothing useful. Poll rather than
+    // sleep a fixed time so a fast page is not penalised.
+    let t_net = std::time::Instant::now();
+    while !net_provider.is_empty() && t_net.elapsed().as_secs() < 15 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        doc.as_mut().resolve_deferred_tasks();
+    }
+    let net_ms = t_net.elapsed().as_millis();
+
+    let t_layout = std::time::Instant::now();
+    // Resolve twice. The first pass builds the CSS animation sets (they are
+    // created pending, stamped with this `now`); the second advances the clock
+    // well past any plausible entrance animation so they land on their final
+    // keyframe.
+    //
+    // Without it a screenshot captures frame zero, and the very common
+    // `animation: fade-in .6s both` pattern renders as a blank page — with
+    // `fill-mode: both` an element takes the 0% keyframe (`opacity: 0`) until
+    // the animation actually runs. A real browser is a second past that by the
+    // time anyone looks at it, so settling is the honest comparison point.
+    doc.as_mut().resolve(0.0);
+    doc.as_mut().resolve(ANIMATION_SETTLE_SECS);
+    let layout_ms = t_layout.elapsed().as_millis();
+
+    let t_paint = std::time::Instant::now();
+    let mut painter = zipp_renderer::tinyskia::TinySkiaPainter::new(width, height);
+    zipp_renderer::paint_scene(&mut painter, doc.as_ref(), 1.0, width, height, 0, 0);
+    let paint_ms = t_paint.elapsed().as_millis();
+
+    eprintln!(
+        "[PERF] Render: parse={parse_ms}ms net-wait={net_ms}ms layout={layout_ms}ms paint={paint_ms}ms"
+    );
+
+    match painter.pixmap.save_png(out_path) {
+        Ok(()) => {
+            eprintln!("[SHOT] wrote {out_path}");
+            true
+        }
+        Err(e) => {
+            eprintln!("[SHOT] failed to write {out_path}: {e}");
+            false
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
