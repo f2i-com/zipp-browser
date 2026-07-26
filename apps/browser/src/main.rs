@@ -593,7 +593,12 @@ function __zippDispatchEvent(handlerNid, targetNid, type) {
         // the control became inert after its first use.
         if (immediateStopped) break;
     }
-    return true;
+    // Report whether a listener called preventDefault(). The caller turns this
+    // into blitz's own event state, which is what suppresses the element's
+    // default action — for an <a>, a real navigation. React Router cancels the
+    // click and routes in-page; without this the navigation ALSO ran, throwing
+    // away the live JS state and leaving every control on the next page dead.
+    return defaultPrevented;
 }
 "#;
 
@@ -819,6 +824,11 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
         base_url: Some(url.to_string()),
         net_provider: Some(net_provider.clone() as _),
         html_parser_provider: Some(Arc::new(HtmlProvider) as _),
+        // Present so link clicks take the SAME path they take in the window:
+        // it records rather than navigates, so `[NAV-WOULD]` in the log means
+        // the page did NOT cancel the click and the real browser would have
+        // reloaded and dropped its JS state.
+        navigation_provider: Some(Arc::new(RecordingNavProvider) as _),
         viewport: Some(Viewport::new(width, height, 1.0, ColorScheme::Light)),
         ..Default::default()
     };
@@ -887,39 +897,52 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
     // proves the JS half, which is why it once reported success while clicking
     // in the window still did nothing.
     if let Some(spec) = std::env::var("ZIPP_UICLICK").ok() {
-        if let Some((sx, sy)) = spec.split_once(',') {
-            if let (Ok(x), Ok(y)) = (sx.trim().parse::<f32>(), sy.trim().parse::<f32>()) {
+        // Semicolon-separated points, clicked in order: `x,y;x,y;...`. A single
+        // point is the common case and behaves exactly as before. A SEQUENCE is
+        // what you need to reproduce anything that depends on getting somewhere
+        // first — following a link and then using a control on the page you
+        // landed on cannot be expressed by repeating one coordinate.
+        let points: Vec<(f32, f32)> = spec
+            .split(';')
+            .filter_map(|p| p.split_once(','))
+            .filter_map(|(sx, sy)| {
+                match (sx.trim().parse::<f32>(), sy.trim().parse::<f32>()) {
+                    (Ok(x), Ok(y)) => Some((x, y)),
+                    _ => None,
+                }
+            })
+            .collect();
+        if !points.is_empty() {
+            {
                 use zipp_dom::Document;
                 use zipp_dom::traits_src::events::{
                     MouseEventButton, MouseEventButtons, PointerCoords, PointerDetails,
                     PointerEvent, PointerId, UiEvent,
                 };
-                let coords = PointerCoords {
-                    screen_x: x, screen_y: y,
-                    client_x: x, client_y: y,
-                    page_x: x, page_y: y,
-                };
-                let mk = || PointerEvent {
+                let mk = |x: f32, y: f32| PointerEvent {
                     id: PointerId::Mouse,
                     is_primary: true,
-                    coords,
+                    coords: PointerCoords {
+                        screen_x: x, screen_y: y,
+                        client_x: x, client_y: y,
+                        page_x: x, page_y: y,
+                    },
                     button: MouseEventButton::Main,
                     buttons: MouseEventButtons::Primary,
                     mods: Default::default(),
                     details: PointerDetails::default(),
                 };
-                // Repeat the click `ZIPP_UICLICK_N` times (default 1). Two
-                // clicks is the interesting case: the second only works if the
-                // handler rebuilt its node maps after the first re-render.
                 let clicks: u32 = std::env::var("ZIPP_UICLICK_N")
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(1);
-                for i in 0..clicks {
+                let total = clicks as usize * points.len();
+                for i in 0..total {
+                    let (x, y) = points[i % points.len()];
                     eprintln!("[UICLICK] click {} at ({x}, {y})", i + 1);
-                    doc.handle_ui_event(UiEvent::PointerMove(mk()));
-                    doc.handle_ui_event(UiEvent::PointerDown(mk()));
-                    doc.handle_ui_event(UiEvent::PointerUp(mk()));
+                    doc.handle_ui_event(UiEvent::PointerMove(mk(x, y)));
+                    doc.handle_ui_event(UiEvent::PointerDown(mk(x, y)));
+                    doc.handle_ui_event(UiEvent::PointerUp(mk(x, y)));
                     // Settle layout between clicks so the next hit-test runs
                     // against the tree the previous click produced.
                     // Two resolves: the first creates the animations the
@@ -943,7 +966,7 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
                 // SETTLE*(3+2(N-1)), so a hardcoded 4/8 lands mid-animation for
                 // N>=3 and screenshots a half-faded page that looks like a
                 // rendering bug.
-                let after = ANIMATION_SETTLE_SECS * (2.0 * clicks as f64 + 2.0);
+                let after = ANIMATION_SETTLE_SECS * (2.0 * total as f64 + 2.0);
                 // Several frames, spread out. Each re-render builds BRAND NEW
                 // nodes whose entrance animations are created on the next
                 // resolve and stamped with that moment, and the site staggers
@@ -1210,6 +1233,21 @@ fn run_zipp_js_inner(
 /// Handles link clicks by loading pages internally.
 struct BrowserNavProvider {
     proxy: ShellProxy,
+}
+
+/// Records navigations instead of performing them, for `--screenshot`.
+///
+/// The screenshot path had NO navigation provider at all, so a link click could
+/// never trigger a real navigation there — which meant the harness happily
+/// reported the SPA working while the windowed browser threw its JS state away
+/// on the first link click and left the next page dead. A harness that cannot
+/// reach the broken path is worse than none: it reports success.
+struct RecordingNavProvider;
+
+impl NavigationProvider for RecordingNavProvider {
+    fn navigate_to(&self, options: NavigationOptions) {
+        eprintln!("[NAV-WOULD] {}", options.url);
+    }
 }
 
 impl NavigationProvider for BrowserNavProvider {

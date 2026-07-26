@@ -187,8 +187,16 @@ impl EventHandler for JsEventBridge {
                                 JsValue::String(event_name.to_string()),
                             ],
                         );
-                        if let Err(e) = &dispatched {
-                            eprintln!("[EVENT] handler for \"{event_name}\" failed: {e}");
+                        match &dispatched {
+                            Err(e) => {
+                                eprintln!("[EVENT] handler for \"{event_name}\" failed: {e}")
+                            }
+                            // The page called preventDefault(). Blitz checks its
+                            // own event state before running an element's default
+                            // action, so this is what stops an <a> the page
+                            // handled itself from also navigating for real.
+                            Ok(JsValue::Bool(true)) => event_state.prevent_default(),
+                            Ok(_) => {}
                         }
                         // Flush what the handler scheduled. `call_global` returns
                         // the moment the listener returns, so anything it queued

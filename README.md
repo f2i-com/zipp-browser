@@ -100,6 +100,15 @@ Honest list, not an exhaustive one:
 - **Intrinsic sizing keywords** (`max-content`, `min-content`, `fit-content`,
   `stretch`) collapse to `auto` in the Stylo→Taffy conversion. Lowering them
   properly currently hits an `unreachable!()` in Taffy's resolver.
+- **A real navigation drops the page's JavaScript.** In-page routing is fine —
+  a framework that cancels the click (React Router does) keeps its live VM, so
+  SPA links work and the page stays interactive. But an address-bar navigation
+  or a link the page does not handle replaces the document with fetched or
+  prerendered HTML and installs no event bridge, so that page renders correctly
+  and responds to nothing. Fixing it means running the new page's JS and
+  attaching a bridge to the new document in the navigation path.
+- **Client-side routing does not update the address bar.** The URL shown stays
+  the one that was loaded, even after in-page navigation.
 - **The DOM bridge is one-shot per render.** JS mutations are re-serialized and
   re-parsed rather than applied incrementally to the live tree. See
   `docs/DOM_BRIDGE_DESIGN.md`.
