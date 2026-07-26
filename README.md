@@ -99,6 +99,14 @@ Honest list, not an exhaustive one:
   next to a float should sit beside it, or below when there is no room; instead
   it overlaps. This is what still misplaces GitHub's profile name over its
   Follow button.
+- **`filter: blur()` is not implemented.** A blurred element paints sharp, so a
+  decorative glow — a large soft circle behind a hero — renders as a hard opaque
+  disc, which is far more obtrusive than the effect it stands in for.
+  formlogic.local uses `blur(18px)`–`blur(22px)` for exactly that. Fixing it
+  needs the rasterizer to render the element into its own pixmap, blur those
+  pixels and composite: `anyrender`'s `PaintScene` trait has no blur, so it
+  cannot be threaded through `push_layer` and needs either an upstream addition
+  or a painter-side escape hatch.
 - **Conic/sweep gradients** fall back to their middle stop — tiny-skia has no
   sweep shader.
 - **Intrinsic sizing keywords** (`max-content`, `min-content`, `fit-content`,
