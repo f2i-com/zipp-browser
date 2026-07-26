@@ -74,13 +74,27 @@ page's handlers and the updated tree is re-rendered.
 
 Honest list, not an exhaustive one:
 
-- **Nested clips replace rather than intersect**, so a clipped box inside a
-  rounded `overflow:hidden` ancestor can paint over its parent's corners.
-  Intersecting is correct but needs bbox-limited masks to be affordable — with
-  full-framebuffer masks paint went from 0.8s to 10.7s.
+- **`-webkit-line-clamp` and `display:-webkit-box` do nothing.** Both are
+  `engine = "gecko"` in stylo, so they are compiled out of a servo-featured
+  build and no pref can reach them — the declarations are dropped in the
+  cascade. Text that Chrome truncates to N lines with an ellipsis renders in
+  full, making clamped cards taller. Fixing it means patching stylo, not this
+  repo.
+- **`mask-image` is unsupported**; a masked element paints unmasked. That is
+  much closer to Chrome than dropping the layer, but a `mask-image` fade (the
+  hero dot-grid's, for one) simply does not fade.
+- **Conic/sweep gradients** fall back to their middle stop — tiny-skia has no
+  sweep shader.
+- **Intrinsic sizing keywords** (`max-content`, `min-content`, `fit-content`,
+  `stretch`) collapse to `auto` in the Stylo→Taffy conversion. Lowering them
+  properly currently hits an `unreachable!()` in Taffy's resolver.
 - **The DOM bridge is one-shot per render.** JS mutations are re-serialized and
   re-parsed rather than applied incrementally to the live tree. See
   `docs/DOM_BRIDGE_DESIGN.md`.
+- **Builtin statics ignore reassignment in zipp-vm** — `Object.keys = f` then
+  `Object.keys(x)` still calls the native, because the call site is lowered at
+  compile time. This breaks polyfills, and is why 4 of the bundled JS tests
+  fail.
 - `Error.prototype.stack` is empty in zipp-vm, so page errors have no traceback.
 - No scrolling-driven `IntersectionObserver`: observed elements are reported as
   intersecting immediately, which matches a fully-scrolled page rather than the
