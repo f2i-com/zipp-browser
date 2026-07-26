@@ -312,5 +312,31 @@ impl BaseDocument {
 
         taffy::compute_root_layout(self, root_element_id, available_space);
         taffy::round_layout(self, root_element_id);
+
+        // Content sizes are only correct now, so this is the one place a scroll
+        // offset can be clamped against the truth. Anything that shortens the
+        // page — a window resize, a zoom change, a JS re-render — would
+        // otherwise leave the content parked past its end with nothing to pull
+        // it back; the pre-existing clamps all run BEFORE the relayout their own
+        // change triggers, so they measure the previous frame.
+        self.clamp_scroll_offsets();
+    }
+
+    /// Clamp every scroll offset to its element's current scrollable range.
+    ///
+    /// Cheap in practice: almost every node sits at offset zero and is skipped
+    /// without touching its layout.
+    fn clamp_scroll_offsets(&mut self) {
+        for (_, node) in self.nodes.iter_mut() {
+            if node.scroll_offset.x == 0.0 && node.scroll_offset.y == 0.0 {
+                continue;
+            }
+            let max_x = node.final_layout.scroll_width() as f64;
+            let max_y = node.final_layout.scroll_height() as f64;
+            node.scroll_offset.x = node.scroll_offset.x.clamp(0.0, max_x.max(0.0));
+            node.scroll_offset.y = node.scroll_offset.y.clamp(0.0, max_y.max(0.0));
+        }
+        // And the document scroller, now that the root's content size is fresh.
+        self.scroll_viewport_by(0.0, 0.0);
     }
 }

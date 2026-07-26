@@ -1658,10 +1658,18 @@ impl BaseDocument {
             return false;
         };
 
-        let is_html_or_body = node.data.downcast_element().is_some_and(|e| {
-            let tag = &e.name.local;
-            tag == "html" || tag == "body"
-        });
+        // CSS gives a document exactly ONE viewport scrolling box: the root
+        // element's overflow propagates to the viewport, and <body>'s propagates
+        // to <html>. Treating both as scrollers made them stack — each clamped
+        // to its own scroll_height, with <body> saturating and bubbling the
+        // remainder up to <html>, which then scrolled the same distance again.
+        // A 3648px page got a 5696px scroll range, so it ran off the end into
+        // blank space and needed the whole excess scrolled back before any
+        // content reappeared.
+        let is_root_scroller = node
+            .data
+            .downcast_element()
+            .is_some_and(|e| e.name.local == *"html");
 
         let (can_x_scroll, can_y_scroll) = node
             .primary_styles()
@@ -1669,7 +1677,7 @@ impl BaseDocument {
                 (
                     matches!(styles.clone_overflow_x(), Overflow::Scroll | Overflow::Auto),
                     matches!(styles.clone_overflow_y(), Overflow::Scroll | Overflow::Auto)
-                        || (styles.clone_overflow_y() == Overflow::Visible && is_html_or_body),
+                        || (styles.clone_overflow_y() == Overflow::Visible && is_root_scroller),
                 )
             })
             .unwrap_or((false, false));
@@ -1756,7 +1764,16 @@ impl BaseDocument {
 
     /// Scroll the viewport by the given (x, y) delta. Returns `true` if the offset changed.
     pub fn scroll_viewport_by_has_changed(&mut self, x: f64, y: f64) -> bool {
-        let content_size = self.root_element().final_layout.size;
+        // The SCROLLABLE extent, not the border box. `size` is the root's own
+        // laid-out height, which the chrome wrapper pins to the window; the
+        // content that overflows it lives in `content_size`. Using `size` made
+        // the maximum offset come out as zero, so anything that reached the
+        // viewport scroller was silently dropped.
+        let layout = self.root_element().final_layout;
+        let content_size = taffy::geometry::Size {
+            width: layout.size.width.max(layout.content_size.width),
+            height: layout.size.height.max(layout.content_size.height),
+        };
         let new_scroll = (self.viewport_scroll.x - x, self.viewport_scroll.y - y);
         let window_width = self.viewport.window_size.0 as f64 / self.viewport.scale() as f64;
         let window_height = self.viewport.window_size.1 as f64 / self.viewport.scale() as f64;

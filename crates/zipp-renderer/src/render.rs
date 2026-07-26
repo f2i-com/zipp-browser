@@ -174,6 +174,7 @@ impl<'dom> DocumentPainter<'dom> {
                 x: self.initial_x - viewport_scroll.x,
                 y: self.initial_y - viewport_scroll.y,
             },
+            Affine::IDENTITY,
         );
 
         // Render debug overlay
@@ -200,7 +201,13 @@ impl<'dom> DocumentPainter<'dom> {
     ///
     /// Approaching rendering this way guarantees we have all the styles we need when rendering text with not having
     /// to traverse back to the parent for its styles, or needing to pass down styles
-    fn render_element(&self, scene: &mut impl PaintScene, node_id: usize, location: Point) {
+    fn render_element(
+        &self,
+        scene: &mut impl PaintScene,
+        node_id: usize,
+        location: Point,
+        ancestor_transform: Affine,
+    ) {
         let node = &self.dom.as_ref().tree()[node_id];
 
         // Early return if the element is hidden
@@ -282,7 +289,7 @@ impl<'dom> DocumentPainter<'dom> {
             return;
         }
 
-        let mut cx = self.element_cx(node, layout, box_position);
+        let mut cx = self.element_cx(node, layout, box_position, ancestor_transform);
 
         cx.draw_outline(scene);
         cx.draw_outset_box_shadow(scene);
@@ -348,12 +355,18 @@ impl<'dom> DocumentPainter<'dom> {
     }
 
     #[inline]
-    fn render_node(&self, scene: &mut impl PaintScene, node_id: usize, location: Point) {
+    fn render_node(
+        &self,
+        scene: &mut impl PaintScene,
+        node_id: usize,
+        location: Point,
+        ancestor_transform: Affine,
+    ) {
         let node = &self.dom.as_ref().tree()[node_id];
 
         match &node.data {
             NodeData::Element(_) | NodeData::AnonymousBlock(_) => {
-                self.render_element(scene, node_id, location)
+                self.render_element(scene, node_id, location, ancestor_transform)
             }
             NodeData::Text(TextNodeData { .. }) => {
                 // Text nodes should never be rendered directly
@@ -371,6 +384,7 @@ impl<'dom> DocumentPainter<'dom> {
         node: &'w Node,
         layout: Layout,
         box_position: Point,
+        ancestor_transform: Affine,
     ) -> ElementCx<'w> {
         let style = node
             .stylo_element_data
@@ -390,7 +404,11 @@ impl<'dom> DocumentPainter<'dom> {
 
         // the bezpaths for every element are (potentially) cached (not yet, tbd)
         // By performing the transform, we prevent the cache from becoming invalid when the page shifts around
-        let mut transform = Affine::translate(box_position.to_vec2() * scale);
+        // `box_position` is an ABSOLUTE document coordinate, so the ancestor
+        // matrix must be expressed about the document origin too — see
+        // `child_transform` below for how it is built.
+        let node_local = Affine::translate(box_position.to_vec2() * scale);
+        let mut transform = ancestor_transform * node_local;
 
         // Reference box for resolve percentage transforms
         let reference_box = euclid::Rect::new(
@@ -404,16 +422,40 @@ impl<'dom> DocumentPainter<'dom> {
         // Apply CSS transform property (where transforms are 2d)
         //
         // TODO: Handle hit testing correctly for transformed nodes
-        // TODO: Implement nested transforms
-        if let Some(style_transform) =
-            zipp_dom::resolve_2d_transform(style.get_box(), reference_box, scale)
-        {
-            transform *= style_transform
+        let style_transform =
+            zipp_dom::resolve_2d_transform(style.get_box(), reference_box, scale);
+        if let Some(style_transform) = style_transform {
+            transform *= style_transform;
         }
+
+        // What descendants inherit. A CSS transform applies about its own
+        // element's origin, but children are positioned in ABSOLUTE document
+        // coordinates, so the parent's own translate has to be undone or every
+        // ancestor offset would be applied twice and nested content would fly
+        // off-screen:
+        //
+        //     child = ancestor * translate(P_parent) * T_parent
+        //                      * translate(-P_parent)          <- undo
+        //                      * translate(P_child) * T_child
+        //
+        // With no CSS transform anywhere this collapses to the identity, so
+        // ordinary pages are unaffected.
+        //
+        // Until this existed, `transform: translateY(...)` moved only the
+        // element's own background and border: descendants stayed put, so
+        // `.rise`/`.reveal` entrance animations faded in without ever rising —
+        // and because the opacity layer's CLIP was transformed while its
+        // contents were not, the leading edge of the content was erased.
+        let child_transform = match style_transform {
+            Some(_) => transform * node_local.inverse(),
+            // Fast path: nothing to inherit, so do not build a matrix per node.
+            None => ancestor_transform,
+        };
 
         let element = node.element_data().unwrap();
 
         ElementCx {
+            child_transform,
             context: self,
             frame,
             scale,
@@ -468,6 +510,9 @@ struct ElementCx<'a> {
     node: &'a Node,
     element: &'a ElementData,
     transform: Affine,
+    /// The matrix descendants compose with — this element's `transform` with its
+    /// own absolute-position translate removed. See `element_cx`.
+    child_transform: Affine,
     #[cfg(feature = "svg")]
     svg: Option<&'a usvg::Tree>,
     text_input: Option<&'a TextInputData>,
@@ -613,14 +658,14 @@ impl ElementCx<'_> {
                     x: self.pos.x + hoisted_child.position.x as f64,
                     y: self.pos.y + hoisted_child.position.y as f64,
                 };
-                self.render_node(scene, hoisted_child.node_id, pos);
+                self.render_node(scene, hoisted_child.node_id, pos, self.child_transform);
             }
         }
 
         // Regular children — render_node/render_element handles position via node_position()
         if let Some(children) = &*self.node.paint_children.borrow() {
             for child_id in children {
-                self.render_node(scene, *child_id, self.pos);
+                self.render_node(scene, *child_id, self.pos, self.child_transform);
             }
         }
 
@@ -631,7 +676,7 @@ impl ElementCx<'_> {
                     x: self.pos.x + hoisted_child.position.x as f64,
                     y: self.pos.y + hoisted_child.position.y as f64,
                 };
-                self.render_node(scene, hoisted_child.node_id, pos);
+                self.render_node(scene, hoisted_child.node_id, pos, self.child_transform);
             }
         }
     }
