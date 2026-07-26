@@ -67,6 +67,97 @@ fn make_paint(r: u8, g: u8, b: u8, a: u8) -> Paint<'static> {
     paint
 }
 
+/// Build a tiny-skia paint for any [`anyrender::PaintRef`], using a real
+/// gradient shader when the brush is a gradient.
+///
+/// Falling back to a flat colour for gradients is what made every
+/// `linear-gradient(...)` on the web paint as an opaque black box: gradients are
+/// built correctly all the way through `gradient::to_peniko_gradient`, and were
+/// then discarded here.
+///
+/// `transform` is the shape's transform: tiny-skia resolves gradient geometry in
+/// the shader's own space, so the same transform has to be handed to the shader
+/// for the gradient to line up with the shape it fills.
+fn make_brush_paint<'a>(
+    paint_ref: &anyrender::PaintRef<'a>,
+    transform: Transform,
+) -> Paint<'static> {
+    let anyrender::PaintRef::Gradient(gradient) = paint_ref else {
+        let (r, g, b, a) = extract_rgba(paint_ref);
+        return make_paint(r, g, b, a);
+    };
+
+    let stops: Vec<tiny_skia::GradientStop> = gradient
+        .stops
+        .iter()
+        .map(|stop| {
+            let c = stop.color.to_alpha_color::<Srgb>().to_rgba8();
+            tiny_skia::GradientStop::new(
+                stop.offset,
+                tiny_skia::Color::from_rgba8(c.r, c.g, c.b, c.a),
+            )
+        })
+        .collect();
+
+    // A shader needs at least two stops; with fewer, paint the single colour.
+    if stops.len() < 2 {
+        let (r, g, b, a) = gradient
+            .stops
+            .first()
+            .map(|s| color_to_rgba(s.color.to_alpha_color::<Srgb>()))
+            .unwrap_or((0, 0, 0, 255));
+        return make_paint(r, g, b, a);
+    }
+
+    let mode = match gradient.extend {
+        peniko::Extend::Pad => tiny_skia::SpreadMode::Pad,
+        peniko::Extend::Repeat => tiny_skia::SpreadMode::Repeat,
+        peniko::Extend::Reflect => tiny_skia::SpreadMode::Reflect,
+    };
+
+    let shader = match gradient.kind {
+        peniko::GradientKind::Linear(pos) => tiny_skia::LinearGradient::new(
+            tiny_skia::Point::from_xy(pos.start.x as f32, pos.start.y as f32),
+            tiny_skia::Point::from_xy(pos.end.x as f32, pos.end.y as f32),
+            stops,
+            mode,
+            transform,
+        ),
+        // tiny-skia's radial shader is single-circle, so the two-circle (focal)
+        // form collapses to the end circle — exact for the overwhelmingly common
+        // `radial-gradient(...)`, which has a zero-radius start circle.
+        peniko::GradientKind::Radial(pos) => tiny_skia::RadialGradient::new(
+            tiny_skia::Point::from_xy(pos.start_center.x as f32, pos.start_center.y as f32),
+            tiny_skia::Point::from_xy(pos.end_center.x as f32, pos.end_center.y as f32),
+            pos.end_radius.max(f32::EPSILON),
+            stops,
+            mode,
+            transform,
+        ),
+        // tiny-skia has no sweep/conic shader, and faking one with a linear
+        // sweep looks plainly wrong. Fall through to the mid-stop colour below.
+        peniko::GradientKind::Sweep(_) => None,
+    };
+
+    match shader {
+        Some(shader) => Paint {
+            shader,
+            anti_alias: true,
+            ..Default::default()
+        },
+        None => {
+            // Shader construction failed (degenerate geometry, or conic above):
+            // fall back to the middle stop rather than black.
+            let (r, g, b, a) = gradient
+                .stops
+                .get(gradient.stops.len() / 2)
+                .map(|s| color_to_rgba(s.color.to_alpha_color::<Srgb>()))
+                .unwrap_or((0, 0, 0, 255));
+            make_paint(r, g, b, a)
+        }
+    }
+}
+
 // ============================================================================
 // Coordinate and path conversion helpers
 // ============================================================================
@@ -444,16 +535,12 @@ impl PaintScene for TinySkiaPainter {
                 self.fill_with_image(img, transform, shape);
             }
             _ => {
-                let (r, g, b, a) = extract_rgba(&paint_ref);
                 if let Some(path) = shape_to_path(shape) {
+                    let ts = affine_to_transform(transform);
+                    let paint = make_brush_paint(&paint_ref, ts);
                     let mask = self.active_clip_mask();
-                    self.pixmap.fill_path(
-                        &path,
-                        &make_paint(r, g, b, a),
-                        FillRule::Winding,
-                        affine_to_transform(transform),
-                        mask.as_ref(),
-                    );
+                    self.pixmap
+                        .fill_path(&path, &paint, FillRule::Winding, ts, mask.as_ref());
                 }
             }
         }
@@ -468,7 +555,7 @@ impl PaintScene for TinySkiaPainter {
         _brush_transform: Option<Affine>,
         shape: &impl Shape,
     ) {
-        let (r, g, b, a) = extract_rgba(&brush.into());
+        let paint_ref = brush.into();
         if let Some(path) = shape_to_path(shape) {
             let stroke = tiny_skia::Stroke {
                 width: style.width as f32,
@@ -476,14 +563,11 @@ impl PaintScene for TinySkiaPainter {
                 line_join: tiny_skia::LineJoin::Round,
                 ..Default::default()
             };
+            let ts = affine_to_transform(transform);
+            let paint = make_brush_paint(&paint_ref, ts);
             let mask = self.active_clip_mask();
-            self.pixmap.stroke_path(
-                &path,
-                &make_paint(r, g, b, a),
-                &stroke,
-                affine_to_transform(transform),
-                mask.as_ref(),
-            );
+            self.pixmap
+                .stroke_path(&path, &paint, &stroke, ts, mask.as_ref());
         }
     }
 
@@ -530,6 +614,16 @@ impl PaintScene for TinySkiaPainter {
             .map(|h| h.units_per_em() as f32)
             .unwrap_or(1000.0);
 
+        // Rasterize the active clip ONCE for the whole run. `active_clip_mask`
+        // allocates a full-framebuffer mask, so calling it per glyph would cost
+        // a 1280x2000 allocation for every character on the page.
+        //
+        // Passing `None` here (as this did) meant text was the one primitive
+        // that ignored clipping entirely — every other path passes the mask.
+        // That is why the `.sr-only` skip link, a 1x1 `overflow:hidden` box
+        // containing nothing but text, painted its content across the page.
+        let clip_mask = self.active_clip_mask();
+
         for glyph in glyphs {
             let glyph_id = skrifa::GlyphId::new(glyph.id);
 
@@ -551,8 +645,13 @@ impl PaintScene for TinySkiaPainter {
             let settings = skrifa::outline::DrawSettings::unhinted(size, location);
             if outline.draw(settings, &mut pen).is_ok() {
                 if let Some(path) = path_builder.finish() {
-                    self.pixmap
-                        .fill_path(&path, &paint, FillRule::Winding, skia_transform, None);
+                    self.pixmap.fill_path(
+                        &path,
+                        &paint,
+                        FillRule::Winding,
+                        skia_transform,
+                        clip_mask.as_ref(),
+                    );
                 }
             }
         }

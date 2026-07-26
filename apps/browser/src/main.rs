@@ -726,14 +726,30 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
     let mut doc = HtmlDocument::from_html(&final_html, config);
     let parse_ms = t_parse.elapsed().as_millis();
 
-    // Let linked stylesheets and images arrive before layout: a screenshot taken
-    // before the CSS lands would be measuring nothing useful. Poll rather than
-    // sleep a fixed time so a fast page is not penalised.
+    // Let linked stylesheets, webfonts and images arrive before layout.
+    //
+    // Each pass must `resolve`, not just `resolve_deferred_tasks`: only
+    // `resolve` calls `handle_messages`, and a fetched stylesheet is not read
+    // until its message is handled. Fonts are a SECOND round-trip — the
+    // `@font-face` rules only exist once the CSS message is processed, and each
+    // one then queues its own woff2 fetch. Draining `resolve_deferred_tasks`
+    // alone left the CSS messages unread until after this loop, so the font
+    // fetches were still in flight at paint time and every page was screenshotted
+    // in fallback fonts. That silently invalidates any comparison against a real
+    // browser, since substituted fonts change every metric and line break.
+    //
+    // Hence: keep going while the network is busy OR the document still knows it
+    // is waiting on something.
     let t_net = std::time::Instant::now();
-    while !net_provider.is_empty() && t_net.elapsed().as_secs() < 15 {
+    while (!net_provider.is_empty() || doc.as_ref().has_pending_critical_resources())
+        && t_net.elapsed().as_secs() < 20
+    {
         std::thread::sleep(std::time::Duration::from_millis(50));
-        doc.as_mut().resolve_deferred_tasks();
+        doc.as_mut().resolve(0.0);
     }
+    // One more drain so a font blob that landed after the last poll is registered
+    // (which invalidates inline layout) before the final resolve + paint.
+    doc.as_mut().handle_messages();
     let net_ms = t_net.elapsed().as_millis();
 
     let t_layout = std::time::Instant::now();

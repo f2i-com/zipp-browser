@@ -421,6 +421,12 @@ impl BaseDocument {
         style_config::set_pref!("layout.unimplemented", true);
         style_config::set_pref!("layout.columns.enabled", true);
         style_config::set_pref!("layout.threads", -1);
+        // Variable fonts. Google Fonts serves most modern faces as variable
+        // (Bricolage Grotesque ships an `opsz` axis, for one), so leaving this
+        // off makes `font-variation-settings` / `@font-face` axis ranges
+        // unparseable and the face falls back to a system font — which changes
+        // every glyph, advance and line break on the page.
+        style_config::set_pref!("layout.css.font-variations.enabled", true);
 
         let viewport = config.viewport.unwrap_or_default();
         let device = make_device(&viewport, font_ctx.clone());

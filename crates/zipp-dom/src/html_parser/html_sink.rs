@@ -66,6 +66,48 @@ impl<'m, 'doc> DocumentHtmlParser<'m, 'doc> {
         }
     }
 
+    /// Feed `html` through an html5ever `Parser` and finish it.
+    ///
+    /// This exists instead of the obvious `.from_utf8().read_from(…)` because
+    /// html5ever's own `TendrilSink::finish` cannot survive a `<meta charset>`.
+    /// The tree builder returns `ProcessResult::EncodingIndicator` for EVERY
+    /// `<meta charset>` in head — unconditionally, even when the declared
+    /// encoding is the one already in use — and its driver loop only spins on
+    /// `TokenizerResult::Script`. So the loop exits with input still queued and
+    /// `assert!(self.input_buffer.is_empty())` aborts the process.
+    ///
+    /// It only looked intermittent because `read_from` feeds in chunks: a later
+    /// chunk would resume the tokenizer and drain the queue, so the crash
+    /// appeared only when the `<meta charset>` fell in the final chunk — i.e.
+    /// on SMALL documents. Shrinking the injected toolbar CSS was enough to
+    /// start crashing on pages that had parsed fine minutes earlier.
+    ///
+    /// html5ever's own comment says the embedder "can safely continue spinning
+    /// the tokenizer", which is exactly what this does. The indicated encoding
+    /// is ignored: the input is already a `&str`, decoded upstream.
+    fn drive_html_parser<Sink>(parser: html5ever::driver::Parser<Sink>, html: &str)
+    where
+        Sink: html5ever::interface::TreeSink,
+    {
+        use markup5ever::TokenizerResult;
+
+        parser
+            .input_buffer
+            .push_back(html5ever::tendril::StrTendril::from_slice(html));
+        // Bounded so a tokenizer state that consumes nothing cannot hang the
+        // browser on a malformed document. Each iteration corresponds to one
+        // <script> or <meta charset>, so real pages need a handful.
+        for _ in 0..100_000 {
+            match parser.tokenizer.feed(&parser.input_buffer) {
+                TokenizerResult::Done => break,
+                // Both mean "keep going": a script we do not execute during
+                // parsing, and an encoding declaration we do not act on.
+                TokenizerResult::Script(_) | TokenizerResult::EncodingIndicator(_) => continue,
+            }
+        }
+        parser.tokenizer.end();
+    }
+
     pub fn parse_into_mutator<'a, 'd>(mutr: &'a mut DocumentMutator<'d>, html: &str) {
         let mut sink = DocumentHtmlParser::new(mutr);
 
@@ -95,10 +137,7 @@ impl<'m, 'doc> DocumentHtmlParser<'m, 'doc> {
                     quirks_mode: QuirksMode::NoQuirks,
                 },
             };
-            html5ever::parse_document(sink, opts)
-                .from_utf8()
-                .read_from(&mut html.as_bytes())
-                .unwrap();
+            Self::drive_html_parser(html5ever::parse_document(sink, opts), html);
         }
     }
 
@@ -119,10 +158,10 @@ impl<'m, 'doc> DocumentHtmlParser<'m, 'doc> {
                 quirks_mode: QuirksMode::NoQuirks,
             },
         };
-        html5ever::driver::parse_fragment_for_element(sink, opts, element_id, false, None)
-            .from_utf8()
-            .read_from(&mut html.as_bytes())
-            .unwrap();
+        Self::drive_html_parser(
+            html5ever::driver::parse_fragment_for_element(sink, opts, element_id, false, None),
+            html,
+        );
 
         // html5ever creates a new fragment root node under the document node and parses the nodes into that fragment root.
         // So here we move the children of the fragment root to element_id and then remove the fragment root
