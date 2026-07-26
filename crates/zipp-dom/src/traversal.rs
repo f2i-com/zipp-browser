@@ -262,12 +262,24 @@ impl BaseDocument {
         }
     }
 
+    /// Ancestors of `node_id`, root first.
+    ///
+    /// Tolerates an id that no longer exists rather than indexing a freed slot.
+    /// Callers pass REMEMBERED ids — the hovered node, the active node — and a
+    /// DOM mutation can free those between one mouse move and the next. Panicking
+    /// there takes the whole browser down over a stale hover, which is exactly
+    /// what happened once in-page routing started replacing the body: hover a
+    /// link, click it, move the mouse, "invalid key".
+    ///
+    /// Interaction state is cleared on a body swap, so this should not come up;
+    /// it stays because no id that merely went stale is worth a crash.
     pub fn node_layout_ancestors(&self, node_id: usize) -> Vec<usize> {
         let mut ancestors = Vec::with_capacity(12);
         let mut maybe_id = Some(node_id);
         while let Some(id) = maybe_id {
+            let Some(node) = self.nodes.get(id) else { break };
             ancestors.push(id);
-            maybe_id = self.nodes[id].layout_parent.get();
+            maybe_id = node.layout_parent.get();
         }
         ancestors.reverse();
         ancestors

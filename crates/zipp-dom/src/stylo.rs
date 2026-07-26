@@ -69,6 +69,26 @@ impl crate::document::BaseDocument {
     /// Everything visible lives under `<body>`, so after a body swap there is no
     /// animation worth keeping. The new elements start their animations fresh,
     /// which is also what they should do — they really are new elements.
+    /// Forget every cached node id held as interaction state.
+    ///
+    /// Replacing the body frees that whole subtree, but the document keeps
+    /// pointing at the node the mouse was over, the node with focus, and the
+    /// node that received the last mousedown. The very next mouse move walks
+    /// the hovered node's ancestors to work out what changed, indexes a freed
+    /// id and panics with "invalid key".
+    ///
+    /// This only became reachable once in-page routing started replacing the
+    /// body instead of navigating: a real navigation built a whole new document
+    /// and took this state with it.
+    pub fn clear_interaction_state(&mut self) {
+        self.hover_node_id = None;
+        self.hover_node_is_text = false;
+        self.focus_node_id = None;
+        self.active_node_id = None;
+        self.mousedown_node_id = None;
+        self.changed_nodes.clear();
+    }
+
     pub fn clear_animation_state(&mut self) {
         self.animations.sets.write().clear();
         self.has_active_animations = false;

@@ -81,6 +81,9 @@ impl Document for HtmlDocument {
                     // recycled by the re-parse, so stale entries would attach
                     // to whichever new element inherits the id.
                     self.inner.clear_animation_state();
+                    // Hover/focus/mousedown ids point into the subtree that was
+                    // just freed; the next mouse move would index a dead id.
+                    self.inner.clear_interaction_state();
                     // Every node id the handler cached is stale now — the body's
                     // whole subtree was dropped and re-parsed. Let it rebuild
                     // before the next event arrives, or only the FIRST
