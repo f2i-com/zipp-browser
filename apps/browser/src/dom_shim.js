@@ -255,10 +255,15 @@ class Element extends DOMNode {
     set innerHTML(v) { this.childNodes=[]; if(v) this.appendChild(new Text(String(v))); }
     get outerHTML() { return __sn(this); }
     get children() { return this.childNodes.filter(function(c){return c.nodeType===1;}); }
-    setAttribute(n,v) { v=String(v); this.attributes[n]=v; if(n==="class")this.className=v; if(n==="id")this.id=v; if(n==="style")this._ps(v); if(n.indexOf("data-")===0)this.dataset[n.slice(5)]=v; }
-    getAttribute(n) { if(n==="class")return this.className||null; if(n==="id")return this.id||null; return this.attributes[n]!==undefined?this.attributes[n]:null; }
-    removeAttribute(n) { delete this.attributes[n]; }
-    hasAttribute(n) { return n in this.attributes||(n==="class"&&this.className)||(n==="id"&&this.id); }
+    // Attribute names are DOMStrings: WebIDL stringifies whatever it is given,
+    // so `setAttribute(undefined, x)` sets an attribute literally named
+    // "undefined" rather than throwing. Taking `n` on trust meant a name that
+    // was not already a string blew up on `n.indexOf`, which is how this shim
+    // turned a harmless call into a dead page.
+    setAttribute(n,v) { n=String(n); v=String(v); this.attributes[n]=v; if(n==="class")this.className=v; if(n==="id")this.id=v; if(n==="style")this._ps(v); if(n.indexOf("data-")===0)this.dataset[n.slice(5)]=v; }
+    getAttribute(n) { n=String(n); if(n==="class")return this.className||null; if(n==="id")return this.id||null; return this.attributes[n]!==undefined?this.attributes[n]:null; }
+    removeAttribute(n) { n=String(n); delete this.attributes[n]; }
+    hasAttribute(n) { n=String(n); return n in this.attributes||(n==="class"&&this.className)||(n==="id"&&this.id); }
     setAttributeNS(ns,n,v) { this.setAttribute(n,v); }
     getAttributeNS(ns,n) { return this.getAttribute(n); }
     hasAttributeNS(ns,n) { return this.hasAttribute(n); }

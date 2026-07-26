@@ -31,6 +31,7 @@ use zipp_dom::{DocumentConfig, FontContext};
 use zipp_renderer::tinyskia::TinySkiaWindowRenderer;
 use zipp_shell::{create_default_event_loop, ZippApp, ShellProxy, WindowConfig};
 
+mod esm;
 mod event_bridge;
 
 // ---------------------------------------------------------------------------
@@ -506,8 +507,17 @@ var http = (function () {
 function __zippDrainQueues(rounds) {
     for (var i = 0; i < rounds; i++) {
         if (__timerQueue.length === 0 && __mcQueue.length === 0) break;
-        while (__timerQueue.length > 0) { try { __timerQueue.shift()(); } catch (e) {} }
-        while (__mcQueue.length > 0) { try { __mcQueue.shift()(); } catch (e) {} }
+        // Report, never swallow. A page's real work happens in these callbacks
+        // — React commits its first render from one — so an empty catch here
+        // turns a broken app into a blank page with no explanation.
+        while (__timerQueue.length > 0) {
+            try { __timerQueue.shift()(); }
+            catch (e) { env.log('error', 'timer callback threw: ' + ((e && (e.stack || e.message)) || e)); }
+        }
+        while (__mcQueue.length > 0) {
+            try { __mcQueue.shift()(); }
+            catch (e) { env.log('error', 'microtask threw: ' + ((e && (e.stack || e.message)) || e)); }
+        }
     }
 }
 
@@ -1097,6 +1107,11 @@ fn run_zipp_js_inner(
     viewport: (u32, u32),
 ) -> Option<(String, String, ScriptState)> {
     let mut external_scripts = Vec::new();
+    // `<script type="module">` entries are linked separately: their source is ES
+    // module syntax, which is a syntax error in the classic program the rest of
+    // the pipeline builds. Before this, the whole bundle was concatenated in as
+    // a script and died at `import.meta is only valid in modules`.
+    let mut module_entries: Vec<String> = Vec::new();
     let mut pos = 0;
     while let Some(start) = html[pos..].find("<script") {
         let abs = pos + start;
@@ -1104,13 +1119,15 @@ fn run_zipp_js_inner(
         let tag = &html[abs..tag_end];
         if let Some(src) = attr(tag, "src") {
             let full = resolve(page_url, &src);
-            if let Ok(source) = fetch(&full) {
+            if attr(tag, "type").is_some_and(|t| t.trim() == "module") {
+                module_entries.push(full);
+            } else if let Ok(source) = fetch(&full) {
                 external_scripts.push((full, source));
             }
         }
         pos = tag_end;
     }
-    if external_scripts.is_empty() {
+    if external_scripts.is_empty() && module_entries.is_empty() {
         return None;
     }
 
@@ -1171,6 +1188,42 @@ fn run_zipp_js_inner(
         full.push_str(&patched);
         full.push('\n');
     }
+    // Link and append the ES module graph.
+    //
+    // Every reachable module is fetched and rewritten into calls on a registry,
+    // then emitted as one classic script. It has to happen up front: our host
+    // HTTP is synchronous and there is no way to fetch from inside the VM part
+    // way through execution, so a chunk that is not linked here could never be
+    // loaded at all — including the lazily `import()`ed route chunks.
+    if !module_entries.is_empty() {
+        let t_link = std::time::Instant::now();
+        let linked = esm::link_graph(&module_entries, &fetch, &resolve);
+        eprintln!(
+            "[ESM] Linked {} modules from {} entr{} in {}ms",
+            linked.module_count,
+            module_entries.len(),
+            if module_entries.len() == 1 { "y" } else { "ies" },
+            t_link.elapsed().as_millis(),
+        );
+        for (url, err) in &linked.failures {
+            eprintln!("[ESM] FAILED {url}: {err}");
+        }
+        if std::env::var_os("ZIPP_DEBUG_ESM").is_some() {
+            full.push_str("
+var __zippEsmDebug=true;
+");
+        }
+        full.push_str(esm::MODULE_RUNTIME_JS);
+        full.push_str(&linked.source);
+        // `ZIPP_DUMP_LINKED=<path>` writes the linked graph out. A rewrite bug
+        // shows up as a runtime error deep inside minified code, and the only
+        // way to read it is to look at what was actually emitted.
+        if let Ok(path) = std::env::var("ZIPP_DUMP_LINKED") {
+            let _ = std::fs::write(&path, &linked.source);
+            eprintln!("[ESM] wrote linked graph to {path}");
+        }
+    }
+
     // Settle the page: run timers and microtasks until nothing is left to do,
     // so the tree we serialise below is the one the page actually intended.
     full.push_str("\n__zippDrainQueues(100);\n");
@@ -1217,6 +1270,12 @@ fn run_zipp_js_inner(
                 .replace("\\u2014", "\u{2014}");
             let head = make_urls_absolute(&head_content(html), &base);
             eprintln!("[JS] Rendered {} bytes", inner.len());
+            // `ZIPP_DUMP_ROOT=<path>` writes what the page's JS actually built.
+            // For a client-rendered app this IS the page; without it a short
+            // render is indistinguishable from a blank one.
+            if let Ok(path) = std::env::var("ZIPP_DUMP_ROOT") {
+                let _ = std::fs::write(&path, &inner);
+            }
             let html_out = format!(
                 "<!DOCTYPE html><html><head>{head}</head><body>{inner}</body></html>"
             );

@@ -34,6 +34,15 @@ cache = ["zipp-shell/cache"]
 http2 = ["zipp-shell/http2"]
 
 [dependencies]
+# Parsing ES modules so their import/export statements can be rewritten by byte
+# span rather than pattern-matched out of minified source. Same version zipp-vm
+# already parses with, so this adds no new tree.
+oxc_allocator = "0.126.0"
+oxc_ast = "0.126.0"
+oxc_ast_visit = "0.126.0"
+oxc_parser = "0.126.0"
+oxc_span = "0.126.0"
+
 # In-repo workspace crates
 zipp-dom = { workspace = true, features = ["default", "woff-rust", "parallel-construct"] }
 zipp-renderer = { workspace = true, features = ["default"] }

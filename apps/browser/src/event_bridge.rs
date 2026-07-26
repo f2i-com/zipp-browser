@@ -456,7 +456,7 @@ mod tests {
         flid_map.insert(20, 60);
 
         let json = r#"{"10":["click"],"20":["mousedown","click"]}"#;
-        let bridge = JsEventBridge::new(flid_map, json, None);
+        let bridge = JsEventBridge::new(flid_map, json, None, "http://example.com/");
 
         assert_eq!(bridge.handler_count(), 2);
         assert!(bridge.has_js_state() == false);
