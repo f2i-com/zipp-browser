@@ -60,6 +60,12 @@ impl BaseDocument {
 
             let font_size = style.clone_font_size().used_size().px();
             let line_height = match style.clone_line_height() {
+                // Approximation. `normal` is really the font's ascent + descent
+                // + line gap (which is what the Parley path uses, via
+                // `LineHeight::MetricsRelative` in stylo_to_parley), but no font
+                // has been resolved at this point in layout. This value only
+                // feeds boxes with no inline text of their own, where the error
+                // is not observable; text line boxes go through Parley.
                 LineHeight::Normal => font_size * 1.2,
                 LineHeight::Number(num) => font_size * num.0,
                 LineHeight::Length(value) => value.0.px(),

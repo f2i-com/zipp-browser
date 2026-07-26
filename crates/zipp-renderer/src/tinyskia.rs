@@ -162,6 +162,27 @@ fn make_brush_paint<'a>(
 // Coordinate and path conversion helpers
 // ============================================================================
 
+/// A shape's bounding box in device space.
+#[inline]
+fn device_bounds(shape: &impl Shape, transform: Affine) -> Rect {
+    let b = shape.bounding_box();
+    let corners = [
+        transform * kurbo::Point::new(b.x0, b.y0),
+        transform * kurbo::Point::new(b.x1, b.y0),
+        transform * kurbo::Point::new(b.x0, b.y1),
+        transform * kurbo::Point::new(b.x1, b.y1),
+    ];
+    let (mut x0, mut y0, mut x1, mut y1) =
+        (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for p in corners {
+        x0 = x0.min(p.x);
+        y0 = y0.min(p.y);
+        x1 = x1.max(p.x);
+        y1 = y1.max(p.y);
+    }
+    Rect::new(x0, y0, x1, y1)
+}
+
 /// The transform a gradient shader should carry: the BRUSH transform only.
 ///
 /// Gradient geometry is expressed in brush space (peniko emits a unit circle /
@@ -275,6 +296,14 @@ enum ClipRegion {
         bounding_box: Rect,
         path: kurbo::BezPath,
     },
+
+    /// A clip nested inside another: a pixel must be inside BOTH.
+    ///
+    /// CSS clips nest, so a clipped box inside a rounded `overflow:hidden`
+    /// ancestor must be confined to the intersection. Only built when at least
+    /// one side has curves — rectangle-on-rectangle nesting (the common case)
+    /// collapses to a single `Rect` in `ClipRegion::intersect`.
+    Intersection(Box<ClipRegion>, Box<ClipRegion>),
 }
 
 impl ClipRegion {
@@ -298,7 +327,30 @@ impl ClipRegion {
                 // Full winding-number test at the pixel center (no allocation)
                 path.winding(kurbo::Point::new(x + 0.5, y + 0.5)) != 0
             }
+            ClipRegion::Intersection(a, b) => a.contains(x, y) && b.contains(x, y),
         }
+    }
+
+    /// Combine two clips, collapsing to a plain rectangle whenever possible.
+    ///
+    /// Rect-on-rect is exact and free, and it is what almost all nesting is:
+    /// most clipped boxes are ordinary `overflow:hidden` rectangles. Keeping
+    /// those out of the `Intersection`/mask path is what makes correct nesting
+    /// affordable — a mask costs a full-framebuffer rasterization.
+    fn intersect(outer: ClipRegion, inner: ClipRegion) -> ClipRegion {
+        if let (ClipRegion::Rect(a), ClipRegion::Rect(b)) = (&outer, &inner) {
+            return ClipRegion::Rect(a.intersect(*b));
+        }
+        // A side whose bounding box already contains the other's constrains
+        // nothing when it is a plain rectangle, so it can be dropped.
+        let (obox, ibox) = (outer.bounding_box(), inner.bounding_box());
+        if matches!(inner, ClipRegion::Rect(_)) && contains_box(ibox, obox) {
+            return outer;
+        }
+        if matches!(outer, ClipRegion::Rect(_)) && contains_box(obox, ibox) {
+            return inner;
+        }
+        ClipRegion::Intersection(Box::new(outer), Box::new(inner))
     }
 
     /// Return the axis-aligned bounding box of this clip region.
@@ -307,6 +359,7 @@ impl ClipRegion {
         match self {
             ClipRegion::Rect(r) => *r,
             ClipRegion::RoundedPath { bounding_box, .. } => *bounding_box,
+            ClipRegion::Intersection(a, b) => a.bounding_box().intersect(b.bounding_box()),
         }
     }
 
@@ -315,20 +368,53 @@ impl ClipRegion {
     /// Returns `None` for simple rectangular clips (which are handled via
     /// coordinate tests instead) or if mask allocation fails.
     fn to_mask(&self, width: u32, height: u32) -> Option<tiny_skia::Mask> {
-        let ClipRegion::RoundedPath { path, .. } = self else {
-            return None;
-        };
+        match self {
+            ClipRegion::Rect(r) => {
+                let clip_path = shape_to_path(r)?;
+                let mut mask = tiny_skia::Mask::new(width, height)?;
+                mask.fill_path(&clip_path, FillRule::EvenOdd, true, Transform::identity());
+                Some(mask)
+            }
+            ClipRegion::RoundedPath { path, .. } => {
+                let clip_path = shape_to_path(path)?;
+                let mut mask = tiny_skia::Mask::new(width, height)?;
+                // Anti-aliased fill produces smooth clip edges on rounded corners
+                mask.fill_path(
+                    &clip_path,
+                    FillRule::EvenOdd,
+                    true, // anti-alias
+                    Transform::identity(),
+                );
+                Some(mask)
+            }
+            // Seed with the intersected bounding box, then cut each curved side
+            // out of it.
+            ClipRegion::Intersection(a, b) => {
+                let mut mask = tiny_skia::Mask::new(width, height)?;
+                let seed = shape_to_path(&self.bounding_box())?;
+                mask.fill_path(&seed, FillRule::EvenOdd, true, Transform::identity());
+                a.intersect_into(&mut mask);
+                b.intersect_into(&mut mask);
+                Some(mask)
+            }
+        }
+    }
 
-        let clip_path = shape_to_path(path)?;
-        let mut mask = tiny_skia::Mask::new(width, height)?;
-        // Anti-aliased fill produces smooth clip edges on rounded corners
-        mask.fill_path(
-            &clip_path,
-            FillRule::EvenOdd,
-            true, // anti-alias
-            Transform::identity(),
-        );
-        Some(mask)
+    /// Cut this region out of `mask`. Rectangles are already covered by the
+    /// seeded bounding box, so only curved sides do work.
+    fn intersect_into(&self, mask: &mut tiny_skia::Mask) {
+        match self {
+            ClipRegion::Rect(_) => {}
+            ClipRegion::RoundedPath { path, .. } => {
+                if let Some(path) = shape_to_path(path) {
+                    mask.intersect_path(&path, FillRule::EvenOdd, true, Transform::identity());
+                }
+            }
+            ClipRegion::Intersection(a, b) => {
+                a.intersect_into(mask);
+                b.intersect_into(mask);
+            }
+        }
     }
 }
 
@@ -387,10 +473,58 @@ fn transform_clip_shape(transform: Affine, shape: &impl Shape) -> ClipRegion {
 
     let bounding_box = Rect::new(min_x, min_y, max_x, max_y);
 
+    // An axis-aligned rectangle becomes a `Rect`, not a path.
+    //
+    // This matters far beyond tidiness: a `RoundedPath` clip forces a
+    // full-framebuffer `tiny_skia::Mask` to be rasterized, while a `Rect` is a
+    // handful of comparisons. Almost every clip on a real page is a plain
+    // `overflow:hidden` rectangle, and returning `RoundedPath` unconditionally
+    // meant every one of them paid for a mask — and made nesting them
+    // prohibitively expensive.
+    if is_axis_aligned_rect(&screen_elements, bounding_box) {
+        return ClipRegion::Rect(bounding_box);
+    }
+
     ClipRegion::RoundedPath {
         bounding_box,
         path: kurbo::BezPath::from_vec(screen_elements),
     }
+}
+
+/// Whether a transformed path is exactly its own axis-aligned bounding box.
+///
+/// True when the path has no curves and every vertex sits on a corner of the
+/// bounding box — i.e. it is the rectangle itself, possibly closed.
+fn is_axis_aligned_rect(elements: &[kurbo::PathEl], bbox: Rect) -> bool {
+    // Sub-pixel tolerance: transforms introduce rounding, and a clip that is a
+    // rectangle to within a hundredth of a pixel is a rectangle.
+    const EPS: f64 = 0.01;
+    let mut corners = 0usize;
+    for el in elements {
+        let p = match el {
+            kurbo::PathEl::MoveTo(p) | kurbo::PathEl::LineTo(p) => *p,
+            kurbo::PathEl::ClosePath => continue,
+            // Any curve means real geometry (a rounded corner, an ellipse).
+            _ => return false,
+        };
+        let on_x = (p.x - bbox.x0).abs() < EPS || (p.x - bbox.x1).abs() < EPS;
+        let on_y = (p.y - bbox.y0).abs() < EPS || (p.y - bbox.y1).abs() < EPS;
+        if !on_x || !on_y {
+            return false;
+        }
+        corners += 1;
+    }
+    // 4 corners, or 5 when the path repeats its start point to close.
+    (4..=5).contains(&corners)
+}
+
+/// Whether `outer` fully contains `inner`, within the same sub-pixel tolerance.
+#[inline]
+fn contains_box(outer: Rect, inner: Rect) -> bool {
+    outer.x0 <= inner.x0 + 0.01
+        && outer.y0 <= inner.y0 + 0.01
+        && outer.x1 >= inner.x1 - 0.01
+        && outer.y1 >= inner.y1 - 0.01
 }
 
 // ============================================================================
@@ -407,6 +541,8 @@ fn transform_clip_shape(transform: Affine, shape: &impl Shape) -> ClipRegion {
 struct LayerEntry {
     /// Previous clip region to restore on pop.
     saved_clip: Option<ClipRegion>,
+    /// The previous clip's rasterized mask, restored with it.
+    saved_mask: Option<Arc<tiny_skia::Mask>>,
     /// If this is an opacity layer (alpha < 1.0), holds the pixmap snapshot
     /// taken *before* any content was drawn into the layer, plus the alpha.
     opacity_snapshot: Option<(Pixmap, f32)>,
@@ -422,6 +558,15 @@ pub struct TinySkiaPainter {
     /// The currently active clip region, if any. Drawing operations outside this
     /// region are discarded or masked.
     active_clip: Option<ClipRegion>,
+
+    /// `active_clip` rasterized, or `None` when the clip is rectangular and
+    /// needs no mask.
+    ///
+    /// Cached because every fill, stroke and glyph run consults it; rasterizing
+    /// per draw call made painting a real page take seconds. `Arc` so a draw
+    /// site can hold it while `&mut self.pixmap` is borrowed without copying a
+    /// full-framebuffer mask.
+    clip_mask: Option<Arc<tiny_skia::Mask>>,
 }
 
 impl TinySkiaPainter {
@@ -431,6 +576,7 @@ impl TinySkiaPainter {
             pixmap: Pixmap::new(width.max(1), height.max(1)).unwrap(),
             layer_stack: Vec::new(),
             active_clip: None,
+            clip_mask: None,
         }
     }
 
@@ -442,10 +588,57 @@ impl TinySkiaPainter {
     }
 
     /// Build a clip mask from the active clip region, sized to the current pixmap.
-    fn active_clip_mask(&self) -> Option<tiny_skia::Mask> {
-        self.active_clip
-            .as_ref()
-            .and_then(|clip| clip.to_mask(self.pixmap.width(), self.pixmap.height()))
+    /// The clip mask to pass to a draw whose device-space bounds are `bounds`.
+    ///
+    /// Returns `None` — meaning "no clipping needed" — when the shape lies
+    /// wholly inside the clip, which is the usual case for content drawn inside
+    /// its own clipped box. That matters because a mask is a full-framebuffer
+    /// allocation: building one per draw made painting a real page take
+    /// seconds, and building one per clipped BOX is still wasteful when nothing
+    /// ever crosses the boundary.
+    ///
+    /// The mask is memoized per clip, so a page where many draws do cross pays
+    /// for one rasterization per clip rather than one per draw.
+    fn clip_mask_for(&mut self, bounds: Rect) -> Option<Arc<tiny_skia::Mask>> {
+        let clip = self.active_clip.as_ref()?;
+        // A rectangular clip that fully contains the shape constrains nothing.
+        // (Only sound for rectangles: a rounded clip can cut a shape that sits
+        // inside its bounding box.)
+        if matches!(clip, ClipRegion::Rect(_)) && contains_box(clip.bounding_box(), bounds) {
+            return None;
+        }
+        if self.clip_mask.is_none() {
+            let (w, h) = (self.pixmap.width(), self.pixmap.height());
+            // Re-borrow: `to_mask` needs `&self.active_clip` while `self` is &mut.
+            self.clip_mask = self
+                .active_clip
+                .as_ref()
+                .and_then(|c| c.to_mask(w, h))
+                .map(Arc::new);
+        }
+        self.clip_mask.clone()
+    }
+
+    /// Make `new_clip` active, INTERSECTED with whatever is already active, and
+    /// return the previous (clip, mask) so `pop_layer` can restore them.
+    ///
+    /// Intersecting rather than replacing is what makes nested clips correct: a
+    /// clipped box inside a rounded `overflow:hidden` ancestor must be confined
+    /// to both, or it paints over its parent's corners.
+    fn push_clip(
+        &mut self,
+        new_clip: ClipRegion,
+    ) -> (Option<ClipRegion>, Option<Arc<tiny_skia::Mask>>) {
+        let old_clip = self.active_clip.take();
+        let old_mask = self.clip_mask.take();
+        let combined = match old_clip.clone() {
+            Some(existing) => ClipRegion::intersect(existing, new_clip),
+            None => new_clip,
+        };
+        // Left unrasterized: `clip_mask_for` builds it on first genuine need.
+        self.clip_mask = None;
+        self.active_clip = Some(combined);
+        (old_clip, old_mask)
     }
 }
 
@@ -463,6 +656,7 @@ impl PaintScene for TinySkiaPainter {
         self.pixmap.fill(tiny_skia::Color::WHITE);
         self.layer_stack.clear();
         self.active_clip = None;
+        self.clip_mask = None;
     }
 
     /// Push a compositing layer with a clip shape and optional opacity.
@@ -477,8 +671,7 @@ impl PaintScene for TinySkiaPainter {
         transform: Affine,
         clip: &impl Shape,
     ) {
-        let new_clip = transform_clip_shape(transform, clip);
-        let old_clip = std::mem::replace(&mut self.active_clip, Some(new_clip));
+        let (old_clip, old_mask) = self.push_clip(transform_clip_shape(transform, clip));
 
         let opacity_snapshot = if alpha < 1.0 {
             Some((self.pixmap.clone(), alpha))
@@ -488,16 +681,17 @@ impl PaintScene for TinySkiaPainter {
 
         self.layer_stack.push(LayerEntry {
             saved_clip: old_clip,
+            saved_mask: old_mask,
             opacity_snapshot,
         });
     }
 
     /// Push a clip-only layer (no blend mode, full opacity).
     fn push_clip_layer(&mut self, transform: Affine, clip: &impl Shape) {
-        let new_clip = transform_clip_shape(transform, clip);
-        let old_clip = std::mem::replace(&mut self.active_clip, Some(new_clip));
+        let (old_clip, old_mask) = self.push_clip(transform_clip_shape(transform, clip));
         self.layer_stack.push(LayerEntry {
             saved_clip: old_clip,
+            saved_mask: old_mask,
             opacity_snapshot: None,
         });
     }
@@ -509,6 +703,7 @@ impl PaintScene for TinySkiaPainter {
     fn pop_layer(&mut self) {
         if let Some(entry) = self.layer_stack.pop() {
             self.active_clip = entry.saved_clip;
+            self.clip_mask = entry.saved_mask;
 
             if let Some((snapshot, alpha)) = entry.opacity_snapshot {
                 // Blend: for each pixel, result = snapshot + (current - snapshot) * alpha
@@ -561,9 +756,9 @@ impl PaintScene for TinySkiaPainter {
                     // radial gradients with a ~1px radius at the origin — they
                     // rendered as nothing at all.
                     let paint = make_brush_paint(&paint_ref, brush_space(brush_transform));
-                    let mask = self.active_clip_mask();
+                    let mask = self.clip_mask_for(device_bounds(shape, transform));
                     self.pixmap
-                        .fill_path(&path, &paint, FillRule::Winding, ts, mask.as_ref());
+                        .fill_path(&path, &paint, FillRule::Winding, ts, mask.as_deref());
                 }
             }
         }
@@ -588,9 +783,10 @@ impl PaintScene for TinySkiaPainter {
             };
             let ts = affine_to_transform(transform);
             let paint = make_brush_paint(&paint_ref, brush_space(brush_transform));
-            let mask = self.active_clip_mask();
+            let mask =
+                self.clip_mask_for(device_bounds(shape, transform).inflate(style.width, style.width));
             self.pixmap
-                .stroke_path(&path, &paint, &stroke, ts, mask.as_ref());
+                .stroke_path(&path, &paint, &stroke, ts, mask.as_deref());
         }
     }
 
@@ -637,15 +833,41 @@ impl PaintScene for TinySkiaPainter {
             .map(|h| h.units_per_em() as f32)
             .unwrap_or(1000.0);
 
-        // Rasterize the active clip ONCE for the whole run. `active_clip_mask`
-        // allocates a full-framebuffer mask, so calling it per glyph would cost
-        // a 1280x2000 allocation for every character on the page.
+        // Collect the run so its extent can be measured before drawing. The
+        // clip mask is then requested ONCE for the whole run — it is a
+        // full-framebuffer allocation, so per-glyph would be ruinous — and only
+        // when the run actually reaches outside the clip.
         //
-        // Passing `None` here (as this did) meant text was the one primitive
-        // that ignored clipping entirely — every other path passes the mask.
-        // That is why the `.sr-only` skip link, a 1x1 `overflow:hidden` box
-        // containing nothing but text, painted its content across the page.
-        let clip_mask = self.active_clip_mask();
+        // Text used to pass `None` here, making it the one primitive that
+        // ignored clipping: a 1x1 `overflow:hidden` sr-only box printed its
+        // "Skip to content" across the page.
+        let glyphs: Vec<Glyph> = glyphs.collect();
+        let run_bounds = {
+            let (mut x0, mut y0, mut x1, mut y1) = (
+                f64::INFINITY,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::NEG_INFINITY,
+            );
+            for g in &glyphs {
+                x0 = x0.min(g.x as f64);
+                y0 = y0.min(g.y as f64);
+                x1 = x1.max(g.x as f64);
+                y1 = y1.max(g.y as f64);
+            }
+            if x0.is_finite() {
+                // Pad by the em size: glyph origins are baseline-left, so the
+                // run extends above, below and past the last origin.
+                let pad = font_size as f64;
+                device_bounds(
+                    &Rect::new(x0 - pad, y0 - pad, x1 + pad, y1 + pad),
+                    transform,
+                )
+            } else {
+                Rect::new(0.0, 0.0, 0.0, 0.0)
+            }
+        };
+        let clip_mask = self.clip_mask_for(run_bounds);
 
         for glyph in glyphs {
             let glyph_id = skrifa::GlyphId::new(glyph.id);
@@ -673,7 +895,7 @@ impl PaintScene for TinySkiaPainter {
                         &paint,
                         FillRule::Winding,
                         skia_transform,
-                        clip_mask.as_ref(),
+                        clip_mask.as_deref(),
                     );
                 }
             }
@@ -805,12 +1027,17 @@ impl PaintScene for TinySkiaPainter {
         );
 
         if let Some(skia_rect) = shadow_rect {
-            let mask = self.active_clip_mask();
+            let mask = self.clip_mask_for(Rect::new(
+                f64::NEG_INFINITY,
+                f64::NEG_INFINITY,
+                f64::INFINITY,
+                f64::INFINITY,
+            ));
             self.pixmap.fill_rect(
                 skia_rect,
                 &make_paint(r, g, b, shadow_alpha),
                 affine_to_transform(transform),
-                mask.as_ref(),
+                mask.as_deref(),
             );
         }
     }

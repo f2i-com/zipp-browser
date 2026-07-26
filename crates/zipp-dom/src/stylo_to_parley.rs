@@ -119,7 +119,13 @@ pub(crate) fn style(
     // Convert font size and line height
     let font_size = font_styles.font_size.used_size.0.px();
     let line_height = match font_styles.line_height {
-        stylo::LineHeight::Normal => parley::LineHeight::FontSizeRelative(1.2),
+        // CSS `line-height: normal` is the FONT's own line height — ascent +
+        // descent + line gap — not a fixed multiple of the font size. Parley
+        // models exactly that as `MetricsRelative`. Hardcoding 1.2 here gave
+        // every `normal` line box the same height regardless of the face, which
+        // drifts from a real browser on any font whose metrics are not ~1.2
+        // (most display and monospace faces), and compounds down a long page.
+        stylo::LineHeight::Normal => parley::LineHeight::MetricsRelative(1.0),
         stylo::LineHeight::Number(num) => parley::LineHeight::FontSizeRelative(num.0),
         stylo::LineHeight::Length(value) => parley::LineHeight::Absolute(value.0.px()),
     };
