@@ -1135,6 +1135,55 @@ var screen = window.screen;
 var globalThis = window;
 var fetch = window.fetch;
 var location = loc;
+
+// Re-export `window`'s API surface as bare globals.
+//
+// In a browser these two spellings are the same binding, and page code always
+// writes the bare one — `new IntersectionObserver(...)`, `getComputedStyle(el)`.
+// Reaching them only through `window.` made the shim look like it implemented
+// them while every real use threw a ReferenceError.
+//
+// This has to be a list of `var` declarations rather than a loop copying
+// `window` onto `globalThis`: bare identifiers are resolved to global SLOTS at
+// COMPILE time, so a property created at runtime is never seen by them. The
+// property really was on `globalThis` and the bare read still threw.
+var innerWidth = window.innerWidth;
+var innerHeight = window.innerHeight;
+var outerWidth = window.outerWidth;
+var outerHeight = window.outerHeight;
+var devicePixelRatio = window.devicePixelRatio;
+var scrollX = window.scrollX;
+var scrollY = window.scrollY;
+var pageXOffset = window.pageXOffset;
+var pageYOffset = window.pageYOffset;
+var screenX = window.screenX;
+var screenY = window.screenY;
+var screenLeft = window.screenLeft;
+var screenTop = window.screenTop;
+var isSecureContext = window.isSecureContext;
+var history = window.history;
+var getComputedStyle = window.getComputedStyle;
+var matchMedia = window.matchMedia;
+var getSelection = window.getSelection;
+var scrollTo = window.scrollTo;
+var scroll = window.scroll;
+var scrollBy = window.scrollBy;
+var addEventListener = window.addEventListener;
+var removeEventListener = window.removeEventListener;
+var dispatchEvent = window.dispatchEvent;
+var postMessage = window.postMessage;
+var alert = window.alert;
+var confirm = window.confirm;
+var prompt = window.prompt;
+var open = window.open;
+var close = window.close;
+var focus = window.focus;
+var blur = window.blur;
+var print = window.print;
+var requestIdleCallback = window.requestIdleCallback;
+var cancelIdleCallback = window.cancelIdleCallback;
+var ResizeObserver = window.ResizeObserver;
+var IntersectionObserver = window.IntersectionObserver;
 // NOTE: Do NOT define setImmediate - it causes infinite recursion in React's scheduler.
 // React will fall through to MessageChannel which has proper queue-draining.
 
