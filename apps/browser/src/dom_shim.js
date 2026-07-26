@@ -156,9 +156,18 @@ class ClassList {
     forEach(fn) { this._list().forEach(fn); }
 }
 
+// Live nodes by _id. The Rust event bridge identifies the clicked element by
+// its `data-flid`, and React (which delegates ALL events to the root container)
+// needs `event.target` to be the actual node its fibers hang off — an id alone
+// is not enough. Only ELEMENTS are registered: they are the only nodes that
+// carry data-flid, and registering text nodes would double the retention for
+// nothing.
+var __nodesById = {};
+
 class DOMNode {
     constructor(nodeType, nodeName) {
         this._id = _nid++;
+        if (nodeType === 1) { __nodesById[this._id] = this; }
         this.nodeType = nodeType;
         this.nodeName = nodeName || "";
         this.childNodes = [];
@@ -368,7 +377,7 @@ function __sn(node) {
     for(var k in node.attributes) { if(k==="id"||k==="class") continue; h+=" "+k+"=\""+__ea(node.attributes[k])+"\""; }
     var sk=[]; for(var p in node.style) { if(typeof node.style[p]==="string"&&p!=="setProperty"&&p!=="getPropertyValue"&&p!=="removeProperty"&&p!=="cssText"&&p.indexOf("_")!==0) sk.push(p); }
     if(sk.length>0) { h+=" style=\""; for(var i=0;i<sk.length;i++) { var kk=sk[i].replace(/[A-Z]/g,function(m){return "-"+m.toLowerCase();}); h+=kk+":"+node.style[sk[i]]+";"; } h+="\""; }
-    if(__eventHandlers[node._id]) h+=" data-flid=\""+node._id+"\"";
+    h+=" data-flid=\""+node._id+"\"";
     h+=">";
     var voids=["area","base","br","col","embed","hr","img","input","link","meta","param","source","track","wbr"];
     if(voids.indexOf(tag)>=0) return h;
@@ -1103,7 +1112,7 @@ function __serializeNode(node) {
     if(node.id) r+=" id=\""+node.id+"\"";
     if(node.className) r+=" class=\""+node.className+"\"";
     for(var k in node.attributes){if(k==="id"||k==="class") continue; r+=" "+k+"=\""+node.attributes[k]+"\"";}
-    if(__eventHandlers[node._id]) r+=" data-flid=\""+node._id+"\"";
+    r+=" data-flid=\""+node._id+"\"";
     r+=">";
     // Serialize SVG elements with their attributes for Rust-side SVG rendering
     if(tag==="svg") {

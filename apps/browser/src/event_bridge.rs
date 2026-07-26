@@ -74,6 +74,9 @@ pub struct JsEventBridge {
     /// If a click handler caused a DOM update, this holds the new HTML.
     /// The shell should check this after event dispatch and re-render if set.
     pub pending_rerender: Option<String>,
+    /// The page URL, used to re-absolutise relative URLs and rebuild the
+    /// browser chrome when a re-render replaces the document body.
+    page_url: String,
 }
 
 impl JsEventBridge {
@@ -86,6 +89,7 @@ impl JsEventBridge {
         flid_map: HashMap<u32, usize>,
         event_map_json: &str,
         js_state: Option<ScriptState>,
+        page_url: &str,
     ) -> Self {
         let handler_map = parse_event_map(&flid_map, event_map_json);
         // Build reverse map: blitz_node_id -> JS flid
@@ -98,6 +102,7 @@ impl JsEventBridge {
             reverse_flid,
             js_state,
             pending_rerender: None,
+            page_url: page_url.to_string(),
         }
     }
 
@@ -132,6 +137,16 @@ impl EventHandler for JsEventBridge {
     ) {
         let event_name = event.data.name();
 
+        // The element actually under the pointer. `chain` is ordered target
+        // first, so this is the click target regardless of which ancestor ends
+        // up carrying the handler — and with React it is nearly always a
+        // different node, because React delegates every listener to the root.
+        let target_flid = chain
+            .first()
+            .and_then(|id| self.reverse_flid.get(id))
+            .copied()
+            .unwrap_or(0);
+
         // Walk the bubble chain (target first, then ancestors).
         for &node_id in chain {
             if let Some(types) = self.handler_map.get(&node_id) {
@@ -150,6 +165,7 @@ impl EventHandler for JsEventBridge {
                             "__zippDispatchEvent",
                             &[
                                 JsValue::Number(f64::from(flid)),
+                                JsValue::Number(f64::from(target_flid)),
                                 JsValue::String(event_name.to_string()),
                             ],
                         );
@@ -170,11 +186,26 @@ impl EventHandler for JsEventBridge {
                                 state.call_global("__getRenderedHTML", &[])
                             {
                                 if !new_html.is_empty() {
+                                    // `__getRenderedHTML` returns the page's own
+                                    // <body> only. The document's body also holds
+                                    // the browser chrome, and the re-render
+                                    // replaces the body wholesale — so rebuild
+                                    // the same structure the initial load
+                                    // produced, or the toolbar disappears and the
+                                    // page falls out of the flex column that
+                                    // gives it its height. Relative URLs need
+                                    // re-absolutising for the same reason: the
+                                    // initial render did it, this path did not,
+                                    // so images broke on the first click.
+                                    let rebuilt = crate::rerender_body(
+                                        &new_html,
+                                        &self.page_url,
+                                    );
                                     eprintln!(
                                         "[EVENT] DOM updated after click ({} bytes)",
-                                        new_html.len()
+                                        rebuilt.len()
                                     );
-                                    self.pending_rerender = Some(new_html);
+                                    self.pending_rerender = Some(rebuilt);
                                 }
                             }
                         }

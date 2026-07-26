@@ -157,7 +157,7 @@ fn main() {
         if !flid_map.is_empty() {
             eprintln!("[EVENT-BRIDGE] Mapped {} nodes with data-flid attributes", flid_map.len());
         }
-        let bridge = event_bridge::JsEventBridge::new(flid_map, emap_json, js_state);
+        let bridge = event_bridge::JsEventBridge::new(flid_map, emap_json, js_state, &url);
         eprintln!(
             "[EVENT-BRIDGE] Bridge created with {} handler entries (live JS: {})",
             bridge.handler_count(),
@@ -548,24 +548,64 @@ function __zippDrainQueues(rounds) {
     }
 }
 
-// Invoke the handlers registered for (node id, event type). Returns whether
-// any ran. A handler that throws does not stop the others — that is what a
-// real dispatcher does, and one broken listener should not disable the rest.
-function __zippDispatchEvent(nid, type) {
-    var byType = __eventHandlers[nid];
+// Invoke the handlers registered on `handlerNid` for `type`, with the event
+// targeted at `targetNid`.
+//
+// The two ids are usually DIFFERENT, and that is the whole point. React 18 does
+// not put listeners on the elements you click — it attaches ONE delegated
+// listener per event type to the root container and works out which component
+// was hit by reading `event.target`. So `handlerNid` is nearly always the root,
+// and `targetNid` is the element actually under the pointer.
+//
+// Passing `target: null` (as this once did) meant React received every click as
+// "something in the root was clicked, but nothing in particular" and routed it
+// nowhere: buttons appeared dead. The hamburger menu was the visible symptom.
+//
+// `target` must be the live node object, not an id — React finds its fiber via
+// an expando it set on that very object.
+function __zippDispatchEvent(handlerNid, targetNid, type) {
+    var byType = __eventHandlers[handlerNid];
     if (!byType) return false;
     var handlers = byType[type];
     if (!handlers || handlers.length === 0) return false;
+
+    var target = __nodesById[targetNid] || __nodesById[handlerNid] || null;
+    var currentTarget = __nodesById[handlerNid] || null;
+    var defaultPrevented = false;
+    var propagationStopped = false;
     var ev = {
         type: type,
-        target: null,
-        currentTarget: null,
-        preventDefault: function () {},
-        stopPropagation: function () {},
-        bubbles: true
+        target: target,
+        // Legacy alias some libraries still read.
+        srcElement: target,
+        currentTarget: currentTarget,
+        eventPhase: 2,
+        bubbles: true,
+        cancelable: true,
+        isTrusted: true,
+        timeStamp: 0,
+        detail: 1,
+        button: 0,
+        buttons: 1,
+        clientX: 0, clientY: 0, pageX: 0, pageY: 0, screenX: 0, screenY: 0,
+        altKey: false, ctrlKey: false, metaKey: false, shiftKey: false,
+        get defaultPrevented() { return defaultPrevented; },
+        preventDefault: function () { defaultPrevented = true; },
+        stopPropagation: function () { propagationStopped = true; },
+        stopImmediatePropagation: function () { propagationStopped = true; },
+        composedPath: function () {
+            var path = [], n = target;
+            while (n) { path.push(n); n = n.parentNode; }
+            return path;
+        }
     };
+    // React reads `nativeEvent` off its synthetic wrapper; point it at itself so
+    // either access works.
+    ev.nativeEvent = ev;
+
     for (var i = 0; i < handlers.length; i++) {
         try { handlers[i](ev); } catch (e) {}
+        if (propagationStopped) break;
     }
     return true;
 }
@@ -700,7 +740,56 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
     use zipp_dom::traits_src::shell::{ColorScheme, Viewport};
 
     eprintln!("[SHOT] {url} -> {out_path} ({width}x{height})");
-    let (final_html, _event_map, _js_state) = prepare_page(url, (width, height));
+    let (mut final_html, _event_map, mut js_state) = prepare_page(url, (width, height));
+
+    // `ZIPP_CLICK=<data-flid>` dispatches a click at that element after the page
+    // has settled, then re-serialises. Interaction otherwise needs a window and a
+    // human, which makes it untestable here; this exercises the same JS path the
+    // event bridge uses (`__zippDispatchEvent` -> drain -> `__getRenderedHTML`).
+    if let Some(flid) = std::env::var("ZIPP_CLICK").ok().and_then(|v| v.parse::<u32>().ok()) {
+        if let Some(state) = js_state.as_mut() {
+            // React delegates to the root, so the handler node and the clicked
+            // node differ: find the root's flid the same way the bridge does.
+            let root_flid = match state.eval_in_context(
+                "(function(){for(var k in __eventHandlers){if(__eventHandlers[k]['click'])return k}return ''})()",
+            ) {
+                Ok(JsValue::String(s)) => s.parse::<u32>().unwrap_or(flid),
+                _ => flid,
+            };
+            eprintln!("[CLICK] dispatching click: handler=#{root_flid} target=#{flid}");
+            match state.call_global(
+                "__zippDispatchEvent",
+                &[
+                    JsValue::Number(f64::from(root_flid)),
+                    JsValue::Number(f64::from(flid)),
+                    JsValue::String("click".to_string()),
+                ],
+            ) {
+                Ok(v) => eprintln!("[CLICK] dispatched -> {v:?}"),
+                Err(e) => eprintln!("[CLICK] dispatch failed: {e}"),
+            }
+            let _ = state.call_global("__zippDrainQueues", &[JsValue::Number(50.0)]);
+            if let Ok(JsValue::String(updated)) = state.call_global("__getRenderedHTML", &[]) {
+                if !updated.is_empty() {
+                    eprintln!("[CLICK] DOM after click: {} bytes", updated.len());
+                    // Same rebuild the event bridge performs, so this harness
+                    // exercises the real path rather than an approximation.
+                    let body = rerender_body(&updated, url);
+                    final_html = final_html
+                        .split_once("<body")
+                        .and_then(|(head, rest)| {
+                            rest.find('>').map(|e| {
+                                let close = rest.rfind("</body>").unwrap_or(rest.len());
+                                format!("{head}<body{}>{body}</body></html>", &rest[..e])
+                                    .replace("</body></html></html>", "</body></html>")
+                                    + &rest[close..close]
+                            })
+                        })
+                        .unwrap_or(final_html);
+                }
+            }
+        }
+    }
     // Write the HTML the renderer sees alongside the image. When a screenshot
     // looks wrong the first question is always "is this a CSS/layout problem or
     // did the page's JS produce the wrong DOM?", and this answers it directly.
@@ -1116,16 +1205,52 @@ fn wrap_with_toolbar(html: &str, current_url: &str) -> String {
 <meta charset="utf-8">
 {head_content}
 <style>{TOOLBAR_CSS}</style>
-</head><body style="margin:0 !important;padding:0 !important;max-width:none !important;width:100% !important">
-<div style="display:flex;flex-direction:column;margin:0;padding:0;width:100%;height:100vh">
+</head><body style="margin:0 !important;padding:0 !important;max-width:none !important;width:100% !important">{body}</body></html>"#,
+        head_content = head_content,
+        body = toolbar_body(body_content, current_url),
+    )
+}
+
+/// Rebuild the document body after a JS re-render.
+///
+/// `__getRenderedHTML()` hands back the page's own `<body>` element. Strip that
+/// wrapper, re-absolutise its URLs against the page (the initial load does this;
+/// skipping it broke every relative image on the first click), and put the
+/// browser chrome back around it.
+pub(crate) fn rerender_body(rendered_body: &str, page_url: &str) -> String {
+    let inner = match (rendered_body.find("<body"), rendered_body.rfind("</body>")) {
+        (Some(start), Some(end)) => {
+            let open_end = rendered_body[start..]
+                .find('>')
+                .map(|e| start + e + 1)
+                .unwrap_or(start);
+            &rendered_body[open_end..end]
+        }
+        _ => rendered_body,
+    };
+    let base = url::Url::parse(page_url)
+        .ok()
+        .map(|u| format!("{}://{}", u.scheme(), u.host_str().unwrap_or("")))
+        .unwrap_or_default();
+    toolbar_body(&make_urls_absolute(inner, &base), page_url)
+}
+
+/// The `<body>` contents: the browser chrome followed by the page.
+///
+/// Factored out because a JS re-render replaces the WHOLE body — it is the only
+/// element the event handler can address — so the chrome has to be rebuilt with
+/// it. Without this a single click removed the toolbar and dropped the page out
+/// of the flex column that gives it its height.
+fn toolbar_body(page_html: &str, current_url: &str) -> String {
+    format!(
+        r#"<div style="display:flex;flex-direction:column;margin:0;padding:0;width:100%;height:100vh">
   <form action="{current_url}" method="GET" style="height:42px;min-height:42px;background:#f8f9fa;border-bottom:1px solid #dee2e6;display:flex;align-items:center;padding:4px 8px;gap:6px;font-family:Arial,sans-serif;box-sizing:border-box;width:100%;margin:0;flex-shrink:0">
     <span style="font-size:16px;color:#495057;padding:0 4px;cursor:pointer">◀</span>
     <span style="font-size:16px;color:#495057;padding:0 4px;cursor:pointer">▶</span>
     <input type="text" name="__nav_url" value="{current_url}" style="width:90%;height:32px;padding:0 12px;border:1px solid #ced4da;border-radius:8px;font-size:14px;background:white;outline:none;box-sizing:border-box" />
   </form>
-  {body_content}
-</div>
-</body></html>"#
+  {page_html}
+</div>"#
     )
 }
 
