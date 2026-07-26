@@ -504,17 +504,21 @@ var http = (function () {
 // has typically only QUEUED the re-render when it returns; without this the
 // page would be read back before the update landed. Bounded because a page
 // can legitimately reschedule forever (a spinner, a poll loop).
+var __zippDrainStats = { rounds: 0, timers: 0, micro: 0 };
 function __zippDrainQueues(rounds) {
     for (var i = 0; i < rounds; i++) {
         if (__timerQueue.length === 0 && __mcQueue.length === 0) break;
         // Report, never swallow. A page's real work happens in these callbacks
         // — React commits its first render from one — so an empty catch here
         // turns a broken app into a blank page with no explanation.
+        __zippDrainStats.rounds++;
         while (__timerQueue.length > 0) {
+            __zippDrainStats.timers++;
             try { __timerQueue.shift()(); }
             catch (e) { env.log('error', 'timer callback threw: ' + ((e && (e.stack || e.message)) || e)); }
         }
         while (__mcQueue.length > 0) {
+            __zippDrainStats.micro++;
             try { __mcQueue.shift()(); }
             catch (e) { env.log('error', 'microtask threw: ' + ((e && (e.stack || e.message)) || e)); }
         }
@@ -1227,6 +1231,11 @@ var __zippEsmDebug=true;
     // Settle the page: run timers and microtasks until nothing is left to do,
     // so the tree we serialise below is the one the page actually intended.
     full.push_str("\n__zippDrainQueues(100);\n");
+    full.push_str(
+        "\nif (typeof __zippEsmDebug !== 'undefined' && __zippEsmDebug) { \
+         env.log('info','drain rounds='+__zippDrainStats.rounds+' timers='+__zippDrainStats.timers+\
+         ' micro='+__zippDrainStats.micro); }\n",
+    );
 
     eprintln!("[JS] Compiling {} bytes...", full.len());
     let mut state = match compile_script(&full) {
@@ -1242,6 +1251,23 @@ var __zippEsmDebug=true;
         // of a tree to render, so fall through and check. This matches how a
         // real browser treats a script error — the page is what it is.
         eprintln!("[JS] Uncaught: {e}");
+    }
+    // Settle the VM's microtasks against the shim's queues.
+    //
+    // These are two SEPARATE queues. `__zippDrainQueues` runs the shim's timers
+    // and MessageChannel callbacks; the continuation of an `await` lives in the
+    // VM's own microtask queue and is only drained from here. Draining one feeds
+    // the other — an awaited fetch resolves in the VM, its continuation sets
+    // state, React schedules a re-render through MessageChannel — so they have
+    // to alternate until both are quiet.
+    //
+    // Without this a client-rendered app is serialised mid-boot: formlogic.local
+    // fetched its session, got its 401, and would have rendered the logged-out
+    // UI, but the tree was read before the continuation that sets
+    // `isInitialized` ever ran, so the page was captured on its loading screen.
+    for _ in 0..32 {
+        state.run_microtasks();
+        let _ = state.call_global("__zippDrainQueues", &[JsValue::Number(50.0)]);
     }
     for line in state.take_output() {
         eprintln!("[JS] {line}");

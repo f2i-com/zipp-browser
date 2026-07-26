@@ -418,6 +418,19 @@ pub fn link_graph(
                 continue;
             }
         };
+        // Same `ZIPP_JS_FROM`/`ZIPP_JS_TO` rewrite the classic-script path has.
+        // A client-rendered app's behaviour lives entirely in these modules, so
+        // without it there is no way to instrument the code that actually runs.
+        let source = match (
+            std::env::var("ZIPP_JS_FROM").ok(),
+            std::env::var("ZIPP_JS_TO").ok(),
+        ) {
+            (Some(from), Some(to)) if source.contains(&from) => {
+                eprintln!("[ESM] substituted page source in {url}");
+                source.replace(&from, &to)
+            }
+            _ => source,
+        };
         match rewrite_module(&url, &source, resolve) {
             Ok(rw) => {
                 for d in &rw.deps {

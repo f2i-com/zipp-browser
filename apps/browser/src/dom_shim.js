@@ -138,6 +138,50 @@ var _nid = 1;
 
 // Event handler registry for the Live DOM Bridge (Phase 1).
 // Maps JS node _id -> { eventType -> [handlerFn, ...] }
+// A `style` object with the CSSStyleDeclaration methods on it.
+//
+// It used to be a bare `{}`, so `style.setProperty` / `removeProperty` /
+// `getPropertyValue` were undefined. React calls `setProperty` for every CSS
+// CUSTOM PROPERTY (`--x`) and `removeProperty` when a style prop goes away, so
+// any component using either took down the render with "undefined is not a
+// function".
+//
+// The methods are non-enumerable: the serialiser walks this object to build the
+// style attribute, and enumerable functions would be walked as if they were
+// declarations.
+function __makeStyle() {
+    var s = {};
+    function def(name, fn) {
+        Object.defineProperty(s, name, { value: fn, enumerable: false, writable: true, configurable: true });
+    }
+    // Names are stored exactly as given. The serialiser lowercases camelCase to
+    // dashed on the way out, and a dashed or `--custom` name passes through it
+    // unchanged, so both spellings land correctly.
+    def('setProperty', function (name, value) {
+        if (name == null) return;
+        s[String(name)] = value == null ? '' : String(value);
+    });
+    def('getPropertyValue', function (name) {
+        if (name == null) return '';
+        var v = s[String(name)];
+        return typeof v === 'string' ? v : '';
+    });
+    def('removeProperty', function (name) {
+        if (name == null) return '';
+        var k = String(name);
+        var v = typeof s[k] === 'string' ? s[k] : '';
+        delete s[k];
+        return v;
+    });
+    def('getPropertyPriority', function () { return ''; });
+    def('item', function (i) {
+        var keys = [];
+        for (var k in s) { if (typeof s[k] === 'string' && k !== 'cssText') keys.push(k); }
+        return keys[i] || '';
+    });
+    return s;
+}
+
 // Populated by addEventListener, read by Rust after SSR to wire up event dispatch.
 var __eventHandlers = {};
 
@@ -240,7 +284,7 @@ class Element extends DOMNode {
         this.localName = tag.toLowerCase();
         this.namespaceURI = ns || "http://www.w3.org/1999/xhtml";
         this.attributes = {};
-        this.style = {};
+        this.style = __makeStyle();
         this.className = "";
         this.id = "";
         this.dataset = _makeDataset(this);
