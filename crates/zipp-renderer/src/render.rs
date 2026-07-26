@@ -233,6 +233,21 @@ impl<'dom> DocumentPainter<'dom> {
 
         // Opacity: hide fully transparent elements; partial opacity uses layer compositing
         let opacity = styles.get_effects().opacity;
+        // `ZIPP_DUMP_OPACITY=1` lists every translucent element. An element that
+        // is laid out correctly but invisible looks exactly like a missing
+        // element, and this is the quickest way to tell those apart. Read once:
+        // this is per-node, per-frame.
+        static DUMP_OPACITY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if opacity < 1.0
+            && *DUMP_OPACITY.get_or_init(|| std::env::var_os("ZIPP_DUMP_OPACITY").is_some())
+        {
+            eprintln!(
+                "[OPACITY] {:.3} node={} <{}>",
+                opacity,
+                node.id,
+                node.node_debug_str().chars().take(80).collect::<String>()
+            );
+        }
         if opacity == 0.0 {
             return;
         }

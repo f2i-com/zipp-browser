@@ -4,7 +4,10 @@ use crate::BaseDocument;
 
 impl BaseDocument {
     pub fn print_taffy_tree(&self) {
-        #[cfg(debug_assertions)]
+        // Not gated on debug_assertions: the interesting layout bugs only show
+        // up in a release build (a debug build is far too slow to drive a real
+        // site), and a dump that silently prints nothing there is worse than no
+        // dump at all.
         taffy::print_tree(self, taffy::NodeId::from(0usize));
     }
 

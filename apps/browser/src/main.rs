@@ -608,7 +608,16 @@ function __zippDispatchEvent(handlerNid, targetNid, type) {
     ev.nativeEvent = ev;
 
     for (var i = 0; i < handlers.length; i++) {
-        try { handlers[i](ev); } catch (e) {}
+        // Never swallow this silently. A listener that throws is the difference
+        // between "the click did nothing" and "the click did nothing BECAUSE
+        // React tore its own state down", and those need very different fixes.
+        // Swallowing it cost real debugging time on the hamburger menu.
+        try {
+            handlers[i](ev);
+        } catch (e) {
+            env.log('error', 'listener for "' + type + '" threw: ' +
+                ((e && (e.stack || e.message)) || e));
+        }
         // Only stopImmediatePropagation may cut short the OTHER listeners on
         // this same node. stopPropagation stops the event travelling to other
         // nodes, which is a different thing entirely.
@@ -966,8 +975,21 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
                 // stamped with that moment — sampling at the same instant shows
                 // every one of them at its 0% keyframe (opacity:0), i.e. a blank
                 // page. The second resolve advances past their duration.
-                doc.as_mut().resolve(ANIMATION_SETTLE_SECS * 4.0);
-                doc.as_mut().resolve(ANIMATION_SETTLE_SECS * 8.0);
+                // Past the LAST click's clock, not a fixed multiple: with N
+                // clicks the loop above has already advanced to
+                // SETTLE*(3+2(N-1)), so a hardcoded 4/8 lands mid-animation for
+                // N>=3 and screenshots a half-faded page that looks like a
+                // rendering bug.
+                let after = ANIMATION_SETTLE_SECS * (2.0 * clicks as f64 + 2.0);
+                // Several frames, spread out. Each re-render builds BRAND NEW
+                // nodes whose entrance animations are created on the next
+                // resolve and stamped with that moment, and the site staggers
+                // them with per-item delays. One extra frame is not enough to
+                // clear the longest delay, which is why a late screenshot
+                // showed a blank hero and a missing nav item.
+                for step in [0.0, 4.0, 12.0, 30.0] {
+                    doc.as_mut().resolve(after + ANIMATION_SETTLE_SECS * step);
+                }
                 if let Some(state) = js_state.as_mut() {
                     if let Ok(JsValue::String(after)) =
                         state.call_global("__getRenderedHTML", &[])
@@ -1145,6 +1167,20 @@ fn run_zipp_js_inner(
                 "let i=null;for(let l=0;null==i&&l<o.length;++l){let e=R(a);i=T(o[l],e,r)}",
                 "var i=null;for(var __ml=0;null==i&&__ml<o.length;++__ml){var __me=__RR(a);i=__RT(o[__ml],__me,r)}",
             );
+        // `ZIPP_JS_FROM` / `ZIPP_JS_TO` rewrite the page's own source before it
+        // is compiled. Page bundles are minified with no source map, so when a
+        // handler misbehaves the only way to see inside it is to edit it.
+        // Harmless when unset.
+        let patched = match (
+            std::env::var("ZIPP_JS_FROM").ok(),
+            std::env::var("ZIPP_JS_TO").ok(),
+        ) {
+            (Some(from), Some(to)) if patched.contains(&from) => {
+                eprintln!("[JS] substituted {} bytes of page source", from.len());
+                patched.replace(&from, &to)
+            }
+            _ => patched,
+        };
         full.push('\n');
         full.push_str(&patched);
         full.push('\n');

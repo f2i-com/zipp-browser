@@ -56,6 +56,24 @@ use style_dom::ElementState;
 use style::values::computed::text::TextAlign as StyloTextAlign;
 
 impl crate::document::BaseDocument {
+    /// Drop every animation and transition still keyed to a node id.
+    ///
+    /// Animation state is keyed by OPAQUE NODE ID, and replacing the body frees
+    /// that whole subtree and re-parses it — so the ids come straight back and a
+    /// brand-new element silently inherits whatever the previous occupant of
+    /// that id was running. On lance.name a plain unclassed `<div>` adopted a
+    /// neighbour's `rise` keyframes, whose 0% frame is `opacity: 0`, and sat
+    /// there permanently: after the third menu toggle the hero vanished while
+    /// its layout stayed pixel-identical.
+    ///
+    /// Everything visible lives under `<body>`, so after a body swap there is no
+    /// animation worth keeping. The new elements start their animations fresh,
+    /// which is also what they should do — they really are new elements.
+    pub fn clear_animation_state(&mut self) {
+        self.animations.sets.write().clear();
+        self.has_active_animations = false;
+    }
+
     pub fn resolve_stylist(&mut self, now: f64) {
         style::thread_state::enter(ThreadState::LAYOUT);
 

@@ -18,7 +18,6 @@
 use std::collections::HashMap;
 
 use zipp_vm::embed::{JsValue, ScriptState};
-use zipp_dom::html_parser::HtmlDocument;
 use zipp_dom::traits_events::{DomEvent, EventState};
 use zipp_dom::{BaseDocument, Document, EventHandler, LocalName};
 
@@ -167,6 +166,12 @@ impl EventHandler for JsEventBridge {
                     // Look up the JS flid for this blitz-dom node.
                     let flid = self.reverse_flid.get(&node_id).copied();
 
+                    if std::env::var_os("ZIPP_DEBUG_EVENTS").is_some() {
+                        eprintln!(
+                            "[EVDBG] {event_name}: handler node={node_id} flid={flid:?} target_flid={target_flid} chain={:?}",
+                            &chain[..chain.len().min(6)]
+                        );
+                    }
                     if let (Some(flid), Some(state)) = (flid, &mut self.js_state) {
                         // Call the prelude's dispatcher rather than assembling
                         // JS source per event: `call_global` compiles nothing,

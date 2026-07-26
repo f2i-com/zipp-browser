@@ -77,6 +77,10 @@ impl Document for HtmlDocument {
                     let mut mutator = crate::DocumentMutator::new(&mut self.inner);
                     mutator.set_inner_html(body_id, &html);
                     drop(mutator);
+                    // Animation state is keyed by node id and those ids are
+                    // recycled by the re-parse, so stale entries would attach
+                    // to whichever new element inherits the id.
+                    self.inner.clear_animation_state();
                     // Every node id the handler cached is stale now — the body's
                     // whole subtree was dropped and re-parsed. Let it rebuild
                     // before the next event arrives, or only the FIRST
