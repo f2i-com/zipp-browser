@@ -33,7 +33,7 @@ use render::DocumentPainter;
 /// Generally this will involve executing them to draw a rasterized image/texture. But in some cases it may choose to
 /// transform them to a vector format (e.g. SVG/PDF) or serialize them in raw form for later use.
 pub fn paint_scene(
-    scene: &mut impl PaintScene,
+    scene: &mut (impl PaintScene + crate::tinyskia::BlurLayer),
     dom: &BaseDocument,
     scale: f64,
     width: u32,

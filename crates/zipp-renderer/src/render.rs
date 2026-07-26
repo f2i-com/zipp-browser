@@ -19,6 +19,7 @@ use crate::kurbo_css::NonUniformRoundedRectRadii;
 use crate::layers::LayerManager;
 use crate::sizing::compute_object_fit;
 use anyrender::{CustomPaint, Paint, PaintScene};
+use crate::tinyskia::BlurLayer;
 use zipp_dom::node::{
     ListItemLayout, ListItemLayoutPosition, Marker, NodeData, RasterImageData, SpecialElementData,
     TextInputData, TextNodeData,
@@ -143,7 +144,7 @@ impl<'dom> DocumentPainter<'dom> {
     ///
     /// This assumes styles are resolved and layout is complete.
     /// Make sure you do those before trying to render
-    pub fn paint_scene(&self, scene: &mut impl PaintScene) {
+    pub fn paint_scene(&self, scene: &mut (impl PaintScene + BlurLayer)) {
         // Render starting from the root element (not the root node).
         let root_element = self.dom.as_ref().root_element();
         let bg_width = (self.width as f32).max(root_element.final_layout.size.width);
@@ -203,7 +204,7 @@ impl<'dom> DocumentPainter<'dom> {
     /// to traverse back to the parent for its styles, or needing to pass down styles
     fn render_element(
         &self,
-        scene: &mut impl PaintScene,
+        scene: &mut (impl PaintScene + BlurLayer),
         node_id: usize,
         location: Point,
         ancestor_transform: Affine,
@@ -304,6 +305,25 @@ impl<'dom> DocumentPainter<'dom> {
             return;
         }
 
+        // `filter: blur()`. Painted into an offscreen surface and blurred on
+        // pop, so a decorative glow reads as a soft wash instead of the hard
+        // opaque disc it used to be.
+        let blur_radius: Option<f32> = styles
+            .get_effects()
+            .filter
+            .0
+            .iter()
+            .find_map(|f| match f {
+                style::values::computed::Filter::Blur(len) => {
+                    let px = len.0.px();
+                    (px >= 0.5).then_some(px * self.scale as f32)
+                }
+                _ => None,
+            });
+        if let Some(r) = blur_radius {
+            scene.push_blur_layer(r);
+        }
+
         let mut cx = self.element_cx(node, layout, box_position, ancestor_transform);
 
         cx.draw_outline(scene);
@@ -367,12 +387,16 @@ impl<'dom> DocumentPainter<'dom> {
                 );
             },
         );
+
+        if blur_radius.is_some() {
+            scene.pop_blur_layer();
+        }
     }
 
     #[inline]
     fn render_node(
         &self,
-        scene: &mut impl PaintScene,
+        scene: &mut (impl PaintScene + BlurLayer),
         node_id: usize,
         location: Point,
         ancestor_transform: Affine,
@@ -541,7 +565,7 @@ fn convert_rect(rect: &parley::BoundingBox) -> kurbo::Rect {
 }
 
 impl ElementCx<'_> {
-    fn draw_inline_layout(&self, scene: &mut impl PaintScene, pos: Point) {
+    fn draw_inline_layout(&self, scene: &mut (impl PaintScene + BlurLayer), pos: Point) {
         if self.node.flags.is_inline_root() {
             let text_layout = self.element
                 .inline_layout_data
@@ -574,7 +598,7 @@ impl ElementCx<'_> {
         }
     }
 
-    fn draw_text_input_text(&self, scene: &mut impl PaintScene, pos: Point) {
+    fn draw_text_input_text(&self, scene: &mut (impl PaintScene + BlurLayer), pos: Point) {
         // Render the text in text inputs
         if let Some(input_data) = self.text_input {
             // For single-line inputs, add an offset to vertically center the text input layout
@@ -626,7 +650,7 @@ impl ElementCx<'_> {
         }
     }
 
-    fn draw_marker(&self, scene: &mut impl PaintScene, pos: Point) {
+    fn draw_marker(&self, scene: &mut (impl PaintScene + BlurLayer), pos: Point) {
         if let Some(ListItemLayout {
             marker,
             position: ListItemLayoutPosition::Outside(layout),
@@ -665,7 +689,7 @@ impl ElementCx<'_> {
         }
     }
 
-    fn draw_children(&self, scene: &mut impl PaintScene) {
+    fn draw_children(&self, scene: &mut (impl PaintScene + BlurLayer)) {
         // Negative z_index hoisted nodes
         if let Some(hoisted) = &self.node.stacking_context {
             for hoisted_child in hoisted.neg_z_hoisted_children() {
@@ -697,7 +721,7 @@ impl ElementCx<'_> {
     }
 
     #[cfg(feature = "svg")]
-    fn draw_svg(&self, scene: &mut impl PaintScene) {
+    fn draw_svg(&self, scene: &mut (impl PaintScene + BlurLayer)) {
         use style::properties::generated::longhands::object_fit::computed_value::T as ObjectFit;
 
         let Some(svg) = self.svg else {
@@ -745,7 +769,7 @@ impl ElementCx<'_> {
         anyrender_svg::render_svg_tree(scene, svg, transform);
     }
 
-    fn draw_image(&self, scene: &mut impl PaintScene) {
+    fn draw_image(&self, scene: &mut (impl PaintScene + BlurLayer)) {
         if let Some(image) = self.element.raster_image_data() {
             let width = self.frame.content_box.width() as u32;
             let height = self.frame.content_box.height() as u32;
@@ -789,7 +813,7 @@ impl ElementCx<'_> {
         }
     }
 
-    fn draw_canvas(&self, scene: &mut impl PaintScene) {
+    fn draw_canvas(&self, scene: &mut (impl PaintScene + BlurLayer)) {
         if let Some(custom_paint_source) = self.element.canvas_data() {
             let width = self.frame.content_box.width() as u32;
             let height = self.frame.content_box.height() as u32;
@@ -814,7 +838,7 @@ impl ElementCx<'_> {
         }
     }
 
-    fn draw_sub_document(&self, scene: &mut impl PaintScene) {
+    fn draw_sub_document(&self, scene: &mut (impl PaintScene + BlurLayer)) {
         if let Some(sub_doc) = self.element.sub_doc_data().map(|doc| doc.inner()) {
             let scale = self.scale;
             let width = self.frame.content_box.width() as u32;
@@ -828,7 +852,7 @@ impl ElementCx<'_> {
         }
     }
 
-    fn stroke_devtools(&self, scene: &mut impl PaintScene) {
+    fn stroke_devtools(&self, scene: &mut (impl PaintScene + BlurLayer)) {
         if self.devtools.show_layout {
             let shape = &self.frame.border_box;
             let stroke = Stroke::new(self.scale);
@@ -845,7 +869,7 @@ impl ElementCx<'_> {
     }
 
     /// Draw all borders for a node
-    fn draw_border(&self, scene: &mut impl PaintScene) {
+    fn draw_border(&self, scene: &mut (impl PaintScene + BlurLayer)) {
         let style = &*self.style;
         let border = style.get_border();
         let current_color = style.clone_color();
@@ -924,7 +948,7 @@ impl ElementCx<'_> {
         }
     }
 
-    fn draw_table_borders(&self, scene: &mut impl PaintScene) {
+    fn draw_table_borders(&self, scene: &mut (impl PaintScene + BlurLayer)) {
         let SpecialElementData::TableRoot(table) = &self.element.special_data else {
             return;
         };
@@ -1023,7 +1047,7 @@ impl ElementCx<'_> {
     /// ❌ outset - Defines a 3D outset border. The effect depends on the border-color value
     /// ✅ none - Defines no border
     /// ✅ hidden - Defines a hidden border
-    fn draw_outline(&self, scene: &mut impl PaintScene) {
+    fn draw_outline(&self, scene: &mut (impl PaintScene + BlurLayer)) {
         let outline = self.style.get_outline();
 
         let current_color = self.style.clone_color();

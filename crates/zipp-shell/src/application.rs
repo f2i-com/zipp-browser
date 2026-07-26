@@ -26,7 +26,10 @@ pub struct ZippApp<Rend: WindowRenderer> {
     pub event_queue: Receiver<ShellEvent>,
 }
 
-impl<Rend: WindowRenderer> ZippApp<Rend> {
+impl<Rend: WindowRenderer> ZippApp<Rend> 
+where
+    for<'a> Rend::ScenePainter<'a>: zipp_renderer::tinyskia::BlurLayer,
+{
     pub fn new(proxy: ShellProxy, event_queue: Receiver<ShellEvent>) -> Self {
         ZippApp {
             windows: HashMap::new(),
@@ -106,7 +109,10 @@ impl<Rend: WindowRenderer> ZippApp<Rend> {
     }
 }
 
-impl<Rend: WindowRenderer> ApplicationHandler for ZippApp<Rend> {
+impl<Rend: WindowRenderer> ApplicationHandler for ZippApp<Rend> 
+where
+    for<'a> Rend::ScenePainter<'a>: zipp_renderer::tinyskia::BlurLayer,
+{
     fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
         // Resume existing windows
         for (_, view) in self.windows.iter_mut() {
@@ -185,7 +191,10 @@ impl<Rend: WindowRenderer> ApplicationHandler for ZippApp<Rend> {
 }
 
 #[cfg(target_os = "macos")]
-impl<Rend: WindowRenderer> ApplicationHandlerExtMacOS for ZippApp<Rend> {
+impl<Rend: WindowRenderer> ApplicationHandlerExtMacOS for ZippApp<Rend> 
+where
+    for<'a> Rend::ScenePainter<'a>: zipp_renderer::tinyskia::BlurLayer,
+{
     fn standard_key_binding(
         &mut self,
         event_loop: &dyn ActiveEventLoop,

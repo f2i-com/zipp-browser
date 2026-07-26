@@ -89,7 +89,10 @@ pub struct View<Rend: WindowRenderer> {
     pub ios_request_redraw: std::cell::Cell<bool>,
 }
 
-impl<Rend: WindowRenderer> View<Rend> {
+impl<Rend: WindowRenderer> View<Rend> 
+where
+    for<'a> Rend::ScenePainter<'a>: zipp_renderer::tinyskia::BlurLayer,
+{
     pub fn init(
         config: WindowConfig<Rend>,
         event_loop: &dyn ActiveEventLoop,
@@ -212,7 +215,12 @@ impl<Rend: WindowRenderer> View<Rend> {
     }
 }
 
-impl<Rend: WindowRenderer> View<Rend> {
+// `paint_scene` needs a painter that can blur (`filter: blur()`), which is a
+// capability beyond `PaintScene`.
+impl<Rend: WindowRenderer> View<Rend>
+where
+    for<'a> Rend::ScenePainter<'a>: zipp_renderer::tinyskia::BlurLayer,
+{
     pub fn resume(&mut self) {
         let window_id = self.window_id();
         let animation_time = self.current_animation_time();

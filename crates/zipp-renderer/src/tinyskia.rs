@@ -554,6 +554,8 @@ pub struct TinySkiaPainter {
 
     /// Stack of saved layer states, pushed/popped alongside layers.
     layer_stack: Vec<LayerEntry>,
+    /// Offscreen surfaces captured for `filter: blur()`, with their radii.
+    blur_stack: Vec<(Pixmap, f32)>,
 
     /// The currently active clip region, if any. Drawing operations outside this
     /// region are discarded or masked.
@@ -575,6 +577,7 @@ impl TinySkiaPainter {
         Self {
             pixmap: Pixmap::new(width.max(1), height.max(1)).unwrap(),
             layer_stack: Vec::new(),
+            blur_stack: Vec::new(),
             active_clip: None,
             clip_mask: None,
         }
@@ -645,6 +648,136 @@ impl TinySkiaPainter {
 // ---------------------------------------------------------------------------
 // PaintScene trait implementation
 // ---------------------------------------------------------------------------
+
+/// Painting an element through a blur.
+///
+/// `anyrender`'s `PaintScene` has no notion of a filter, so this cannot be
+/// threaded through `push_layer`. It is a separate capability the renderer
+/// requires of its painter instead.
+pub trait BlurLayer {
+    /// Begin capturing into an offscreen surface to be blurred on pop.
+    fn push_blur_layer(&mut self, radius_px: f32);
+    /// Blur what was captured and composite it over the surface below.
+    fn pop_blur_layer(&mut self);
+}
+
+/// Blur `pixmap` in place with three box passes.
+///
+/// Three successive box blurs approximate a Gaussian closely enough that the
+/// difference is invisible for the decorative glows this exists to serve, and
+/// each pass is a running sum — O(pixels), independent of radius, where a true
+/// Gaussian would be O(pixels x radius).
+///
+/// Operates on PREMULTIPLIED RGBA, which is what tiny-skia stores. That matters:
+/// averaging un-premultiplied colour would drag the colour of fully transparent
+/// pixels into its neighbours and fringe the edges.
+fn box_blur(pixmap: &mut tiny_skia::Pixmap, radius: f32) {
+    let w = pixmap.width() as usize;
+    let h = pixmap.height() as usize;
+    if w == 0 || h == 0 || radius < 0.5 {
+        return;
+    }
+    // Box width for three passes approximating a Gaussian of this sigma.
+    let sigma = radius;
+    let box_w = ((sigma * 3.0 * (2.0 * std::f32::consts::PI).sqrt() / 4.0) + 0.5) as usize;
+    let r = (box_w / 2).max(1);
+    if r == 0 {
+        return;
+    }
+
+    let data = pixmap.data_mut();
+    let mut src: Vec<u8> = data.to_vec();
+    let mut dst: Vec<u8> = vec![0; data.len()];
+
+    for _ in 0..3 {
+        // Horizontal.
+        for y in 0..h {
+            let row = y * w * 4;
+            let mut acc = [0u32; 4];
+            // Prime the window with the clamped left edge.
+            for i in 0..=r {
+                let x = i.min(w - 1);
+                for c in 0..4 {
+                    acc[c] += src[row + x * 4 + c] as u32;
+                }
+            }
+            for c in 0..4 {
+                acc[c] += src[row + c] as u32 * r as u32;
+            }
+            let count = (2 * r + 1) as u32;
+            for x in 0..w {
+                for c in 0..4 {
+                    dst[row + x * 4 + c] = (acc[c] / count) as u8;
+                }
+                let add = (x + r + 1).min(w - 1);
+                let sub = x.saturating_sub(r);
+                for c in 0..4 {
+                    acc[c] += src[row + add * 4 + c] as u32;
+                    acc[c] -= src[row + sub * 4 + c] as u32;
+                }
+            }
+        }
+        std::mem::swap(&mut src, &mut dst);
+
+        // Vertical.
+        for x in 0..w {
+            let col = x * 4;
+            let mut acc = [0u32; 4];
+            for i in 0..=r {
+                let y = i.min(h - 1);
+                for c in 0..4 {
+                    acc[c] += src[y * w * 4 + col + c] as u32;
+                }
+            }
+            for c in 0..4 {
+                acc[c] += src[col + c] as u32 * r as u32;
+            }
+            let count = (2 * r + 1) as u32;
+            for y in 0..h {
+                for c in 0..4 {
+                    dst[y * w * 4 + col + c] = (acc[c] / count) as u8;
+                }
+                let add = (y + r + 1).min(h - 1);
+                let sub = y.saturating_sub(r);
+                for c in 0..4 {
+                    acc[c] += src[add * w * 4 + col + c] as u32;
+                    acc[c] -= src[sub * w * 4 + col + c] as u32;
+                }
+            }
+        }
+        std::mem::swap(&mut src, &mut dst);
+    }
+    data.copy_from_slice(&src);
+}
+
+impl BlurLayer for TinySkiaPainter {
+    fn push_blur_layer(&mut self, radius_px: f32) {
+        let (w, h) = (self.pixmap.width(), self.pixmap.height());
+        // Draw into a fresh transparent surface so the blur sees ONLY this
+        // element. Blurring in place would smear whatever was already painted
+        // underneath it.
+        let saved = std::mem::replace(
+            &mut self.pixmap,
+            Pixmap::new(w.max(1), h.max(1)).unwrap(),
+        );
+        self.blur_stack.push((saved, radius_px));
+    }
+
+    fn pop_blur_layer(&mut self) {
+        if let Some((saved, radius)) = self.blur_stack.pop() {
+            let mut layer = std::mem::replace(&mut self.pixmap, saved);
+            box_blur(&mut layer, radius);
+            self.pixmap.draw_pixmap(
+                0,
+                0,
+                layer.as_ref(),
+                &tiny_skia::PixmapPaint::default(),
+                tiny_skia::Transform::identity(),
+                None,
+            );
+        }
+    }
+}
 
 impl PaintScene for TinySkiaPainter {
     /// Clear the framebuffer to white and reset the clip stack.
