@@ -450,6 +450,27 @@ impl BaseDocument {
             let mut breaker = inline_layout.layout.break_lines();
             let initial_slot = block_ctx.find_content_slot(0.0, Clear::None, None);
             let mut has_active_floats = initial_slot.segment_id.is_some();
+
+            /// A float that could not fit beside the content already on its line.
+            ///
+            /// CSS 2.1 §9.5: a float's outer top may not be higher than the top
+            /// of any line box holding content from an earlier element, and it
+            /// may not overlap that content. When the line has no room left the
+            /// float belongs BELOW it — placing it at the current line's top
+            /// instead forces the line to start after the float, which drags
+            /// content that was already positioned sideways. GitHub's profile
+            /// sidebar is exactly this: a full-width avatar followed by a
+            /// full-width floated name block, which shoved the avatar a whole
+            /// column to the right and left it hovering over the repo list.
+            struct DeferredFloat {
+                node_id: usize,
+                size: taffy::Size<f32>,
+                margin: taffy::Rect<f32>,
+                direction: taffy::FloatDirection,
+                clear: Clear,
+            }
+            let mut deferred_floats: Vec<DeferredFloat> = Vec::new();
+            let mut last_line_y_end = 0.0f64;
             let state = breaker.state_mut();
             state.set_layout_max_advance(width);
             state.set_line_max_advance(initial_slot.width * scale);
@@ -465,7 +486,28 @@ impl BaseDocument {
 
             while let Some(yield_data) = breaker.break_next() {
                 match yield_data {
-                    YieldData::LineBreak(_line_break_data) => {
+                    YieldData::LineBreak(line_break_data) => {
+                        last_line_y_end = line_break_data.line_y_end;
+                        // Floats that did not fit beside this line's content go
+                        // directly below it, now that its end is known.
+                        if !deferred_floats.is_empty() {
+                            let min_y = (line_break_data.line_y_end / scale as f64) as f32;
+                            for f in deferred_floats.drain(..) {
+                                let mut pos = block_ctx.place_floated_box(
+                                    f.size + f.margin.sum_axes(),
+                                    min_y,
+                                    f.direction,
+                                    f.clear,
+                                );
+                                pos.x += container_pb.left;
+                                pos.y += container_pb.top;
+                                let layout = &mut self.nodes[f.node_id].unrounded_layout;
+                                layout.size = f.size;
+                                layout.location.x = pos.x + f.margin.left + container_pb.left;
+                                layout.location.y = pos.y + f.margin.top + container_pb.top;
+                            }
+                            has_active_floats = true;
+                        }
                         let state = breaker.state_mut();
 
                         if has_active_floats {
@@ -512,6 +554,26 @@ impl BaseDocument {
 
                         let output =
                             self.compute_child_layout(NodeId::from(node_id), float_child_inputs);
+                        // Room left on this line, beside what is already on it.
+                        // `advance` is the line's used width at the moment the
+                        // float was reached.
+                        let used = box_break_data.advance / scale;
+                        let line_avail = state.line_max_advance() / scale;
+                        let float_outer_w = output.size.width + margin_sum.width;
+                        if used > 0.0 && float_outer_w > (line_avail - used) + 0.5 {
+                            deferred_floats.push(DeferredFloat {
+                                node_id,
+                                size: output.size,
+                                margin,
+                                direction,
+                                clear,
+                            });
+                            // Leave the line's x and max-advance alone: content
+                            // already placed on it must not move.
+                            state.append_inline_box_to_line(box_break_data.advance, 0.0);
+                            continue;
+                        }
+
                         let min_y = state.line_y() as f32 / scale;
                         let mut pos = block_ctx.place_floated_box(
                             output.size + margin_sum,
@@ -550,6 +612,22 @@ impl BaseDocument {
                         // }
                     }
                 }
+            }
+            // A float deferred on the LAST line never sees another line break.
+            for f in deferred_floats.drain(..) {
+                let min_y = (last_line_y_end / scale as f64) as f32;
+                let mut pos = block_ctx.place_floated_box(
+                    f.size + f.margin.sum_axes(),
+                    min_y,
+                    f.direction,
+                    f.clear,
+                );
+                pos.x += container_pb.left;
+                pos.y += container_pb.top;
+                let layout = &mut self.nodes[f.node_id].unrounded_layout;
+                layout.size = f.size;
+                layout.location.x = pos.x + f.margin.left + container_pb.left;
+                layout.location.y = pos.y + f.margin.top + container_pb.top;
             }
             breaker.finish();
         }

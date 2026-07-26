@@ -95,6 +95,10 @@ Honest list, not an exhaustive one:
 - **`mask-image` is unsupported**; a masked element paints unmasked. That is
   much closer to Chrome than dropping the layer, but a `mask-image` fade (the
   hero dot-grid's, for one) simply does not fade.
+- **A block that establishes a BFC does not avoid floats.** `overflow: hidden`
+  next to a float should sit beside it, or below when there is no room; instead
+  it overlaps. This is what still misplaces GitHub's profile name over its
+  Follow button.
 - **Conic/sweep gradients** fall back to their middle stop — tiny-skia has no
   sweep shader.
 - **Intrinsic sizing keywords** (`max-content`, `min-content`, `fit-content`,
