@@ -540,6 +540,28 @@ function __zippDrainQueues(rounds) {
 //
 // `target` must be the live node object, not an id — React finds its fiber via
 // an expando it set on that very object.
+// The class list the page put on <html>.
+//
+// Tailwind's dark mode is a `.dark` class on the document element, and the app
+// toggles it from an effect. Our re-render replaces only the BODY, so that
+// change never reached the real DOM and the theme toggle did nothing.
+function __getHtmlClass() {
+    try {
+        var el = doc.documentElement;
+        if (!el) return '';
+        var out = [];
+        if (el.className) out.push('class="' + String(el.className).replace(/"/g, '&quot;') + '"');
+        // Themes are marked with a class OR an attribute (`data-theme`,
+        // `data-mode`, `color-scheme`); carry whatever is actually there rather
+        // than guessing which convention this page uses.
+        for (var k in el.attributes) {
+            if (k === 'class' || k === 'style') continue;
+            out.push(k + '="' + String(el.attributes[k]).replace(/"/g, '&quot;') + '"');
+        }
+        return out.join(' ');
+    } catch (e) { return ''; }
+}
+
 function __zippDispatchEvent(handlerNid, targetNid, type) {
     var byType = __eventHandlers[handlerNid];
     if (!byType) return false;
@@ -1116,20 +1138,61 @@ fn run_zipp_js_inner(
     // the pipeline builds. Before this, the whole bundle was concatenated in as
     // a script and died at `import.meta is only valid in modules`.
     let mut module_entries: Vec<String> = Vec::new();
+    let mut inline_modules: Vec<String> = Vec::new();
     let mut pos = 0;
     while let Some(start) = html[pos..].find("<script") {
         let abs = pos + start;
         let tag_end = abs + html[abs..].find('>')? + 1;
         let tag = &html[abs..tag_end];
+        let ty = attr(tag, "type").unwrap_or_default();
+        let ty = ty.trim().to_ascii_lowercase();
+        // A `type` that names a non-JS format (importmap, application/json,
+        // text/template) is data, not code, and must not be executed.
+        let is_js = ty.is_empty()
+            || ty == "module"
+            || ty == "text/javascript"
+            || ty == "application/javascript";
         if let Some(src) = attr(tag, "src") {
             let full = resolve(page_url, &src);
-            if attr(tag, "type").is_some_and(|t| t.trim() == "module") {
+            if ty == "module" {
                 module_entries.push(full);
-            } else if let Ok(source) = fetch(&full) {
-                external_scripts.push((full, source));
+            } else if is_js {
+                if let Ok(source) = fetch(&full) {
+                    external_scripts.push((full, source));
+                }
+            }
+        } else if is_js {
+            // INLINE script. These were skipped entirely, so a page whose
+            // behaviour lives in a `<script>` block ran none of it — the tag was
+            // parsed for `src`, found none, and moved on.
+            let body_start = tag_end;
+            if let Some(close) = html[body_start..].find("</script") {
+                let code = &html[body_start..body_start + close];
+                if !code.trim().is_empty() {
+                    if ty == "module" {
+                        // An inline module still needs linking; give it a URL of
+                        // its own so relative specifiers resolve against the page.
+                        inline_modules.push(code.to_string());
+                    } else {
+                        external_scripts
+                            .push((format!("{page_url}#inline{abs}"), code.to_string()));
+                    }
+                }
+                pos = body_start + close;
+                continue;
             }
         }
         pos = tag_end;
+    }
+    // An inline module is rare and needs the linker; run it as a classic script
+    // when it has no import/export, which is the common case for a bootstrap
+    // snippet, and report it otherwise rather than silently dropping it.
+    for code in inline_modules {
+        if code.contains("import ") || code.contains("export ") || code.contains("import(") {
+            eprintln!("[JS] inline <script type=module> with imports is not linked yet");
+        } else {
+            external_scripts.push((format!("{page_url}#inline-module"), code));
+        }
     }
     if external_scripts.is_empty() && module_entries.is_empty() {
         return None;
@@ -1499,6 +1562,15 @@ fn wrap_with_toolbar(html: &str, current_url: &str) -> String {
 /// skipping it broke every relative image on the first click), and put the
 /// browser chrome back around it.
 pub(crate) fn rerender_body(rendered_body: &str, page_url: &str) -> String {
+    rerender_body_themed(rendered_body, page_url, "")
+}
+
+/// `rerender_body`, carrying the class the page put on `<html>`.
+pub(crate) fn rerender_body_themed(
+    rendered_body: &str,
+    page_url: &str,
+    html_class: &str,
+) -> String {
     let inner = match (rendered_body.find("<body"), rendered_body.rfind("</body>")) {
         (Some(start), Some(end)) => {
             let open_end = rendered_body[start..]
@@ -1513,7 +1585,7 @@ pub(crate) fn rerender_body(rendered_body: &str, page_url: &str) -> String {
         .ok()
         .map(|u| format!("{}://{}", u.scheme(), u.host_str().unwrap_or("")))
         .unwrap_or_default();
-    toolbar_body(&make_urls_absolute(inner, &base), page_url)
+    toolbar_body_themed(&make_urls_absolute(inner, &base), page_url, html_class)
 }
 
 /// The `<body>` contents: the browser chrome followed by the page.
@@ -1541,8 +1613,23 @@ pub(crate) fn rerender_body(rendered_body: &str, page_url: &str) -> String {
 /// it. Without this a single click removed the toolbar and dropped the page out
 /// of the flex column that gives it its height.
 fn toolbar_body(page_html: &str, current_url: &str) -> String {
+    toolbar_body_themed(page_html, current_url, "")
+}
+
+/// `toolbar_body`, carrying the class the page put on `<html>`.
+///
+/// The class goes on the injected wrapper rather than the real `<html>`: the
+/// wrapper is an ancestor of every page node, which is all a `.dark .x`
+/// selector needs, and it survives the body swap that a re-render performs.
+fn toolbar_body_themed(page_html: &str, current_url: &str, html_class: &str) -> String {
+    // Already a rendered attribute list (`class="dark" data-theme="dark"`).
+    let class_attr = if html_class.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" {html_class}")
+    };
     format!(
-        r#"<div style="display:flex;flex-direction:column;margin:0;padding:0;width:100%;min-height:100vh">
+        r#"<div{class_attr} style="display:flex;flex-direction:column;margin:0;padding:0;width:100%;min-height:100vh">
   <form action="{current_url}" method="GET" style="height:42px;min-height:42px;background:#f8f9fa;border-bottom:1px solid #dee2e6;display:flex;align-items:center;padding:4px 8px;gap:6px;font-family:Arial,sans-serif;box-sizing:border-box;width:100%;margin:0;flex-shrink:0">
     <span style="font-size:16px;color:#495057;padding:0 4px;cursor:pointer">◀</span>
     <span style="font-size:16px;color:#495057;padding:0 4px;cursor:pointer">▶</span>

@@ -242,9 +242,21 @@ impl EventHandler for JsEventBridge {
                                     // re-absolutising for the same reason: the
                                     // initial render did it, this path did not,
                                     // so images broke on the first click.
-                                    let rebuilt = crate::rerender_body(
+                                    // Carry the page's <html> class across: the
+                                    // theme toggle lives there and a body-only
+                                    // swap would drop it every re-render.
+                                    let html_class = match state.call_global("__getHtmlClass", &[])
+                                    {
+                                        Ok(JsValue::String(c)) => c,
+                                        _ => String::new(),
+                                    };
+                                    if std::env::var_os("ZIPP_DEBUG_EVENTS").is_some() {
+                                        eprintln!("[EVENT] <html> class = {html_class:?}");
+                                    }
+                                    let rebuilt = crate::rerender_body_themed(
                                         &new_html,
                                         &self.page_url,
+                                        &html_class,
                                     );
                                     eprintln!(
                                         "[EVENT] DOM updated after click ({} bytes)",
