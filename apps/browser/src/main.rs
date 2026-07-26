@@ -54,6 +54,14 @@ lazy_static::lazy_static! {
         .expect("failed to build HTTP client");
 }
 
+/// Viewport the page's JavaScript is told about on the windowed path.
+///
+/// The window does not exist yet when the page's script runs, so this is the
+/// size the shim reports for `window.innerWidth`/`innerHeight`. CSS is laid out
+/// against the real window (the Stylo device is rebuilt from it, and again on
+/// every resize), so only JS that branches on the reported size is affected.
+const INITIAL_WINDOW_SIZE: (u32, u32) = (1280, 800);
+
 /// Seconds to advance the animation clock before a headless screenshot, so CSS
 /// entrance animations land on their final keyframe rather than frame zero.
 const ANIMATION_SETTLE_SECS: f64 = 5.0;
@@ -101,7 +109,7 @@ fn main() {
 
     // 1-3. Fetch, run the page's JS, post-process. The ScriptState is !Send, so
     //      this stays on the main thread to keep it alive for event dispatch.
-    let (final_html, event_map_json, js_state) = prepare_page(&url);
+    let (final_html, event_map_json, js_state) = prepare_page(&url, INITIAL_WINDOW_SIZE);
     eprintln!("[BROWSER] Ready ({} bytes)", final_html.len());
 
     // Cache the initial page for instant back-navigation
@@ -351,7 +359,7 @@ fn prerender_linked_pages(html: &str, base_url: &str) {
         };
         let rendered = if html.contains("<script") {
             // Prerender only needs the HTML, discard the ScriptState.
-            run_zipp_js(&html, link)
+            run_zipp_js(&html, link, INITIAL_WINDOW_SIZE)
                 .map(|(h, _emap, _state)| h)
                 .unwrap_or(html)
         } else {
@@ -645,7 +653,7 @@ fn json_quote(s: &str) -> String {
 ///
 /// Returns the final HTML, the JS event map (when the page ran script), and the
 /// live `ScriptState` that keeps event handlers callable.
-fn prepare_page(url: &str) -> (String, Option<String>, Option<ScriptState>) {
+fn prepare_page(url: &str, viewport: (u32, u32)) -> (String, Option<String>, Option<ScriptState>) {
     let t_fetch = std::time::Instant::now();
     let html = fetch(url)
         .unwrap_or_else(|e| format!("<html><body><h1>Error</h1><p>{e}</p></body></html>"));
@@ -653,7 +661,7 @@ fn prepare_page(url: &str) -> (String, Option<String>, Option<ScriptState>) {
 
     let t_js = std::time::Instant::now();
     let (rendered, event_map_json, js_state) = if html.contains("<script") {
-        match run_zipp_js(&html, url) {
+        match run_zipp_js(&html, url, viewport) {
             Some((r, emap, state)) => (r, Some(emap), Some(state)),
             None => (html.clone(), None, None),
         }
@@ -692,7 +700,7 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
     use zipp_dom::traits_src::shell::{ColorScheme, Viewport};
 
     eprintln!("[SHOT] {url} -> {out_path} ({width}x{height})");
-    let (final_html, _event_map, _js_state) = prepare_page(url);
+    let (final_html, _event_map, _js_state) = prepare_page(url, (width, height));
     // Write the HTML the renderer sees alongside the image. When a screenshot
     // looks wrong the first question is always "is this a CSS/layout problem or
     // did the page's JS produce the wrong DOM?", and this answers it directly.
@@ -811,7 +819,11 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
 /// Phase 2 of the Live DOM Bridge: the ScriptState is kept alive on the
 /// main thread so that click (etc.) events can invoke actual JS handlers
 /// via `eval_in_context`.
-fn run_zipp_js(html: &str, page_url: &str) -> Option<(String, String, ScriptState)> {
+fn run_zipp_js(
+    html: &str,
+    page_url: &str,
+    viewport: (u32, u32),
+) -> Option<(String, String, ScriptState)> {
     // Grow the stack here rather than at each call site. JS recursion itself is
     // safe — zipp-vm keeps JS frames in an explicit Vec, not the native stack —
     // but PARSING and COMPILING a bundle is recursive over the AST on the native
@@ -819,11 +831,15 @@ fn run_zipp_js(html: &str, page_url: &str) -> Option<(String, String, ScriptStat
     // default thread stack. The prerender worker used to skip this and crashed
     // the process a few pages in.
     stacker::maybe_grow(64 * 1024 * 1024, 64 * 1024 * 1024, || {
-        run_zipp_js_inner(html, page_url)
+        run_zipp_js_inner(html, page_url, viewport)
     })
 }
 
-fn run_zipp_js_inner(html: &str, page_url: &str) -> Option<(String, String, ScriptState)> {
+fn run_zipp_js_inner(
+    html: &str,
+    page_url: &str,
+    viewport: (u32, u32),
+) -> Option<(String, String, ScriptState)> {
     let mut external_scripts = Vec::new();
     let mut pos = 0;
     while let Some(start) = html[pos..].find("<script") {
@@ -854,9 +870,12 @@ fn run_zipp_js_inner(html: &str, page_url: &str) -> Option<(String, String, Scri
         "__PAGE_URL__",
         &page_url.replace('\\', "\\\\").replace('\'', "\\'"),
     );
+    // The page's JS must see the SAME viewport the CSS is laid out against, or
+    // a responsive app that branches on `window.innerWidth` renders for one
+    // width while the cascade uses another.
     let shim = shim
-        .replace("__VIEWPORT_W__", "1024")
-        .replace("__VIEWPORT_H__", "768")
+        .replace("__VIEWPORT_W__", &viewport.0.to_string())
+        .replace("__VIEWPORT_H__", &viewport.1.to_string())
         .replace(
             "__BODY_HTML__",
             &body_html(html)
@@ -1006,7 +1025,7 @@ impl NavigationProvider for BrowserNavProvider {
                     // During navigation we extract just the HTML; the
                     // ScriptState is discarded since we can't move it
                     // across threads (!Send due to Rc).
-                    run_zipp_js(&html, &url)
+                    run_zipp_js(&html, &url, INITIAL_WINDOW_SIZE)
                         .map(|(h, _emap, _state)| h)
                         .unwrap_or(html)
                 } else {
@@ -1095,7 +1114,6 @@ fn wrap_with_toolbar(html: &str, current_url: &str) -> String {
     format!(
         r#"<!DOCTYPE html><html><head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=1280">
 {head_content}
 <style>{TOOLBAR_CSS}</style>
 </head><body style="margin:0 !important;padding:0 !important;max-width:none !important;width:100% !important">
