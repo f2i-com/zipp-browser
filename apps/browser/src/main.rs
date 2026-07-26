@@ -740,7 +740,7 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
     use zipp_dom::traits_src::shell::{ColorScheme, Viewport};
 
     eprintln!("[SHOT] {url} -> {out_path} ({width}x{height})");
-    let (mut final_html, _event_map, mut js_state) = prepare_page(url, (width, height));
+    let (mut final_html, event_map, mut js_state) = prepare_page(url, (width, height));
 
     // `ZIPP_CLICK=<data-flid>` dispatches a click at that element after the page
     // has settled, then re-serialises. Interaction otherwise needs a window and a
@@ -821,6 +821,19 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
 
     let t_parse = std::time::Instant::now();
     let mut doc = HtmlDocument::from_html(&final_html, config);
+
+    // Install the JS event bridge here too, not just on the windowed path.
+    // Without it `--screenshot` has no event handler at all, so a simulated
+    // click silently does nothing — which is exactly how a broken click path
+    // could look "verified" while the real window stayed dead.
+    if let Some(ref emap) = event_map {
+        let flid_map = event_bridge::build_flid_map(&doc);
+        let bridge =
+            event_bridge::JsEventBridge::new(flid_map, emap, js_state.take(), url);
+        if bridge.handler_count() > 0 {
+            doc.set_event_handler(Box::new(bridge));
+        }
+    }
     let parse_ms = t_parse.elapsed().as_millis();
 
     // Let linked stylesheets, webfonts and images arrive before layout.
@@ -863,6 +876,61 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
     doc.as_mut().resolve(0.0);
     doc.as_mut().resolve(ANIMATION_SETTLE_SECS);
     let layout_ms = t_layout.elapsed().as_millis();
+
+    // `ZIPP_UICLICK=x,y` sends a real pointer down+up at those client
+    // coordinates, so hit-testing, the event driver and the JS bridge all run —
+    // the same path a mouse takes. `ZIPP_CLICK` bypasses all of that and only
+    // proves the JS half, which is why it once reported success while clicking
+    // in the window still did nothing.
+    if let Some(spec) = std::env::var("ZIPP_UICLICK").ok() {
+        if let Some((sx, sy)) = spec.split_once(',') {
+            if let (Ok(x), Ok(y)) = (sx.trim().parse::<f32>(), sy.trim().parse::<f32>()) {
+                use zipp_dom::Document;
+                use zipp_dom::traits_src::events::{
+                    MouseEventButton, MouseEventButtons, PointerCoords, PointerDetails,
+                    PointerEvent, PointerId, UiEvent,
+                };
+                let coords = PointerCoords {
+                    screen_x: x, screen_y: y,
+                    client_x: x, client_y: y,
+                    page_x: x, page_y: y,
+                };
+                let mk = || PointerEvent {
+                    id: PointerId::Mouse,
+                    is_primary: true,
+                    coords,
+                    button: MouseEventButton::Main,
+                    buttons: MouseEventButtons::Primary,
+                    mods: Default::default(),
+                    details: PointerDetails::default(),
+                };
+                eprintln!("[UICLICK] pointer at ({x}, {y})");
+                doc.handle_ui_event(UiEvent::PointerMove(mk()));
+                doc.handle_ui_event(UiEvent::PointerDown(mk()));
+                doc.handle_ui_event(UiEvent::PointerUp(mk()));
+                // Advance PAST the settle time: nodes inserted by the click
+                // start their entrance animations at "now", so resolving at the
+                // same instant would capture them at opacity 0 and the page
+                // would look blank for reasons that have nothing to do with the
+                // click.
+                // Two frames. The re-render builds BRAND NEW nodes, so their
+                // entrance animations are created on the next resolve and
+                // stamped with that moment — sampling at the same instant shows
+                // every one of them at its 0% keyframe (opacity:0), i.e. a blank
+                // page. The second resolve advances past their duration.
+                doc.as_mut().resolve(ANIMATION_SETTLE_SECS * 4.0);
+                doc.as_mut().resolve(ANIMATION_SETTLE_SECS * 8.0);
+                if let Some(state) = js_state.as_mut() {
+                    if let Ok(JsValue::String(after)) =
+                        state.call_global("__getRenderedHTML", &[])
+                    {
+                        let _ = std::fs::write(format!("{out_path}.click.html"), &after);
+                        eprintln!("[UICLICK] wrote {out_path}.click.html");
+                    }
+                }
+            }
+        }
+    }
 
     // `ZIPP_DUMP_TREE=1` prints the resolved Taffy layout tree — the fastest way
     // to tell a cascade problem (wrong computed style) from a layout problem

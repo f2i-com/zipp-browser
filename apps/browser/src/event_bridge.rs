@@ -141,9 +141,22 @@ impl EventHandler for JsEventBridge {
         // first, so this is the click target regardless of which ancestor ends
         // up carrying the handler — and with React it is nearly always a
         // different node, because React delegates every listener to the root.
+        // The nearest node in the chain that the JS side knows about — NOT
+        // simply `chain[0]`.
+        //
+        // Hit-testing lands on whatever is actually under the pointer, which is
+        // often an element the shim never serialised with a `data-flid`: an
+        // anonymous block, a text run, or (the case that broke the hamburger) a
+        // `<path>` inside an inline `<svg>` icon. With no flid the target fell
+        // back to 0, `__nodesById[0]` was undefined, and React — which routes
+        // purely by `event.target` — dropped the click on the floor.
+        //
+        // Walking up to the nearest identified ancestor is also what the DOM
+        // says should happen: an event target is an element, and React expects
+        // the element whose fiber owns the handler to be reachable from it.
         let target_flid = chain
-            .first()
-            .and_then(|id| self.reverse_flid.get(id))
+            .iter()
+            .find_map(|id| self.reverse_flid.get(id))
             .copied()
             .unwrap_or(0);
 

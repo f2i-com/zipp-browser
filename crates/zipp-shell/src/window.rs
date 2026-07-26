@@ -540,6 +540,12 @@ impl<Rend: WindowRenderer> View<Rend> {
                 };
 
                 self.doc.handle_ui_event(UiEvent::Wheel(event));
+                // Every other input arm requests a repaint unconditionally; this
+                // one relied on `handle_wheel` doing it via the shell provider,
+                // and only when the offset actually changed. Any path that moved
+                // the page without that predicate agreeing left the window
+                // showing a stale frame — scrolling appeared to do nothing.
+                self.request_redraw();
             }
             WindowEvent::Focused(_) => {}
             WindowEvent::TouchpadPressure { .. } => {}
