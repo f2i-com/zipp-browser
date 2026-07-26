@@ -73,6 +73,26 @@ impl Document for HtmlDocument {
                     }
                     body
                 };
+                // The page's <html> class (its theme) must track the re-render
+                // too. A body-only swap left whatever the initial load put there
+                // in place forever, so dark mode could be turned on and never
+                // off — the `.dark` on the document element outlived the state
+                // that produced it.
+                let html_class = handler.document_element_class();
+                if let Some(class) = html_class {
+                    let root_id = self.inner.root_element().id;
+                    let mut mutator = crate::DocumentMutator::new(&mut self.inner);
+                    mutator.set_attribute(
+                        root_id,
+                        markup5ever::QualName::new(
+                            None,
+                            markup5ever::ns!(),
+                            markup5ever::local_name!("class"),
+                        ),
+                        &class,
+                    );
+                    drop(mutator);
+                }
                 if let Some(body_id) = body_id {
                     let mut mutator = crate::DocumentMutator::new(&mut self.inner);
                     mutator.set_inner_html(body_id, &html);

@@ -29,6 +29,14 @@ pub trait EventHandler {
     /// resolving events against nodes that no longer exist — the first
     /// interaction works and every one after it silently does nothing.
     fn document_rerendered(&mut self, _doc: &BaseDocument) {}
+
+    /// The class the page has on its `<html>` element, if the handler can say.
+    ///
+    /// Themes live there — `:root.dark` and friends — and a body-only re-render
+    /// cannot carry it, so the document has to be told separately.
+    fn document_element_class(&mut self) -> Option<String> {
+        None
+    }
 }
 
 pub struct NoopEventHandler;
@@ -59,6 +67,10 @@ impl EventHandler for Box<dyn EventHandler> {
     fn take_pending_rerender(&mut self) -> Option<String> {
         (**self).take_pending_rerender()
     }
+    fn document_element_class(&mut self) -> Option<String> {
+        (**self).document_element_class()
+    }
+
     fn document_rerendered(&mut self, doc: &BaseDocument) {
         (**self).document_rerendered(doc)
     }
@@ -70,6 +82,10 @@ impl EventHandler for &mut dyn EventHandler {
     fn take_pending_rerender(&mut self) -> Option<String> {
         (**self).take_pending_rerender()
     }
+    fn document_element_class(&mut self) -> Option<String> {
+        (**self).document_element_class()
+    }
+
     fn document_rerendered(&mut self, doc: &BaseDocument) {
         (**self).document_rerendered(doc)
     }

@@ -545,6 +545,12 @@ function __zippDrainQueues(rounds) {
 // Tailwind's dark mode is a `.dark` class on the document element, and the app
 // toggles it from an effect. Our re-render replaces only the BODY, so that
 // change never reached the real DOM and the theme toggle did nothing.
+// Just the class list on <html>, for applying to the real document element.
+function __getHtmlClassOnly() {
+    try { return String((doc.documentElement && doc.documentElement.className) || ''); }
+    catch (e) { return ''; }
+}
+
 function __getHtmlClass() {
     try {
         var el = doc.documentElement;

@@ -286,6 +286,21 @@ impl EventHandler for JsEventBridge {
         self.pending_rerender.take()
     }
 
+    /// The class the page currently has on `<html>`.
+    ///
+    /// Themes live there and a body-only re-render cannot carry it, so the
+    /// document applies this to the real document element separately. Returning
+    /// the value even when EMPTY matters: clearing the class is how a page
+    /// leaves dark mode, and treating "" as "nothing to say" would make the
+    /// theme switchable one way only.
+    fn document_element_class(&mut self) -> Option<String> {
+        let state = self.js_state.as_mut()?;
+        match state.call_global("__getHtmlClassOnly", &[]) {
+            Ok(JsValue::String(c)) => Some(c),
+            _ => None,
+        }
+    }
+
     /// Rebuild the node maps after the body was replaced.
     ///
     /// `set_inner_html` drops and re-parses the entire body, so every blitz-dom
