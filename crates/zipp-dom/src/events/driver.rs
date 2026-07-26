@@ -1,6 +1,6 @@
 //! Event dispatch driver for the DOM.
 
-use crate::Document;
+use crate::{BaseDocument, Document};
 use crate::traits_src::events::{
     PointerEvent, PointerId, DomEvent, DomEventData, EventState, UiEvent,
 };
@@ -16,10 +16,19 @@ pub trait EventHandler {
     );
 
     /// If the handler produced new HTML (e.g. React re-render after state update),
-    /// return it here. The caller will re-parse the document.
+    /// return it here. The caller replaces the document body with it.
     fn take_pending_rerender(&mut self) -> Option<String> {
         None
     }
+
+    /// Called after a `take_pending_rerender` result has been applied.
+    ///
+    /// Replacing the body destroys and recreates every node, so ANY node id the
+    /// handler cached is now stale. A handler that maps DOM nodes to its own
+    /// world (as the JS bridge does) has to rebuild here, or it will keep
+    /// resolving events against nodes that no longer exist — the first
+    /// interaction works and every one after it silently does nothing.
+    fn document_rerendered(&mut self, _doc: &BaseDocument) {}
 }
 
 pub struct NoopEventHandler;
@@ -50,6 +59,9 @@ impl EventHandler for Box<dyn EventHandler> {
     fn take_pending_rerender(&mut self) -> Option<String> {
         (**self).take_pending_rerender()
     }
+    fn document_rerendered(&mut self, doc: &BaseDocument) {
+        (**self).document_rerendered(doc)
+    }
 }
 
 /// Forwarding impl so an `&mut dyn EventHandler` reference can be passed by
@@ -57,6 +69,9 @@ impl EventHandler for Box<dyn EventHandler> {
 impl EventHandler for &mut dyn EventHandler {
     fn take_pending_rerender(&mut self) -> Option<String> {
         (**self).take_pending_rerender()
+    }
+    fn document_rerendered(&mut self, doc: &BaseDocument) {
+        (**self).document_rerendered(doc)
     }
     fn handle_event(
         &mut self,

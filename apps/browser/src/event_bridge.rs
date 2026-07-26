@@ -29,7 +29,7 @@ use zipp_dom::{BaseDocument, Document, EventHandler, LocalName};
 /// Walk every node in the parsed blitz-dom document and collect the
 /// `data-flid` attribute values.  Returns a map from JS node ID (the flid
 /// integer) to the blitz-dom slab node ID.
-pub fn build_flid_map(doc: &HtmlDocument) -> HashMap<u32, usize> {
+pub fn build_flid_map(doc: &BaseDocument) -> HashMap<u32, usize> {
     let mut map = HashMap::new();
     let flid_attr = LocalName::from("data-flid");
     // Recursive tree walk starting from the root node (id 0).
@@ -185,6 +185,15 @@ impl EventHandler for JsEventBridge {
                         if let Err(e) = &dispatched {
                             eprintln!("[EVENT] handler for \"{event_name}\" failed: {e}");
                         }
+                        // Flush what the handler scheduled. `call_global` returns
+                        // the moment the listener returns, so anything it queued
+                        // as a microtask is still pending — and React applies
+                        // state updates on a microtask. Without this the first
+                        // interaction appeared to work (its update happened to be
+                        // flushed synchronously) and every later one silently did
+                        // nothing, which is how the menu opened but would not
+                        // close.
+                        state.run_microtasks();
 
                         // For click events: settle the page, then see whether
                         // the handler changed the DOM.
@@ -195,6 +204,16 @@ impl EventHandler for JsEventBridge {
                                 "__zippDrainQueues",
                                 &[JsValue::Number(50.0)],
                             );
+                            // The shim's own queues and the VM's are separate,
+                            // and draining one can feed the other, so alternate
+                            // until both settle.
+                            for _ in 0..8 {
+                                state.run_microtasks();
+                                let _ = state.call_global(
+                                    "__zippDrainQueues",
+                                    &[JsValue::Number(50.0)],
+                                );
+                            }
                             if let Ok(JsValue::String(new_html)) =
                                 state.call_global("__getRenderedHTML", &[])
                             {
@@ -218,6 +237,9 @@ impl EventHandler for JsEventBridge {
                                         "[EVENT] DOM updated after click ({} bytes)",
                                         rebuilt.len()
                                     );
+                                    if let Ok(path) = std::env::var("ZIPP_DUMP_RERENDER") {
+                                        let _ = std::fs::write(&path, &rebuilt);
+                                    }
                                     self.pending_rerender = Some(rebuilt);
                                 }
                             }
@@ -237,6 +259,34 @@ impl EventHandler for JsEventBridge {
 
     fn take_pending_rerender(&mut self) -> Option<String> {
         self.pending_rerender.take()
+    }
+
+    /// Rebuild the node maps after the body was replaced.
+    ///
+    /// `set_inner_html` drops and re-parses the entire body, so every blitz-dom
+    /// node id in `flid_map`/`reverse_flid`/`handler_map` now refers to a node
+    /// that no longer exists. Without this the first click on a page worked and
+    /// every later one resolved against dead ids and did nothing — which is why
+    /// the hamburger opened but its X would not close it.
+    ///
+    /// The event map is re-read from the VM at the same time: a re-render can
+    /// mount new components, and those register their own listeners.
+    fn document_rerendered(&mut self, doc: &BaseDocument) {
+        let flid_map = build_flid_map(doc);
+        let event_map_json = self
+            .js_state
+            .as_mut()
+            .and_then(|state| match state.call_global("__getEventMap", &[]) {
+                Ok(JsValue::String(s)) => Some(s),
+                _ => None,
+            })
+            .unwrap_or_else(|| "{}".to_string());
+
+        self.handler_map = parse_event_map(&flid_map, &event_map_json);
+        self.reverse_flid = flid_map
+            .iter()
+            .map(|(&flid, &blitz_id)| (blitz_id, flid))
+            .collect();
     }
 }
 

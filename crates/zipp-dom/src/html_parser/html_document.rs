@@ -77,6 +77,11 @@ impl Document for HtmlDocument {
                     let mut mutator = crate::DocumentMutator::new(&mut self.inner);
                     mutator.set_inner_html(body_id, &html);
                     drop(mutator);
+                    // Every node id the handler cached is stale now — the body's
+                    // whole subtree was dropped and re-parsed. Let it rebuild
+                    // before the next event arrives, or only the FIRST
+                    // interaction on a page ever works.
+                    handler.document_rerendered(&self.inner);
                     self.inner.shell_provider.request_redraw();
                 }
             }

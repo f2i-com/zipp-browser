@@ -153,7 +153,7 @@ fn main() {
     // and wire the event bridge into the document so that DOM events call
     // actual JS handlers via the live ScriptState.
     if let Some(ref emap_json) = event_map_json {
-        let flid_map = event_bridge::build_flid_map(&doc);
+        let flid_map = event_bridge::build_flid_map(doc.as_ref());
         if !flid_map.is_empty() {
             eprintln!("[EVENT-BRIDGE] Mapped {} nodes with data-flid attributes", flid_map.len());
         }
@@ -573,6 +573,7 @@ function __zippDispatchEvent(handlerNid, targetNid, type) {
     var currentTarget = __nodesById[handlerNid] || null;
     var defaultPrevented = false;
     var propagationStopped = false;
+    var immediateStopped = false;
     var ev = {
         type: type,
         target: target,
@@ -592,7 +593,10 @@ function __zippDispatchEvent(handlerNid, targetNid, type) {
         get defaultPrevented() { return defaultPrevented; },
         preventDefault: function () { defaultPrevented = true; },
         stopPropagation: function () { propagationStopped = true; },
-        stopImmediatePropagation: function () { propagationStopped = true; },
+        stopImmediatePropagation: function () {
+            propagationStopped = true;
+            immediateStopped = true;
+        },
         composedPath: function () {
             var path = [], n = target;
             while (n) { path.push(n); n = n.parentNode; }
@@ -605,7 +609,17 @@ function __zippDispatchEvent(handlerNid, targetNid, type) {
 
     for (var i = 0; i < handlers.length; i++) {
         try { handlers[i](ev); } catch (e) {}
-        if (propagationStopped) break;
+        // Only stopImmediatePropagation may cut short the OTHER listeners on
+        // this same node. stopPropagation stops the event travelling to other
+        // nodes, which is a different thing entirely.
+        //
+        // React registers TWO listeners per event type on the root — one for
+        // the capture phase, one for bubble — and `onClick` lives on the bubble
+        // one. Treating stopPropagation as "stop calling listeners" meant that
+        // as soon as anything stopped propagation during capture (a
+        // click-outside overlay, for instance), onClick was never reached and
+        // the control became inert after its first use.
+        if (immediateStopped) break;
     }
     return true;
 }
@@ -756,7 +770,14 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
                 Ok(JsValue::String(s)) => s.parse::<u32>().unwrap_or(flid),
                 _ => flid,
             };
-            eprintln!("[CLICK] dispatching click: handler=#{root_flid} target=#{flid}");
+            let repeats: u32 = std::env::var("ZIPP_CLICK_N")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1);
+            for n in 0..repeats {
+            if n == 0 {
+            }
+            eprintln!("[CLICK] dispatch {} handler=#{root_flid} target=#{flid}", n + 1);
             match state.call_global(
                 "__zippDispatchEvent",
                 &[
@@ -768,13 +789,22 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
                 Ok(v) => eprintln!("[CLICK] dispatched -> {v:?}"),
                 Err(e) => eprintln!("[CLICK] dispatch failed: {e}"),
             }
-            let _ = state.call_global("__zippDrainQueues", &[JsValue::Number(50.0)]);
+            for _ in 0..8 {
+                state.run_microtasks();
+                let _ = state.call_global("__zippDrainQueues", &[JsValue::Number(50.0)]);
+            }
             if let Ok(JsValue::String(updated)) = state.call_global("__getRenderedHTML", &[]) {
                 if !updated.is_empty() {
-                    eprintln!("[CLICK] DOM after click: {} bytes", updated.len());
+                    eprintln!(
+                        "[CLICK] after dispatch {}: {} bytes, menu_open={}",
+                        n + 1,
+                        updated.len(),
+                        updated.contains("Close menu")
+                    );
                     // Same rebuild the event bridge performs, so this harness
                     // exercises the real path rather than an approximation.
                     let body = rerender_body(&updated, url);
+                    let _ = &body;
                     final_html = final_html
                         .split_once("<body")
                         .and_then(|(head, rest)| {
@@ -799,6 +829,8 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
     } else {
         eprintln!("[SHOT] wrote {html_path}");
     }
+
+            }
 
     let font_ctx = load_fonts();
     // The net provider fetches stylesheets and images. Those land asynchronously,
@@ -827,7 +859,7 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
     // click silently does nothing — which is exactly how a broken click path
     // could look "verified" while the real window stayed dead.
     if let Some(ref emap) = event_map {
-        let flid_map = event_bridge::build_flid_map(&doc);
+        let flid_map = event_bridge::build_flid_map(doc.as_ref());
         let bridge =
             event_bridge::JsEventBridge::new(flid_map, emap, js_state.take(), url);
         if bridge.handler_count() > 0 {
@@ -904,10 +936,26 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
                     mods: Default::default(),
                     details: PointerDetails::default(),
                 };
-                eprintln!("[UICLICK] pointer at ({x}, {y})");
-                doc.handle_ui_event(UiEvent::PointerMove(mk()));
-                doc.handle_ui_event(UiEvent::PointerDown(mk()));
-                doc.handle_ui_event(UiEvent::PointerUp(mk()));
+                // Repeat the click `ZIPP_UICLICK_N` times (default 1). Two
+                // clicks is the interesting case: the second only works if the
+                // handler rebuilt its node maps after the first re-render.
+                let clicks: u32 = std::env::var("ZIPP_UICLICK_N")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1);
+                for i in 0..clicks {
+                    eprintln!("[UICLICK] click {} at ({x}, {y})", i + 1);
+                    doc.handle_ui_event(UiEvent::PointerMove(mk()));
+                    doc.handle_ui_event(UiEvent::PointerDown(mk()));
+                    doc.handle_ui_event(UiEvent::PointerUp(mk()));
+                    // Settle layout between clicks so the next hit-test runs
+                    // against the tree the previous click produced.
+                    // Two resolves: the first creates the animations the
+                    // re-render introduced, the second advances past them, so
+                    // the next hit-test runs against settled geometry.
+                    doc.as_mut().resolve(ANIMATION_SETTLE_SECS * (2 + i * 2) as f64);
+                    doc.as_mut().resolve(ANIMATION_SETTLE_SECS * (3 + i * 2) as f64);
+                }
                 // Advance PAST the settle time: nodes inserted by the click
                 // start their entrance animations at "now", so resolving at the
                 // same instant would capture them at opacity 0 and the page
