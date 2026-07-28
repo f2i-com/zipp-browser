@@ -604,6 +604,17 @@ impl Node {
         self.tree().get(id).unwrap()
     }
 
+    /// [`Self::with`], but `None` when the id is no longer in the tree.
+    ///
+    /// A JS re-render replaces the whole body, which frees every node under it.
+    /// Cached child lists (`paint_children`, hoisted stacking-context children)
+    /// can still hold ids from before the swap until the next layout rebuilds
+    /// them, so anything walking those lists in response to an input event has
+    /// to tolerate a missing node rather than unwrap and take the process down.
+    pub fn try_with(&self, id: usize) -> Option<&Node> {
+        self.tree().get(id)
+    }
+
     pub fn print_tree(&self, level: usize) {
         println!(
             "{} {} {:?} {} {:?}",
@@ -995,7 +1006,10 @@ impl Node {
                 for hoisted_child in hoisted.pos_z_hoisted_children().rev() {
                     let x = x - hoisted_child.position.x;
                     let y = y - hoisted_child.position.y;
-                    if let Some(hit) = self.with(hoisted_child.node_id).hit(x, y) {
+                    let Some(child) = self.try_with(hoisted_child.node_id) else {
+                        continue;
+                    };
+                    if let Some(hit) = child.hit(x, y) {
                         return Some(hit);
                     }
                 }
@@ -1004,7 +1018,12 @@ impl Node {
 
         // Call `.hit()` on each child in turn. If any return `Some` then return that value. Else return `Some(self.id).
         for child_id in self.paint_children.borrow().iter().flatten().rev() {
-            if let Some(hit) = self.with(*child_id).hit(x, y) {
+            // Skip ids left over from before a body swap rather than unwrapping
+            // on a freed node -- see `try_with`.
+            let Some(child) = self.try_with(*child_id) else {
+                continue;
+            };
+            if let Some(hit) = child.hit(x, y) {
                 return Some(hit);
             }
         }
@@ -1015,7 +1034,10 @@ impl Node {
                 for hoisted_child in hoisted.neg_z_hoisted_children().rev() {
                     let x = x - hoisted_child.position.x;
                     let y = y - hoisted_child.position.y;
-                    if let Some(hit) = self.with(hoisted_child.node_id).hit(x, y) {
+                    let Some(child) = self.try_with(hoisted_child.node_id) else {
+                        continue;
+                    };
+                    if let Some(hit) = child.hit(x, y) {
                         return Some(hit);
                     }
                 }

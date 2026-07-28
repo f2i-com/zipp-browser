@@ -14,7 +14,7 @@ name = "test-inline"
 path = "src/test.rs"
 
 [features]
-default = ["svg", "system_fonts", "grid", "tracing", "net", "floats"]
+default = ["svg", "system_fonts", "grid", "tracing", "net", "floats", "cookies"]
 svg = [
     "zipp-dom/svg",
     "zipp-renderer/svg",

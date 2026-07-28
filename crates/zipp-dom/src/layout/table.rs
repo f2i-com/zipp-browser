@@ -87,6 +87,7 @@ pub(crate) fn build_table_context(
 
     let mut column_sizes: Vec<taffy::TrackSizingFunction> = Vec::new();
     let mut first_cell_border: Option<ServoArc<Border>> = None;
+    let mut occupied: Vec<u16> = Vec::new();
     for child_id in children.iter().copied() {
         collect_table_cells(
             doc,
@@ -99,9 +100,12 @@ pub(crate) fn build_table_context(
             &mut rows,
             &mut column_sizes,
             &mut first_cell_border,
+            &mut occupied,
         );
     }
-    column_sizes.resize(col as usize, style_helpers::auto());
+    // `col` alone is the LAST row's width, which a rowspan can leave short of
+    // the table's real column count.
+    column_sizes.resize((col as usize).max(occupied.len()), style_helpers::auto());
 
     style.grid_template_columns = column_sizes.into_iter().map(|dim| dim.into()).collect();
     style.grid_template_rows = vec![style_helpers::auto(); row as usize];
@@ -170,6 +174,10 @@ pub(crate) fn collect_table_cells(
     rows: &mut Vec<TableRow>,
     columns: &mut Vec<TrackSizingFunction>,
     first_cell_border: &mut Option<ServoArc<Border>>,
+    // Per column, the last row index a `rowspan` keeps that column covered
+    // through. Without it every row restarted at column 0 and slid underneath
+    // the cells above it.
+    occupied: &mut Vec<u16>,
 ) {
     let node = &mut doc.nodes[node_id];
 
@@ -208,6 +216,7 @@ pub(crate) fn collect_table_cells(
                     rows,
                     columns,
                     first_cell_border,
+                    occupied,
                 );
             }
             doc.nodes[node_id].children = children;
@@ -235,6 +244,7 @@ pub(crate) fn collect_table_cells(
                     rows,
                     columns,
                     first_cell_border,
+                    occupied,
                 );
             }
             doc.nodes[node_id].children = children;
@@ -246,6 +256,19 @@ pub(crate) fn collect_table_cells(
                 .attr(local_name!("colspan"))
                 .and_then(|val| val.parse().ok())
                 .unwrap_or(1);
+            let rowspan: u16 = node
+                .attr(local_name!("rowspan"))
+                .and_then(|val| val.parse().ok())
+                .filter(|n| *n >= 1)
+                .unwrap_or(1);
+
+            // Step over columns still covered by a rowspan from an earlier row.
+            // `col` is reset to 0 at the start of every row, so without this a
+            // cell was placed in a column another cell already occupied and the
+            // whole row shifted left underneath the spanning cell.
+            while (*col as usize) < occupied.len() && occupied[*col as usize] >= *row {
+                *col += 1;
+            }
             let mut style = crate::stylo_bridge::to_taffy_style(stylo_style);
 
             if first_cell_border.is_none() {
@@ -285,10 +308,22 @@ pub(crate) fn collect_table_cells(
             };
             style.grid_row = taffy::Line {
                 start: style_helpers::line(*row as i16),
-                end: style_helpers::span(1),
+                end: style_helpers::span(rowspan),
             };
             style.size.width = style_helpers::auto();
             cells.push(TableCell { node_id, style });
+
+            // Record the coverage so the following rows skip these columns.
+            if rowspan > 1 {
+                let last_row = *row + rowspan - 1;
+                let end = (*col + colspan) as usize;
+                if occupied.len() < end {
+                    occupied.resize(end, 0);
+                }
+                for c in (*col as usize)..end {
+                    occupied[c] = occupied[c].max(last_row);
+                }
+            }
 
             *col += colspan;
         }

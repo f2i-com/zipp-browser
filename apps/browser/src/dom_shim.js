@@ -479,6 +479,35 @@ doc.compatMode = "CSS1Compat";
 doc.characterSet = "UTF-8";
 doc.contentType = "text/html";
 
+// --- document.cookie ---
+//
+// Was entirely absent, so `document.cookie` read as undefined and any script
+// doing `document.cookie.split(';')` threw on the first line. Plenty of apps
+// read a CSRF token or a theme preference straight out of it during startup and
+// died there.
+//
+// This is a per-document jar with no persistence and no server round trip: the
+// network layer keeps its own store (the `cookies` feature), and nothing joins
+// the two yet. Expiry is honoured well enough that a script deleting a cookie by
+// setting a past `expires` sees it disappear, which is the common idiom.
+// This is a STUB, deliberately: a plain string property, not a real jar.
+// Reading gives back whatever was last written, verbatim, including any
+// `; path=/; expires=...` attributes, and writing a second cookie discards the
+// first. That is wrong, but it is inert-wrong — the property existing at all
+// stops `document.cookie.split(';')` throwing on line one of a startup script,
+// which is what actually broke pages.
+//
+// A correct jar needs a get/set accessor, and one cannot be made to work here
+// yet: the VM bypasses an accessor's setter when the assignment is compiled in a
+// different unit from the `defineProperty` (a page script assigning to a
+// property the shim defined), replacing it with an own data property. The same
+// fault shows up for any accessor defined on a PROTOTYPE. Both are reproducible
+// standalone; once the VM honours those, the parsing jar can replace this.
+//
+// Note also that nothing joins this to the network cookie store, so cookies
+// still do not survive a navigation or reach a server.
+doc.cookie = "";
+
 var __createElement_count = 0;
 var __domMutations = 0;
 doc.createElement = function(tag) { __createElement_count++; var el=new Element(tag); el.ownerDocument=doc; return el; };
@@ -804,10 +833,35 @@ if (!Array.prototype.entries) Array.prototype.entries = function() { var i = 0, 
 if (!Array.prototype.values) Array.prototype.values = function() { var i = 0, self = this; return { next: function() { return i < self.length ? {value:self[i++],done:false} : {done:true}; } }; };
 if (!Array.prototype.keys) Array.prototype.keys = function() { var i = 0, self = this; return { next: function() { return i < this.length ? {value:i++,done:false} : {done:true}; } }; };
 
-// --- sessionStorage polyfill ---
-var sessionStorage = { _data: {}, getItem: function(k) { return this._data[k] || null; }, setItem: function(k,v) { this._data[k] = String(v); }, removeItem: function(k) { delete this._data[k]; }, clear: function() { this._data = {}; } };
-// Also define localStorage as alias
-var localStorage = { _data: {}, getItem: function(k) { return this._data[k] || null; }, setItem: function(k,v) { this._data[k] = String(v); }, removeItem: function(k) { delete this._data[k]; }, clear: function() { this._data = {}; } };
+// --- Storage (localStorage / sessionStorage) ---
+//
+// The previous objects had only the four methods. `length` and `key(i)` were
+// missing, so the standard enumeration loop
+//   for (var i = 0; i < localStorage.length; i++) localStorage.key(i)
+// read `undefined` as the bound, silently iterated zero times, and any code
+// restoring saved state on startup just found nothing. `getItem` also used
+// `|| null`, which turned a stored "" or "0" into null.
+//
+// Still in-memory only: nothing is persisted across a page load, so this is a
+// working Storage API, not a working store.
+function __Storage() { this._data = {}; }
+__Storage.prototype.getItem = function(k) {
+    k = String(k);
+    return Object.prototype.hasOwnProperty.call(this._data, k) ? this._data[k] : null;
+};
+__Storage.prototype.setItem = function(k, v) { this._data[String(k)] = String(v); };
+__Storage.prototype.removeItem = function(k) { delete this._data[String(k)]; };
+__Storage.prototype.clear = function() { this._data = {}; };
+__Storage.prototype.key = function(i) {
+    var keys = Object.keys(this._data);
+    return i >= 0 && i < keys.length ? keys[i] : null;
+};
+Object.defineProperty(__Storage.prototype, "length", {
+    get: function() { return Object.keys(this._data).length; }
+});
+
+var sessionStorage = new __Storage();
+var localStorage = new __Storage();
 
 var __b64chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 function __btoa(s) {
