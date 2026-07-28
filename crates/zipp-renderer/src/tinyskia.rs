@@ -543,10 +543,75 @@ struct LayerEntry {
     saved_clip: Option<ClipRegion>,
     /// The previous clip's rasterized mask, restored with it.
     saved_mask: Option<Arc<tiny_skia::Mask>>,
-    /// If this is an opacity layer (alpha < 1.0), holds the pixmap snapshot
-    /// taken *before* any content was drawn into the layer, plus the alpha.
-    opacity_snapshot: Option<(Pixmap, f32)>,
+    /// If this is an opacity layer (alpha < 1.0), what the surface looked like
+    /// before the layer drew anything, plus the alpha.
+    opacity: Option<OpacityGroup>,
+    /// The enclosing group's dirty region, restored (and re-unioned) on pop so
+    /// that the layer's own region can be measured in isolation.
+    saved_dirty: Option<DirtyRect>,
+    /// How many `filter: blur()` layers were capturing when this layer was
+    /// pushed — i.e. which surface it composites against.
+    blur_depth: usize,
 }
+
+/// The surface underneath an `opacity` group, kept one row at a time.
+///
+/// Group opacity is applied by re-blending the group's result against what was
+/// there before, so the "before" has to survive the group. Snapshotting the
+/// WHOLE framebuffer to do it costs several megabytes of memcpy for an element
+/// that usually covers a sliver of the page — and the composite only ever reads
+/// back the rows the group actually wrote. So rows are saved lazily, the first
+/// time something draws into them, from the same place that records the group's
+/// dirty region: the set of saved rows and the set of blended rows are
+/// therefore the same set by construction, and cannot drift apart.
+struct OpacityGroup {
+    alpha: f32,
+    /// Where in `rows` each surface row was saved, or `-1` for "untouched".
+    slot: Vec<i32>,
+    /// The saved rows, back to back.
+    rows: Vec<u8>,
+}
+
+impl OpacityGroup {
+    fn new(alpha: f32, height: usize) -> Self {
+        Self {
+            alpha,
+            slot: vec![-1; height],
+            rows: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn save_row(&mut self, y: usize, row: &[u8]) {
+        if self.slot[y] >= 0 {
+            return;
+        }
+        self.slot[y] = (self.rows.len() / row.len()) as i32;
+        self.rows.extend_from_slice(row);
+    }
+
+    #[inline]
+    fn row(&self, y: usize, stride: usize) -> Option<&[u8]> {
+        let slot = *self.slot.get(y)?;
+        if slot < 0 {
+            return None;
+        }
+        let start = slot as usize * stride;
+        Some(&self.rows[start..start + stride])
+    }
+}
+
+/// Offscreen surface captured for `filter: blur()`.
+struct BlurEntry {
+    /// The surface the element is being painted *over*.
+    saved: Pixmap,
+    radius: f32,
+    saved_dirty: Option<DirtyRect>,
+}
+
+/// Device-space `[x0, y0, x1, y1]` with an exclusive maximum, always clamped to
+/// the framebuffer.
+type DirtyRect = [i32; 4];
 
 pub struct TinySkiaPainter {
     /// The RGBA pixel buffer that accumulates all drawing operations.
@@ -555,7 +620,18 @@ pub struct TinySkiaPainter {
     /// Stack of saved layer states, pushed/popped alongside layers.
     layer_stack: Vec<LayerEntry>,
     /// Offscreen surfaces captured for `filter: blur()`, with their radii.
-    blur_stack: Vec<(Pixmap, f32)>,
+    blur_stack: Vec<BlurEntry>,
+
+    /// Bounding box of every pixel written since the current group was pushed.
+    ///
+    /// Group operations — the opacity composite and the `filter: blur()`
+    /// composite — are whole-surface by nature: they have to touch every pixel
+    /// the group could have changed. Tracking what the group ACTUALLY changed
+    /// turns both from O(surface) into O(the element), which is what they cost
+    /// on a real page. Every primitive unions its device-space bounds in here,
+    /// padded a pixel for anti-aliasing spill and intersected with the clip
+    /// (which is what actually bounds the write).
+    dirty: Option<DirtyRect>,
 
     /// The currently active clip region, if any. Drawing operations outside this
     /// region are discarded or masked.
@@ -580,6 +656,83 @@ impl TinySkiaPainter {
             blur_stack: Vec::new(),
             active_clip: None,
             clip_mask: None,
+            dirty: None,
+        }
+    }
+
+    /// Union `bounds` (device space) into the current group's dirty region,
+    /// first intersecting it with the active clip.
+    ///
+    /// Only sound for primitives that honour the clip — every one of them does
+    /// except the group composites, which use [`mark_dirty_device`].
+    #[inline]
+    fn mark_dirty(&mut self, bounds: Rect) {
+        let bounds = match &self.active_clip {
+            Some(clip) => bounds.intersect(clip.bounding_box()),
+            None => bounds,
+        };
+        self.mark_dirty_device(bounds);
+    }
+
+    /// Union `bounds` into the current group's dirty region without consulting
+    /// the clip.
+    ///
+    /// MUST be called before the pixels are written: it is also where any
+    /// enclosing `opacity` group saves the rows about to change.
+    fn mark_dirty_device(&mut self, bounds: Rect) {
+        let (w, h) = (self.pixmap.width() as i64, self.pixmap.height() as i64);
+        // One pixel of slack on every side: a rasterizer writes anti-aliased
+        // coverage just outside a shape's geometric bounds, and this region has
+        // to be a superset of what was touched or the group composite would
+        // leave a sliver of the element uncomposited. Float-to-int casts
+        // saturate in Rust, so infinities and NaN land inside the clamp.
+        let x0 = ((bounds.x0.floor() as i64) - 1).clamp(0, w) as i32;
+        let y0 = ((bounds.y0.floor() as i64) - 1).clamp(0, h) as i32;
+        let x1 = ((bounds.x1.ceil() as i64) + 1).clamp(0, w) as i32;
+        let y1 = ((bounds.y1.ceil() as i64) + 1).clamp(0, h) as i32;
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+
+        // Preserve what any enclosing opacity group is about to lose.
+        //
+        // Only groups sitting on the CURRENT surface: `filter: blur()` swaps
+        // `pixmap` for an offscreen one, so a group pushed outside that blur
+        // composites against a surface these pixels are not part of, and must
+        // not sample them. Its turn comes when `pop_blur_layer` records the
+        // composite back onto the real surface.
+        if !self.layer_stack.is_empty() {
+            let depth = self.blur_stack.len();
+            let stride = self.pixmap.width() as usize * 4;
+            // Disjoint fields: the surface is read while the stack is updated.
+            let data = self.pixmap.data();
+            for entry in self.layer_stack.iter_mut() {
+                if entry.blur_depth != depth {
+                    continue;
+                }
+                let Some(group) = entry.opacity.as_mut() else {
+                    continue;
+                };
+                for y in y0 as usize..y1 as usize {
+                    let start = y * stride;
+                    group.save_row(y, &data[start..start + stride]);
+                }
+            }
+        }
+
+        self.union_dirty([x0, y0, x1, y1]);
+    }
+
+    #[inline]
+    fn union_dirty(&mut self, r: DirtyRect) {
+        match &mut self.dirty {
+            Some(d) => {
+                d[0] = d[0].min(r[0]);
+                d[1] = d[1].min(r[1]);
+                d[2] = d[2].max(r[2]);
+                d[3] = d[3].max(r[3]);
+            }
+            None => self.dirty = Some(r),
         }
     }
 
@@ -663,6 +816,29 @@ pub trait BlurLayer {
     fn apply_backdrop_blur(&mut self, radius_px: f32, rect: (f32, f32, f32, f32));
 }
 
+/// Half-width of the box window used for each of [`box_blur`]'s three passes,
+/// for a Gaussian of standard deviation `sigma`.
+#[inline]
+fn box_blur_half_width(sigma: f32) -> usize {
+    let box_w = ((sigma * 3.0 * (2.0 * std::f32::consts::PI).sqrt() / 4.0) + 0.5) as usize;
+    (box_w / 2).max(1)
+}
+
+/// How far [`box_blur`] can carry a pixel's colour: three passes of half-width
+/// `r` each, plus a pixel of slack.
+///
+/// A blur confined to a region is identical to a blur of the whole surface as
+/// long as the region extends this far past the last non-transparent pixel —
+/// beyond it the window sees only transparent pixels, and the edge-clamping the
+/// passes do at the region border clamps transparent onto transparent.
+#[inline]
+fn box_blur_reach(sigma: f32) -> i32 {
+    if sigma < 0.5 {
+        return 0;
+    }
+    (box_blur_half_width(sigma) * 3) as i32 + 1
+}
+
 /// Blur `pixmap` in place with three box passes.
 ///
 /// Three successive box blurs approximate a Gaussian closely enough that the
@@ -679,77 +855,138 @@ fn box_blur(pixmap: &mut tiny_skia::Pixmap, radius: f32) {
     if w == 0 || h == 0 || radius < 0.5 {
         return;
     }
-    // Box width for three passes approximating a Gaussian of this sigma.
-    let sigma = radius;
-    let box_w = ((sigma * 3.0 * (2.0 * std::f32::consts::PI).sqrt() / 4.0) + 0.5) as usize;
-    let r = (box_w / 2).max(1);
-    if r == 0 {
-        return;
-    }
+    let r = box_blur_half_width(radius);
+    let recip = Reciprocal::new((2 * r + 1) as u32);
 
     let data = pixmap.data_mut();
-    let mut src: Vec<u8> = data.to_vec();
-    let mut dst: Vec<u8> = vec![0; data.len()];
+    // A pixel at a time rather than a byte at a time. The window update is four
+    // independent lanes, and grouping them lets the compiler keep a pixel in one
+    // register and vectorize the pass; addressing every channel separately hid
+    // that, and cost a bounds check per channel on top.
+    let n = w * h;
+    let mut src: Vec<[u8; 4]> = Vec::with_capacity(n);
+    src.extend(data.chunks_exact(4).map(|p| [p[0], p[1], p[2], p[3]]));
+    let mut dst: Vec<[u8; 4]> = vec![[0u8; 4]; n];
 
     for _ in 0..3 {
-        // Horizontal.
-        for y in 0..h {
-            let row = y * w * 4;
-            let mut acc = [0u32; 4];
-            // Prime the window with the clamped left edge.
-            for i in 0..=r {
-                let x = i.min(w - 1);
-                for c in 0..4 {
-                    acc[c] += src[row + x * 4 + c] as u32;
-                }
-            }
-            for c in 0..4 {
-                acc[c] += src[row + c] as u32 * r as u32;
-            }
-            let count = (2 * r + 1) as u32;
-            for x in 0..w {
-                for c in 0..4 {
-                    dst[row + x * 4 + c] = (acc[c] / count) as u8;
-                }
-                let add = (x + r + 1).min(w - 1);
-                let sub = x.saturating_sub(r);
-                for c in 0..4 {
-                    acc[c] += src[row + add * 4 + c] as u32;
-                    acc[c] -= src[row + sub * 4 + c] as u32;
-                }
-            }
-        }
+        blur_rows(&src, &mut dst, w, h, r, recip);
         std::mem::swap(&mut src, &mut dst);
-
-        // Vertical.
-        for x in 0..w {
-            let col = x * 4;
-            let mut acc = [0u32; 4];
-            for i in 0..=r {
-                let y = i.min(h - 1);
-                for c in 0..4 {
-                    acc[c] += src[y * w * 4 + col + c] as u32;
-                }
-            }
-            for c in 0..4 {
-                acc[c] += src[col + c] as u32 * r as u32;
-            }
-            let count = (2 * r + 1) as u32;
-            for y in 0..h {
-                for c in 0..4 {
-                    dst[y * w * 4 + col + c] = (acc[c] / count) as u8;
-                }
-                let add = (y + r + 1).min(h - 1);
-                let sub = y.saturating_sub(r);
-                for c in 0..4 {
-                    acc[c] += src[add * w * 4 + col + c] as u32;
-                    acc[c] -= src[sub * w * 4 + col + c] as u32;
-                }
-            }
-        }
+        blur_cols(&src, &mut dst, w, h, r, recip);
         std::mem::swap(&mut src, &mut dst);
     }
-    data.copy_from_slice(&src);
+
+    for (out, px) in data.chunks_exact_mut(4).zip(src.iter()) {
+        out.copy_from_slice(px);
+    }
+}
+
+/// Division by a fixed box width, as a multiply.
+///
+/// The box passes divide by the window width once per channel per pixel — four
+/// integer divisions per pixel per pass, twenty-four per pixel per blur, and an
+/// integer division is an order of magnitude slower than a multiply. This
+/// reproduces `n / d` EXACTLY (not approximately) for every `n` the passes can
+/// produce, so the blurred output is unchanged bit for bit.
+#[derive(Clone, Copy)]
+struct Reciprocal(u64);
+
+impl Reciprocal {
+    /// `m = floor(2^55 / d) + 1` gives `floor(n*m / 2^55) == floor(n / d)` for
+    /// all `0 <= n <= 255*d` provided `256*d^2 < 2^55` — true for any `d` up to
+    /// eleven million, where the largest a box window can be here is a few
+    /// thousand. `n*m` stays under `255 * 2^55`, well inside `u64`.
+    #[inline]
+    fn new(d: u32) -> Self {
+        Self((1u64 << 55) / d as u64 + 1)
+    }
+
+    #[inline(always)]
+    fn apply(self, n: u32) -> u8 {
+        ((n as u64 * self.0) >> 55) as u8
+    }
+}
+
+/// One horizontal box pass: `dst[x] = mean(src[x-r ..= x+r])`, with the row's
+/// end pixels replicated past its edges.
+fn blur_rows(src: &[[u8; 4]], dst: &mut [[u8; 4]], w: usize, h: usize, r: usize, recip: Reciprocal) {
+    for y in 0..h {
+        let s = &src[y * w..y * w + w];
+        let d = &mut dst[y * w..y * w + w];
+        let mut acc = [0u32; 4];
+        // Prime the window with the clamped left edge.
+        for i in 0..=r {
+            let p = s[i.min(w - 1)];
+            for c in 0..4 {
+                acc[c] += p[c] as u32;
+            }
+        }
+        let first = s[0];
+        for c in 0..4 {
+            acc[c] += first[c] as u32 * r as u32;
+        }
+        for x in 0..w {
+            let mut out = [0u8; 4];
+            for c in 0..4 {
+                out[c] = recip.apply(acc[c]);
+            }
+            d[x] = out;
+            let add = s[(x + r + 1).min(w - 1)];
+            let sub = s[x.saturating_sub(r)];
+            for c in 0..4 {
+                acc[c] = acc[c] + add[c] as u32 - sub[c] as u32;
+            }
+        }
+    }
+}
+
+/// One vertical box pass.
+///
+/// Walked in strips of columns rather than one column at a time: a single
+/// column steps through memory by a whole row per pixel, so every read is a
+/// cache miss that fetches 64 bytes to use 4. A strip that wide uses the entire
+/// line it pulls in.
+fn blur_cols(src: &[[u8; 4]], dst: &mut [[u8; 4]], w: usize, h: usize, r: usize, recip: Reciprocal) {
+    const STRIP: usize = 16;
+    let mut x0 = 0;
+    while x0 < w {
+        let x1 = (x0 + STRIP).min(w);
+        let bw = x1 - x0;
+        let mut acc = [[0u32; 4]; STRIP];
+
+        for i in 0..=r {
+            let row = &src[i.min(h - 1) * w + x0..i.min(h - 1) * w + x1];
+            for k in 0..bw {
+                for c in 0..4 {
+                    acc[k][c] += row[k][c] as u32;
+                }
+            }
+        }
+        let top = &src[x0..x1];
+        for k in 0..bw {
+            for c in 0..4 {
+                acc[k][c] += top[k][c] as u32 * r as u32;
+            }
+        }
+
+        for y in 0..h {
+            let out = &mut dst[y * w + x0..y * w + x1];
+            for k in 0..bw {
+                for c in 0..4 {
+                    out[k][c] = recip.apply(acc[k][c]);
+                }
+            }
+            let ya = (y + r + 1).min(h - 1);
+            let ys = y.saturating_sub(r);
+            let add = &src[ya * w + x0..ya * w + x1];
+            let sub = &src[ys * w + x0..ys * w + x1];
+            for k in 0..bw {
+                for c in 0..4 {
+                    acc[k][c] = acc[k][c] + add[k][c] as u32 - sub[k][c] as u32;
+                }
+            }
+        }
+        x0 = x1;
+    }
 }
 
 impl BlurLayer for TinySkiaPainter {
@@ -762,7 +999,11 @@ impl BlurLayer for TinySkiaPainter {
             &mut self.pixmap,
             Pixmap::new(w.max(1), h.max(1)).unwrap(),
         );
-        self.blur_stack.push((saved, radius_px));
+        self.blur_stack.push(BlurEntry {
+            saved,
+            radius: radius_px,
+            saved_dirty: self.dirty.take(),
+        });
     }
 
     fn apply_backdrop_blur(&mut self, radius_px: f32, rect: (f32, f32, f32, f32)) {
@@ -802,6 +1043,14 @@ impl BlurLayer for TinySkiaPainter {
         );
         let Some(keep) = keep else { return };
         let Some(cropped) = region.clone_rect(keep) else { return };
+        // Recorded before the write, and without consulting the clip, which
+        // this ignores.
+        self.mark_dirty_device(Rect::new(
+            x0.floor() as f64,
+            y0.floor() as f64,
+            x1.ceil() as f64,
+            y1.ceil() as f64,
+        ));
         self.pixmap.draw_pixmap(
             x0.floor() as i32,
             y0.floor() as i32,
@@ -813,18 +1062,50 @@ impl BlurLayer for TinySkiaPainter {
     }
 
     fn pop_blur_layer(&mut self) {
-        if let Some((saved, radius)) = self.blur_stack.pop() {
-            let mut layer = std::mem::replace(&mut self.pixmap, saved);
-            box_blur(&mut layer, radius);
-            self.pixmap.draw_pixmap(
-                0,
-                0,
-                layer.as_ref(),
-                &tiny_skia::PixmapPaint::default(),
-                tiny_skia::Transform::identity(),
-                None,
-            );
-        }
+        let Some(entry) = self.blur_stack.pop() else {
+            return;
+        };
+        let layer = std::mem::replace(&mut self.pixmap, entry.saved);
+
+        // What the element actually painted into the offscreen surface.
+        let content = self.dirty;
+        self.dirty = entry.saved_dirty;
+
+        // Nothing was drawn: there is no glow, and no reason to blur or
+        // composite a surface that is uniformly transparent.
+        let Some(d) = content else {
+            return;
+        };
+
+        // Blurring and compositing the WHOLE surface for one element is what
+        // made a single `filter: blur()` cost as much as the rest of the frame.
+        // The element's own region plus the blur's reach is all that can differ
+        // from transparent, so it is all that has to be touched.
+        let pad = box_blur_reach(entry.radius);
+        let (w, h) = (self.pixmap.width() as i32, self.pixmap.height() as i32);
+        let x0 = (d[0] - pad).max(0);
+        let y0 = (d[1] - pad).max(0);
+        let x1 = (d[2] + pad).min(w);
+        let y1 = (d[3] + pad).min(h);
+        let (Some(rect), true) = (tiny_skia::IntRect::from_ltrb(x0, y0, x1, y1), x1 > x0 && y1 > y0)
+        else {
+            return;
+        };
+        let Some(mut region) = layer.clone_rect(rect) else {
+            return;
+        };
+        box_blur(&mut region, entry.radius);
+        // Recorded before the write, and unclipped: the composite ignores the
+        // clip.
+        self.mark_dirty_device(Rect::new(x0 as f64, y0 as f64, x1 as f64, y1 as f64));
+        self.pixmap.draw_pixmap(
+            x0,
+            y0,
+            region.as_ref(),
+            &tiny_skia::PixmapPaint::default(),
+            tiny_skia::Transform::identity(),
+            None,
+        );
     }
 }
 
@@ -837,15 +1118,18 @@ impl PaintScene for TinySkiaPainter {
 
         self.pixmap.fill(tiny_skia::Color::WHITE);
         self.layer_stack.clear();
+        self.blur_stack.clear();
         self.active_clip = None;
         self.clip_mask = None;
+        self.dirty = None;
     }
 
     /// Push a compositing layer with a clip shape and optional opacity.
     ///
-    /// When `alpha` < 1.0 the current pixmap is snapshotted so that on
-    /// [`pop_layer`] the newly drawn content can be alpha-blended over the
-    /// original. This gives correct group-opacity semantics.
+    /// When `alpha` < 1.0 the surface underneath is preserved — lazily, a row
+    /// at a time as the layer paints — so that on [`pop_layer`] the newly drawn
+    /// content can be alpha-blended over the original. This gives correct
+    /// group-opacity semantics.
     fn push_layer(
         &mut self,
         _blend: impl Into<BlendMode>,
@@ -853,57 +1137,91 @@ impl PaintScene for TinySkiaPainter {
         transform: Affine,
         clip: &impl Shape,
     ) {
-        let (old_clip, old_mask) = self.push_clip(transform_clip_shape(transform, clip));
+        let shape = transform_clip_shape(transform, clip);
+        let (old_clip, old_mask) = self.push_clip(shape);
 
-        let opacity_snapshot = if alpha < 1.0 {
-            Some((self.pixmap.clone(), alpha))
-        } else {
-            None
-        };
+        let opacity =
+            (alpha < 1.0).then(|| OpacityGroup::new(alpha, self.pixmap.height() as usize));
 
         self.layer_stack.push(LayerEntry {
             saved_clip: old_clip,
             saved_mask: old_mask,
-            opacity_snapshot,
+            opacity,
+            saved_dirty: self.dirty.take(),
+            blur_depth: self.blur_stack.len(),
         });
     }
 
     /// Push a clip-only layer (no blend mode, full opacity).
     fn push_clip_layer(&mut self, transform: Affine, clip: &impl Shape) {
-        let (old_clip, old_mask) = self.push_clip(transform_clip_shape(transform, clip));
+        let shape = transform_clip_shape(transform, clip);
+        let (old_clip, old_mask) = self.push_clip(shape);
         self.layer_stack.push(LayerEntry {
             saved_clip: old_clip,
             saved_mask: old_mask,
-            opacity_snapshot: None,
+            opacity: None,
+            saved_dirty: self.dirty.take(),
+            blur_depth: self.blur_stack.len(),
         });
     }
 
     /// Pop the most recent layer, restoring the previous clip region.
     ///
-    /// For opacity layers the snapshotted pixmap is restored and the content
-    /// drawn during the layer is composited on top at the layer's alpha value.
+    /// For opacity layers the preserved rows are blended back with the content
+    /// drawn during the layer, at the layer's alpha value — over the region the
+    /// layer actually painted, and no further.
     fn pop_layer(&mut self) {
         if let Some(entry) = self.layer_stack.pop() {
             self.active_clip = entry.saved_clip;
             self.clip_mask = entry.saved_mask;
 
-            if let Some((snapshot, alpha)) = entry.opacity_snapshot {
-                // Blend: for each pixel, result = snapshot + (current - snapshot) * alpha
+            // What this layer painted, measured in isolation; then folded back
+            // into the enclosing group, which is equally changed by it.
+            let content = self.dirty;
+            self.dirty = entry.saved_dirty;
+            if let Some(c) = content {
+                self.union_dirty(c);
+            }
+
+            if let Some(group) = entry.opacity {
+                // Only the region the layer actually painted can differ from
+                // what was underneath, so it is the only region worth blending
+                // — walking the whole framebuffer per opacity group is what
+                // made a page with a dozen of them spend more time compositing
+                // than drawing.
+                let Some([x0, y0, x1, y1]) = content else {
+                    return;
+                };
+                // Blend: for each pixel, result = under + (current - under) * alpha
                 //
-                // `current - snapshot` is SIGNED — the layer darkens a pixel as
+                // `current - under` is SIGNED — the layer darkens a pixel as
                 // often as it lightens one. Computed in u16 the negative case
                 // wraps to ~65535 and the following multiply overflows, which
                 // panicked on the first frame of any page using opacity. i32 is
                 // wide enough that no intermediate can overflow: the difference
                 // is within ±255 and the product within ±65025.
-                let alpha = (alpha * 255.0).round().clamp(0.0, 255.0) as i32;
-                let src = snapshot.data();
+                let alpha = (group.alpha * 255.0).round().clamp(0.0, 255.0) as i32;
+                let stride = self.pixmap.width() as usize * 4;
+                let (lo, hi) = (x0 as usize * 4, x1 as usize * 4);
+                // Disjoint fields: the saved rows are read while the surface is
+                // written.
                 let dst = self.pixmap.data_mut();
-                // Both pixmaps have the same dimensions so byte counts match.
-                for (d, s) in dst.iter_mut().zip(src.iter()) {
-                    let snapshot = i32::from(*s);
-                    let current = i32::from(*d);
-                    *d = (snapshot + (current - snapshot) * alpha / 255) as u8;
+                for y in y0 as usize..y1 as usize {
+                    // A row inside the group's bounding box that it never
+                    // actually wrote is unchanged, and blending it would be a
+                    // no-op.
+                    let Some(under) = group.row(y, stride) else {
+                        continue;
+                    };
+                    let base = y * stride;
+                    for (d, s) in dst[base + lo..base + hi]
+                        .iter_mut()
+                        .zip(under[lo..hi].iter())
+                    {
+                        let under = i32::from(*s);
+                        let current = i32::from(*d);
+                        *d = (under + (current - under) * alpha / 255) as u8;
+                    }
                 }
             }
         }
@@ -938,7 +1256,9 @@ impl PaintScene for TinySkiaPainter {
                     // radial gradients with a ~1px radius at the origin — they
                     // rendered as nothing at all.
                     let paint = make_brush_paint(&paint_ref, brush_space(brush_transform));
-                    let mask = self.clip_mask_for(device_bounds(shape, transform));
+                    let bounds = device_bounds(shape, transform);
+                    self.mark_dirty(bounds);
+                    let mask = self.clip_mask_for(bounds);
                     self.pixmap
                         .fill_path(&path, &paint, FillRule::Winding, ts, mask.as_deref());
                 }
@@ -965,8 +1285,9 @@ impl PaintScene for TinySkiaPainter {
             };
             let ts = affine_to_transform(transform);
             let paint = make_brush_paint(&paint_ref, brush_space(brush_transform));
-            let mask =
-                self.clip_mask_for(device_bounds(shape, transform).inflate(style.width, style.width));
+            let bounds = device_bounds(shape, transform).inflate(style.width, style.width);
+            self.mark_dirty(bounds);
+            let mask = self.clip_mask_for(bounds);
             self.pixmap
                 .stroke_path(&path, &paint, &stroke, ts, mask.as_deref());
         }
@@ -1049,6 +1370,11 @@ impl PaintScene for TinySkiaPainter {
                 Rect::new(0.0, 0.0, 0.0, 0.0)
             }
         };
+        // Twice the em size for the dirty region: `run_bounds` is a good enough
+        // guess for "does this run cross the clip", but a group composite needs
+        // a bound it can never fall outside, and an accent or a swash can reach
+        // past one em from the baseline.
+        self.mark_dirty(run_bounds.inflate(font_size as f64, font_size as f64));
         let clip_mask = self.clip_mask_for(run_bounds);
 
         for glyph in glyphs {
@@ -1114,6 +1440,13 @@ impl PaintScene for TinySkiaPainter {
         // Ratio to map from destination pixels back to source pixels
         let sample_ratio_x = image_width as f32 / dest_width;
         let sample_ratio_y = image_height as f32 / dest_height;
+
+        self.mark_dirty(Rect::new(
+            dest_x as f64,
+            dest_y as f64,
+            (dest_x + dest_width) as f64,
+            (dest_y + dest_height) as f64,
+        ));
 
         // Prepare clip mask. For rounded containers (e.g. avatar circles), the
         // clip region is rasterized into a 1-bit mask. Each destination pixel is
@@ -1259,12 +1592,9 @@ impl PaintScene for TinySkiaPainter {
 
         box_blur(&mut layer, sigma);
 
-        let mask = self.clip_mask_for(Rect::new(
-            x0 as f64,
-            y0 as f64,
-            (x0 + w) as f64,
-            (y0 + h) as f64,
-        ));
+        let bounds = Rect::new(x0 as f64, y0 as f64, (x0 + w) as f64, (y0 + h) as f64);
+        self.mark_dirty(bounds);
+        let mask = self.clip_mask_for(bounds);
         let paint = tiny_skia::PixmapPaint {
             opacity: a as f32 / 255.0,
             ..Default::default()
@@ -1328,6 +1658,13 @@ impl TinySkiaPainter {
         // area was covered by one stretched copy instead of repeats.
         let wrap_x = matches!(img.sampler.x_extend, peniko::Extend::Repeat);
         let wrap_y = matches!(img.sampler.y_extend, peniko::Extend::Repeat);
+
+        self.mark_dirty(Rect::new(
+            dest_x as f64,
+            dest_y as f64,
+            (dest_x + dest_width) as f64,
+            (dest_y + dest_height) as f64,
+        ));
 
         // Honour the active clip, exactly as `draw_image` does. Without this a
         // background image ignored `overflow:hidden` and rounded corners and
