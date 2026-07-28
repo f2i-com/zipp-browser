@@ -626,11 +626,21 @@ pub fn to_taffy_style(style: &stylo::ComputedValues) -> taffy::Style<Atom> {
         },
         aspect_ratio: self::aspect_ratio(pos.aspect_ratio),
 
-        inset: taffy::Rect {
-            left: self::inset(&pos.left),
-            right: self::inset(&pos.right),
-            top: self::inset(&pos.top),
-            bottom: self::inset(&pos.bottom),
+        // Taffy has no `Static`, so `position()` maps it to `Relative` -- and
+        // Taffy applies a relative box's inset as a displacement. That made a
+        // static element honour `top`/`left`, which CSS says it must ignore
+        // outright. Stray offsets on static elements are common (a rule sets
+        // `top` for a `.foo:hover` state, or a utility class leaves one behind),
+        // and each one silently shifted the box. Drop the inset for static.
+        inset: if matches!(style.clone_position(), stylo::Position::Static) {
+            taffy::Rect::auto()
+        } else {
+            taffy::Rect {
+                left: self::inset(&pos.left),
+                right: self::inset(&pos.right),
+                top: self::inset(&pos.top),
+                bottom: self::inset(&pos.bottom),
+            }
         },
         margin: taffy::Rect {
             left: self::margin(&margin.margin_left),

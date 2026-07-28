@@ -23,6 +23,20 @@ use style::{
 //
 // <https://drafts.csswg.org/css-transforms-2/#ctm>
 #[inline]
+/// Whether any of the transform properties are set to something other than
+/// `none`.
+///
+/// Cheaper than calling [`resolve_2d_transform`] and discarding the matrix, and
+/// usable where no reference box is available. A transformed element creates a
+/// stacking context and paints above in-flow siblings, so paint ordering needs
+/// this answer without needing the matrix itself.
+pub fn has_2d_transform(box_styles: &BoxStyleStruct) -> bool {
+    !matches!(box_styles.translate, Translate::None)
+        || !matches!(box_styles.rotate, Rotate::None)
+        || !matches!(box_styles.scale, Scale::None)
+        || !box_styles.transform.0.is_empty()
+}
+
 pub fn resolve_2d_transform(
     box_styles: &BoxStyleStruct,
     reference_box: Rect<CSSPixelLength>,

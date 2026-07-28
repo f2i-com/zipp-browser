@@ -880,8 +880,14 @@ impl Node {
             return true;
         }
 
+        // A transform creates a stacking context, so the element and its
+        // subtree paint as one atomic unit. Without this a later static sibling
+        // painted straight over any transformed element.
+        if crate::stylo_to_kurbo::has_2d_transform(style.get_box()) {
+            return true;
+        }
+
         // TODO: mix-blend-mode
-        // TODO: transforms
         // TODO: filter
         // TODO: clip-path
         // TODO: mask

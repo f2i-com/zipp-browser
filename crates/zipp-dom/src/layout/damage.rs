@@ -497,8 +497,17 @@ impl BaseDocument {
                 let position = style.clone_position();
                 let z_index = style.clone_z_index().integer_or(0);
 
+                // A static flex/grid item with a z-index is a stacking-context
+                // root too (see `Node::is_stacking_context_root`), but it was
+                // excluded here, so it stayed in `paint_children` -- which for
+                // flex/grid is sorted by the CSS `order` property, not z-index.
+                // Two such items both scored 0 and the stable sort just kept DOM
+                // order, making z-index inert on every flex and grid item.
+                //
                 // TODO: more complete hoisting detection
-                if position != Position::Static && z_index != 0 {
+                let positioned = position != Position::Static
+                    || (is_flex_or_grid && !style.clone_z_index().is_auto());
+                if positioned && z_index != 0 {
                     stacking_context.children.push(HoistedPaintChild {
                         node_id: child_id,
                         z_index,
@@ -540,13 +549,6 @@ impl BaseDocument {
 }
 
 #[inline(always)]
-fn position_to_order(pos: Position) -> i32 {
-    match pos {
-        Position::Static | Position::Relative | Position::Sticky => 0,
-        Position::Absolute | Position::Fixed => 2,
-    }
-}
-#[inline(always)]
 fn float_to_order(pos: Float) -> i32 {
     match pos {
         Float::None => 0,
@@ -554,6 +556,19 @@ fn float_to_order(pos: Float) -> i32 {
     }
 }
 
+/// Paint bucket within a stacking context, following CSS 2.1 Appendix E.
+///
+/// `Relative` and `Sticky` used to share bucket 0 with `Static`, so a later
+/// static sibling painted OVER a relatively positioned element. Appendix E puts
+/// in-flow non-positioned boxes in step 4, floats in step 5, and every
+/// positioned box with `z-index: auto`/`0` in step 7 — above both. A positioned
+/// box is never also a float for paint purposes, so the float bucket only
+/// applies to in-flow content.
+///
+/// A transform likewise lifts an element into the positioned bucket (and makes
+/// it a stacking context; see `Node::is_stacking_context_root`), which is what
+/// Chrome does — without it a later static sibling painted over any transformed
+/// element.
 #[inline(always)]
 fn node_to_paint_order(node: &Node, is_flex_or_grid: bool) -> i32 {
     let Some(style) = node.primary_styles() else {
@@ -565,6 +580,11 @@ fn node_to_paint_order(node: &Node, is_flex_or_grid: bool) -> i32 {
             Position::Absolute | Position::Fixed => 0,
         }
     } else {
-        position_to_order(style.clone_position()) + float_to_order(style.clone_float())
+        match style.clone_position() {
+            Position::Static if !crate::stylo_to_kurbo::has_2d_transform(style.get_box()) => {
+                float_to_order(style.clone_float())
+            }
+            _ => 2,
+        }
     }
 }
