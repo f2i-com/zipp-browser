@@ -358,14 +358,24 @@ impl<'dom> DocumentPainter<'dom> {
         cx.draw_outline(scene);
         cx.draw_outset_box_shadow(scene);
 
-        // Opacity layer if box has opacity. Clipped to border-box as it needs to include
-        // the background and borders.
+        // Opacity layer if box has opacity.
+        //
+        // The layer must NOT clip. It used to be given `border_box_path()` as
+        // its clip shape, which the backend installs as a real clip region for
+        // everything drawn inside -- including `draw_children`. Any descendant
+        // that legitimately paints outside the parent's border box (a shadow, a
+        // negative margin, an absolutely positioned child, a transform) was cut
+        // off the moment the parent had `opacity` on it. `opacity` groups its
+        // subtree for compositing; it does not clip it. Overflow clipping is
+        // applied separately by the `should_clip` layer just below, which is
+        // where it belongs.
+        let unclipped = cx.frame.border_box.inflate(1.0e5, 1.0e5);
         self.layer_manager.maybe_with_layer(
             scene,
             has_opacity,
             opacity,
             cx.transform,
-            &cx.frame.border_box_path(),
+            &unclipped,
             |scene| {
                 cx.draw_background(scene);
                 cx.draw_inset_box_shadow(scene);

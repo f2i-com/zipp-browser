@@ -5790,12 +5790,8 @@ dependencies = [
  "dynasmrt",
  "num-bigint",
  "num-traits",
- "oxc_allocator",
- "oxc_ast",
- "oxc_parser",
- "oxc_span",
- "oxc_syntax",
  "rustc-hash",
+ "unicode-id-start",
  "unicode-normalization",
  "zipp-regress",
 ]

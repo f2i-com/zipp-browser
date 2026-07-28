@@ -1652,6 +1652,13 @@ fn toolbar_body_themed(page_html: &str, current_url: &str, html_class: &str) -> 
     } else {
         format!(" {html_class}")
     };
+    // The page goes inside its own block container rather than straight into the
+    // flex column. As a direct child of the column, every TOP-LEVEL page element
+    // became a flex item, which silently changed the page's layout semantics:
+    // `align-items:stretch` overrode the intrinsic and attribute-derived sizes of
+    // replaced elements (an `<img width=64>` came out viewport-wide), each one
+    // established its own BFC, and adjacent margins stopped collapsing. None of
+    // that is how the element would behave in the document the author wrote.
     format!(
         r#"<div{class_attr} style="display:flex;flex-direction:column;margin:0;padding:0;width:100%;min-height:100vh">
   <form action="{current_url}" method="GET" style="color:#212529;height:42px;min-height:42px;background:#f8f9fa;border-bottom:1px solid #dee2e6;display:flex;align-items:center;padding:4px 8px;gap:6px;font-family:Arial,sans-serif;box-sizing:border-box;width:100%;margin:0;flex-shrink:0">
@@ -1659,7 +1666,9 @@ fn toolbar_body_themed(page_html: &str, current_url: &str, html_class: &str) -> 
     <span style="font-size:16px;color:#495057;padding:0 4px;cursor:pointer">▶</span>
     <input type="text" name="__nav_url" value="{current_url}" style="width:90%;height:32px;padding:0 12px;border:1px solid #ced4da;border-radius:8px;font-size:14px;background:white;color:#212529;outline:none;box-sizing:border-box" />
   </form>
-  {page_html}
+  <div style="display:block;flex:1 1 auto;width:100%;margin:0;padding:0;min-width:0">
+{page_html}
+  </div>
 </div>"#
     )
 }

@@ -1188,40 +1188,85 @@ impl PaintScene for TinySkiaPainter {
         }
     }
 
-    /// Draw a box shadow as a semi-transparent expanded rectangle.
+    /// Draw a box shadow: the (rounded) box filled with the shadow colour and
+    /// blurred by the CSS blur radius.
+    ///
+    /// This used to fill a hard-edged rectangle at a fixed 30% of the shadow's
+    /// alpha, inflated by the element's BORDER RADIUS while ignoring the blur
+    /// entirely. That made every shadow the wrong colour, and made a blur-only
+    /// shadow (`0 0 30px`, by far the most common form) invisible: with no
+    /// blur and no spread the flat rect coincides exactly with the border box,
+    /// which the caller's `shadow_clip` annulus punches out.
+    ///
+    /// `radius` is the box's corner radius and `std_dev` the CSS blur radius,
+    /// both in device pixels. CSS specifies the shadow to ramp across a band
+    /// the width of the blur radius, which is a Gaussian of half that sigma.
     fn draw_box_shadow(
         &mut self,
         transform: Affine,
         rect: Rect,
         color: Color,
         radius: f64,
-        _std_dev: f64,
+        std_dev: f64,
     ) {
         let (r, g, b, a) = color_to_rgba(color);
-        let shadow_alpha = (a as f32 * 0.3) as u8;
+        if a == 0 {
+            return;
+        }
 
-        // Expand the rectangle by the blur radius on all sides
-        let shadow_rect = tiny_skia::Rect::from_xywh(
-            (rect.x0 - radius) as f32,
-            (rect.y0 - radius) as f32,
-            (rect.width() + radius * 2.0) as f32,
-            (rect.height() + radius * 2.0) as f32,
+        let sigma = (std_dev / 2.0).max(0.0) as f32;
+        // Three box passes reach ~3 sigma; past that the tail is rounding noise.
+        let pad = (sigma * 3.0).ceil() as i32 + 1;
+
+        // The scratch surface is axis-aligned in device space, so the shape's
+        // bounds have to be taken after the transform.
+        let shape = kurbo::RoundedRect::from_rect(rect, radius.max(0.0));
+        let dev = transform.transform_rect_bbox(rect);
+        let x0 = dev.x0.floor() as i32 - pad;
+        let y0 = dev.y0.floor() as i32 - pad;
+        let w = (dev.width().ceil() as i32 + pad * 2).max(1);
+        let h = (dev.height().ceil() as i32 + pad * 2).max(1);
+
+        // Refuse absurd allocations rather than trying to blur them.
+        if w > 8192 || h > 8192 {
+            return;
+        }
+
+        let (Some(mut layer), Some(path)) = (Pixmap::new(w as u32, h as u32), shape_to_path(&shape))
+        else {
+            return;
+        };
+
+        // Filled opaque and composited at the shadow's alpha afterwards, so the
+        // blur ramp is not multiplied by that alpha twice.
+        layer.fill_path(
+            &path,
+            &make_paint(r, g, b, 255),
+            FillRule::Winding,
+            affine_to_transform(transform).post_translate(-x0 as f32, -y0 as f32),
+            None,
         );
 
-        if let Some(skia_rect) = shadow_rect {
-            let mask = self.clip_mask_for(Rect::new(
-                f64::NEG_INFINITY,
-                f64::NEG_INFINITY,
-                f64::INFINITY,
-                f64::INFINITY,
-            ));
-            self.pixmap.fill_rect(
-                skia_rect,
-                &make_paint(r, g, b, shadow_alpha),
-                affine_to_transform(transform),
-                mask.as_deref(),
-            );
-        }
+        box_blur(&mut layer, sigma);
+
+        let mask = self.clip_mask_for(Rect::new(
+            x0 as f64,
+            y0 as f64,
+            (x0 + w) as f64,
+            (y0 + h) as f64,
+        ));
+        let paint = tiny_skia::PixmapPaint {
+            opacity: a as f32 / 255.0,
+            ..Default::default()
+        };
+        self.pixmap.draw_pixmap(
+            x0,
+            y0,
+            layer.as_ref(),
+            &paint,
+            Transform::identity(),
+            mask.as_deref(),
+        );
     }
 }
 

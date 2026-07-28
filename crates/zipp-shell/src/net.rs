@@ -116,14 +116,13 @@ impl Provider {
                 let url_str = request.url.as_str();
                 let data_url = DataUrl::process(url_str)?;
                 let decoded = data_url.decode_to_vec()?;
-                // Truncate data URLs in the returned identifier to avoid huge
-                // string copies (callers only use this for logging/identity).
-                let id = if url_str.len() > 64 {
-                    url_str[..64].to_string()
-                } else {
-                    url_str.to_string()
-                };
-                (id, Bytes::from(decoded.0))
+                // The returned string is NOT just for logging: it comes back as
+                // `resolved_url` and is the key the document looks the waiting
+                // nodes up under (`pending_images.remove(url)`), registered
+                // against the full URL. Truncating it to 64 chars meant every
+                // base64 image -- all of which are longer than that -- decoded
+                // successfully and was then dropped on the floor.
+                (url_str.to_string(), Bytes::from(decoded.0))
             }
             "file" => {
                 // `url.path()` is the URL path, not a filesystem path: on Windows

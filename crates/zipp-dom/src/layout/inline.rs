@@ -664,11 +664,18 @@ impl BaseDocument {
 
         #[cfg(feature = "floats")]
         {
-            let contains_floats = is_bfc_root;
-            if contains_floats {
-                height = height.max(
-                    (block_ctx.floated_content_height_contribution() + container_pb.top) * scale,
-                )
+            // Only actual floats can push a BFC root taller than its line boxes.
+            // This used to read `let contains_floats = is_bfc_root;`, treating
+            // "establishes a BFC" as "contains floats". With no floats the
+            // contribution is 0 and the clamp degenerated to
+            // `height.max(container_pb.top)` -- a floor of padding-top +
+            // border-top on the CONTENT height, which is then added a second
+            // time as part of `content_box_inset` below. Every BFC root with
+            // inline content (and the page wrapper makes that nearly every
+            // top-level box) came out padding-top too tall.
+            let floated = block_ctx.floated_content_height_contribution();
+            if is_bfc_root && floated > 0.0 {
+                height = height.max((floated + container_pb.top) * scale)
             };
         }
 
