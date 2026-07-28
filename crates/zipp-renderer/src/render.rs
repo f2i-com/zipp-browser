@@ -931,7 +931,22 @@ impl ElementCx<'_> {
             .resolve_to_absolute(&current_color)
             .as_srgb_color();
 
+            let edge_style = match edge {
+                Edge::Top => border.border_top_style,
+                Edge::Right => border.border_right_style,
+                Edge::Bottom => border.border_bottom_style,
+                Edge::Left => border.border_left_style,
+            };
+
             if color.components[3] > 0.0 {
+                // `dashed` and `dotted` used to fall through to a solid fill.
+                // The pattern is drawn clipped to the edge's own shape, so
+                // mitred and rounded corners stay correct without the dash
+                // geometry having to know about them.
+                if matches!(edge_style, BorderStyle::Dashed | BorderStyle::Dotted) {
+                    self.draw_dashed_edge(scene, edge, edge_style, color);
+                    continue;
+                }
                 borders[count] = (color, Some(self.frame.border_edge_shape(edge)));
                 count += 1;
             }
@@ -1076,8 +1091,80 @@ impl ElementCx<'_> {
         }
     }
 
-    /// ❌ dotted - Defines a dotted border
-    /// ❌ dashed - Defines a dashed border
+    /// Paint one `dashed` or `dotted` edge.
+    ///
+    /// The dashes are plain rectangles laid along the edge and clipped to the
+    /// edge's own shape, which is what keeps mitred joins and rounded corners
+    /// right — the pattern itself stays a simple 1-D walk.
+    ///
+    /// Lengths follow what browsers actually draw rather than a specific spec
+    /// requirement (CSS leaves the pattern up to the UA): dashes three times
+    /// the border width separated by gaps of the same width, dots a single
+    /// width square. The period is then stretched slightly so a whole number of
+    /// them spans the edge, which is why a dashed box has symmetric corners
+    /// instead of a truncated dash on one side.
+    fn draw_dashed_edge(
+        &self,
+        scene: &mut (impl PaintScene + BlurLayer),
+        edge: Edge,
+        style: BorderStyle,
+        color: Color,
+    ) {
+        let bb = self.frame.border_box;
+        let bw = &self.frame.border_width;
+
+        // Thickness of this edge, and the span the dashes run along.
+        let (thickness, span): (f64, f64) = match edge {
+            Edge::Top => (bw.y0, bb.width()),
+            Edge::Bottom => (bw.y1, bb.width()),
+            Edge::Left => (bw.x0, bb.height()),
+            Edge::Right => (bw.x1, bb.height()),
+        };
+        if thickness <= 0.0 || span <= 0.0 {
+            return;
+        }
+
+        let (dash, gap) = match style {
+            BorderStyle::Dotted => (thickness, thickness),
+            _ => (thickness * 3.0, thickness),
+        };
+        let period = dash + gap;
+        // Fit a whole number of periods so both ends land on a dash.
+        let count = ((span + gap) / period).round().max(1.0);
+        let period = (span + gap) / count;
+        let dash = (period - gap).max(thickness * 0.5);
+
+        // How far each dash reaches INTO the box. A rounded corner curves away
+        // from the straight edge, so a rect only `thickness` deep leaves the
+        // arcs bare and a rounded dashed box comes out with four blank corners.
+        // Over-reaching costs nothing because the edge shape clips it back --
+        // and that shape is mitred, so a dash can never bleed into the
+        // neighbouring edge. Half the shorter side always covers any legal
+        // corner radius.
+        let depth = thickness.max(bb.width().min(bb.height()) * 0.5);
+
+        let mut pattern = BezPath::new();
+        let mut offset = 0.0;
+        while offset < span - 0.01 {
+            let end = (offset + dash).min(span);
+            let r = match edge {
+                Edge::Top => Rect::new(bb.x0 + offset, bb.y0, bb.x0 + end, bb.y0 + depth),
+                Edge::Bottom => Rect::new(bb.x0 + offset, bb.y1 - depth, bb.x0 + end, bb.y1),
+                Edge::Left => Rect::new(bb.x0, bb.y0 + offset, bb.x0 + depth, bb.y0 + end),
+                Edge::Right => Rect::new(bb.x1 - depth, bb.y0 + offset, bb.x1, bb.y0 + end),
+            };
+            pattern.extend(kurbo::Shape::path_elements(&r, 0.1));
+            offset += period;
+        }
+
+        let clip = self.frame.border_edge_shape(edge);
+        scene.push_layer(peniko::Mix::Normal, 1.0, self.transform, &clip);
+        scene.fill(Fill::NonZero, self.transform, color, None, &pattern);
+        scene.pop_layer();
+    }
+
+    /// ✅ dotted - Defines a dotted border
+    /// ✅ dashed - Defines a dashed border
     /// ✅ solid - Defines a solid border
     /// ❌ double - Defines a double border
     /// ❌ groove - Defines a 3D grooved border. The effect depends on the border-color value
