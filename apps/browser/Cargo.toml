@@ -59,7 +59,7 @@ linebender_resource_handle = { workspace = true }
 # IO & Networking
 tokio = { workspace = true, features = ["rt-multi-thread"], optional = true }
 url = { workspace = true, features = ["serde"], optional = true }
-reqwest = { workspace = true, features = ["blocking", "rustls-tls"] }
+reqwest = { workspace = true, features = ["blocking", "rustls-tls", "cookies"] }
 
 # Utilities
 base64 = "0.22"

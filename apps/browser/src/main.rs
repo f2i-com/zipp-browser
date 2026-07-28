@@ -54,6 +54,14 @@ lazy_static::lazy_static! {
         .redirect(reqwest::redirect::Policy::limited(10))
         .danger_accept_invalid_certs(true)
         .user_agent(USER_AGENT)
+        // Every `fetch()` the page's JS makes goes through this client. Without
+        // a cookie store it discarded every `Set-Cookie` the server sent, so a
+        // login POST succeeded and the session it established was thrown away
+        // immediately -- the next request went out unauthenticated and the app
+        // decided the user was not logged in. Nothing about that looks like a
+        // network failure from inside the page, which is why it surfaced as a
+        // dashboard 404 rather than an error.
+        .cookie_store(true)
         .build()
         .expect("failed to build HTTP client");
 }
