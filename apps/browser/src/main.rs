@@ -25,6 +25,13 @@ use linebender_resource_handle::Blob;
 
 // -- internal (workspace) --
 use zipp_vm::embed::{compile_script, JsValue, ScriptState};
+
+// The JS compiler front end allocates heavily -- a HashSet<String> per scope on
+// every capture walk, Vec<(String, Reg)> scope chains -- so the allocator is on
+// the hot path for page load, not just for running code. zipp-lang adopted
+// mimalloc for the same workload.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use zipp_dom::html_parser::{HtmlDocument, HtmlProvider};
 use zipp_dom::traits_src::navigation::{NavigationOptions, NavigationProvider};
 use zipp_dom::{DocumentConfig, FontContext};

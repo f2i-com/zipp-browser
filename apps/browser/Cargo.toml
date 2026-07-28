@@ -60,6 +60,7 @@ linebender_resource_handle = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"], optional = true }
 url = { workspace = true, features = ["serde"], optional = true }
 reqwest = { workspace = true, features = ["blocking", "rustls-tls", "cookies"] }
+mimalloc = { version = "0.1.52", default-features = false }
 
 # Utilities
 base64 = "0.22"
