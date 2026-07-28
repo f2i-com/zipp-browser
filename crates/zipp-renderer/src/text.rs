@@ -123,18 +123,46 @@ pub(crate) fn draw_text_runs<'a>(
                     .primary_styles()
                     .unwrap();
                 let itext_styles = styles.get_inherited_text();
-                let text_styles = styles.get_text();
                 let text_color = itext_styles.color.as_color_color();
-                let text_decoration_color = text_styles
-                    .text_decoration_color
-                    .as_absolute()
-                    .map(ToColorColor::as_color_color)
-                    .unwrap_or(text_color);
-                let text_decoration_brush = anyrender::Paint::from(text_decoration_color);
-                let text_decoration_line = text_styles.text_decoration_line;
-                let has_underline = text_decoration_line.contains(TextDecorationLine::UNDERLINE);
-                let has_strikethrough =
-                    text_decoration_line.contains(TextDecorationLine::LINE_THROUGH);
+
+                // `text-decoration` does NOT inherit — it PROPAGATES from the
+                // box that declares it down through that box's inline
+                // descendants, and is painted in the declaring box's own colour.
+                // Reading only the run's own element left a gap in the underline
+                // wherever a link contained a `<span>`, because the span's own
+                // `text-decoration-line` is `none`.
+                //
+                // So walk out to the block container, collecting every
+                // declaration on the way. Each is drawn separately: two
+                // ancestors can contribute differently coloured lines, and the
+                // spec paints both.
+                let mut decorations: Vec<(TextDecorationLine, anyrender::Paint)> = Vec::new();
+                let mut cursor = Some(style.brush.id);
+                while let Some(id) = cursor {
+                    let Some(ancestor) = doc.get_node(id) else {
+                        break;
+                    };
+                    let Some(astyles) = ancestor.primary_styles() else {
+                        break;
+                    };
+                    let atext = astyles.get_text();
+                    let line = atext.text_decoration_line;
+                    if !line.is_empty() {
+                        let color = atext
+                            .text_decoration_color
+                            .as_absolute()
+                            .map(ToColorColor::as_color_color)
+                            .unwrap_or_else(|| {
+                                astyles.get_inherited_text().color.as_color_color()
+                            });
+                        decorations.push((line, anyrender::Paint::from(color)));
+                    }
+                    // The block container ends the propagation chain.
+                    if astyles.clone_display().outside() != DisplayOutside::Inline {
+                        break;
+                    }
+                    cursor = ancestor.parent;
+                }
 
                 scene.draw_glyphs(
                     font,
@@ -162,18 +190,27 @@ pub(crate) fn draw_text_runs<'a>(
                         scene.stroke(&Stroke::new(size as f64), transform, brush, None, &line)
                     };
 
-                if has_underline {
-                    let offset = metrics.underline_offset;
-                    let size = metrics.underline_size;
-
-                    // TODO: intercept line when crossing an descending character like "gqy"
-                    draw_decoration_line(offset, size, &text_decoration_brush);
-                }
-                if has_strikethrough {
-                    let offset = metrics.strikethrough_offset;
-                    let size = metrics.strikethrough_size;
-
-                    draw_decoration_line(offset, size, &text_decoration_brush);
+                for (line, brush) in &decorations {
+                    if line.contains(TextDecorationLine::UNDERLINE) {
+                        // TODO: intercept line when crossing a descending character like "gqy"
+                        draw_decoration_line(
+                            metrics.underline_offset,
+                            metrics.underline_size,
+                            brush,
+                        );
+                    }
+                    if line.contains(TextDecorationLine::LINE_THROUGH) {
+                        draw_decoration_line(
+                            metrics.strikethrough_offset,
+                            metrics.strikethrough_size,
+                            brush,
+                        );
+                    }
+                    if line.contains(TextDecorationLine::OVERLINE) {
+                        // Never drawn before. Measured from the baseline like
+                        // the others, so the offset is the font's ascent.
+                        draw_decoration_line(metrics.ascent, metrics.underline_size, brush);
+                    }
                 }
             }
         }
