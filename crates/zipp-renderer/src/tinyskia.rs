@@ -1287,20 +1287,37 @@ impl TinySkiaPainter {
         let image_height = img.image.height;
         let source_pixels: &[u8] = img.image.data.as_ref();
 
-        // The shape's bounding box defines the destination rectangle
+        // The destination is the shape's bounding box AFTER the transform.
+        //
+        // This used to read only the translation out of the matrix
+        // (`coeffs[4]`, `coeffs[5]`) and take the extent from the shape's
+        // UNTRANSFORMED bounds. The caller encodes `background-size` as the
+        // matrix's scale and expresses the shape in image space to match
+        // (`render/background.rs`), so dropping the linear part meant
+        // background-size was ignored entirely and one copy of the image was
+        // stretched over the whole positioning area.
         let bounds = shape.bounding_box();
         let coeffs = transform.as_coeffs();
-        let dest_x = coeffs[4] as f32 + bounds.x0 as f32;
-        let dest_y = coeffs[5] as f32 + bounds.y0 as f32;
-        let dest_width = bounds.width() as f32;
-        let dest_height = bounds.height() as f32;
+        // Backgrounds are axis-aligned; skew/rotation (coeffs 1 and 2) only
+        // appear via `transform`, which is handled by the layer machinery.
+        let scale_x = coeffs[0] as f32;
+        let scale_y = coeffs[3] as f32;
+        if scale_x.abs() < 1.0e-6 || scale_y.abs() < 1.0e-6 {
+            return;
+        }
+        let dest_x = (coeffs[0] * bounds.x0 + coeffs[2] * bounds.y0 + coeffs[4]) as f32;
+        let dest_y = (coeffs[1] * bounds.x0 + coeffs[3] * bounds.y0 + coeffs[5]) as f32;
+        let dest_width = (bounds.width() * coeffs[0]).abs() as f32;
+        let dest_height = (bounds.height() * coeffs[3]).abs() as f32;
 
         let framebuffer_width = self.pixmap.width() as i32;
         let framebuffer_height = self.pixmap.height() as i32;
 
-        // Ratio to map from destination pixels back to source pixels
-        let sample_ratio_x = image_width as f32 / dest_width;
-        let sample_ratio_y = image_height as f32 / dest_height;
+        // `background-repeat` reaches here as the brush's extend mode. Sampling
+        // used to clamp unconditionally, which silently discarded it: the tiled
+        // area was covered by one stretched copy instead of repeats.
+        let wrap_x = matches!(img.sampler.x_extend, peniko::Extend::Repeat);
+        let wrap_y = matches!(img.sampler.y_extend, peniko::Extend::Repeat);
 
         // Honour the active clip, exactly as `draw_image` does. Without this a
         // background image ignored `overflow:hidden` and rounded corners and
@@ -1347,8 +1364,20 @@ impl TinySkiaPainter {
                     }
                 }
 
-                let src_col = ((col as f32 * sample_ratio_x) as u32).min(image_width - 1);
-                let src_row = ((row as f32 * sample_ratio_y) as u32).min(image_height - 1);
+                // Device offset back into image space, then wrapped (repeat) or
+                // clamped (pad) into the source.
+                let u = col as f32 / scale_x.abs();
+                let v = row as f32 / scale_y.abs();
+                let src_col = if wrap_x {
+                    (u as i64).rem_euclid(image_width as i64) as u32
+                } else {
+                    (u as u32).min(image_width - 1)
+                };
+                let src_row = if wrap_y {
+                    (v as i64).rem_euclid(image_height as i64) as u32
+                } else {
+                    (v as u32).min(image_height - 1)
+                };
 
                 let source_index = ((src_row * image_width + src_col) * 4) as usize;
                 if source_index + 3 >= source_pixels.len() {

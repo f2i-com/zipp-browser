@@ -970,6 +970,22 @@ pub(crate) fn build_inline_layout_into(
                             );
 
 
+                            // parley DELETES the leading and trailing whitespace
+                            // of every style span; CSS collapses it against its
+                            // neighbour instead. Emit it outside the span so
+                            // parley's own collapsing rules apply to it. See
+                            // `inline_edge_is_whitespace`.
+                            let collapsing =
+                                !matches!(collapse_mode, WhiteSpaceCollapse::Preserve);
+                            let lead_ws =
+                                collapsing && inline_edge_is_whitespace(nodes, node_id, true);
+                            let trail_ws =
+                                collapsing && inline_edge_is_whitespace(nodes, node_id, false);
+
+                            if lead_ws {
+                                builder.push_text(" ");
+                            }
+
                             builder.push_style_span(style);
 
                             if let Some(before_id) = node.before {
@@ -1008,6 +1024,10 @@ pub(crate) fn build_inline_layout_into(
                             }
 
                             builder.pop_style_span();
+
+                            if trail_ws {
+                                builder.push_text(" ");
+                            }
                         }
                     }
                     // Inline box
@@ -1045,5 +1065,63 @@ pub(crate) fn build_inline_layout_into(
             }
             NodeData::Document => unreachable!(),
         }
+    }
+}
+
+/// Whether this inline subtree's text starts (`leading`) or ends with
+/// collapsible whitespace.
+///
+/// parley trims the leading and trailing whitespace of every style span
+/// outright: `push_style_span` sets `is_span_first`, `pop_style_span` passes
+/// `is_span_last`, and `push_uncommitted_text` then applies `trim_start` /
+/// `trim_end` (`parley/src/resolve/tree.rs`). CSS 2.1 §16.6 collapses that
+/// whitespace against its neighbour rather than deleting it, so `x<b> mid </b>y`
+/// has to render as `x mid y` — zipp rendered `xmidy`, joining the words.
+///
+/// `set_is_span_first` is `pub(crate)` in parley, so the space cannot be
+/// preserved from outside. Instead the caller emits it OUTSIDE the span, where
+/// parley's ordinary collapsing applies: it is dropped when the preceding text
+/// already ends in whitespace, or when it would open a line, and kept
+/// otherwise. The only cost is that the space is measured in the parent's font
+/// rather than the inline element's.
+fn inline_edge_is_whitespace(nodes: &Slab<Node>, node_id: usize, leading: bool) -> bool {
+    let node = &nodes[node_id];
+    match &node.data {
+        NodeData::Text(data) => {
+            let mut chars = data.content.chars();
+            let edge = if leading {
+                chars.next()
+            } else {
+                chars.next_back()
+            };
+            edge.is_some_and(|c| c.is_ascii_whitespace())
+        }
+        NodeData::Element(_) | NodeData::AnonymousBlock(_) => {
+            // Only inline flow content joins this line. An inline box (an image,
+            // a form control, a block) is a hard edge with no whitespace to
+            // collapse across.
+            let display = node.display_style().unwrap_or(Display::inline());
+            if display.outside() != DisplayOutside::Inline
+                || display.inside() != DisplayInside::Flow
+            {
+                return false;
+            }
+            let mut children = node.children.clone();
+            if !leading {
+                children.reverse();
+            }
+            for child_id in children {
+                // Skip children that contribute no text at all, so that
+                // `<b><!--c--> x</b>` still sees the space.
+                match &nodes[child_id].data {
+                    NodeData::Comment => continue,
+                    NodeData::Text(d) if d.content.is_empty() => continue,
+                    _ => {}
+                }
+                return inline_edge_is_whitespace(nodes, child_id, leading);
+            }
+            false
+        }
+        _ => false,
     }
 }

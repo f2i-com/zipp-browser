@@ -906,16 +906,33 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
     //
     // Hence: keep going while the network is busy OR the document still knows it
     // is waiting on something.
+    //
+    // The whole thing runs in an OUTER loop because layout is what discovers
+    // background images: a `background-image` URL is only requested once styles
+    // resolve (`zipp-dom/src/layout/damage.rs`), which happens during the
+    // resolve below, not during parsing. A page whose only images are
+    // backgrounds therefore had an empty network queue here, exited the wait
+    // immediately, and was painted before a single tile arrived — every
+    // background image came out blank. Keep going until a full resolve leaves
+    // the queue still empty.
     let t_net = std::time::Instant::now();
-    while (!net_provider.is_empty() || doc.as_ref().has_pending_critical_resources())
-        && t_net.elapsed().as_secs() < 20
-    {
-        std::thread::sleep(std::time::Duration::from_millis(50));
+    loop {
+        while (!net_provider.is_empty() || doc.as_ref().has_pending_critical_resources())
+            && t_net.elapsed().as_secs() < 20
+        {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            doc.as_mut().resolve(0.0);
+        }
+        // One more drain so a font blob that landed after the last poll is
+        // registered (which invalidates inline layout) before the final resolve.
+        doc.as_mut().handle_messages();
         doc.as_mut().resolve(0.0);
+        if t_net.elapsed().as_secs() >= 20
+            || (net_provider.is_empty() && !doc.as_ref().has_pending_critical_resources())
+        {
+            break;
+        }
     }
-    // One more drain so a font blob that landed after the last poll is registered
-    // (which invalidates inline layout) before the final resolve + paint.
-    doc.as_mut().handle_messages();
     let net_ms = t_net.elapsed().as_millis();
 
     let t_layout = std::time::Instant::now();
