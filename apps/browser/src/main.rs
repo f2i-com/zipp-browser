@@ -521,6 +521,10 @@ var http = (function () {
 // can legitimately reschedule forever (a spinner, a poll loop).
 var __zippDrainStats = { rounds: 0, timers: 0, micro: 0 };
 function __zippDrainQueues(rounds) {
+    // Returns how many callbacks ran, so the host can stop settling once the
+    // page is genuinely quiet instead of always burning a fixed number of
+    // rounds.
+    var did = 0;
     for (var i = 0; i < rounds; i++) {
         if (__timerQueue.length === 0 && __mcQueue.length === 0) break;
         // Report, never swallow. A page's real work happens in these callbacks
@@ -529,15 +533,18 @@ function __zippDrainQueues(rounds) {
         __zippDrainStats.rounds++;
         while (__timerQueue.length > 0) {
             __zippDrainStats.timers++;
+            did++;
             try { __timerQueue.shift()(); }
             catch (e) { env.log('error', 'timer callback threw: ' + ((e && (e.stack || e.message)) || e)); }
         }
         while (__mcQueue.length > 0) {
             __zippDrainStats.micro++;
+            did++;
             try { __mcQueue.shift()(); }
             catch (e) { env.log('error', 'microtask threw: ' + ((e && (e.stack || e.message)) || e)); }
         }
     }
+    return did;
 }
 
 // Invoke the handlers registered on `handlerNid` for `type`, with the event
@@ -1400,9 +1407,22 @@ var __zippEsmDebug=true;
     // fetched its session, got its 401, and would have rendered the logged-out
     // UI, but the tree was read before the continuation that sets
     // `isInitialized` ever ran, so the page was captured on its loading screen.
+    // Stop as soon as the page is quiet. This used to run all 32 rounds
+    // unconditionally, so a settled app still paid for 32 `run_microtasks` calls
+    // and 32 trips into JS -- the bulk of the settle time on a large page, spent
+    // finding nothing to do. Two consecutive empty rounds rather than one,
+    // because a microtask can enqueue a timer that has not been drained yet.
+    let mut quiet = 0;
     for _ in 0..32 {
         state.run_microtasks();
-        let _ = state.call_global("__zippDrainQueues", &[JsValue::Number(50.0)]);
+        let ran = match state.call_global("__zippDrainQueues", &[JsValue::Number(50.0)]) {
+            Ok(JsValue::Number(n)) => n,
+            _ => 0.0,
+        };
+        quiet = if ran == 0.0 { quiet + 1 } else { 0 };
+        if quiet >= 2 {
+            break;
+        }
     }
     for line in state.take_output() {
         eprintln!("[JS] {line}");
@@ -1719,7 +1739,13 @@ fn toolbar_body_themed(page_html: &str, current_url: &str, html_class: &str) -> 
         format!(" {html_class}")
     };
     // The page goes inside its own block container rather than straight into the
-    // flex column. As a direct child of the column, every TOP-LEVEL page element
+    // flex column. It is `position:relative` so that it is the containing block
+    // for the page's out-of-flow boxes: without that, a `position:fixed`
+    // sidebar resolved against the ROOT, whose box starts above the injected
+    // toolbar, and so painted straight over the URL bar. Anchoring to the
+    // content area instead puts `top:0` at the top of the page — which is what
+    // the author meant by the viewport, given our chrome lives inside the
+    // document. As a direct child of the column, every TOP-LEVEL page element
     // became a flex item, which silently changed the page's layout semantics:
     // `align-items:stretch` overrode the intrinsic and attribute-derived sizes of
     // replaced elements (an `<img width=64>` came out viewport-wide), each one
@@ -1732,7 +1758,7 @@ fn toolbar_body_themed(page_html: &str, current_url: &str, html_class: &str) -> 
     <span style="font-size:16px;color:#495057;padding:0 4px;cursor:pointer">▶</span>
     <input type="text" name="__nav_url" value="{current_url}" style="width:90%;height:32px;padding:0 12px;border:1px solid #ced4da;border-radius:8px;font-size:14px;background:white;color:#212529;outline:none;box-sizing:border-box" />
   </form>
-  <div style="display:block;flex:1 1 auto;width:100%;margin:0;padding:0;min-width:0">
+  <div style="display:block;position:relative;flex:1 1 auto;width:100%;margin:0;padding:0;min-width:0">
 {page_html}
   </div>
 </div>"#

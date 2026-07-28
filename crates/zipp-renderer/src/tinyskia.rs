@@ -1232,6 +1232,16 @@ impl PaintScene for TinySkiaPainter {
             return;
         }
 
+        // Cull shadows that fall entirely outside the surface before allocating
+        // and blurring a scratch pixmap for them. A long page has far more
+        // shadowed cards off screen than on, and each one otherwise costs a full
+        // allocation plus three box-blur passes to produce nothing visible.
+        let sw = self.pixmap.width() as i32;
+        let sh = self.pixmap.height() as i32;
+        if x0 >= sw || y0 >= sh || x0 + w <= 0 || y0 + h <= 0 {
+            return;
+        }
+
         let (Some(mut layer), Some(path)) = (Pixmap::new(w as u32, h as u32), shape_to_path(&shape))
         else {
             return;
