@@ -1380,6 +1380,7 @@ var __zippEsmDebug=true;
     );
 
     eprintln!("[JS] Compiling {} bytes...", full.len());
+    let t_compile = std::time::Instant::now();
     let mut state = match compile_script(&full) {
         Ok(s) => s,
         Err(e) => {
@@ -1387,6 +1388,8 @@ var __zippEsmDebug=true;
             return None;
         }
     };
+    let compile_ms = t_compile.elapsed().as_millis();
+    let t_init = std::time::Instant::now();
     state.set_host_call(Box::new(browser_host_call));
     if let Err(e) = state.run_init() {
         // An uncaught throw is not fatal: the shim may still have built enough
@@ -1412,6 +1415,8 @@ var __zippEsmDebug=true;
     // and 32 trips into JS -- the bulk of the settle time on a large page, spent
     // finding nothing to do. Two consecutive empty rounds rather than one,
     // because a microtask can enqueue a timer that has not been drained yet.
+    let init_ms = t_init.elapsed().as_millis();
+    let t_settle = std::time::Instant::now();
     let mut quiet = 0;
     for _ in 0..32 {
         state.run_microtasks();
@@ -1424,6 +1429,12 @@ var __zippEsmDebug=true;
             break;
         }
     }
+    // Split so it is obvious whether time goes into compiling the script or
+    // running it -- they need completely different fixes.
+    eprintln!(
+        "[PERF] JS: compile={compile_ms}ms init={init_ms}ms settle={}ms",
+        t_settle.elapsed().as_millis()
+    );
     for line in state.take_output() {
         eprintln!("[JS] {line}");
     }
