@@ -3,3 +3,6 @@
 *.pdb
 debug_*.html
 test_portfolio.html
+
+# Agent worktrees (transient; created by the Workflow tool)
+.claude/worktrees/
