@@ -608,8 +608,10 @@ var loc = {
     search: __locUrl.search || "",
     hash: __locUrl.hash || "",
     origin: __locUrl.origin || (__locUrl.protocol + "//" + __locUrl.hostname + (__locUrl.port ? ":" + __locUrl.port : "")),
-    assign: function(url) { this.href = url; },
-    replace: function(url) { this.href = url; },
+    // These only wrote to a plain `href` property that nothing observed, so
+    // script-driven navigation silently did nothing.
+    assign: function(url) { this.href = url; if(url) { try { __zippHostCall("navigate", String(url)); } catch(e) {} } },
+    replace: function(url) { this.href = url; if(url) { try { __zippHostCall("navigate", String(url)); } catch(e) {} } },
     reload: function() {},
     toString: function() { return this.href; }
 };
@@ -1102,7 +1104,11 @@ var window = {
     },
     queueMicrotask:function(fn){if(typeof fn==="function")__mcQueue.push(fn);},
     btoa:__btoa, atob:__atob,
-    open:function(){return null;}, close:function(){},
+    // Was `function(){return null;}` -- a page whose call to action is "opens
+    // in a new tab" had a button that did nothing at all. There are no tabs
+    // yet, so this navigates the current window.
+    open:function(url){ if(url) { try { __zippHostCall("navigate", String(url)); } catch(e) {} } return null; },
+    close:function(){},
     postMessage:function(){},
     alert:function(){}, confirm:function(){return false;}, prompt:function(){return null;},
     focus:function(){}, blur:function(){}, print:function(){},

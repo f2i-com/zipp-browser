@@ -43,6 +43,9 @@ lazy_static::lazy_static! {
     static ref FETCH_CACHE: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
     /// Inlined images (URL -> base64 data URI).
     static ref IMAGE_CACHE: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
+    /// The URL of the page currently loaded, so a relative `window.open` or
+    /// `location.assign` from the page can be resolved against it.
+    static ref CURRENT_URL: Mutex<String> = Mutex::new(String::new());
     /// Fully rendered HTML keyed by URL (skip JS re-compilation on revisit).
     static ref RENDERED_CACHE: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
     /// Shared blocking HTTP client -- reused across all fetch() calls to
@@ -140,6 +143,10 @@ fn main() {
     let nav_provider = Arc::new(BrowserNavProvider {
         proxy: proxy.clone(),
     });
+    // Published so `browser_host_call` can drive a navigation the PAGE asked
+    // for (`window.open`, `location.assign`) -- it is a free function with no
+    // other route to the shell.
+    let _ = NAV_PROVIDER.set(nav_provider.clone() as Arc<dyn NavigationProvider>);
     let config = DocumentConfig {
         font_ctx: Some(font_ctx),
         base_url: Some(url.clone()),
@@ -650,6 +657,10 @@ function __zippDispatchEvent(handlerNid, targetNid, type) {
 /// `fetch` resolves its promise synchronously from this result, and the whole
 /// SSR pass runs to completion before anything is rendered, so there is no
 /// event loop to yield to yet.
+/// Set once the window's navigation provider exists; see `browser_host_call`.
+static NAV_PROVIDER: std::sync::OnceLock<Arc<dyn NavigationProvider>> =
+    std::sync::OnceLock::new();
+
 fn browser_host_call(kind: &str, args: &[String]) -> Result<String, String> {
     match kind {
         // Page `console.*`, via the shim's `env.log`.
@@ -683,6 +694,35 @@ fn browser_host_call(kind: &str, args: &[String]) -> Result<String, String> {
                 "{{\"status\":{status},\"ok\":{ok},\"body\":{}}}",
                 json_quote(&body)
             ))
+        }
+        // `window.open` and `location.assign`/`replace`. Both were inert: `open`
+        // returned null and did nothing, and `assign` only wrote to a plain
+        // `href` property that nothing observed. A page whose call to action is
+        // "opens in a new tab" therefore had a button that did nothing at all.
+        //
+        // There are no tabs yet, so this navigates the CURRENT window. That is
+        // the honest single-window behaviour and beats silently dropping it.
+        "navigate" => {
+            let raw = args.first().cloned().unwrap_or_default();
+            if raw.is_empty() {
+                return Ok(String::new());
+            }
+            let base = CURRENT_URL.lock().unwrap().clone();
+            let full = resolve(&base, &raw);
+            match full.parse::<url::Url>() {
+                Ok(parsed) => {
+                    eprintln!("[NAV] page requested {full}");
+                    if let Some(provider) = NAV_PROVIDER.get() {
+                        provider.navigate_to(NavigationOptions::new(
+                            parsed,
+                            String::from("text/html"),
+                            0,
+                        ));
+                    }
+                    Ok(String::new())
+                }
+                Err(e) => Err(format!("Error: bad navigate url {full:?}: {e}")),
+            }
         }
         other => Err(format!("Error: unknown host call {other:?}")),
     }
@@ -727,6 +767,7 @@ fn json_quote(s: &str) -> String {
 /// Returns the final HTML, the JS event map (when the page ran script), and the
 /// live `ScriptState` that keeps event handlers callable.
 fn prepare_page(url: &str, viewport: (u32, u32)) -> (String, Option<String>, Option<ScriptState>) {
+    *CURRENT_URL.lock().unwrap() = url.to_string();
     let t_fetch = std::time::Instant::now();
     let html = fetch(url)
         .unwrap_or_else(|e| format!("<html><body><h1>Error</h1><p>{e}</p></body></html>"));
