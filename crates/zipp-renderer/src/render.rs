@@ -627,6 +627,16 @@ impl ElementCx<'_> {
                 );
             }
 
+            // Backgrounds of inline elements, behind the glyphs. Inline
+            // elements are parley style spans rather than Taffy nodes, so the
+            // ordinary box-painting path never reaches them.
+            crate::text::draw_inline_backgrounds(
+                scene,
+                text_layout.layout.lines(),
+                self.context.dom,
+                transform,
+            );
+
             // Render text
             crate::text::draw_text_runs(
                 scene,
