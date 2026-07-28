@@ -8,6 +8,7 @@ use peniko::Fill;
 use style::values::computed::TextDecorationLine;
 use style::values::specified::box_::{DisplayInside, DisplayOutside};
 use crate::color::ToColorColor as _;
+use crate::tinyskia::BlurLayer;
 
 use crate::SELECTION_COLOR;
 
@@ -98,7 +99,7 @@ pub(crate) fn draw_inline_backgrounds<'a>(
 /// Draws the glyph runs for every line in the provided iterator, including
 /// underline and strikethrough decorations when the computed style requests them.
 pub(crate) fn draw_text_runs<'a>(
-    scene: &mut impl PaintScene,
+    scene: &mut (impl PaintScene + BlurLayer),
     lines: impl Iterator<Item = Line<'a, TextBrush>>,
     doc: &BaseDocument,
     transform: Affine,
@@ -162,6 +163,51 @@ pub(crate) fn draw_text_runs<'a>(
                         break;
                     }
                     cursor = ancestor.parent;
+                }
+
+                // `text-shadow`, painted behind the glyphs. It inherits, so the
+                // computed value here is already the effective one. The list is
+                // walked back to front: the first shadow in the list is the
+                // topmost, so it must be drawn last.
+                let current_color = styles.clone_color();
+                for shadow in itext_styles.text_shadow.0.iter().rev() {
+                    let color = shadow
+                        .color
+                        .resolve_to_absolute(&current_color)
+                        .as_srgb_color();
+                    if color.components[3] <= 0.0 {
+                        continue;
+                    }
+                    let offset = Affine::translate((
+                        shadow.horizontal.px() as f64,
+                        shadow.vertical.px() as f64,
+                    ));
+                    // CSS blur radius spans the ramp; a Gaussian of half that
+                    // sigma matches, the same convention box-shadow uses.
+                    let sigma = shadow.blur.px() / 2.0;
+                    let blurred = sigma >= 0.5;
+                    if blurred {
+                        scene.push_blur_layer(sigma);
+                    }
+                    scene.draw_glyphs(
+                        font,
+                        font_size,
+                        true,
+                        run.normalized_coords(),
+                        Fill::NonZero,
+                        &anyrender::Paint::from(color),
+                        1.0,
+                        offset * transform,
+                        glyph_xform,
+                        glyph_run.positioned_glyphs().map(|glyph| anyrender::Glyph {
+                            id: glyph.id as _,
+                            x: glyph.x,
+                            y: glyph.y,
+                        }),
+                    );
+                    if blurred {
+                        scene.pop_blur_layer();
+                    }
                 }
 
                 scene.draw_glyphs(
