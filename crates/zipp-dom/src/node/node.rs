@@ -25,6 +25,7 @@ use style::selector_parser::{PseudoElement, RestyleDamage};
 use style::servo_arc::Arc as ServoArc;
 use style::shared_lock::SharedRwLock;
 use style::stylesheets::UrlExtraData;
+use style::values::computed::CSSPixelLength;
 use style::values::computed::Display as StyloDisplay;
 use style::values::specified::box_::{DisplayInside, DisplayOutside};
 use style_dom::ElementState;
@@ -921,8 +922,38 @@ impl Node {
         let mut x = x - self.final_layout.location.x + self.scroll_offset.x as f32;
         let mut y = y - self.final_layout.location.y + self.scroll_offset.y as f32;
 
-
         let size = self.final_layout.size;
+
+        // Undo this element's CSS transform before testing against its box.
+        //
+        // Hit-testing walked purely in layout coordinates while the transform
+        // was applied only at paint time, so a transformed element was clickable
+        // at the position it WOULD have occupied untransformed — a translated
+        // button responded to clicks on empty space and ignored clicks on
+        // itself. Inverting the matrix here also fixes every descendant for
+        // free, since they are tested in the coordinates this produces.
+        if let Some(style) = self.primary_styles() {
+            let reference_box = euclid::Rect::new(
+                euclid::Point2D::new(CSSPixelLength::new(0.0), CSSPixelLength::new(0.0)),
+                euclid::Size2D::new(
+                    CSSPixelLength::new(size.width),
+                    CSSPixelLength::new(size.height),
+                ),
+            );
+            // Scale 1.0: hit-testing works in CSS pixels, not device pixels.
+            if let Some(transform) =
+                crate::stylo_to_kurbo::resolve_2d_transform(style.get_box(), reference_box, 1.0)
+            {
+                // A singular matrix (`scale(0)`) collapses the element to
+                // nothing, so there is no point to map back.
+                let c = transform.as_coeffs();
+                if (c[0] * c[3] - c[1] * c[2]).abs() > 1.0e-9 {
+                    let p = transform.inverse() * kurbo::Point::new(x as f64, y as f64);
+                    x = p.x as f32;
+                    y = p.y as f32;
+                }
+            }
+        }
         let matches_self = !(x < 0.0
             || x > size.width + self.scroll_offset.x as f32
             || y < 0.0
