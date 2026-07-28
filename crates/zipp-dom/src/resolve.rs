@@ -25,6 +25,7 @@ thread_local! {
 
 #[cfg(feature = "incremental")]
 use style::selector_parser::RestyleDamage;
+use style::properties::generated::longhands::position::computed_value::T as Position;
 use taffy::AvailableSpace;
 
 use crate::{
@@ -178,6 +179,7 @@ impl BaseDocument {
     /// mode, only nodes whose damage flags indicate they need reconstruction are visited.
     pub fn resolve_layout_children(&mut self) {
         resolve_layout_children_recursive(self, self.root_node().id);
+        reparent_out_of_flow_children(self, self.root_node().id);
 
         fn resolve_layout_children_recursive(doc: &mut BaseDocument, node_id: usize) {
             let mut damage = doc.nodes[node_id].damage().unwrap_or(ALL_DAMAGE);
@@ -339,4 +341,84 @@ impl BaseDocument {
         // And the document scroller, now that the root's content size is fresh.
         self.scroll_viewport_by(0.0, 0.0);
     }
+}
+
+/// Move absolutely positioned boxes onto their real containing block.
+///
+/// Taffy lays every `Position::Absolute` child out against its IMMEDIATE
+/// parent's box, unconditionally — see `perform_absolute_layout_on_absolute_children`.
+/// CSS says an absolutely positioned box is instead laid out against the padding
+/// box of its nearest *positioned* ancestor. Nothing re-parented them, so
+/// `top`/`left`/`right`/`bottom`, percentage sizes and `auto` sizing were all
+/// resolved against whatever `<div>` happened to wrap the element. That is the
+/// single most common positioning idiom on the web — a `position:relative` card
+/// with an absolutely placed badge or overlay two or three levels down — and it
+/// landed in the wrong place every time.
+///
+/// The layout tree is a separate structure from the DOM (`layout_children`
+/// already differs from `children`: it carries anonymous blocks and pseudo
+/// elements), so the fix is simply to build it with the out-of-flow boxes
+/// attached where CSS says they belong. Taffy then resolves everything against
+/// the right box with no further special-casing, and paint and hit-testing
+/// follow because both walk the layout tree.
+///
+/// Returns the boxes that could not be placed at `node_id` and must be adopted
+/// by an ancestor.
+fn reparent_out_of_flow_children(doc: &mut BaseDocument, node_id: usize) -> Vec<usize> {
+    let is_root = doc.nodes[node_id].parent.is_none()
+        || doc.nodes[node_id].id == doc.root_element().id;
+
+    // A box establishes a containing block for absolute descendants when it is
+    // itself positioned, or when it has a transform. The root always does.
+    //
+    // Inline roots are treated as containing blocks too, but for a different
+    // reason: inline layout positions the out-of-flow boxes embedded in its own
+    // line boxes (`layout/inline.rs`), so lifting them out from under it would
+    // strand geometry that code still expects to own. That leaves abspos inside
+    // a text-carrying block resolved against that block — the pre-existing
+    // behaviour, not a regression.
+    let is_containing_block = is_root
+        || doc.nodes[node_id].flags.is_inline_root()
+        || doc.nodes[node_id]
+            .primary_styles()
+            .map(|s| {
+                !matches!(s.clone_position(), Position::Static)
+                    || crate::stylo_to_kurbo::has_2d_transform(s.get_box())
+            })
+            .unwrap_or(false);
+
+    let children = doc.nodes[node_id].layout_children.borrow_mut().take();
+    let Some(children) = children else {
+        return Vec::new();
+    };
+
+    let mut kept = Vec::with_capacity(children.len());
+    let mut escaping = Vec::new();
+
+    for child_id in children {
+        // Depth first: anything the child could not contain surfaces here.
+        let from_child = reparent_out_of_flow_children(doc, child_id);
+
+        let child_is_abs = doc.nodes[child_id]
+            .primary_styles()
+            .map(|s| matches!(s.clone_position(), Position::Absolute | Position::Fixed))
+            .unwrap_or(false);
+
+        if child_is_abs {
+            escaping.push(child_id);
+        } else {
+            kept.push(child_id);
+        }
+        escaping.extend(from_child);
+    }
+
+    if is_containing_block {
+        for &adopted in escaping.iter() {
+            doc.nodes[adopted].layout_parent.set(Some(node_id));
+        }
+        kept.append(&mut escaping);
+    }
+
+    *doc.nodes[node_id].layout_children.borrow_mut() = Some(kept);
+    escaping
 }
