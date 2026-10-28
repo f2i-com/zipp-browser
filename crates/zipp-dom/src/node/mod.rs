@@ -8,7 +8,7 @@ mod stylo_data;
 pub use attributes::{Attribute, Attributes};
 pub use element::{
     BackgroundImageData, CanvasData, ElementData, ImageData, ListItemLayout,
-    ListItemLayoutPosition, Marker, RasterImageData, SpecialElementData, SpecialElementType,
+    ListItemLayoutPosition, Marker, MediaElement, RasterImageData, SpecialElementData, SpecialElementType,
     Status, TextBrush, TextInputData, TextLayout,
 };
 pub use node::*;

@@ -413,6 +413,7 @@ impl<'dom> DocumentPainter<'dom> {
                             y: -node.scroll_offset.y,
                         });
                         cx.draw_image(scene);
+                        cx.draw_media_controls(scene);
                         #[cfg(feature = "svg")]
                         cx.draw_svg(scene);
                         cx.draw_canvas(scene);
@@ -819,7 +820,16 @@ impl ElementCx<'_> {
     }
 
     fn draw_image(&self, scene: &mut (impl PaintScene + BlurLayer)) {
-        if let Some(image) = self.element.raster_image_data() {
+        // A playing video draws its latest frame; before the first one, and
+        // when nothing plays, the element's own image (a video's poster).
+        let frame = self.element.media.as_ref().and_then(|media| {
+            media.0.set_display_size(
+                self.frame.content_box.width().round() as u32,
+                self.frame.content_box.height().round() as u32,
+            );
+            media.0.frame()
+        });
+        if let Some(image) = frame.as_ref().or(self.element.raster_image_data()) {
             let width = self.frame.content_box.width() as u32;
             let height = self.frame.content_box.height() as u32;
             let x = self.frame.content_box.origin().x;
@@ -859,6 +869,120 @@ impl ElementCx<'_> {
                 .pre_scale_non_uniform(x_scale, y_scale);
 
             scene.draw_image(to_peniko_image(image, quality).as_ref(), transform);
+        }
+    }
+
+    /// A video's built-in controls: a play button over it while it is not
+    /// playing, and with `controls` a bar along the bottom -- play/pause, the
+    /// progress through it, mute. Laid out by `MediaControlsLayout`, which the
+    /// click handling shares.
+    fn draw_media_controls(&self, scene: &mut (impl PaintScene + BlurLayer)) {
+        use kurbo::{Circle, Shape};
+        use zipp_dom::traits_src::media::{ControlRect, MediaControlsLayout};
+
+        if self.element.name.local != local_name!("video") {
+            return;
+        }
+        let has_controls = self.element.attr(local_name!("controls")).is_some();
+        let status = self.element.media.as_ref().map(|media| media.0.status());
+        if !has_controls && status.is_some() {
+            // A video without controls that is already under way (a muted
+            // autoplaying background, say) is drawn bare.
+            return;
+        }
+        let status = status.unwrap_or_default();
+
+        let scale = self.scale;
+        let origin = self.frame.border_box.origin();
+        let width = self.frame.border_box.width() / scale;
+        let height = self.frame.border_box.height() / scale;
+        if width < 8.0 || height < 8.0 {
+            return;
+        }
+        let to_device = |r: ControlRect| {
+            Rect::new(
+                origin.x + r.x as f64 * scale,
+                origin.y + r.y as f64 * scale,
+                origin.x + (r.x + r.width) as f64 * scale,
+                origin.y + (r.y + r.height) as f64 * scale,
+            )
+        };
+        let shade = peniko::Color::from_rgba8(0, 0, 0, 140);
+        let white = peniko::Color::from_rgba8(255, 255, 255, 235);
+        let faint = peniko::Color::from_rgba8(255, 255, 255, 90);
+        // A play triangle centred in `r`, `size` device pixels tall.
+        let triangle = |center: Point, size: f64| {
+            let mut path = BezPath::new();
+            path.move_to((center.x - size * 0.35, center.y - size * 0.5));
+            path.line_to((center.x + size * 0.55, center.y));
+            path.line_to((center.x - size * 0.35, center.y + size * 0.5));
+            path.close_path();
+            path
+        };
+
+        let playing = !status.paused && !status.ended;
+        if !playing {
+            let center = Point::new(origin.x + width * scale / 2.0, origin.y + height * scale / 2.0);
+            let radius = (width.min(height) / 6.0).clamp(14.0, 36.0) * scale;
+            scene.fill(Fill::NonZero, self.transform, shade, None, &Circle::new(center, radius));
+            let glyph = triangle(Point::new(center.x + radius * 0.08, center.y), radius * 0.9);
+            scene.fill(Fill::NonZero, self.transform, white, None, &glyph);
+        }
+        if !has_controls {
+            return;
+        }
+
+        let layout = MediaControlsLayout::new(width as f32, height as f32);
+        scene.fill(Fill::NonZero, self.transform, shade, None, &to_device(layout.bar));
+
+        // Play/pause.
+        let play = to_device(layout.play);
+        let glyph_size = play.height() * 0.45;
+        if playing {
+            let bar_w = glyph_size * 0.3;
+            for dx in [-glyph_size * 0.3, glyph_size * 0.3] {
+                let cx = play.center().x + dx;
+                let r = Rect::new(cx - bar_w / 2.0, play.center().y - glyph_size / 2.0, cx + bar_w / 2.0, play.center().y + glyph_size / 2.0);
+                scene.fill(Fill::NonZero, self.transform, white, None, &r);
+            }
+        } else {
+            scene.fill(Fill::NonZero, self.transform, white, None, &triangle(play.center(), glyph_size));
+        }
+
+        // Progress.
+        let track = to_device(layout.track);
+        if track.width() > 0.0 {
+            scene.fill(Fill::NonZero, self.transform, faint, None, &track.to_rounded_rect(track.height() / 2.0));
+            if let Some(duration) = status.duration.filter(|d| d.is_finite() && *d > 0.0) {
+                let fraction = (status.position / duration).clamp(0.0, 1.0);
+                let done = Rect::new(track.x0, track.y0, track.x0 + track.width() * fraction, track.y1);
+                scene.fill(Fill::NonZero, self.transform, white, None, &done.to_rounded_rect(track.height() / 2.0));
+                let knob = Circle::new(Point::new(done.x1, track.center().y), track.height() * 1.5);
+                scene.fill(Fill::NonZero, self.transform, white, None, &knob);
+            }
+        }
+
+        // Mute: a speaker, struck through when muted.
+        let mute = to_device(layout.mute);
+        let c = mute.center();
+        let s = mute.height() * 0.22;
+        let mut speaker = BezPath::new();
+        speaker.move_to((c.x - s * 1.3, c.y - s * 0.5));
+        speaker.line_to((c.x - s * 0.5, c.y - s * 0.5));
+        speaker.line_to((c.x + s * 0.4, c.y - s * 1.2));
+        speaker.line_to((c.x + s * 0.4, c.y + s * 1.2));
+        speaker.line_to((c.x - s * 0.5, c.y + s * 0.5));
+        speaker.line_to((c.x - s * 1.3, c.y + s * 0.5));
+        speaker.close_path();
+        scene.fill(Fill::NonZero, self.transform, white, None, &speaker);
+        if status.muted {
+            let mut cross = BezPath::new();
+            cross.move_to((c.x - s * 1.5, c.y - s * 1.5));
+            cross.line_to((c.x + s * 1.5, c.y + s * 1.5));
+            scene.stroke(&Stroke::new(1.6 * scale), self.transform, white, None, &cross);
+        } else {
+            let wave = kurbo::Arc::new((c.x + s * 0.4, c.y), (s * 0.9, s * 0.9), -0.9, 1.8, 0.0);
+            scene.stroke(&Stroke::new(1.4 * scale), self.transform, white, None, &wave.into_path(0.1));
         }
     }
 

@@ -214,6 +214,20 @@ impl BaseDocument {
                         _ => unreachable!(),
                     };
 
+                    // A started video is as big as its frames, once they are
+                    // known; until then, its poster's size.
+                    let inherent_size = match element_data
+                        .media
+                        .as_ref()
+                        .and_then(|media| media.0.status().video_size)
+                    {
+                        Some((width, height)) => taffy::Size {
+                            width: width as f32,
+                            height: height as f32,
+                        },
+                        None => inherent_size,
+                    };
+
                     let replaced_context = ReplacedContext {
                         inherent_size,
                         attr_size,

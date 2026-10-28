@@ -66,6 +66,7 @@ mod form;
 mod html;
 /// Integration of taffy and the DOM.
 mod layout;
+mod media;
 mod mutator;
 mod query_selector;
 mod resolve;

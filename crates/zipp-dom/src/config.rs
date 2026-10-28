@@ -38,6 +38,9 @@ pub struct DocumentConfig {
     /// Shell provider for redraw requests, clipboard access, cursor changes, etc.
     pub shell_provider: Option<Arc<dyn ShellProvider>>,
 
+    /// Media provider that plays `<video>`. Without one, a video shows its poster.
+    pub media_provider: Option<Arc<dyn crate::traits_src::media::MediaProvider>>,
+
     /// HTML parser provider used to implement `setInnerHTML` and similar operations.
     pub html_parser_provider: Option<Arc<dyn HtmlParserProvider>>,
 

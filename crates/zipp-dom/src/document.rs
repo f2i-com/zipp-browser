@@ -350,6 +350,8 @@ pub struct BaseDocument {
     pub navigation_provider: Arc<dyn NavigationProvider>,
     /// Shell provider for redraw requests, clipboard access, cursor changes, etc.
     pub shell_provider: Arc<dyn ShellProvider>,
+    /// Plays `<video>`; `None` where playback is unavailable (posters only).
+    pub media_provider: Option<Arc<dyn crate::traits_src::media::MediaProvider>>,
     /// HTML parser provider for `setInnerHTML` and similar operations.
     pub html_parser_provider: Arc<dyn HtmlParserProvider>,
 }
@@ -463,6 +465,7 @@ impl BaseDocument {
         let html_parser_provider = config
             .html_parser_provider
             .unwrap_or_else(|| Arc::new(DummyHtmlParserProvider));
+        let media_provider = config.media_provider;
 
         let (tx, rx) = channel();
 
@@ -506,6 +509,7 @@ impl BaseDocument {
             net_provider,
             navigation_provider,
             shell_provider,
+            media_provider,
             html_parser_provider,
             last_mousedown_time: None,
             mousedown_position: taffy::Point::ZERO,
@@ -561,6 +565,7 @@ impl BaseDocument {
 
     /// Set the document's shell provider.
     pub fn set_shell_provider(&mut self, shell_provider: Arc<dyn ShellProvider>) {
+        self.update_media_shell_providers(&shell_provider);
         self.shell_provider = shell_provider;
     }
 
@@ -1040,6 +1045,7 @@ impl BaseDocument {
             net_provider: Some(self.net_provider.clone()),
             navigation_provider: Some(self.navigation_provider.clone()),
             shell_provider: Some(self.shell_provider.clone()),
+            media_provider: self.media_provider.clone(),
             html_parser_provider: Some(self.html_parser_provider.clone()),
             ..Default::default()
         }

@@ -65,6 +65,9 @@ pub struct ElementData {
 
     /// The element's template contents (\<template\> elements only)
     pub template_contents: Option<usize>,
+
+    /// The player of a \<video\> that has started; `None` until then.
+    pub media: Option<MediaElement>,
     // /// Whether the node is a [HTML integration point] (https://html.spec.whatwg.org/multipage/#html-integration-point)
     // pub mathml_annotation_xml_integration_point: bool,
 }
@@ -149,6 +152,7 @@ impl ElementData {
             list_item_data: None,
             special_data: SpecialElementData::None,
             template_contents: None,
+            media: None,
             background_images: Vec::new(),
         };
         data.flush_is_focussable();
@@ -438,6 +442,17 @@ impl ElementData {
             && self.attr(LocalName::from("command")).is_none()
             && self.attr(LocalName::from("commandfor")).is_none();
         is_submit || is_auto_submit
+    }
+}
+
+/// The player behind a started `<video>` (see `traits_src::media`). Shared
+/// with the painter; the last handle dropped stops playback.
+#[derive(Clone)]
+pub struct MediaElement(pub Arc<dyn crate::traits_src::media::MediaPlayer>);
+
+impl std::fmt::Debug for MediaElement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("MediaElement").field(&self.0.status()).finish()
     }
 }
 

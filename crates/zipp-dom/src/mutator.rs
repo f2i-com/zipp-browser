@@ -49,6 +49,8 @@ pub struct DocumentMutator<'doc> {
     title_node: Option<usize>,
     style_nodes: HashSet<usize>,
     form_nodes: HashSet<usize>,
+    /// `<video>` elements added in this batch.
+    media_nodes: HashSet<usize>,
 
     /// Whether an element/attribute that affect animation status has been seen
     recompute_is_animating: bool,
@@ -72,6 +74,7 @@ impl DocumentMutator<'_> {
             title_node: None,
             style_nodes: HashSet::new(),
             form_nodes: HashSet::new(),
+            media_nodes: HashSet::new(),
             recompute_is_animating: false,
             #[cfg(feature = "autofocus")]
             node_to_autofocus: None,
@@ -556,6 +559,10 @@ impl<'doc> DocumentMutator<'doc> {
             self.doc.reset_form_owner(id);
         }
 
+        for id in self.media_nodes.drain() {
+            self.doc.media_element_added(id);
+        }
+
         #[cfg(feature = "autofocus")]
         if let Some(node_id) = self.node_to_autofocus.take() {
             if self.doc.get_node(node_id).is_some() {
@@ -610,7 +617,13 @@ impl<'doc> DocumentMutator<'doc> {
                 "link" => self.eager_op_queue.push(SpecialOp::LoadStylesheet(node_id)),
                 // A <video> is drawn as its poster frame: there is no
                 // playback, and the poster is what a browser shows until play.
-                "img" | "video" => self.eager_op_queue.push(SpecialOp::LoadImage(node_id)),
+                "img" => self.eager_op_queue.push(SpecialOp::LoadImage(node_id)),
+                "video" => {
+                    self.eager_op_queue.push(SpecialOp::LoadImage(node_id));
+                    // Its `<source>` children are not parsed yet: start any
+                    // player once the batch is flushed.
+                    self.media_nodes.insert(node_id);
+                }
                 "canvas" => self
                     .eager_op_queue
                     .push(SpecialOp::LoadCustomPaintSource(node_id)),

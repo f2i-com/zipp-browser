@@ -525,6 +525,10 @@ pub(crate) fn handle_click(
                         break 'matched true;
                     }
                 }
+                local_name!("video") => {
+                    doc.media_click(node_id, event.page_x(), event.page_y());
+                    break 'matched true;
+                }
                 local_name!("a") => {
                     if let Some(href) = el.attr(local_name!("href")) {
                         if let Some(url) = doc.url.resolve_relative(href) {
