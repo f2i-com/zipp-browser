@@ -2133,16 +2133,70 @@ fn resolve(base: &str, rel: &str) -> String {
 // HTML attribute extraction
 // ---------------------------------------------------------------------------
 
-/// Extract the value of a `name="value"` attribute from an HTML tag string.
-#[inline]
+/// The value of attribute `name` in an HTML start tag (`<script src=...>`),
+/// read as the HTML parser reads it: double-, single- or un-quoted, the name
+/// matched whole and without regard to case. It used to find only
+/// `name="value"`, by substring -- so a minified `<script type=module
+/// src=/assets/app.js>` was never loaded, and asking for `src` found
+/// `data-src="..."` first.
 fn attr(tag: &str, name: &str) -> Option<String> {
-    let mut s = String::with_capacity(name.len() + 2);
-    s.push_str(name);
-    s.push_str("=\"");
-    let p = tag.find(&s)? + s.len();
-    let raw = &tag[p..p + tag[p..].find('"')?];
-    // Decode common HTML entities in attribute values
-    Some(raw.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\""))
+    let b = tag.as_bytes();
+    let space = |c: u8| matches!(c, b' ' | b'\t' | b'\n' | b'\r' | b'\x0c');
+    // Past `<` and the tag name.
+    let mut i = 1;
+    while i < b.len() && !space(b[i]) && b[i] != b'>' && b[i] != b'/' {
+        i += 1;
+    }
+    loop {
+        while i < b.len() && (space(b[i]) || b[i] == b'/') {
+            i += 1;
+        }
+        if i >= b.len() || b[i] == b'>' {
+            return None;
+        }
+        let name_start = i;
+        // The first character may be `=`; after that it ends the name.
+        i += 1;
+        while i < b.len() && !space(b[i]) && !matches!(b[i], b'=' | b'>' | b'/') {
+            i += 1;
+        }
+        let found = &tag[name_start..i];
+        while i < b.len() && space(b[i]) {
+            i += 1;
+        }
+        let mut value = "";
+        if i < b.len() && b[i] == b'=' {
+            i += 1;
+            while i < b.len() && space(b[i]) {
+                i += 1;
+            }
+            if i < b.len() && (b[i] == b'"' || b[i] == b'\'') {
+                let quote = b[i];
+                let start = i + 1;
+                let end = tag[start..].bytes().position(|c| c == quote).map_or(b.len(), |e| start + e);
+                value = &tag[start..end];
+                i = end + 1;
+            } else {
+                let start = i;
+                while i < b.len() && !space(b[i]) && b[i] != b'>' {
+                    i += 1;
+                }
+                value = &tag[start..i];
+            }
+        }
+        if found.eq_ignore_ascii_case(name) {
+            // Decode common HTML entities in attribute values; `&amp;` last, so
+            // `&amp;lt;` stays the text `&lt;`.
+            return Some(
+                value
+                    .replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace("&quot;", "\"")
+                    .replace("&#39;", "'")
+                    .replace("&amp;", "&"),
+            );
+        }
+    }
 }
 
 #[inline]
@@ -2216,6 +2270,20 @@ mod tests {
         // Not a body element: all contents.
         assert_eq!(split_body_element("<bodyguard>z</bodyguard>"), ("", "<bodyguard>z</bodyguard>"));
         assert_eq!(split_body_element("<p>w</p>"), ("", "<p>w</p>"));
+    }
+
+    #[test]
+    fn attributes_read_as_the_parser_reads_them() {
+        let tag = r#"<script type=module data-src="no.js" SRC='/a.js' defer>"#;
+        assert_eq!(attr(tag, "src").as_deref(), Some("/a.js"));
+        assert_eq!(attr(tag, "type").as_deref(), Some("module"));
+        assert_eq!(attr(tag, "defer").as_deref(), Some(""));
+        assert_eq!(attr(tag, "async"), None);
+        assert_eq!(attr("<script src=/s.js>", "src").as_deref(), Some("/s.js"));
+        assert_eq!(attr(r#"<script src="/x.js?a=1&amp;b=2">"#, "src").as_deref(), Some("/x.js?a=1&b=2"));
+        assert_eq!(attr("<script>", "src"), None);
+        // Unterminated quote: the rest of the tag.
+        assert_eq!(attr(r#"<script src="/y.js"#, "src").as_deref(), Some("/y.js"));
     }
 
     #[test]
