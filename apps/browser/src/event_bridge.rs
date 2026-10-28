@@ -232,32 +232,15 @@ impl EventHandler for JsEventBridge {
                             {
                                 if !new_html.is_empty() {
                                     // `__getRenderedHTML` returns the page's own
-                                    // <body> only. The document's body also holds
-                                    // the browser chrome, and the re-render
-                                    // replaces the body wholesale — so rebuild
-                                    // the same structure the initial load
-                                    // produced, or the toolbar disappears and the
-                                    // page falls out of the flex column that
-                                    // gives it its height. Relative URLs need
-                                    // re-absolutising for the same reason: the
-                                    // initial render did it, this path did not,
-                                    // so images broke on the first click.
-                                    // Carry the page's <html> class across: the
-                                    // theme toggle lives there and a body-only
-                                    // swap would drop it every re-render.
-                                    let html_class = match state.call_global("__getHtmlClass", &[])
-                                    {
-                                        Ok(JsValue::String(c)) => c,
-                                        _ => String::new(),
-                                    };
-                                    if std::env::var_os("ZIPP_DEBUG_EVENTS").is_some() {
-                                        eprintln!("[EVENT] <html> class = {html_class:?}");
-                                    }
-                                    let rebuilt = crate::rerender_body_themed(
-                                        &new_html,
-                                        &self.page_url,
-                                        &html_class,
-                                    );
+                                    // <body> element; its contents replace the
+                                    // document body's. Relative URLs need
+                                    // re-absolutising: the initial render did it,
+                                    // and without it images broke on the first
+                                    // click. The <html> attributes (the theme)
+                                    // travel separately, through
+                                    // `document_element_attributes`.
+                                    let rebuilt =
+                                        crate::rerender_body(&new_html, &self.page_url);
                                     eprintln!(
                                         "[EVENT] DOM updated after click ({} bytes)",
                                         rebuilt.len()

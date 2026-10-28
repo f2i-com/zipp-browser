@@ -184,7 +184,7 @@ fn main() {
         html_parser_provider: Some(Arc::new(HtmlProvider) as _),
         ..Default::default()
     };
-    let mut doc = HtmlDocument::from_html(&final_html, config);
+    let mut doc = build_document(&final_html, config);
     attach_event_bridge(&mut doc, event_map_json, js_state, &url);
 
     // Pre-render linked pages in background for instant navigation
@@ -203,7 +203,7 @@ fn main() {
     // respond to nothing.
     app.set_document_builder(Box::new(|url, html, config, viewport| {
         let (final_html, event_map_json, js_state) = render_page(&url, &html, viewport, None);
-        let mut doc = HtmlDocument::from_html(&final_html, config);
+        let mut doc = build_document(&final_html, config);
         attach_event_bridge(&mut doc, event_map_json, js_state, &url);
         Box::new(doc)
     }));
@@ -961,8 +961,7 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
                     );
                     // Same rebuild the event bridge performs, so this harness
                     // exercises the real path rather than an approximation.
-                    let body = rerender_body(&updated, url);
-                    let _ = &body;
+                    let body = rerender_body(&updated, url) + &toolbar_markup(url);
                     final_html = final_html
                         .split_once("<body")
                         .and_then(|(head, rest)| {
@@ -1020,7 +1019,7 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
     };
 
     let t_parse = std::time::Instant::now();
-    let mut doc = HtmlDocument::from_html(&final_html, config);
+    let mut doc = build_document(&final_html, config);
 
     // Install the JS event bridge here too, not just on the windowed path.
     // Without it `--screenshot` has no event handler at all, so a simulated
@@ -1560,10 +1559,7 @@ var __zippEsmDebug=true;
                 _ => "{}".to_string(),
             };
 
-            let inner = rendered
-                .find("<body>")
-                .map(|s| &rendered[s + 6..rendered.rfind("</body>").unwrap_or(rendered.len())])
-                .unwrap_or(&rendered);
+            let (body_attrs, inner) = split_body_element(&rendered);
             let inner = make_urls_absolute(inner, page_url);
             let inner = inner
                 .replace("\\xa9", "\u{00A9}")
@@ -1586,7 +1582,7 @@ var __zippEsmDebug=true;
                 _ => String::new(),
             };
             let html_out = format!(
-                "<!DOCTYPE html><html{html_attrs}><head>{head}</head><body>{inner}</body></html>"
+                "<!DOCTYPE html><html{html_attrs}><head>{head}</head><body{body_attrs}>{inner}</body></html>"
             );
             return Some((html_out, event_map_json, state));
         }
@@ -1802,179 +1798,150 @@ impl BrowserNavProvider {
 // Toolbar CSS + HTML
 // ---------------------------------------------------------------------------
 
-/// CSS injected into every page. Resets body constraints for the toolbar layout
-/// and provides Tailwind utility class fallbacks for sites with purged CSS.
 /// Styles for the injected browser chrome.
 ///
 /// Deliberately TINY. The toolbar's own markup is styled entirely with inline
-/// `style` attributes, so nothing here is needed to draw it — and anything here
-/// leaks into the page, because the chrome is injected into the page's own
-/// document and therefore shares its CSS namespace.
+/// `style` attributes; this is only the room the root makes for it. Anything
+/// broader leaks into the page, because the chrome is part of the page's own
+/// document and shares its CSS namespace.
 ///
 /// This used to carry ~60 `!important` rules redefining generic Tailwind utility
-/// names (`.grid`, `.flex`, `.w-full`, `.text-4xl`, `.rounded-lg`, `.shadow`, …)
-/// under the heading "CSS Grid not fully supported in layout engine". That was
-/// the same false premise as the old `responsive` module: Taffy implements grid
-/// and it works. What the block actually did was override the design system of
-/// every Tailwind site with `!important` — `.grid{display:flex}` alone turned
-/// every CSS Grid on the page into a flex row, which is why lance.name's project
-/// cards stacked instead of sitting three across.
+/// names (`.grid`, `.flex`, `.w-full`, ...), which overrode the design system of
+/// every Tailwind site -- `.grid{display:flex}` alone turned every CSS Grid into
+/// a flex row. Rule of thumb for anything added here: if a page could plausibly
+/// use the same selector, it does not belong.
 ///
-/// Rule of thumb for anything added here: if a page could plausibly use the same
-/// selector, it does not belong.
+/// The toolbar sits in a band across the top of the root: `<html>` reserves it
+/// with a transparent top border, and the toolbar -- `<html>`'s own child,
+/// beside `<body>` (see `mount_chrome`) -- is placed absolutely into it, from
+/// the root's padding box, hence `top:-42px`. A border rather than padding, so
+/// a page's own `html` padding still applies.
 const TOOLBAR_CSS: &str = r#"
-/* The chrome wrapper is a full-height flex column, so the root element must not
-   impose a width or centre itself. `body` is reset inline on the element. */
-html { max-width:none !important; width:100% !important; margin:0 !important; padding:0 !important; }
+html { border-top:42px solid transparent !important; margin:0 !important; max-width:none !important; }
 "#;
 
+/// Add the browser chrome to a page.
+///
+/// The page's own document is kept whole -- its `<html>` and `<body>` with
+/// their attributes, the page's `body` rules, the default body margin -- and
+/// the toolbar goes in at the end of the body, to be moved up beside it by
+/// `mount_chrome` once the document is parsed.
+///
+/// It used to be the other way round: the document was rebuilt around the
+/// chrome, a full-height flex column in a `<body>` reset inline to
+/// `margin:0;padding:0`, with the page poured into a `<div>` inside it. No
+/// `body` rule could reach the page -- example.com's
+/// `max-width:26em;margin:auto;padding:25vh 2em 2em`, `body{display:grid}`,
+/// `body > header` -- and the page's body attributes were dropped, taking
+/// `body.home .hero`-style selectors with them.
 fn wrap_with_toolbar(html: &str, current_url: &str) -> String {
-    let head_end = html.find("</head>").unwrap_or(0);
-    let body_start = html
-        .find("<body")
-        .and_then(|i| html[i..].find('>').map(|e| i + e + 1))
-        .unwrap_or(0);
-    let body_end = html.find("</body>").unwrap_or(html.len());
-
-    let head_content = if head_end > 0 {
-        let head_start = html
-            .find("<head")
-            .and_then(|i| html[i..].find('>').map(|e| i + e + 1))
-            .unwrap_or(0);
-        &html[head_start..head_end]
-    } else {
-        ""
-    };
-
-    let body_content = if body_start > 0 {
-        &html[body_start..body_end]
-    } else {
-        html
-    };
-
-    // Keep the source document's <html> attributes. This function rebuilds the
-    // document from its head and body, so emitting a bare <html> silently threw
-    // away the theme class that was just resolved.
-    let html_attrs = html
-        .find("<html")
-        .and_then(|i| html[i + 5..].find('>').map(|e| html[i + 5..i + 5 + e].trim().to_string()))
-        .filter(|a| !a.is_empty())
-        .map(|a| format!(" {a}"))
-        .unwrap_or_default();
-
-    format!(
-        r#"<!DOCTYPE html><html{html_attrs}><head>
-<meta charset="utf-8">
-{head_content}
-<style>{TOOLBAR_CSS}</style>
-</head><body style="margin:0 !important;padding:0 !important;max-width:none !important;width:100% !important">{body}</body></html>"#,
-        html_attrs = html_attrs,
-        head_content = head_content,
-        body = toolbar_body(body_content, current_url),
-    )
+    let toolbar = toolbar_markup(current_url);
+    // Lowercasing only ASCII keeps every byte offset valid in `html`.
+    let lower = html.to_ascii_lowercase();
+    let mut out = String::with_capacity(html.len() + toolbar.len() + 16);
+    // Every page used to be rebuilt under `<!DOCTYPE html>`; keep pages without
+    // one in standards mode still.
+    if !lower
+        .trim_start_matches(|c: char| c.is_whitespace() || c == '\u{feff}')
+        .starts_with("<!doctype")
+    {
+        out.push_str("<!DOCTYPE html>");
+    }
+    match lower.rfind("</body>") {
+        Some(end) => {
+            out.push_str(&html[..end]);
+            out.push_str(&toolbar);
+            out.push_str(&html[end..]);
+        }
+        // No closing tag: the parser puts trailing content in the body anyway.
+        None => {
+            out.push_str(html);
+            out.push_str(&toolbar);
+        }
+    }
+    out
 }
 
-/// Rebuild the document body after a JS re-render.
+/// Move the toolbar out of the page's `<body>` to be `<html>`'s own child, in
+/// the band the chrome CSS reserves at the top of the root.
+///
+/// The parser cannot put it there -- content after `</body>` goes back into the
+/// body -- so it is moved once the document is built. There it is placed
+/// against the root, whatever the page does to its body (Taffy positions an
+/// absolute box against its parent, with no containing-block search, so inside
+/// a `max-width` body the toolbar would be as narrow as the body). And it is
+/// outside every JS re-render, which replaces only the body's contents.
+fn mount_chrome(doc: &mut HtmlDocument) {
+    let Ok(Some(chrome)) = doc.query_selector("#__zipp_chrome") else {
+        return;
+    };
+    let root = doc.root_element().id;
+    doc.mutate().append_children(root, &[chrome]);
+}
+
+/// Parse a page built by `render_page` and put its chrome in place.
+fn build_document(final_html: &str, config: DocumentConfig) -> HtmlDocument {
+    let mut doc = HtmlDocument::from_html(final_html, config);
+    mount_chrome(&mut doc);
+    doc
+}
+
+/// Split a serialized `<body ...>...</body>` element into its attribute text
+/// (with its leading space, or empty) and its contents. Anything else is all
+/// contents.
+fn split_body_element(html: &str) -> (&str, &str) {
+    let start = html
+        .match_indices("<body")
+        .map(|(i, _)| i)
+        .find(|&i| matches!(html.as_bytes().get(i + 5), Some(b'>' | b' ' | b'\t' | b'\n' | b'\r' | b'/')));
+    match (start, html.rfind("</body>")) {
+        (Some(start), Some(end)) => {
+            let Some(open_end) = html[start..].find('>').map(|e| start + e) else {
+                return ("", html);
+            };
+            if open_end >= end {
+                return ("", html);
+            }
+            (html[start + 5..open_end].trim_end_matches('/'), &html[open_end + 1..end])
+        }
+        _ => ("", html),
+    }
+}
+
+/// The page's new body contents after a JS re-render.
 ///
 /// `__getRenderedHTML()` hands back the page's own `<body>` element. Strip that
-/// wrapper, re-absolutise its URLs against the page (the initial load does this;
-/// skipping it broke every relative image on the first click), and put the
-/// browser chrome back around it.
+/// wrapper and re-absolutise its URLs against the page (the initial load does
+/// this; skipping it broke every relative image on the first click). The chrome
+/// is not part of it: it lives beside the body, and a re-render replaces only
+/// the body's contents.
 pub(crate) fn rerender_body(rendered_body: &str, page_url: &str) -> String {
-    rerender_body_themed(rendered_body, page_url, "")
+    let (_, inner) = split_body_element(rendered_body);
+    make_urls_absolute(inner, page_url)
 }
 
-/// `rerender_body`, carrying the class the page put on `<html>`.
-pub(crate) fn rerender_body_themed(
-    rendered_body: &str,
-    page_url: &str,
-    html_class: &str,
-) -> String {
-    let inner = match (rendered_body.find("<body"), rendered_body.rfind("</body>")) {
-        (Some(start), Some(end)) => {
-            let open_end = rendered_body[start..]
-                .find('>')
-                .map(|e| start + e + 1)
-                .unwrap_or(start);
-            &rendered_body[open_end..end]
-        }
-        _ => rendered_body,
-    };
-    toolbar_body_themed(&make_urls_absolute(inner, page_url), page_url, html_class)
-}
-
-/// The `<body>` contents: the browser chrome followed by the page.
+/// The toolbar: back, forward, reload and the address bar.
 ///
-/// The wrapper uses `min-height:100vh`, NOT `height:100vh`. A fixed height pins
-/// `<html>` and `<body>` to the window while the page overflows them, which is
-/// not how any real document behaves — the root grows to its content. Two things
-/// broke because of it:
+/// The address bar is a GET form back to the current page; the navigation
+/// provider picks `__nav_url` out of the submitted URL. It is in normal flow of
+/// nothing -- absolutely placed in the root's band -- so it scrolls away with
+/// the page (`position:sticky` is inert here: the Stylo->Taffy conversion maps
+/// Sticky to Relative). Real chrome belongs outside the document; until then a
+/// correctly-rendering page is worth more than a pinned URL bar.
 ///
-///  - the document had no scrollable range of its own (`content_size` lived on a
-///    descendant), so scrolling had to be faked by an element scroller; and
-///  - a page that sets `overflow-x:hidden` on `body` (common, and what
-///    lance.name does) turned `body` into a clipper whose box is only one
-///    viewport tall. Once that box scrolled up, it clipped everything below —
-///    the page appeared to stop rendering partway down.
-///
-/// The trade-off: the toolbar is in normal flow, so it scrolls away with the
-/// page (`position:sticky` is inert here — the Stylo→Taffy conversion maps
-/// Sticky to Relative). Real chrome belongs outside the document rather than
-/// injected into it; until that happens, a correctly-rendering page is worth
-/// more than a pinned URL bar.
-///
-/// Factored out because a JS re-render replaces the WHOLE body — it is the only
-/// element the event handler can address — so the chrome has to be rebuilt with
-/// it. Without this a single click removed the toolbar and dropped the page out
-/// of the flex column that gives it its height.
-fn toolbar_body(page_html: &str, current_url: &str) -> String {
-    toolbar_body_themed(page_html, current_url, "")
-}
-
-/// `toolbar_body`, carrying the class the page put on `<html>`.
-///
-/// The class goes on the injected wrapper rather than the real `<html>`: the
-/// wrapper is an ancestor of every page node, which is all a `.dark .x`
-/// selector needs, and it survives the body swap that a re-render performs.
-fn toolbar_body_themed(page_html: &str, current_url: &str, html_class: &str) -> String {
-    // Already a rendered attribute list (`class="dark" data-theme="dark"`).
-    let class_attr = if html_class.trim().is_empty() {
-        String::new()
-    } else {
-        format!(" {html_class}")
-    };
-    // The page goes inside its own block container rather than straight into the
-    // flex column. It is `position:relative` so that it is the containing block
-    // for the page's out-of-flow boxes: without that, a `position:fixed`
-    // sidebar resolved against the ROOT, whose box starts above the injected
-    // toolbar, and so painted straight over the URL bar. Anchoring to the
-    // content area instead puts `top:0` at the top of the page — which is what
-    // the author meant by the viewport, given our chrome lives inside the
-    // document. As a direct child of the column, every TOP-LEVEL page element
-    // became a flex item, which silently changed the page's layout semantics:
-    // `align-items:stretch` overrode the intrinsic and attribute-derived sizes of
-    // replaced elements (an `<img width=64>` came out viewport-wide), each one
-    // established its own BFC, and adjacent margins stopped collapsing. None of
-    // that is how the element would behave in the document the author wrote.
-    //
-    // The toolbar is its own top stacking layer. Out-of-flow page boxes anchor to
-    // the content wrapper, so anything a page parks just above its viewport —
-    // a skip link at `translateY(-150%)`, a header slid out of view — lands in
-    // the toolbar's band. A real browser clips that at the viewport edge; here
-    // the chrome has to cover it, or a `z-index:100` skip link paints over the
-    // URL bar.
+/// It is the top stacking layer. Anything a page parks just above its content
+/// -- a skip link at `translateY(-150%)`, a header slid out of view -- lands in
+/// the band; a real browser clips that at the viewport edge, here the chrome
+/// has to cover it, or a `z-index:100` skip link paints over the URL bar.
+fn toolbar_markup(current_url: &str) -> String {
     format!(
-        r#"<div{class_attr} style="display:flex;flex-direction:column;margin:0;padding:0;width:100%;min-height:100vh">
-  <form action="{current_url}" method="GET" style="color:#212529;height:42px;min-height:42px;background:#f8f9fa;border-bottom:1px solid #dee2e6;display:flex;align-items:center;padding:4px 8px;gap:6px;font-family:Arial,sans-serif;box-sizing:border-box;width:100%;margin:0;flex-shrink:0;position:relative;z-index:2147483647">
+        r#"<form id="__zipp_chrome" action="{current_url}" method="GET" style="position:absolute;top:-42px;left:0;right:0;z-index:2147483647;color:#212529;height:42px;background:#f8f9fa;border-bottom:1px solid #dee2e6;display:flex;align-items:center;padding:4px 8px;gap:6px;font-family:Arial,sans-serif;font-size:14px;line-height:normal;text-align:left;box-sizing:border-box;margin:0">
+    <style>{TOOLBAR_CSS}</style>
     <a href="zipp-nav:back" title="Back (Alt+Left)" style="display:flex;align-items:center;padding:3px;border-radius:4px;text-decoration:none;color:#495057"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg></a>
     <a href="zipp-nav:forward" title="Forward (Alt+Right)" style="display:flex;align-items:center;padding:3px;border-radius:4px;text-decoration:none;color:#495057"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg></a>
     <a href="zipp-nav:reload" title="Reload (F5)" style="display:flex;align-items:center;padding:3px;border-radius:4px;text-decoration:none;color:#495057"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg></a>
     <input type="text" name="__nav_url" value="{current_url}" style="width:90%;height:32px;padding:0 12px;border:1px solid #ced4da;border-radius:8px;font-size:14px;background:white;color:#212529;outline:none;box-sizing:border-box" />
-  </form>
-  <div style="display:block;position:relative;flex:1 1 auto;width:100%;margin:0;padding:0;min-width:0">
-{page_html}
-  </div>
-</div>"#
+  </form>"#
     )
 }
 
@@ -2224,6 +2191,32 @@ fn head_content(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_page_keeps_its_own_body() {
+        let page = r#"<!doctype html><html lang=en><head><style>body{margin:auto}</style></head><body class="home" style="padding:20px"><p>Hi</p></body></html>"#;
+        let out = wrap_with_toolbar(page, "https://example.com/");
+        assert!(out.starts_with("<!doctype html><html lang=en>"));
+        assert!(out.contains(r#"<body class="home" style="padding:20px"><p>Hi</p><form id="__zipp_chrome""#));
+        assert!(out.ends_with("</form></body></html>"));
+
+        // A page with no doctype still gets standards mode, and one with no
+        // closing body tag still gets its toolbar.
+        let out = wrap_with_toolbar("<p>bare", "https://example.com/");
+        assert!(out.starts_with("<!DOCTYPE html><p>bare<form id=\"__zipp_chrome\""));
+    }
+
+    #[test]
+    fn body_element_splits_into_attributes_and_contents() {
+        assert_eq!(
+            split_body_element(r#"<body data-flid="4" class="a"><div>x</div></body>"#),
+            (r#" data-flid="4" class="a""#, "<div>x</div>")
+        );
+        assert_eq!(split_body_element("<body><b>y</b></body>"), ("", "<b>y</b>"));
+        // Not a body element: all contents.
+        assert_eq!(split_body_element("<bodyguard>z</bodyguard>"), ("", "<bodyguard>z</bodyguard>"));
+        assert_eq!(split_body_element("<p>w</p>"), ("", "<p>w</p>"));
+    }
 
     #[test]
     fn urls_resolve_against_the_page() {
