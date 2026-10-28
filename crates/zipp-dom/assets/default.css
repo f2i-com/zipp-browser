@@ -769,6 +769,14 @@ canvas {
 
 iframe:focus-visible,
 body:focus-visible,
+/* The root's text colour is the system text colour for its colour scheme, as
+   in browsers: black normally, light once the page opts into dark mode
+   (`color-scheme: dark`, or `light dark` with the OS dark). Stylo's initial
+   `color` is plain black, which would leave a dark page's text unreadable. */
+:root {
+    color: CanvasText;
+}
+
 html:focus-visible {
     /* These elements historically don't show outlines when focused by default.
    * We could consider changing that if needed. */

@@ -114,6 +114,29 @@ impl<'dom> DocumentPainter<'dom> {
             }
         };
 
+        // A root whose used colour scheme is dark has a dark canvas, as in
+        // browsers. Without it a `color-scheme: light dark` page with no
+        // background of its own put its light `CanvasText` on white. The rule
+        // matches stylo's `is_dark_color_scheme` (see third_party/stylo).
+        let root_is_dark = dom.as_ref().root_element().primary_styles().is_some_and(|style| {
+            use style::values::specified::color::ColorSchemeFlags;
+            let bits = style.clone_color_scheme().bits;
+            match (bits.contains(ColorSchemeFlags::LIGHT), bits.contains(ColorSchemeFlags::DARK)) {
+                (false, true) => true,
+                (true, true) => {
+                    dom.as_ref().viewport().color_scheme
+                        == zipp_dom::traits_src::shell::ColorScheme::Dark
+                }
+                _ => false,
+            }
+        });
+        let cached_bg_color = match cached_bg_color {
+            Some(color) if color.components[3] > 0.0 => Some(color),
+            // Stylo's dark `Canvas`.
+            _ if root_is_dark => Some(Color::from_rgb8(30, 30, 30)),
+            other => other,
+        };
+
         Self {
             dom,
             scale,

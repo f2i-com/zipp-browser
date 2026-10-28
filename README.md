@@ -136,6 +136,14 @@ script settles, the shim serializes its tree to HTML, which is parsed into the
 real DOM for styling and layout. The VM stays alive, so a click re-enters the
 page's handlers and the updated tree is re-rendered.
 
+## Patched stylo
+
+`third_party/stylo` is stylo 0.14.0 from crates.io with one fix, wired in by
+`[patch.crates-io]`: its servo build never reported a dark colour scheme, so
+`light-dark()` and dark system colours were unusable. See
+`third_party/stylo/ZIPP_PATCHES.md`; drop the copy when moving to a stylo that
+carries the fix.
+
 ## Known gaps
 
 Honest list, not an exhaustive one:
@@ -153,11 +161,6 @@ Honest list, not an exhaustive one:
   markup, and listeners they attach to it never fire (example.com's
   translations, a hand-written menu toggle). Seeding the shim with the parsed
   page is the fix.
-- **`light-dark()` always picks its light colour.** Stylo 0.14's servo
-  `Device::is_dark_color_scheme` is hard-wired to `false`, so a page styled
-  with `color-scheme: light dark` and `light-dark()` (MDN, example.com) stays
-  light in dark mode, although `prefers-color-scheme` queries do follow the
-  system. Fixing it means patching stylo, not this repo.
 - **`mask-image` is unsupported**; a masked element paints unmasked. That is
   much closer to Chrome than dropping the layer, but a `mask-image` fade (the
   hero dot-grid's, for one) simply does not fade, and an icon drawn as a
