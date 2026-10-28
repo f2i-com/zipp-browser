@@ -65,6 +65,11 @@ zipp-browser --test-js                            # DOM/browser JS suite
 zipp-browser --test-compat                        # language compatibility suite
 ```
 
+In the window, the toolbar's back, forward and reload buttons work, as do
+Alt+Left/Right, the mouse's back/forward buttons, and F5 or Ctrl+R. Every page,
+including one reached by a link or revisited from history, runs its own
+JavaScript and responds to clicks.
+
 `--screenshot` writes the post-JavaScript HTML next to the image, which is how
 you tell a CSS problem from a DOM problem. Build with `--release`: a debug build
 runs the JS engine and rasterizer unoptimized and is far slower.

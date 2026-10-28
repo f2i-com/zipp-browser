@@ -6088,6 +6088,7 @@ dependencies = [
  "rfd",
  "tokio",
  "tracing",
+ "url",
  "wasm-bindgen-futures",
  "winit",
  "zipp-dom",

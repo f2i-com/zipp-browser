@@ -18,6 +18,7 @@ use zipp_dom::traits_src::events::{
     PointerEvent, PointerId, WheelDelta, WheelEvent, MouseEventButton,
     MouseEventButtons, PointerCoords, PointerDetails, UiEvent,
 };
+use zipp_dom::traits_src::navigation::NavigationOptions;
 use zipp_dom::traits_src::shell::Viewport;
 use winit::dpi::{LogicalPosition, PhysicalInsets, PhysicalPosition};
 use winit::keyboard::PhysicalKey;
@@ -372,6 +373,20 @@ where
         self.accessibility.update_tree(&inner);
     }
 
+    /// Ask the embedder to go `back`, `forward` or `reload`: a navigation to
+    /// `zipp-nav:<command>`, the same request the browser toolbar's buttons
+    /// make. An embedder without history simply has nothing to do with it.
+    fn navigate_command(&self, command: &str) {
+        let Ok(url) = url::Url::parse(&format!("zipp-nav:{command}")) else {
+            return;
+        };
+        let inner = self.doc.inner();
+        let options = NavigationOptions::new(url, "text/plain".to_string(), inner.id());
+        let provider = inner.navigation_provider.clone();
+        drop(inner);
+        provider.navigate_to(options);
+    }
+
     pub fn handle_winit_event(&mut self, event: WindowEvent) {
         // Update accessibility focus and window size state in response to a Winit WindowEvent
         #[cfg(feature = "accessibility")]
@@ -425,6 +440,22 @@ where
                         let ctrl = self.keyboard_modifiers.state().control_key();
                         let meta = self.keyboard_modifiers.state().meta_key();
                         let alt = self.keyboard_modifiers.state().alt_key();
+
+                        // History and reload, as in any browser. Consumed here:
+                        // the page does not also see them.
+                        let command = match key_code {
+                            KeyCode::ArrowLeft if alt => Some("back"),
+                            KeyCode::ArrowRight if alt => Some("forward"),
+                            KeyCode::BrowserBack => Some("back"),
+                            KeyCode::BrowserForward => Some("forward"),
+                            KeyCode::F5 | KeyCode::BrowserRefresh => Some("reload"),
+                            KeyCode::KeyR if ctrl | meta => Some("reload"),
+                            _ => None,
+                        };
+                        if let Some(command) = command {
+                            self.navigate_command(command);
+                            return;
+                        }
 
                         // Ctrl/Super keyboard shortcuts
                         if ctrl | meta {
@@ -490,6 +521,18 @@ where
                 self.doc.handle_ui_event(event);
             }
             WindowEvent::PointerButton { button, state, primary, position, .. } => {
+                // The mouse's own back/forward buttons.
+                if state == ElementState::Pressed {
+                    let command = match &button {
+                        ButtonSource::Mouse(MouseButton::Back) => Some("back"),
+                        ButtonSource::Mouse(MouseButton::Forward) => Some("forward"),
+                        _ => None,
+                    };
+                    if let Some(command) = command {
+                        self.navigate_command(command);
+                        return;
+                    }
+                }
                 let id = button_source_to_dom(&button);
                 let coords = self.pointer_coords(position);
                 self.pointer_pos = position;

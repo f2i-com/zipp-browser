@@ -170,6 +170,7 @@ fn main() {
     let nav_provider = Arc::new(BrowserNavProvider {
         proxy: proxy.clone(),
         current_url: std::sync::Mutex::new(url.clone()),
+        history: std::sync::Mutex::new(History::new(&url)),
     });
     // Published so `browser_host_call` can drive a navigation the PAGE asked
     // for (`window.open`, `location.assign`) -- it is a free function with no
@@ -1608,6 +1609,47 @@ struct BrowserNavProvider {
     /// The page the window is showing. Every navigation passes through this
     /// provider, so it is the one place that always knows.
     current_url: std::sync::Mutex<String>,
+    /// Back/forward history, for the same reason.
+    history: std::sync::Mutex<History>,
+}
+
+/// The pages visited in this window, and which one is showing.
+struct History {
+    entries: Vec<String>,
+    index: usize,
+}
+
+impl History {
+    fn new(first: &str) -> Self {
+        History { entries: vec![first.to_string()], index: 0 }
+    }
+
+    /// A new page: anything ahead of the current one is dropped, as a browser
+    /// does when you go back and then follow a different link.
+    fn push(&mut self, url: &str) {
+        if self.entries[self.index] == url {
+            return;
+        }
+        self.entries.truncate(self.index + 1);
+        self.entries.push(url.to_string());
+        self.index += 1;
+    }
+
+    fn back(&mut self) -> Option<String> {
+        self.index = self.index.checked_sub(1)?;
+        Some(self.entries[self.index].clone())
+    }
+
+    fn forward(&mut self) -> Option<String> {
+        let next = self.index + 1;
+        let url = self.entries.get(next)?.clone();
+        self.index = next;
+        Some(url)
+    }
+
+    fn current(&self) -> String {
+        self.entries[self.index].clone()
+    }
 }
 
 /// Records navigations instead of performing them, for `--screenshot`.
@@ -1629,6 +1671,29 @@ impl NavigationProvider for BrowserNavProvider {
     fn navigate_to(&self, options: NavigationOptions) {
         let mut url = options.url.to_string();
         eprintln!("[NAV] {url}");
+
+        // Back, forward and reload -- the toolbar's buttons, and the shell's
+        // keyboard and mouse shortcuts, ask for these by URL.
+        if let Some(command) = url.strip_prefix("zipp-nav:") {
+            let target = {
+                let mut history = self.history.lock().unwrap();
+                match command {
+                    "back" => history.back(),
+                    "forward" => history.forward(),
+                    "reload" => {
+                        let current = history.current();
+                        PAGE_CACHE.lock().unwrap().remove(&current);
+                        Some(current)
+                    }
+                    _ => None,
+                }
+            };
+            match target {
+                Some(target) => self.load(target),
+                None => eprintln!("[NAV] nothing to go {command} to"),
+            }
+            return;
+        }
 
         // The PDF viewer's Save button: write the file to Downloads and show the
         // viewer again with a note of where it went.
@@ -1689,6 +1754,15 @@ impl NavigationProvider for BrowserNavProvider {
             }
         }
 
+        self.history.lock().unwrap().push(&url);
+        self.load(url);
+    }
+}
+
+impl BrowserNavProvider {
+    /// Show `url`: fetch it on a worker thread (or take it from the cache), then
+    /// hand it to the window, whose document builder runs its JS.
+    fn load(&self, url: String) {
         *self.current_url.lock().unwrap() = url.clone();
         let proxy = self.proxy.clone();
 
@@ -1901,8 +1975,9 @@ fn toolbar_body_themed(page_html: &str, current_url: &str, html_class: &str) -> 
     format!(
         r#"<div{class_attr} style="display:flex;flex-direction:column;margin:0;padding:0;width:100%;min-height:100vh">
   <form action="{current_url}" method="GET" style="color:#212529;height:42px;min-height:42px;background:#f8f9fa;border-bottom:1px solid #dee2e6;display:flex;align-items:center;padding:4px 8px;gap:6px;font-family:Arial,sans-serif;box-sizing:border-box;width:100%;margin:0;flex-shrink:0;position:relative;z-index:2147483647">
-    <span style="font-size:16px;color:#495057;padding:0 4px;cursor:pointer">◀</span>
-    <span style="font-size:16px;color:#495057;padding:0 4px;cursor:pointer">▶</span>
+    <a href="zipp-nav:back" title="Back (Alt+Left)" style="display:flex;align-items:center;padding:3px;border-radius:4px;text-decoration:none;color:#495057"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg></a>
+    <a href="zipp-nav:forward" title="Forward (Alt+Right)" style="display:flex;align-items:center;padding:3px;border-radius:4px;text-decoration:none;color:#495057"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg></a>
+    <a href="zipp-nav:reload" title="Reload (F5)" style="display:flex;align-items:center;padding:3px;border-radius:4px;text-decoration:none;color:#495057"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg></a>
     <input type="text" name="__nav_url" value="{current_url}" style="width:90%;height:32px;padding:0 12px;border:1px solid #ced4da;border-radius:8px;font-size:14px;background:white;color:#212529;outline:none;box-sizing:border-box" />
   </form>
   <div style="display:block;position:relative;flex:1 1 auto;width:100%;margin:0;padding:0;min-width:0">
