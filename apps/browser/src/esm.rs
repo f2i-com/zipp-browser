@@ -51,13 +51,34 @@ pub struct Linked {
 /// rejects `import.meta` outright ("import.meta is only valid in modules"), and
 /// a dynamic `import()` would reach the VM's filesystem loader and look for a
 /// URL on disk.
+///
+/// It also notes an `await` outside any function: such a module's body has to
+/// become an async function, where a plain one would not compile.
 #[derive(Default)]
 struct DynamicScan {
     dyn_imports: Vec<(u32, u32, u32, u32)>, // expr start/end, argument start/end
     meta_spans: Vec<(u32, u32)>,
+    function_depth: u32,
+    top_level_await: bool,
 }
 
 impl<'a> Visit<'a> for DynamicScan {
+    fn visit_function_body(&mut self, it: &ox::FunctionBody<'a>) {
+        self.function_depth += 1;
+        oxc_ast_visit::walk::walk_function_body(self, it);
+        self.function_depth -= 1;
+    }
+
+    fn visit_await_expression(&mut self, it: &ox::AwaitExpression<'a>) {
+        self.top_level_await |= self.function_depth == 0;
+        oxc_ast_visit::walk::walk_await_expression(self, it);
+    }
+
+    fn visit_for_of_statement(&mut self, it: &ox::ForOfStatement<'a>) {
+        self.top_level_await |= it.r#await && self.function_depth == 0;
+        oxc_ast_visit::walk::walk_for_of_statement(self, it);
+    }
+
     fn visit_import_expression(&mut self, it: &ox::ImportExpression<'a>) {
         let span = it.span();
         let arg = it.source.span();
@@ -87,6 +108,8 @@ struct Rewritten {
     /// only throws if it actually reads one still in its TDZ — which is exactly
     /// what a real engine does.
     export_calls: Vec<String>,
+    /// The body awaits at top level, so it runs as an async function.
+    top_level_await: bool,
 }
 
 fn js_string(s: &str) -> String {
@@ -294,6 +317,7 @@ fn rewrite_module(
     // Dynamic import + import.meta, anywhere in the tree.
     let mut scan = DynamicScan::default();
     scan.visit_program(program);
+    let top_level_await = scan.top_level_await;
     for (start, end, arg_start, arg_end) in scan.dyn_imports {
         let arg_text = &source[arg_start as usize..arg_end as usize];
         // A literal specifier is resolved now, so the target is part of the
@@ -320,7 +344,7 @@ fn rewrite_module(
         body.replace_range(e.start as usize..e.end as usize, &e.text);
     }
 
-    Ok(Rewritten { body, deps, export_calls })
+    Ok(Rewritten { body, deps, export_calls, top_level_await })
 }
 
 /// A quoted string literal's value, when the text is exactly that.
@@ -448,8 +472,9 @@ pub fn link_graph(
     out.push_str("\n;(function(){\n");
     for (url, rw) in &modules {
         out.push_str(&format!(
-            "__zippDefine({},function(__imp,__exp,__expAll,__dyn,__dynRel,__meta){{\n",
-            js_string(url)
+            "__zippDefine({},{}function(__imp,__exp,__expAll,__dyn,__dynRel,__meta){{\n",
+            js_string(url),
+            if rw.top_level_await { "async " } else { "" }
         ));
         for call in &rw.export_calls {
             out.push_str(call);
@@ -521,10 +546,16 @@ function __zippRunModule(url) {
     if (typeof __zippEsmDebug !== 'undefined' && __zippEsmDebug) {
         env.log('info', 'esm run ' + url);
     }
-    try {
-        fn(imp, exp, expAll, dyn, dynRel, meta);
-    } catch (e) {
+    var threw = function (e) {
         env.log('error', 'module threw: ' + url + ': ' + ((e && (e.stack || e.message)) || e));
+    };
+    try {
+        // A module that awaits at top level is an async function: its
+        // exports are there once it settles, and a rejection is its throw.
+        var done = fn(imp, exp, expAll, dyn, dynRel, meta);
+        if (done && typeof done.then === 'function') done.then(null, threw);
+    } catch (e) {
+        threw(e);
     }
     if (typeof __zippEsmDebug !== 'undefined' && __zippEsmDebug) {
         env.log('info', 'esm done ' + url);
@@ -562,6 +593,13 @@ mod tests {
         let r = rw("import d from './d.js'; import * as n from './e.js';");
         assert!(r.body.contains(r#"const{default:d}=__imp("http://x/d.js");"#), "{}", r.body);
         assert!(r.body.contains(r#"const n=__imp("http://x/e.js");"#), "{}", r.body);
+    }
+
+    #[test]
+    fn top_level_await_is_noticed() {
+        assert!(rw("const a = await f();").top_level_await);
+        assert!(rw("for await (const x of xs) {}").top_level_await);
+        assert!(!rw("async function g() { await f(); } const h = async () => await f();").top_level_await);
     }
 
     #[test]
