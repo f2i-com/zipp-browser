@@ -40,7 +40,7 @@ app_units = "0.7.5"
 smallvec = "1"
 
 # Taffy (exact git rev from blitz upstream)
-taffy = { git = "https://github.com/DioxusLabs/taffy", rev = "4b6687da0ca1e9d71da4e48b4c659f5c45060707", default-features = false, features = [
+taffy = { git = "https://github.com/DioxusLabs/taffy", rev = "df2663aad35801f7522f6878a0300646dfe624f7", default-features = false, features = [
     "std",
     "flexbox",
     "grid",
