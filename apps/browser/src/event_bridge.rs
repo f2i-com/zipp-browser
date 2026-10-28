@@ -286,17 +286,24 @@ impl EventHandler for JsEventBridge {
         self.pending_rerender.take()
     }
 
-    /// The class the page currently has on `<html>`.
+    /// The attributes the page currently has on `<html>`.
     ///
-    /// Themes live there and a body-only re-render cannot carry it, so the
-    /// document applies this to the real document element separately. Returning
-    /// the value even when EMPTY matters: clearing the class is how a page
+    /// Themes live there and a body-only re-render cannot carry them, so the
+    /// document applies these to the real document element separately. `class`
+    /// is always included, even when EMPTY: clearing the class is how a page
     /// leaves dark mode, and treating "" as "nothing to say" would make the
     /// theme switchable one way only.
-    fn document_element_class(&mut self) -> Option<String> {
+    fn document_element_attributes(&mut self) -> Option<Vec<(String, String)>> {
         let state = self.js_state.as_mut()?;
-        match state.call_global("__getHtmlClassOnly", &[]) {
-            Ok(JsValue::String(c)) => Some(c),
+        match state.call_global("__getHtmlAttrList", &[]) {
+            // Records separated by U+001E, name from value by U+001F: control
+            // characters no attribute name or theme value contains.
+            Ok(JsValue::String(list)) => Some(
+                list.split('\u{1e}')
+                    .filter_map(|rec| rec.split_once('\u{1f}'))
+                    .map(|(name, value)| (name.to_string(), value.to_string()))
+                    .collect(),
+            ),
             _ => None,
         }
     }

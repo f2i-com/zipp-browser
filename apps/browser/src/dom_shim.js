@@ -268,13 +268,28 @@ class DOMNode {
     normalize() {}
 }
 
-// Dataset helper: maps camelCase property access to data-* attributes
+// Dataset helper: maps camelCase property access to data-* attributes.
+//
+// A live view over the attributes, as DOMStringMap is. It was a plain object,
+// so `el.dataset.theme = "light"` stored a property and never became a
+// `data-theme` attribute — invisible to the serialiser and therefore to CSS.
+// lance.name's theme is exactly that (`:root[data-theme=light]`), which is why
+// its toggle flipped the icon but never the colours.
 function _makeDataset(el) {
-    var ds = {};
-    ds._el = el;
-    ds._toAttr = function(k) { return "data-" + k.replace(/[A-Z]/g, function(m){return "-"+m.toLowerCase();}); };
-    ds._toKey = function(a) { return a.slice(5).replace(/-([a-z])/g, function(_,c){return c.toUpperCase();}); };
-    return ds;
+    function toAttr(k) { return "data-" + String(k).replace(/[A-Z]/g, function(m){return "-"+m.toLowerCase();}); }
+    function toKey(a) { return a.slice(5).replace(/-([a-z])/g, function(_,c){return c.toUpperCase();}); }
+    function get(k) { return typeof k === "string" ? el.attributes[toAttr(k)] : undefined; }
+    return new Proxy({}, {
+        get: function(t, k) { return get(k); },
+        set: function(t, k, v) { if (typeof k === "string") el.setAttribute(toAttr(k), v); return true; },
+        has: function(t, k) { return get(k) !== undefined; },
+        deleteProperty: function(t, k) { if (typeof k === "string") el.removeAttribute(toAttr(k)); return true; },
+        ownKeys: function() { var ks = []; for (var a in el.attributes) if (a.indexOf("data-") === 0) ks.push(toKey(a)); return ks; },
+        getOwnPropertyDescriptor: function(t, k) {
+            var v = get(k);
+            return v === undefined ? undefined : { value: v, writable: true, enumerable: true, configurable: true };
+        }
+    });
 }
 
 class Element extends DOMNode {
@@ -324,7 +339,7 @@ class Element extends DOMNode {
     // "undefined" rather than throwing. Taking `n` on trust meant a name that
     // was not already a string blew up on `n.indexOf`, which is how this shim
     // turned a harmless call into a dead page.
-    setAttribute(n,v) { n=String(n); v=String(v); this.attributes[n]=v; if(n==="class")this.className=v; if(n==="id")this.id=v; if(n==="style")this._ps(v); if(n.indexOf("data-")===0)this.dataset[n.slice(5)]=v; }
+    setAttribute(n,v) { n=String(n); v=String(v); this.attributes[n]=v; if(n==="class")this.className=v; if(n==="id")this.id=v; if(n==="style")this._ps(v); }
     getAttribute(n) { n=String(n); if(n==="class")return this.className||null; if(n==="id")return this.id||null; return this.attributes[n]!==undefined?this.attributes[n]:null; }
     removeAttribute(n) { n=String(n); delete this.attributes[n]; }
     hasAttribute(n) { n=String(n); return n in this.attributes||(n==="class"&&this.className)||(n==="id"&&this.id); }
@@ -1033,6 +1048,79 @@ var Blob = function(parts, options) { this._parts = parts || []; this.type = (op
 Blob.prototype.text = function() { return Promise.resolve(this._parts.join("")); };
 Blob.prototype.arrayBuffer = function() { return Promise.resolve(this._parts.join("")); };
 
+// --- matchMedia ---
+// Evaluates a media query list against the real viewport. It used to answer
+// `false` to everything, so an app branching in JS on `(max-width: 760px)`
+// laid itself out as if no breakpoint ever matched, at every window size, and
+// one asking `(prefers-color-scheme: dark)` always chose light — while the
+// CSS, which Stylo evaluates properly, said otherwise.
+//
+// The host substitutes the OS colour scheme for the placeholder (the window
+// gives Stylo the same answer); left unsubstituted it reads as light.
+var __zippPrefersDark = "__PREFERS_DARK__" === "true";
+function __zippMediaMatches(list) {
+    function px(v) {
+        var m = /^(-?[\d.]+)(px|em|rem)?$/.exec(v.trim());
+        if (!m) return NaN;
+        return parseFloat(m[1]) * (m[2] === "em" || m[2] === "rem" ? 16 : 1);
+    }
+    function cmp(a, op, b) {
+        return op === ">=" ? a >= b : op === "<=" ? a <= b : op === ">" ? a > b : op === "<" ? a < b : a === b;
+    }
+    function feature(f) {
+        var w = window.innerWidth, h = window.innerHeight;
+        // Range syntax: (width >= 600px), (400px < width), (400px <= width <= 900px)
+        var r = /^([\w-]+|[\d.]+\w*)\s*(<=|>=|<|>|=)\s*([\w-]+|[\d.]+\w*)(?:\s*(<=|>=|<|>|=)\s*([\d.]+\w*))?$/.exec(f);
+        if (r) {
+            var dims = { width: w, height: h };
+            if (r[1] in dims) return cmp(dims[r[1]], r[2], px(r[3]));
+            if (r[3] in dims) {
+                var flip = { "<": ">", ">": "<", "<=": ">=", ">=": "<=", "=": "=" };
+                var ok = cmp(dims[r[3]], flip[r[2]], px(r[1]));
+                return r[4] ? ok && cmp(dims[r[3]], r[4], px(r[5])) : ok;
+            }
+            return false;
+        }
+        var kv = f.split(":"), name = kv[0].trim(), val = kv.length > 1 ? kv.slice(1).join(":").trim() : null;
+        switch (name) {
+            case "width": return val !== null && w === px(val);
+            case "min-width": return val !== null && w >= px(val);
+            case "max-width": return val !== null && w <= px(val);
+            case "height": return val !== null && h === px(val);
+            case "min-height": return val !== null && h >= px(val);
+            case "max-height": return val !== null && h <= px(val);
+            case "orientation": return val === (h >= w ? "portrait" : "landscape");
+            case "prefers-color-scheme": return val === (__zippPrefersDark ? "dark" : "light");
+            case "prefers-reduced-motion": return val === null ? false : val === "no-preference";
+            case "prefers-contrast": return val === "no-preference";
+            case "hover": case "any-hover": return val === null || val === "hover";
+            case "pointer": case "any-pointer": return val === null || val === "fine";
+            case "color": return true;
+            case "display-mode": return val === "browser";
+            default: return false;
+        }
+    }
+    function query(q) {
+        q = q.trim().toLowerCase();
+        if (!q) return true;
+        var negate = false;
+        if (/^not\s/.test(q)) { negate = true; q = q.slice(4); }
+        q = q.replace(/^only\s+/, "");
+        var parts = q.split(/\s+and\s+/), ok = true;
+        for (var i = 0; i < parts.length && ok; i++) {
+            var p = parts[i].trim();
+            if (p === "all" || p === "screen") continue;
+            if (p === "print" || p === "speech") { ok = false; continue; }
+            var m = /^\((.*)\)$/.exec(p);
+            ok = m ? feature(m[1].trim()) : false;
+        }
+        return negate ? !ok : ok;
+    }
+    var qs = list.split(",");
+    for (var i = 0; i < qs.length; i++) if (query(qs[i])) return true;
+    return false;
+}
+
 var window = {
     document:doc, location:loc, navigator:navigator, performance:performance,
     innerWidth:__VIEWPORT_W__, innerHeight:__VIEWPORT_H__, devicePixelRatio:1,
@@ -1064,7 +1152,7 @@ var window = {
     addEventListener:function(t,fn){doc.addEventListener(t,fn);},
     removeEventListener:function(t,fn){doc.removeEventListener(t,fn);},
     dispatchEvent:function(ev){return doc.dispatchEvent(ev);},
-    matchMedia:function(q){return {matches:false,media:q,addEventListener:function(){},removeEventListener:function(){},addListener:function(){},removeListener:function(){}};},
+    matchMedia:function(q){return {matches:__zippMediaMatches(String(q)),media:q,onchange:null,addEventListener:function(){},removeEventListener:function(){},addListener:function(){},removeListener:function(){}};},
     scrollTo:function(){}, scroll:function(){}, scrollBy:function(){},
     history:{state:null,pushState:function(s,t,u){this.state=s;if(u)loc.pathname=u;},replaceState:function(s,t,u){this.state=s;if(u)loc.pathname=u;},back:function(){},forward:function(){},go:function(n){},length:1},
     self:null, top:null, parent:null,

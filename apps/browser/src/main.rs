@@ -574,10 +574,21 @@ function __zippDrainQueues(rounds) {
 // Tailwind's dark mode is a `.dark` class on the document element, and the app
 // toggles it from an effect. Our re-render replaces only the BODY, so that
 // change never reached the real DOM and the theme toggle did nothing.
-// Just the class list on <html>, for applying to the real document element.
-function __getHtmlClassOnly() {
-    try { return String((doc.documentElement && doc.documentElement.className) || ''); }
-    catch (e) { return ''; }
+// Every attribute on <html>, for applying to the real document element:
+// `name U+001F value` records joined by U+001E. `class` always comes first,
+// even when empty, because clearing it is how a page leaves dark mode. `style`
+// stays out, as in __getHtmlClass.
+function __getHtmlAttrList() {
+    try {
+        var el = doc.documentElement;
+        if (!el) return '';
+        var out = ['class\u001f' + String(el.className || '')];
+        for (var k in el.attributes) {
+            if (k === 'class' || k === 'style') continue;
+            out.push(k + '\u001f' + String(el.attributes[k]));
+        }
+        return out.join('\u001e');
+    } catch (e) { return ''; }
 }
 
 function __getHtmlClass() {
@@ -934,7 +945,12 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
         // the page did NOT cancel the click and the real browser would have
         // reloaded and dropped its JS state.
         navigation_provider: Some(Arc::new(RecordingNavProvider) as _),
-        viewport: Some(Viewport::new(width, height, 1.0, ColorScheme::Light)),
+        viewport: Some(Viewport::new(
+            width,
+            height,
+            1.0,
+            if system_prefers_dark() { ColorScheme::Dark } else { ColorScheme::Light },
+        )),
         ..Default::default()
     };
 
@@ -1299,9 +1315,12 @@ fn run_zipp_js_inner(
     // The page's JS must see the SAME viewport the CSS is laid out against, or
     // a responsive app that branches on `window.innerWidth` renders for one
     // width while the cascade uses another.
+    // Likewise the colour scheme: `matchMedia('(prefers-color-scheme: dark)')`
+    // has to give the answer Stylo uses for the same query in CSS.
     let shim = shim
         .replace("__VIEWPORT_W__", &viewport.0.to_string())
         .replace("__VIEWPORT_H__", &viewport.1.to_string())
+        .replace("__PREFERS_DARK__", if system_prefers_dark() { "true" } else { "false" })
         .replace(
             "__BODY_HTML__",
             &body_html(html)
@@ -1938,6 +1957,44 @@ fn make_urls_absolute(html: &str, base: &str) -> String {
         }
     }
     out
+}
+
+/// Whether the OS asks apps for a dark colour scheme.
+///
+/// The window hands Stylo the OS theme for `prefers-color-scheme`, but the
+/// page's JS runs before there is a window to ask, so read the same setting
+/// directly. `ZIPP_COLOR_SCHEME=light|dark` overrides it, which keeps
+/// screenshots comparable across machines.
+fn system_prefers_dark() -> bool {
+    if let Ok(scheme) = std::env::var("ZIPP_COLOR_SCHEME") {
+        return scheme.eq_ignore_ascii_case("dark");
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+        let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        let key = wide(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+        let value = wide("AppsUseLightTheme");
+        let mut data: u32 = 1;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        // SAFETY: both strings are NUL-terminated and outlive the call; `data`
+        // and `size` describe a writable DWORD, which RRF_RT_REG_DWORD restricts
+        // the result to.
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                key.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_DWORD,
+                std::ptr::null_mut(),
+                (&mut data as *mut u32).cast(),
+                &mut size,
+            )
+        };
+        return status == 0 && data == 0;
+    }
+    #[allow(unreachable_code)]
+    false
 }
 
 #[inline]

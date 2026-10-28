@@ -30,11 +30,14 @@ pub trait EventHandler {
     /// interaction works and every one after it silently does nothing.
     fn document_rerendered(&mut self, _doc: &BaseDocument) {}
 
-    /// The class the page has on its `<html>` element, if the handler can say.
+    /// The attributes the page has on its `<html>` element, if the handler can
+    /// say, as `(name, value)` pairs.
     ///
-    /// Themes live there — `:root.dark` and friends — and a body-only re-render
-    /// cannot carry it, so the document has to be told separately.
-    fn document_element_class(&mut self) -> Option<String> {
+    /// Themes live there — `:root.dark`, `:root[data-theme=light]` and friends —
+    /// and a body-only re-render cannot carry them, so the document has to be
+    /// told separately. All of them, not just `class`: a theme marked with an
+    /// attribute could otherwise never change.
+    fn document_element_attributes(&mut self) -> Option<Vec<(String, String)>> {
         None
     }
 }
@@ -67,8 +70,8 @@ impl EventHandler for Box<dyn EventHandler> {
     fn take_pending_rerender(&mut self) -> Option<String> {
         (**self).take_pending_rerender()
     }
-    fn document_element_class(&mut self) -> Option<String> {
-        (**self).document_element_class()
+    fn document_element_attributes(&mut self) -> Option<Vec<(String, String)>> {
+        (**self).document_element_attributes()
     }
 
     fn document_rerendered(&mut self, doc: &BaseDocument) {
@@ -82,8 +85,8 @@ impl EventHandler for &mut dyn EventHandler {
     fn take_pending_rerender(&mut self) -> Option<String> {
         (**self).take_pending_rerender()
     }
-    fn document_element_class(&mut self) -> Option<String> {
-        (**self).document_element_class()
+    fn document_element_attributes(&mut self) -> Option<Vec<(String, String)>> {
+        (**self).document_element_attributes()
     }
 
     fn document_rerendered(&mut self, doc: &BaseDocument) {

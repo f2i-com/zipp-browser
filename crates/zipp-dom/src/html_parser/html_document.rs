@@ -13,6 +13,10 @@ pub struct HtmlDocument {
     /// Optional JS event handler. When set, DOM events are dispatched through
     /// this handler instead of the default [`NoopEventHandler`].
     event_handler: Option<Box<dyn EventHandler>>,
+    /// Names of the `<html>` attributes the page's JS last put on the real
+    /// document element, so one the page later drops can be removed without
+    /// touching attributes that came from the original markup (`lang`).
+    js_root_attrs: Vec<String>,
 }
 
 impl Deref for HtmlDocument {
@@ -73,25 +77,28 @@ impl Document for HtmlDocument {
                     }
                     body
                 };
-                // The page's <html> class (its theme) must track the re-render
-                // too. A body-only swap left whatever the initial load put there
-                // in place forever, so dark mode could be turned on and never
-                // off — the `.dark` on the document element outlived the state
-                // that produced it.
-                let html_class = handler.document_element_class();
-                if let Some(class) = html_class {
+                // The page's <html> attributes (its theme) must track the
+                // re-render too. A body-only swap left whatever the initial load
+                // put there in place forever, so dark mode could be turned on and
+                // never off — the `.dark` on the document element outlived the
+                // state that produced it. A theme kept in an attribute
+                // (`data-theme`) could not change at all.
+                if let Some(attrs) = handler.document_element_attributes() {
                     let root_id = self.inner.root_element().id;
+                    let qual = |name: &str| {
+                        markup5ever::QualName::new(None, markup5ever::ns!(), markup5ever::LocalName::from(name))
+                    };
                     let mut mutator = crate::DocumentMutator::new(&mut self.inner);
-                    mutator.set_attribute(
-                        root_id,
-                        markup5ever::QualName::new(
-                            None,
-                            markup5ever::ns!(),
-                            markup5ever::local_name!("class"),
-                        ),
-                        &class,
-                    );
+                    for stale in &self.js_root_attrs {
+                        if !attrs.iter().any(|(name, _)| name == stale) {
+                            mutator.clear_attribute(root_id, qual(stale));
+                        }
+                    }
+                    for (name, value) in &attrs {
+                        mutator.set_attribute(root_id, qual(name), value);
+                    }
                     drop(mutator);
+                    self.js_root_attrs = attrs.into_iter().map(|(name, _)| name).collect();
                 }
                 if let Some(body_id) = body_id {
                     let mut mutator = crate::DocumentMutator::new(&mut self.inner);
@@ -142,6 +149,7 @@ impl HtmlDocument {
         HtmlDocument {
             inner: doc,
             event_handler: None,
+            js_root_attrs: Vec::new(),
         }
     }
 
