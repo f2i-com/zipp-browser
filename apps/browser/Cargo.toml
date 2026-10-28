@@ -42,6 +42,8 @@ oxc_ast = "0.126.0"
 oxc_ast_visit = "0.126.0"
 oxc_parser = "0.126.0"
 oxc_span = "0.126.0"
+# The page's body, parsed for the DOM shim to start from (`seed.rs`).
+html5ever = { workspace = true }
 
 # In-repo workspace crates
 zipp-dom = { workspace = true, features = ["default", "woff-rust", "parallel-construct"] }

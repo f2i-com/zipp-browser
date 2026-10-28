@@ -6381,6 +6381,7 @@ dependencies = [
  "base64 0.22.1",
  "glow",
  "hayro",
+ "html5ever",
  "image",
  "lazy_static",
  "linebender_resource_handle",

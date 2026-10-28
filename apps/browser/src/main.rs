@@ -40,6 +40,7 @@ use zipp_shell::{create_default_event_loop, ZippApp, ShellProxy, WindowConfig};
 
 mod esm;
 mod event_bridge;
+mod seed;
 #[cfg(windows)]
 mod media;
 mod canvas;
@@ -743,6 +744,8 @@ static NAV_PROVIDER: std::sync::OnceLock<Arc<dyn NavigationProvider>> =
 thread_local! {
     /// A binary body fetched by `http_bytes`, waiting for `take_bytes`.
     static PENDING_BYTES: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The page's body for the shim to start from (`seed.rs`), until it asks.
+    static SEED: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
 
 /// A URL from page script, resolved against the page as the browser would.
@@ -778,6 +781,8 @@ fn fetch_bytes_for_page(url: &str) -> Result<(u16, Vec<u8>), String> {
 /// `browser_host_call`'s.
 fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> Result<String, String> {
     match kind {
+        // The page's body, once, as the shim's document starts.
+        "seed" => Ok(SEED.with(|s| std::mem::take(&mut *s.borrow_mut()))),
         // `fetch(url).arrayBuffer()`: fetch the body as bytes and keep it for
         // `take_bytes`; report its status and length, so the shim can make the
         // scratch array big enough first.
@@ -1512,9 +1517,17 @@ fn run_zipp_js_inner(
     // An inline module is rare and needs the linker; run it as a classic script
     // when it has no import/export, which is the common case for a bootstrap
     // snippet, and report it otherwise rather than silently dropping it.
+    // A module's top-level `await` is a syntax error in a script: run one that
+    // awaits as the body of an async function, which is what it amounts to.
     for code in inline_modules {
         if code.contains("import ") || code.contains("export ") || code.contains("import(") {
             eprintln!("[JS] inline <script type=module> with imports is not linked yet");
+        } else if code.contains("await") {
+            let wrapped = format!(
+                "(async function () {{\n{code}\n}})().catch(function (e) {{ \
+                 console.error(\"module threw: \" + ((e && (e.stack || e.message)) || e)); }});"
+            );
+            external_scripts.push((format!("{page_url}#inline-module"), wrapped));
         } else {
             external_scripts.push((format!("{page_url}#inline-module"), code));
         }
@@ -1522,6 +1535,8 @@ fn run_zipp_js_inner(
     if external_scripts.is_empty() && module_entries.is_empty() {
         return None;
     }
+    let seed = seed::body_json(html).unwrap_or_default();
+    SEED.with(|s| *s.borrow_mut() = seed);
 
     let dom_shim = include_str!("dom_shim.js");
     let router_helpers = include_str!("router_helpers.js");

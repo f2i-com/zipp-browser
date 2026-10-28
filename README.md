@@ -111,8 +111,9 @@ On Windows a `<canvas>` can draw with WebGL 1 or WebGPU. The page's calls are
 batched and replayed off the window's thread -- WebGL on desktop OpenGL
 (`webgl.rs`), WebGPU on [wgpu](https://wgpu.rs) over Vulkan or Direct3D 12
 (`webgpu.rs`) -- into an offscreen target, read back at the end of each frame
-and painted as the canvas's image. The window drives `requestAnimationFrame`
-while a context is alive. `getContext("webgl2")` returns null, so a page falls
+and painted as the canvas's image, whether the canvas is in the page's markup
+or made by script. The window drives `requestAnimationFrame` while a context is
+alive. `getContext("webgl2")` returns null, so a page falls
 back to WebGL 1.
 
 ## Beyond HTML
@@ -169,13 +170,13 @@ Honest list, not an exhaustive one:
   cascade. Text that Chrome truncates to N lines with an ellipsis renders in
   full, making clamped cards taller. Fixing it means patching stylo, not this
   repo.
-- **Scripts only take effect on pages that render into `#root`.** The shim's
-  document starts as an empty `<div id="root">`, not the page's own markup, and
-  its tree is used only when that root was filled. A client-rendered app works;
-  on a server-rendered page the scripts run but cannot see or change its
-  markup, and listeners they attach to it never fire (example.com's
-  translations, a hand-written menu toggle). Seeding the shim with the parsed
-  page is the fix.
+- **Script changes show only on pages that render into `#root` or draw on a
+  canvas.** The shim's document starts as the page's own body, so scripts find
+  its elements, but its tree replaces the page only once script filled `#root`
+  or a canvas has a context. On other server-rendered pages the scripts' changes
+  and listeners go unseen (example.com's translations, a hand-written menu
+  toggle): the shim re-serialises SVG lossily, so showing its tree for every
+  page would cost them their icons.
 - **`mask-image` is unsupported**; a masked element paints unmasked. That is
   much closer to Chrome than dropping the layer, but a `mask-image` fade (the
   hero dot-grid's, for one) simply does not fade, and an icon drawn as a

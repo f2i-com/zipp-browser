@@ -304,9 +304,9 @@ class Element extends DOMNode {
         this.id = "";
         this.dataset = _makeDataset(this);
         this.classList = new ClassList(this);
-        this.offsetWidth = 0; this.offsetHeight = 0; this.offsetTop = 0; this.offsetLeft = 0;
+        this.offsetTop = 0; this.offsetLeft = 0;
         this.scrollWidth = 0; this.scrollHeight = 0; this.scrollTop = 0; this.scrollLeft = 0;
-        this.clientWidth = 0; this.clientHeight = 0; this.clientTop = 0; this.clientLeft = 0;
+        this.clientTop = 0; this.clientLeft = 0;
         // Form-control state. React reads `value`/`checked` back off the node
         // when it commits a controlled input, and reconciles `<select>` through
         // `element.options` — which is why a page with a select died in React's
@@ -564,10 +564,50 @@ doc.adoptNode = function(node) { node.ownerDocument=doc; return node; };
 doc.importNode = function(node,deep) { return node.cloneNode(deep); };
 doc.title = "";
 
-// Setup initial body from page HTML
-var _rootDiv = doc.createElement("div");
-_rootDiv.id = "root";
-doc.body.appendChild(_rootDiv);
+// Layout sizes. Nothing is laid out here, so they are 0 -- except a canvas's,
+// which is its drawing buffer's, as it is when no CSS sizes it: pages size a
+// canvas from its `clientWidth`, and 0 left it empty.
+["offsetWidth", "offsetHeight", "clientWidth", "clientHeight"].forEach(function (p) {
+    var dim = p.indexOf("Width") > 0 ? "width" : "height", store = "_" + p;
+    Object.defineProperty(Element.prototype, p, {
+        configurable: true,
+        get: function () {
+            if (this[store] !== undefined) return this[store];
+            return this.tagName === "CANVAS" ? (Number(this[dim]) || 0) : 0;
+        },
+        set: function (v) { this[store] = v; },
+    });
+});
+
+// The page's own body (seed.rs): `[attributes, children]`, an element being
+// `[tag, [name, value, ...], [children], ns?]` and text a string. Its scripts
+// find its elements, a canvas in its markup among them. `#root` comes empty,
+// for a client-rendered app to fill; a page without one gets one, as every
+// page used to.
+(function () {
+    var raw = "";
+    try { raw = __zippHostCall("seed"); } catch (e) {}
+    if (!raw) return;
+    var seed;
+    try { seed = JSON.parse(raw); } catch (e) { return; }
+    var NS = { s: "http://www.w3.org/2000/svg", m: "http://www.w3.org/1998/Math/MathML" };
+    function build(n, parent) {
+        if (typeof n === "string") { parent.appendChild(doc.createTextNode(n)); return; }
+        var el = n[3] ? doc.createElementNS(NS[n[3]], n[0]) : doc.createElement(n[0]);
+        var a = n[1], c = n[2];
+        for (var i = 0; i < a.length; i += 2) el.setAttribute(a[i], a[i + 1]);
+        for (var j = 0; j < c.length; j++) build(c[j], el);
+        parent.appendChild(el);
+    }
+    for (var i = 0; i < seed[0].length; i += 2) doc.body.setAttribute(seed[0][i], seed[0][i + 1]);
+    for (var k = 0; k < seed[1].length; k++) build(seed[1][k], doc.body);
+})();
+var _rootDiv = doc.getElementById("root");
+if (!_rootDiv) {
+    _rootDiv = doc.createElement("div");
+    _rootDiv.id = "root";
+    doc.body.appendChild(_rootDiv);
+}
 
 // Performance.now: return a slowly incrementing counter so React's scheduler
 // thinks minimal time is passing (prevents immediate yielding in sync mode).
@@ -1477,9 +1517,13 @@ function __serializeNode(node) {
     return r;
 }
 
+// The page as script left it, when that is what to show: once script filled
+// `#root`, or once a canvas draws (its frames reach the element through the
+// serialised tree's `data-flid`). Otherwise the page's own HTML is shown.
 function __getRenderedHTML() {
     var root = doc.getElementById("root");
     if(root && root.childNodes.length > 0) return __serializeNode(doc.body);
+    if(typeof __zippCanvasContexts !== "undefined" && __zippCanvasContexts.length > 0) return __serializeNode(doc.body);
     return null;
 }
 
