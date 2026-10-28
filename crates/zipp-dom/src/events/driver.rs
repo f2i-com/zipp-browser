@@ -47,6 +47,15 @@ pub trait EventHandler {
     fn animation_frame(&mut self, _doc: &mut BaseDocument) -> bool {
         false
     }
+
+    /// Run the page's work that has come due while nothing else was happening
+    /// -- timers, messages from its workers -- and say when it next has some
+    /// (`None`: nothing scheduled). A DOM change it makes comes back through
+    /// `take_pending_rerender`. Called often: when nothing is due it should
+    /// cost next to nothing.
+    fn run_tasks(&mut self, _doc: &mut BaseDocument) -> Option<std::time::Instant> {
+        None
+    }
 }
 
 pub struct NoopEventHandler;
@@ -87,6 +96,10 @@ impl EventHandler for Box<dyn EventHandler> {
 
     fn animation_frame(&mut self, doc: &mut BaseDocument) -> bool {
         (**self).animation_frame(doc)
+    }
+
+    fn run_tasks(&mut self, doc: &mut BaseDocument) -> Option<std::time::Instant> {
+        (**self).run_tasks(doc)
     }
 }
 

@@ -71,6 +71,18 @@ Page Up/Down, Space and Home/End scroll the page; Ctrl+L or F6 jumps to the addr
 including one reached by a link or revisited from history, runs its own
 JavaScript and responds to clicks.
 
+F12, or the toolbar's console button, opens the console under the toolbar:
+what the page logged (`console.*`, every argument inspected as a browser's
+console shows it) and what went wrong while it ran -- a script that would not
+compile, a module that would not load, a listener, timer or module that threw,
+a WebGL or WebGPU error -- newest first, with the error count on the button.
+Its input line runs JavaScript in the page and shows what that gave.
+
+Timers keep real time: the window wakes for the next one, and `clearTimeout`
+and `setInterval` work. A page's script stays alive after it loads even when
+the page shows its own markup rather than the script's tree, so its timers,
+its console output and the console's input still reach it.
+
 `--screenshot` writes the post-JavaScript HTML next to the image, which is how
 you tell a CSS problem from a DOM problem. Build with `--release`: a debug build
 runs the JS engine and rasterizer unoptimized and is far slower.

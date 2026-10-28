@@ -44,6 +44,7 @@ mod seed;
 #[cfg(windows)]
 mod media;
 mod canvas;
+mod console;
 #[cfg(windows)]
 mod webgl;
 #[cfg(windows)]
@@ -141,6 +142,8 @@ fn main() {
 
     let url = if arg.is_empty() { "https://lance.name".to_string() } else { arg };
     eprintln!("[BROWSER] Loading {url}");
+    // The window's page runs on this thread: its console is the one shown.
+    console::record_this_thread();
 
     // 1-3. Fetch, run the page's JS, post-process. The ScriptState is !Send, so
     //      this stays on the main thread to keep it alive for event dispatch.
@@ -214,6 +217,7 @@ fn main() {
     // which is why every page reached by a link used to render and then
     // respond to nothing.
     app.set_document_builder(Box::new(|url, html, config, viewport| {
+        console::clear();
         let (final_html, event_map_json, js_state) = render_page(&url, &html, viewport, None);
         let mut doc = build_document(&final_html, config);
         attach_event_bridge(&mut doc, event_map_json, js_state, &url);
@@ -249,6 +253,7 @@ fn run_js_suite(tag: &str, tests: &str, max_failures: usize) -> bool {
     let dom_shim = include_str!("dom_shim.js");
     let shim = dom_shim
         .replace("__PAGE_URL__", "http://localhost/test")
+        .replace("__PAGE_TITLE__", "")
         .replace("__VIEWPORT_W__", "1280")
         .replace("__VIEWPORT_H__", "800")
         .replace("__BODY_HTML__", "<div id=\\'root\\'></div>");
@@ -342,6 +347,7 @@ var result = t1 + " | " + t2 + " | " + t3 + " | " + t4;
     let dom_shim = include_str!("dom_shim.js");
     let shim = dom_shim
         .replace("__PAGE_URL__", "http://localhost/test")
+        .replace("__PAGE_TITLE__", "")
         .replace("__VIEWPORT_W__", "1280")
         .replace("__VIEWPORT_H__", "800")
         .replace("__BODY_HTML__", "<div id=\\'root\\'></div>");
@@ -575,6 +581,7 @@ function __zippDrainQueues(rounds, frames) {
     // (`__zippAnimationFrame`).
     frames = frames || 0;
     for (var i = 0; i < rounds; i++) {
+        __zippDueTimers();
         if (__timerQueue.length === 0 && __mcQueue.length === 0) {
             if (__rafQueue.length === 0 || frames <= 0) break;
             frames--;
@@ -863,6 +870,7 @@ fn browser_host_call(kind: &str, args: &[String]) -> Result<String, String> {
             let level = args.first().map(String::as_str).unwrap_or("info");
             let message = args.get(1).map(String::as_str).unwrap_or("");
             eprintln!("[JS:{level}] {message}");
+            console::push(console::Level::from_name(level), message);
             Ok(String::new())
         }
         "http" => {
@@ -1045,25 +1053,22 @@ fn attach_event_bridge(
     js_state: Option<ScriptState>,
     url: &str,
 ) {
-    let Some(emap_json) = event_map_json else {
-        return;
-    };
+    // A page without script gets a bridge too: it is what runs the console.
+    let emap_json = event_map_json.unwrap_or_else(|| "{}".to_string());
     let flid_map = event_bridge::build_flid_map(doc.as_ref());
     if !flid_map.is_empty() {
         eprintln!("[EVENT-BRIDGE] Mapped {} nodes with data-flid attributes", flid_map.len());
     }
-    let mut bridge = event_bridge::JsEventBridge::new(flid_map, &emap_json, js_state, url);
+    let bridge = event_bridge::JsEventBridge::new(flid_map, &emap_json, js_state, url);
     eprintln!(
         "[EVENT-BRIDGE] Bridge created with {} handler entries (live JS: {})",
         bridge.handler_count(),
         bridge.has_js_state(),
     );
-    // Also for a page with no listeners that draws with WebGL: the bridge is
-    // what runs its animation frames.
-    if bridge.handler_count() > 0 || bridge.has_webgl() {
-        doc.set_event_handler(Box::new(bridge));
-        eprintln!("[EVENT-BRIDGE] Event handler installed on document");
-    }
+    // Every page has one: it runs the page's animation frames and timers, and
+    // the console's controls, whether or not the page listens for anything.
+    doc.set_event_handler(Box::new(bridge));
+    eprintln!("[EVENT-BRIDGE] Event handler installed on document");
 }
 
 // ---------------------------------------------------------------------------
@@ -1562,6 +1567,7 @@ fn run_zipp_js_inner(
         "__PAGE_URL__",
         &page_url.replace('\\', "\\\\").replace('\'', "\\'"),
     );
+    let shim = shim.replace("__PAGE_TITLE__", &js_quoted(&page_title(html)));
     // The page's JS must see the SAME viewport the CSS is laid out against, or
     // a responsive app that branches on `window.innerWidth` renders for one
     // width while the cascade uses another.
@@ -1635,6 +1641,7 @@ fn run_zipp_js_inner(
         );
         for (url, err) in &linked.failures {
             eprintln!("[ESM] FAILED {url}: {err}");
+            console::push(console::Level::Error, format!("module {url} failed to load: {err}"));
         }
         if std::env::var_os("ZIPP_DEBUG_ESM").is_some() {
             full.push_str("
@@ -1668,6 +1675,7 @@ var __zippEsmDebug=true;
         Ok(s) => s,
         Err(e) => {
             eprintln!("[JS] Compile error: {e}");
+            console::push(console::Level::Error, format!("SyntaxError: {e}"));
             return None;
         }
     };
@@ -1714,6 +1722,8 @@ var __zippEsmDebug=true;
             break;
         }
     }
+    // Settled: from here on the page's timers keep real time.
+    let _ = state.call_global("__zippEndSettle", &[]);
     // A page drawing with WebGL shows its first frame from the start: present
     // it now, for the document `build_document` makes from this render.
     if matches!(state.call_global("__zippWebGLContexts", &[]), Ok(JsValue::Number(n)) if n > 0.0) {
@@ -1728,9 +1738,11 @@ var __zippEsmDebug=true;
     );
     for line in state.take_output() {
         eprintln!("[JS] {line}");
+        console::push(console::Level::Log, line);
     }
     for line in state.take_errput() {
         eprintln!("[JS] {line}");
+        console::push(console::Level::Error, line);
     }
 
     if let Ok(JsValue::String(rendered)) = state.eval_in_context("__getRenderedHTML()") {
@@ -1769,7 +1781,10 @@ var __zippEsmDebug=true;
             return Some((html_out, event_map_json, state));
         }
     }
-    None
+    // The page shows its own markup, not the script's tree (see
+    // `__getRenderedHTML`), but its script lives on: its timers run and the
+    // console can reach it. An empty event map says so (`JsEventBridge::new`).
+    Some((html.to_string(), String::new(), state))
 }
 
 // ---------------------------------------------------------------------------
@@ -1866,6 +1881,23 @@ impl NavigationProvider for BrowserNavProvider {
                 None => eprintln!("[NAV] nothing to go {command} to"),
             }
             return;
+        }
+
+        // The console's own links: the event bridge opens, closes and clears it
+        // itself.
+        if url.starts_with("zipp-console:") {
+            return;
+        }
+        // Code typed into the console. Its line is a form posting back to the
+        // page, like the address bar's; the code waits here for the page's
+        // thread (`JsEventBridge::run_tasks`).
+        if url.contains("__js=") {
+            if let Ok(parsed) = url::Url::parse(&url) {
+                if let Some((_, code)) = parsed.query_pairs().find(|(k, _)| k == "__js") {
+                    console::submit(code.into_owned());
+                    return;
+                }
+            }
         }
 
         // The PDF viewer's Save button: write the file to Downloads and show the
@@ -1997,10 +2029,20 @@ impl BrowserNavProvider {
 /// with a transparent top border, and the toolbar -- `<html>`'s own child,
 /// beside `<body>` (see `mount_chrome`) -- is placed absolutely into it, from
 /// the root's padding box, hence `top:-42px`. A border rather than padding, so
-/// a page's own `html` padding still applies.
-const TOOLBAR_CSS: &str = r#"
-html { border-top:42px solid transparent !important; margin:0 !important; max-width:none !important; }
-"#;
+/// a page's own `html` padding still applies. With the console open the band
+/// grows to hold it too, under the toolbar; opening and closing it rewrites
+/// this stylesheet (`JsEventBridge::show_console`).
+pub(crate) fn chrome_css(console_open: bool) -> String {
+    let panel = console::PANEL_HEIGHT;
+    let band = if console_open { 42 + panel } else { 42 };
+    let (display, button) = if console_open { ("flex", "#dbe4ff") } else { ("none", "transparent") };
+    format!(
+        "html {{ border-top:{band}px solid transparent !important; margin:0 !important; max-width:none !important; }}\n\
+         #__zipp_chrome {{ top:-{band}px; }}\n\
+         #__zipp_console {{ display:{display}; top:-{panel}px; height:{panel}px; }}\n\
+         #__zipp_console_button {{ background:{button}; }}\n"
+    )
+}
 
 /// Add the browser chrome to a page.
 ///
@@ -2054,11 +2096,12 @@ fn wrap_with_toolbar(html: &str, current_url: &str) -> String {
 /// a `max-width` body the toolbar would be as narrow as the body). And it is
 /// outside every JS re-render, which replaces only the body's contents.
 fn mount_chrome(doc: &mut HtmlDocument) {
-    let Ok(Some(chrome)) = doc.query_selector("#__zipp_chrome") else {
-        return;
-    };
     let root = doc.root_element().id;
-    doc.mutate().append_children(root, &[chrome]);
+    for id in ["#__zipp_chrome", "#__zipp_console"] {
+        if let Ok(Some(node)) = doc.query_selector(id) {
+            doc.mutate().append_children(root, &[node]);
+        }
+    }
 }
 
 /// Parse a page built by `render_page` and put its chrome in place, with any
@@ -2149,15 +2192,40 @@ pub(crate) fn rerender_body(rendered_body: &str, page_url: &str) -> String {
 /// -- a skip link at `translateY(-150%)`, a header slid out of view -- lands in
 /// the band; a real browser clips that at the viewport edge, here the chrome
 /// has to cover it, or a `z-index:100` skip link paints over the URL bar.
-fn toolbar_markup(current_url: &str) -> String {
+/// The console's input line, inside its form (put back empty after each run).
+pub(crate) const CONSOLE_INPUT: &str = r#"<span style="color:#1c7ed6">›</span><input id="__zipp_console_input" type="text" name="__js" placeholder="Run JavaScript in the page, then Enter" style="flex:1;min-width:0;height:22px;border:0;outline:none;font-family:Consolas,'Liberation Mono',monospace;font-size:12px;background:white;color:#212529" />"#;
+
+/// The console button's icon, and its badge counting the page's errors.
+pub(crate) fn console_button_inner(badge: &str) -> String {
+    let display = if badge.is_empty() { "none" } else { "inline-block" };
     format!(
-        r#"<form id="__zipp_chrome" action="{current_url}" method="GET" style="position:absolute;top:-42px;left:0;right:0;z-index:2147483647;color:#212529;height:42px;background:#f8f9fa;border-bottom:1px solid #dee2e6;display:flex;align-items:center;padding:4px 8px;gap:6px;font-family:Arial,sans-serif;font-size:14px;line-height:normal;text-align:left;box-sizing:border-box;margin:0">
-    <style>{TOOLBAR_CSS}</style>
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></svg><span id="__zipp_console_badge" style="display:{display};min-width:16px;padding:0 4px;border-radius:8px;background:#e03131;color:white;font-size:11px;line-height:16px;text-align:center">{badge}</span>"#
+    )
+}
+
+fn toolbar_markup(current_url: &str) -> String {
+    let css = chrome_css(console::is_open());
+    let button = console_button_inner(&console::badge_text());
+    let counts = console::counts_text();
+    let lines = console::lines_html();
+    format!(
+        r#"<form id="__zipp_chrome" action="{current_url}" method="GET" style="position:absolute;left:0;right:0;z-index:2147483647;color:#212529;height:42px;background:#f8f9fa;border-bottom:1px solid #dee2e6;display:flex;align-items:center;padding:4px 8px;gap:6px;font-family:Arial,sans-serif;font-size:14px;line-height:normal;text-align:left;box-sizing:border-box;margin:0">
+    <style id="__zipp_chrome_css">{css}</style>
     <a href="zipp-nav:back" title="Back (Alt+Left)" style="display:flex;align-items:center;padding:3px;border-radius:4px;text-decoration:none;color:#495057"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg></a>
     <a href="zipp-nav:forward" title="Forward (Alt+Right)" style="display:flex;align-items:center;padding:3px;border-radius:4px;text-decoration:none;color:#495057"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg></a>
     <a href="zipp-nav:reload" title="Reload (F5)" style="display:flex;align-items:center;padding:3px;border-radius:4px;text-decoration:none;color:#495057"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg></a>
-    <input type="text" name="__nav_url" value="{current_url}" style="width:90%;height:32px;padding:0 12px;border:1px solid #ced4da;border-radius:8px;font-size:14px;background:white;color:#212529;outline:none;box-sizing:border-box" />
-  </form>"#
+    <input type="text" name="__nav_url" value="{current_url}" style="flex:1;min-width:0;height:32px;padding:0 12px;border:1px solid #ced4da;border-radius:8px;font-size:14px;background:white;color:#212529;outline:none;box-sizing:border-box" />
+    <a id="__zipp_console_button" href="zipp-console:toggle" title="Console (F12)" style="display:flex;align-items:center;gap:4px;padding:4px 6px;border-radius:4px;text-decoration:none;color:#495057">{button}</a>
+  </form>
+  <div id="__zipp_console" style="position:absolute;left:0;right:0;z-index:2147483646;flex-direction:column;background:white;border-bottom:2px solid #ced4da;font-family:Consolas,'Liberation Mono',monospace;font-size:12px;line-height:16px;color:#212529;text-align:left;box-sizing:border-box;margin:0">
+    <div style="display:flex;align-items:center;gap:14px;padding:4px 10px;background:#f1f3f5;border-bottom:1px solid #dee2e6;font-family:Arial,sans-serif;font-size:12px;flex-shrink:0">
+      <b>Console</b><span id="__zipp_console_counts" style="color:#495057">{counts}</span><span style="flex:1"></span>
+      <a href="zipp-console:clear" id="__zipp_console_clear" style="color:#1c7ed6;text-decoration:none">Clear</a>
+      <a href="zipp-console:toggle" id="__zipp_console_close" style="color:#1c7ed6;text-decoration:none">Close</a>
+    </div>
+    <div id="__zipp_console_lines" style="flex:1;overflow:auto;min-height:0">{lines}</div>
+    <form id="__zipp_console_form" action="{current_url}" method="GET" style="display:flex;align-items:center;gap:6px;margin:0;padding:3px 10px;border-top:1px solid #dee2e6;flex-shrink:0">{CONSOLE_INPUT}</form>
+  </div>"#
     )
 }
 
@@ -2429,6 +2497,25 @@ fn body_html(html: &str) -> String {
 }
 
 #[inline]
+/// The text of the page's `<title>`, its common character references decoded.
+fn page_title(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let Some(open) = lower.find("<title") else {
+        return String::new();
+    };
+    let Some(start) = lower[open..].find('>').map(|i| open + i + 1) else {
+        return String::new();
+    };
+    let end = lower[start..].find("</title").map_or(start, |i| start + i);
+    let text = html[start..end].split_whitespace().collect::<Vec<_>>().join(" ");
+    text.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'").replace("&amp;", "&")
+}
+
+/// `s` inside a single-quoted JS string literal.
+fn js_quoted(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\'', "\\'").replace('\n', "\\n").replace('\r', "")
+}
+
 fn head_content(html: &str) -> String {
     let s = html
         .find("<head")
@@ -2468,7 +2555,9 @@ mod tests {
         let out = wrap_with_toolbar(page, "https://example.com/");
         assert!(out.starts_with("<!doctype html><html lang=en>"));
         assert!(out.contains(r#"<body class="home" style="padding:20px"><p>Hi</p><form id="__zipp_chrome""#));
-        assert!(out.ends_with("</form></body></html>"));
+        // The console panel follows the toolbar, closed.
+        assert!(out.contains(r#"<div id="__zipp_console""#));
+        assert!(out.ends_with("</div></body></html>"));
 
         // A page with no doctype still gets standards mode, and one with no
         // closing body tag still gets its toolbar.

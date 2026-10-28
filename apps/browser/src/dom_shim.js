@@ -94,22 +94,111 @@ Symbol.hasInstance = Symbol("Symbol.hasInstance");
 Symbol.toPrimitive = Symbol("Symbol.toPrimitive");
 Symbol.toStringTag = Symbol("Symbol.toStringTag");
 
-// Set up console using Zipp's env bridge (env.log is the builtin)
+// Set up console using Zipp's env bridge (env.log is the builtin). Every
+// argument is shown, as the browser console shows it: strings as they are,
+// objects and arrays inspected a few levels deep, errors with their stack.
+function __zippInspect(v, depth, seen) {
+    depth = depth || 0;
+    seen = seen || [];
+    if (v === null) return "null";
+    if (v === undefined) return "undefined";
+    var t = typeof v;
+    if (t === "string") return depth > 0 ? JSON.stringify(v) : v;
+    if (t === "bigint") return String(v) + "n";
+    if (t === "number" || t === "boolean" || t === "symbol") return String(v);
+    if (t === "function") return "ƒ " + (v.name || "anonymous") + "()";
+    if (v instanceof Error || (typeof v.message === "string" && typeof v.name === "string" && typeof v.stack === "string")) {
+        return v.stack ? String(v.stack) : v.name + ": " + v.message;
+    }
+    if (seen.indexOf(v) >= 0) return "[Circular]";
+    if (depth > 2) return Array.isArray(v) ? "[…]" : "{…}";
+    seen.push(v);
+    try {
+        var parts = [], i, more = false;
+        if (Array.isArray(v) || ArrayBuffer.isView(v)) {
+            for (i = 0; i < v.length && i < 50; i++) parts.push(__zippInspect(v[i], depth + 1, seen));
+            more = v.length > 50;
+            var kind = Array.isArray(v) ? "" : (v.constructor && v.constructor.name || "") + "(" + v.length + ") ";
+            return kind + "[" + parts.join(", ") + (more ? ", …" : "") + "]";
+        }
+        if (v instanceof ArrayBuffer) return "ArrayBuffer(" + v.byteLength + ")";
+        if (typeof v.nodeType === "number" && v.tagName) {
+            return "<" + String(v.tagName).toLowerCase() + (v.id ? "#" + v.id : "") + (v.className ? "." + String(v.className).split(" ").join(".") : "") + ">";
+        }
+        if (v instanceof Map) {
+            v.forEach(function (val, key) { if (parts.length < 30) parts.push(__zippInspect(key, depth + 1, seen) + " => " + __zippInspect(val, depth + 1, seen)); });
+            return "Map(" + v.size + ") {" + parts.join(", ") + "}";
+        }
+        if (v instanceof Set) {
+            v.forEach(function (val) { if (parts.length < 30) parts.push(__zippInspect(val, depth + 1, seen)); });
+            return "Set(" + v.size + ") {" + parts.join(", ") + "}";
+        }
+        if (typeof v.then === "function") return "Promise {…}";
+        var keys = Object.keys(v);
+        for (i = 0; i < keys.length && i < 30; i++) {
+            var val;
+            try { val = v[keys[i]]; } catch (e) { val = "[getter threw]"; }
+            parts.push(keys[i] + ": " + __zippInspect(val, depth + 1, seen));
+        }
+        var name = v.constructor && v.constructor !== Object && v.constructor.name ? v.constructor.name + " " : "";
+        return name + "{" + parts.join(", ") + (keys.length > 30 ? ", …" : "") + "}";
+    } catch (e) {
+        return String(v);
+    } finally {
+        seen.pop();
+    }
+}
+// A console call's arguments as one line: a leading string's %s/%d/%i/%f/%o/%O/%c
+// take the arguments after it, the rest follow, space-separated.
+function __zippConsoleText(args) {
+    var rest = Array.prototype.slice.call(args), head = "";
+    if (typeof rest[0] === "string" && rest[0].indexOf("%") >= 0) {
+        var format = rest.shift();
+        head = format.replace(/%([sdifoOc%])/g, function (m, c) {
+            if (c === "%") return "%";
+            if (rest.length === 0) return m;
+            var a = rest.shift();
+            if (c === "c") return "";
+            if (c === "d" || c === "i") return String(parseInt(a, 10));
+            if (c === "f") return String(Number(a));
+            return __zippInspect(a, c === "s" ? 0 : 1);
+        });
+        if (rest.length === 0) return head;
+        head += " ";
+    }
+    return head + rest.map(function (a) { return __zippInspect(a); }).join(" ");
+}
+var __zippCounts = {}, __zippTimes = {};
 var console = {
-    log: function(a,b,c,d) { env.log("info", "" + (a!==undefined?a:"") + (b!==undefined?" "+b:"") + (c!==undefined?" "+c:"") + (d!==undefined?" "+d:"")); },
-    warn: function(a,b,c,d) { env.log("warn", "" + (a!==undefined?a:"") + (b!==undefined?" "+b:"") + (c!==undefined?" "+c:"") + (d!==undefined?" "+d:"")); },
-    error: function(a,b,c,d) { env.log("error", "" + (a!==undefined?a:"") + (b!==undefined?" "+b:"") + (c!==undefined?" "+c:"") + (d!==undefined?" "+d:"")); },
-    info: function(a,b) { env.log("info", "" + (a!==undefined?a:"") + (b!==undefined?" "+b:"")); },
-    debug: function() {},
-    trace: function() {},
-    dir: function() {},
-    table: function() {},
-    group: function() {},
-    groupEnd: function() {},
-    time: function() {},
-    timeEnd: function() {},
-    assert: function(cond, msg) { if (!cond) env.log("error", "Assertion failed: " + (msg||"")); }
+    log: function () { env.log("info", __zippConsoleText(arguments)); },
+    info: function () { env.log("info", __zippConsoleText(arguments)); },
+    debug: function () { env.log("info", __zippConsoleText(arguments)); },
+    warn: function () { env.log("warn", __zippConsoleText(arguments)); },
+    error: function () { env.log("error", __zippConsoleText(arguments)); },
+    trace: function () { env.log("info", "Trace: " + __zippConsoleText(arguments)); },
+    dir: function (v) { env.log("info", __zippInspect(v, 1)); },
+    dirxml: function (v) { env.log("info", __zippInspect(v, 1)); },
+    table: function (v) { env.log("info", __zippInspect(v, 1)); },
+    group: function () { if (arguments.length) env.log("info", __zippConsoleText(arguments)); },
+    groupCollapsed: function () { if (arguments.length) env.log("info", __zippConsoleText(arguments)); },
+    groupEnd: function () {},
+    count: function (label) { label = label === undefined ? "default" : String(label); __zippCounts[label] = (__zippCounts[label] || 0) + 1; env.log("info", label + ": " + __zippCounts[label]); },
+    countReset: function (label) { __zippCounts[label === undefined ? "default" : String(label)] = 0; },
+    time: function (label) { __zippTimes[label === undefined ? "default" : String(label)] = Date.now(); },
+    timeLog: function (label) { label = label === undefined ? "default" : String(label); if (label in __zippTimes) env.log("info", label + ": " + (Date.now() - __zippTimes[label]) + " ms"); },
+    timeEnd: function (label) { label = label === undefined ? "default" : String(label); if (label in __zippTimes) { env.log("info", label + ": " + (Date.now() - __zippTimes[label]) + " ms"); delete __zippTimes[label]; } },
+    clear: function () {},
+    assert: function (cond) { if (!cond) env.log("error", "Assertion failed" + (arguments.length > 1 ? ": " + __zippConsoleText(Array.prototype.slice.call(arguments, 1)) : "")); }
 };
+// Code typed into the console: what it gave, inspected, or "\u0001" and
+// what it threw.
+function __zippConsoleEval(code) {
+    try {
+        return __zippInspect((0, eval)(code), 1);
+    } catch (e) {
+        return "\u0001" + ((e && e.stack) || ("Uncaught " + __zippInspect(e)));
+    }
+}
 
 // All definitions at top level (no IIFE) so they become globals in Zipp
 var __fl_strict = true;
@@ -562,7 +651,7 @@ doc.hasFocus = function() { return true; };
 doc.createNodeIterator = function(root) { return { nextNode:function(){return null;}, previousNode:function(){return null;} }; };
 doc.adoptNode = function(node) { node.ownerDocument=doc; return node; };
 doc.importNode = function(node,deep) { return node.cloneNode(deep); };
-doc.title = "";
+doc.title = '__PAGE_TITLE__';
 
 // Layout sizes. Nothing is laid out here, so they are 0 -- except a canvas's,
 // which is its drawing buffer's, as it is when no CSS sizes it: pages size a
@@ -700,7 +789,54 @@ function __zippAbsoluteUrl(u) {
     if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(u)) return u;
     try { return new URL(u, __pageUrl).href; } catch (e) { return u; }
 }
+// Callbacks due now: zero-delay work, and timers whose time has come.
 var __timerQueue = [];
+// Timers, by id: [due, fn, args, interval (0: once), order]. They run when
+// due -- `__zippDrainQueues` moves the due ones into `__timerQueue`, and the
+// window wakes for the next (`__zippNextTimer`, the event bridge's
+// `run_tasks`). While the page settles at load, a one-shot timer due within
+// its first second runs straight away instead, so the page shows what it
+// meant to show; longer ones, and intervals, wait for real time.
+var __timers = {};
+var __timerOrder = 0;
+var __zippSettleUntil = Date.now() + 1000;
+function __zippSetTimer(fn, ms, args, repeat) {
+    var id = ++_tid;
+    if (typeof fn !== "function") return id;
+    ms = Math.max(0, +ms || 0);
+    __timers[id] = [Date.now() + ms, fn, args, repeat ? Math.max(ms, 4) : 0, __timerOrder++];
+    return id;
+}
+function __zippClearTimer(id) { delete __timers[id]; }
+// Move the timers that are due into `__timerQueue`, earliest first.
+function __zippDueTimers() {
+    var now = Date.now(), settling = __zippSettleUntil > 0, due = [];
+    for (var id in __timers) {
+        var t = __timers[id];
+        if (t[0] <= now || (settling && !t[3] && t[0] <= __zippSettleUntil)) due.push(id);
+    }
+    if (due.length === 0) return;
+    due.sort(function (a, b) { return __timers[a][0] - __timers[b][0] || __timers[a][4] - __timers[b][4]; });
+    for (var i = 0; i < due.length; i++) {
+        var t = __timers[due[i]];
+        if (t[3]) t[0] = now + t[3]; else delete __timers[due[i]];
+        __timerQueue.push(function (fn, args) { return function () { fn.apply(window, args); }; }(t[1], t[2]));
+    }
+}
+// Milliseconds until the next timer is due; -1 when there is none.
+function __zippNextTimer() {
+    if (__timerQueue.length > 0 || __mcQueue.length > 0) return 0;
+    var next = -1, now = Date.now();
+    for (var id in __timers) {
+        var wait = Math.max(0, __timers[id][0] - now);
+        if (next < 0 || wait < next) next = wait;
+    }
+    return next;
+}
+// The page has settled: from now on timers keep real time.
+function __zippEndSettle() { __zippSettleUntil = 0; }
+// How many times the DOM has changed, to tell whether to render it again.
+function __zippDomMutationCount() { return __domMutations; }
 
 // MessageChannel - React's scheduler uses this for async work.
 // We simulate it with an iterative task queue to avoid infinite recursion
@@ -839,7 +975,9 @@ Number.EPSILON = 2.220446049250313e-16;
 Number.isSafeInteger = function(v) { return Number.isInteger(v) && Math.abs(v) <= Number.MAX_SAFE_INTEGER; };
 
 // --- Map/Set iterator extensions ---
-if (typeof Map !== "undefined") {
+// Only where the engine has none: zipp-vm's own are iterable, and these
+// replacements were not, so `for (const v of map.values())` threw.
+if (typeof Map !== "undefined" && !Map.prototype.entries) {
     Map.prototype.entries = function() { var arr = []; this.forEach(function(v,k){ arr.push([k,v]); }); var i = 0; return { next: function() { return i < arr.length ? {value:arr[i++],done:false} : {done:true}; } }; };
     Map.prototype.keys = function() { var arr = []; this.forEach(function(v,k){ arr.push(k); }); var i = 0; return { next: function() { return i < arr.length ? {value:arr[i++],done:false} : {done:true}; } }; };
     Map.prototype.values = function() { var arr = []; this.forEach(function(v,k){ arr.push(v); }); var i = 0; return { next: function() { return i < arr.length ? {value:arr[i++],done:false} : {done:true}; } }; };
@@ -1214,9 +1352,10 @@ var window = {
     cancelAnimationFrame:function(id){for(var i=0;i<__rafQueue.length;i++){if(__rafQueue[i][0]===id){__rafQueue.splice(i,1);break;}}},
     // Queue timer callbacks for post-script execution (calling them synchronously
     // causes the IIFE dispatch loop to exit prematurely from deeply nested throws)
-    setTimeout:function(fn,ms){_tid++;if(typeof fn==="function")__timerQueue.push(fn);return _tid;},
-    clearTimeout:function(){},
-    setInterval:function(fn,ms){return _tid++;}, clearInterval:function(){},
+    setTimeout:function(fn,ms){return __zippSetTimer(fn,ms,Array.prototype.slice.call(arguments,2),false);},
+    clearTimeout:function(id){__zippClearTimer(id);},
+    setInterval:function(fn,ms){return __zippSetTimer(fn,ms,Array.prototype.slice.call(arguments,2),true);},
+    clearInterval:function(id){__zippClearTimer(id);},
     addEventListener:function(t,fn){doc.addEventListener(t,fn);},
     removeEventListener:function(t,fn){doc.removeEventListener(t,fn);},
     dispatchEvent:function(ev){return doc.dispatchEvent(ev);},

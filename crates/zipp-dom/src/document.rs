@@ -155,6 +155,12 @@ pub trait Document: Any + 'static {
         false
     }
 
+    /// Run the page's due background work (`EventHandler::run_tasks`); when
+    /// it next has some, if ever.
+    fn run_tasks(&mut self) -> Option<std::time::Instant> {
+        None
+    }
+
     fn handle_ui_event(&mut self, event: UiEvent) {
         let mut doc = self.inner_mut();
         let mut driver = EventDriver::new(&mut *doc, NoopEventHandler);

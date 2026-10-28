@@ -66,6 +66,13 @@ impl Document for HtmlDocument {
         wants_more
     }
 
+    fn run_tasks(&mut self) -> Option<std::time::Instant> {
+        let handler = self.event_handler.as_mut()?;
+        let next = handler.run_tasks(&mut self.inner);
+        self.apply_pending_rerender();
+        next
+    }
+
     fn poll(&mut self, _task_context: Option<std::task::Context>) -> bool {
         let pending_before = self.inner.pending_images.len();
         self.inner.handle_messages();

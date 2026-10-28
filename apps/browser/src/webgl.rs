@@ -104,6 +104,7 @@ pub(crate) fn host_call(ctx: &mut dyn HostCtx, args: &[String]) -> Result<String
     let reply = reply_rx.recv().map_err(|_| "Error: WebGL stopped".to_string())?;
     if let Some(error) = reply.error {
         eprintln!("[WEBGL] {error}");
+        crate::console::push(crate::console::Level::Error, format!("WebGL: {error}"));
     }
     if let Some(bytes) = reply.bytes {
         let (addr, count, kind) = ctx.typed_array_region("__zippHostBytes")?;

@@ -75,6 +75,7 @@ pub(crate) fn host_call(ctx: &mut dyn HostCtx, args: &[String]) -> Result<String
         .map_err(|_| "Error: WebGPU did not answer".to_string())?;
     for error in &reply.errors {
         eprintln!("[WEBGPU] {error}");
+        crate::console::push(crate::console::Level::Error, format!("WebGPU: {error}"));
     }
     if let Some(bytes) = reply.bytes {
         let (addr, count, kind) = ctx.typed_array_region("__zippHostBytes")?;

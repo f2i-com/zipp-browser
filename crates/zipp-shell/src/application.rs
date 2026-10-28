@@ -222,13 +222,23 @@ where
         Some(self)
     }
 
-    #[cfg(target_os = "ios")]
-    fn about_to_wait(&mut self, _event_loop: &dyn ActiveEventLoop) {
+    /// Before waiting for input: run each page's background work that is due
+    /// (timers, its workers' messages), and wake again when the next is.
+    fn about_to_wait(&mut self, event_loop: &dyn ActiveEventLoop) {
+        let mut next: Option<std::time::Instant> = None;
         for view in self.windows.values_mut() {
+            if let Some(due) = view.doc.run_tasks() {
+                next = Some(next.map_or(due, |n| n.min(due)));
+            }
+            #[cfg(target_os = "ios")]
             if view.ios_request_redraw.get() {
                 view.window.request_redraw();
             }
         }
+        event_loop.set_control_flow(match next {
+            Some(due) => winit::event_loop::ControlFlow::WaitUntil(due),
+            None => winit::event_loop::ControlFlow::Wait,
+        });
     }
 }
 

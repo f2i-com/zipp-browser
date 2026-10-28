@@ -16,6 +16,9 @@
 //! `__eventHandlers[flid][eventType][0](event)` registry.
 
 use std::collections::HashMap;
+use std::time::Instant;
+
+use crate::console;
 
 use zipp_vm::embed::{JsValue, ScriptState};
 use zipp_dom::traits_events::{DomEvent, DomEventData, EventState, PointerCoords, PointerId, WheelDelta};
@@ -78,7 +81,27 @@ pub struct JsEventBridge {
     page_url: String,
     /// When the page started, for its animation frames' timestamps.
     started: std::time::Instant,
+    /// Whether the page shows the script's tree, so its listeners are wired
+    /// to it. A page showing its own markup keeps its script for timers and
+    /// the console, but hears no events: its listeners were never wired, and
+    /// a link-intercepting one (a site's own router) could cancel real
+    /// navigations it then cannot carry out.
+    live_dom: bool,
+    /// When the page's next timer is due, as it last said (`__zippNextTimer`).
+    next_timer: Option<Instant>,
+    /// The page's DOM mutation count when its tree was last rendered, so
+    /// background work re-renders only what changed it.
+    rendered_mutations: f64,
+    /// The console as the panel last showed it: its generation, when, and
+    /// the badge's text.
+    console_shown: u64,
+    console_refreshed: Instant,
+    console_badge: String,
 }
+
+/// The console panel refreshes at most this often, so a page logging every
+/// frame does not lay the window out every frame.
+const CONSOLE_REFRESH: std::time::Duration = std::time::Duration::from_millis(250);
 
 impl JsEventBridge {
     /// Build the bridge from:
@@ -98,14 +121,23 @@ impl JsEventBridge {
             .iter()
             .map(|(&flid, &blitz_id)| (blitz_id, flid))
             .collect();
-        JsEventBridge {
+        let mut bridge = JsEventBridge {
             handler_map,
             reverse_flid,
             js_state,
             pending_rerender: None,
             page_url: page_url.to_string(),
             started: std::time::Instant::now(),
-        }
+            live_dom: !event_map_json.is_empty(),
+            next_timer: None,
+            rendered_mutations: 0.0,
+            console_shown: 0,
+            console_refreshed: Instant::now(),
+            console_badge: String::new(),
+        };
+        bridge.note_rendered();
+        bridge.refresh_next_timer();
+        bridge
     }
 
     /// Number of blitz-dom nodes that have at least one JS event handler.
@@ -177,14 +209,124 @@ impl JsEventBridge {
                 self.pending_rerender = Some(rebuilt);
             }
         }
+        self.note_rendered();
+        self.refresh_next_timer();
     }
 
-    /// Whether the page has a WebGL context, so needs its frames driven.
-    pub fn has_webgl(&mut self) -> bool {
+    /// The tree as it is now is the one shown.
+    fn note_rendered(&mut self) {
+        if let Some(state) = self.js_state.as_mut()
+            && let Ok(JsValue::Number(n)) = state.call_global("__zippDomMutationCount", &[])
+        {
+            self.rendered_mutations = n;
+        }
+    }
+
+    /// Ask the page when its next timer is due.
+    fn refresh_next_timer(&mut self) {
         let Some(state) = self.js_state.as_mut() else {
-            return false;
+            self.next_timer = None;
+            return;
         };
-        matches!(state.call_global("__zippWebGLContexts", &[]), Ok(JsValue::Number(n)) if n > 0.0)
+        self.next_timer = match state.call_global("__zippNextTimer", &[]) {
+            Ok(JsValue::Number(ms)) if ms >= 0.0 => Some(Instant::now() + std::time::Duration::from_millis(ms as u64)),
+            _ => None,
+        };
+    }
+
+    /// Run what has come due -- timers, then the promises they settled --
+    /// and render the tree again if that changed it.
+    fn run_due_work(&mut self) {
+        let Some(state) = self.js_state.as_mut() else {
+            return;
+        };
+        let _ = state.call_global("__zippDrainQueues", &[JsValue::Number(50.0), JsValue::Number(0.0)]);
+        for _ in 0..4 {
+            state.run_microtasks();
+            let _ = state.call_global("__zippDrainQueues", &[JsValue::Number(50.0), JsValue::Number(0.0)]);
+        }
+        print_console(state);
+        if let Ok(JsValue::Number(n)) = state.call_global("__zippDomMutationCount", &[])
+            && n != self.rendered_mutations
+        {
+            self.rendered_mutations = n;
+            if let Ok(JsValue::String(html)) = state.call_global("__getRenderedHTML", &[])
+                && !html.is_empty()
+            {
+                self.pending_rerender = Some(crate::rerender_body(&html, &self.page_url));
+            }
+        }
+        self.refresh_next_timer();
+    }
+
+    /// Run the code typed into the console, logging it and what it gave.
+    fn run_console_input(&mut self) {
+        let Some(state) = self.js_state.as_mut() else {
+            for code in console::take_submitted() {
+                console::push(console::Level::Input, code);
+                console::push(console::Level::Error, "This page runs no JavaScript.");
+            }
+            return;
+        };
+        for code in console::take_submitted() {
+            console::push(console::Level::Input, code.clone());
+            match state.call_global("__zippConsoleEval", &[JsValue::String(code)]) {
+                Ok(JsValue::String(text)) => match text.strip_prefix('\u{1}') {
+                    Some(error) => console::push(console::Level::Error, error),
+                    None => console::push(console::Level::Result, text),
+                },
+                Ok(other) => console::push(console::Level::Result, format!("{other:?}")),
+                Err(e) => console::push(console::Level::Error, e.to_string()),
+            }
+        }
+        self.run_due_work();
+    }
+
+    /// Open or close the console panel as `console::is_open` says, and fill it.
+    fn show_console(&mut self, doc: &mut BaseDocument) {
+        if let Ok(Some(style)) = doc.query_selector("#__zipp_chrome_css") {
+            doc.mutate().set_inner_html(style, &crate::chrome_css(console::is_open()));
+        }
+        self.console_shown = u64::MAX;
+        self.refresh_console(doc, Instant::now(), true);
+        doc.shell_provider.request_redraw();
+    }
+
+    /// Bring the toolbar's badge, and the panel when open, up to date with
+    /// the console; when it next should, if it is behind and too soon.
+    fn refresh_console(&mut self, doc: &mut BaseDocument, now: Instant, force: bool) -> Option<Instant> {
+        let generation = console::generation();
+        if generation == self.console_shown {
+            return None;
+        }
+        let since = now.saturating_duration_since(self.console_refreshed);
+        if !force && since < CONSOLE_REFRESH {
+            return Some(now + (CONSOLE_REFRESH - since));
+        }
+        self.console_shown = generation;
+        self.console_refreshed = now;
+        let badge = console::badge_text();
+        let mut changed = false;
+        if badge != self.console_badge || force {
+            if let Ok(Some(button)) = doc.query_selector("#__zipp_console_button") {
+                doc.mutate().set_inner_html(button, &crate::console_button_inner(&badge));
+            }
+            self.console_badge = badge;
+            changed = true;
+        }
+        if console::is_open() {
+            if let Ok(Some(node)) = doc.query_selector("#__zipp_console_counts") {
+                doc.mutate().set_inner_html(node, &console::counts_text());
+            }
+            if let Ok(Some(node)) = doc.query_selector("#__zipp_console_lines") {
+                doc.mutate().set_inner_html(node, &console::lines_html());
+            }
+            changed = true;
+        }
+        if changed {
+            doc.shell_provider.request_redraw();
+        }
+        None
     }
 }
 
@@ -223,6 +365,8 @@ impl EventHandler for JsEventBridge {
                 }
             }
         }
+        self.note_rendered();
+        self.refresh_next_timer();
         flags & 1 != 0
     }
 
@@ -234,6 +378,22 @@ impl EventHandler for JsEventBridge {
         event_state: &mut EventState,
     ) {
         let event_name = event.data.name();
+        // The console's button and links, and F12, are the browser's.
+        let console_key = matches!(&event.data, DomEventData::KeyDown(k) if k.code == keyboard_types::Code::F12);
+        let console_link = matches!(event.data, DomEventData::Click(_))
+            .then(|| chain_element_id(_doc, chain, &["__zipp_console_button", "__zipp_console_close", "__zipp_console_clear"]))
+            .flatten();
+        if console_key || console_link.is_some() {
+            event_state.prevent_default();
+            if console_link.as_deref() == Some("__zipp_console_clear") {
+                console::clear();
+            } else {
+                console::toggle();
+            }
+            let mut inner = _doc.inner_mut();
+            self.show_console(&mut inner);
+            return;
+        }
         let details = event_details(&event.data);
         let mut ran_listener = false;
 
@@ -328,7 +488,7 @@ impl EventHandler for JsEventBridge {
         // keeps on the document): drag handlers that follow the pointer off
         // their element listen there, as do a game's keys. Not for the toolbar,
         // which is the browser's, not the page's.
-        if !event_state.propagation_is_stopped() && !in_chrome(_doc, chain) {
+        if self.live_dom && !event_state.propagation_is_stopped() && !in_chrome(_doc, chain) {
             if let Some(state) = self.js_state.as_mut() {
                 let result = state.call_global(
                     "__zippDispatchToDocument",
@@ -354,7 +514,28 @@ impl EventHandler for JsEventBridge {
         }
         if ran_listener && event_name == "click" {
             self.settle_after_click();
+        } else if ran_listener {
+            self.refresh_next_timer();
         }
+    }
+
+    fn run_tasks(&mut self, doc: &mut BaseDocument) -> Option<Instant> {
+        let now = Instant::now();
+        if console::has_submitted() {
+            self.run_console_input();
+            // An empty line again, still focused, for the next.
+            if let Ok(Some(form)) = doc.query_selector("#__zipp_console_form") {
+                doc.mutate().set_inner_html(form, crate::CONSOLE_INPUT);
+                if let Ok(Some(input)) = doc.query_selector("#__zipp_console_input") {
+                    doc.set_focus_to(input);
+                }
+            }
+        }
+        if self.next_timer.is_some_and(|due| due <= now) {
+            self.run_due_work();
+        }
+        let console_due = self.refresh_console(doc, now, false);
+        [self.next_timer, console_due].into_iter().flatten().min()
     }
 
     fn take_pending_rerender(&mut self) -> Option<String> {
@@ -394,6 +575,8 @@ impl EventHandler for JsEventBridge {
     /// The event map is re-read from the VM at the same time: a re-render can
     /// mount new components, and those register their own listeners.
     fn document_rerendered(&mut self, doc: &mut BaseDocument) {
+        // The script's tree is showing now, whatever it was before.
+        self.live_dom = true;
         // The canvases are new nodes now: give them back the frames they showed.
         crate::reapply_canvas_frames(doc);
         let flid_map = build_flid_map(doc);
@@ -534,10 +717,22 @@ fn event_details(data: &DomEventData) -> String {
 fn print_console(state: &mut ScriptState) {
     for line in state.take_output() {
         eprintln!("[JS] {line}");
+        console::push(console::Level::Log, line);
     }
     for line in state.take_errput() {
         eprintln!("[JS] {line}");
+        console::push(console::Level::Error, line);
     }
+}
+
+/// The first of `ids` that an element on the event's path has.
+fn chain_element_id(doc: &dyn Document, chain: &[usize], ids: &[&str]) -> Option<String> {
+    let doc = doc.inner();
+    chain.iter().find_map(|&id| {
+        let el = doc.get_node(id)?.element_data()?;
+        let found = el.id.as_ref()?;
+        ids.iter().find(|&&want| &**found == want).map(|s| s.to_string())
+    })
 }
 
 fn parse_event_map(
