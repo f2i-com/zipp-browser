@@ -69,6 +69,16 @@ zipp-browser --test-compat                        # language compatibility suite
 you tell a CSS problem from a DOM problem. Build with `--release`: a debug build
 runs the JS engine and rasterizer unoptimized and is far slower.
 
+A few environment switches make a headless render exercise what a window does:
+
+- `ZIPP_UICLICK=x,y[;x,y…]` clicks at those client coordinates before the
+  capture, through hit-testing, the event driver and the JS bridge.
+- `ZIPP_RESIZE=w,h[;w,h…]` resizes the live page through each size in turn.
+  Resizing to a width takes a different path from loading at it, and only the
+  first is what dragging the window does.
+- `ZIPP_COLOR_SCHEME=light|dark` overrides the OS colour scheme, which both
+  CSS `prefers-color-scheme` and the page's `matchMedia` otherwise follow.
+
 ## Fonts
 
 The Liberation faces are compiled into the binary, so `serif`, `sans-serif` and

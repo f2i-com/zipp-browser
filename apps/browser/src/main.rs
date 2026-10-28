@@ -1050,6 +1050,30 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
     doc.as_mut().resolve(ANIMATION_SETTLE_SECS);
     let layout_ms = t_layout.elapsed().as_millis();
 
+    // `ZIPP_RESIZE=w,h[;w,h...]` lays the page out at the requested size first,
+    // then resizes the viewport through each size in turn, the way dragging the
+    // window does, and screenshots at the last. A fresh load at a width and a
+    // resize TO that width take different paths (the second restyles and
+    // relayouts a live tree), and only the second is what a user resizing the
+    // window sees.
+    let (width, height) = {
+        let (mut width, mut height) = (width, height);
+        let sizes = std::env::var("ZIPP_RESIZE").unwrap_or_default();
+        for (i, (w, h)) in sizes
+            .split(';')
+            .filter_map(|s| s.split_once(','))
+            .filter_map(|(w, h)| Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?)))
+            .enumerate()
+        {
+            eprintln!("[RESIZE] {width}x{height} -> {w}x{h}");
+            doc.as_mut().viewport_mut().window_size = (w, h);
+            doc.as_mut().resolve(ANIMATION_SETTLE_SECS * (2 + 2 * i) as f64);
+            doc.as_mut().resolve(ANIMATION_SETTLE_SECS * (3 + 2 * i) as f64);
+            (width, height) = (w, h);
+        }
+        (width, height)
+    };
+
     // `ZIPP_UICLICK=x,y` sends a real pointer down+up at those client
     // coordinates, so hit-testing, the event driver and the JS bridge all run —
     // the same path a mouse takes. `ZIPP_CLICK` bypasses all of that and only
