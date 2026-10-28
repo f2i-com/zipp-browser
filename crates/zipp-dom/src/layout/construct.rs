@@ -512,7 +512,7 @@ fn collect_complex_layout_children(
     layout_children: &mut Vec<usize>,
     anonymous_block_id: &mut Option<usize>,
     hide_whitespace: bool,
-    needs_wrap: impl Fn(NodeKind, DisplayOutside) -> bool,
+    needs_wrap: fn(NodeKind, DisplayOutside) -> bool,
 ) {
     fn block_is_only_whitespace(doc: &BaseDocument, node_id: usize) -> bool {
         for child_id in doc.nodes[node_id].children.iter().copied() {
@@ -550,9 +550,22 @@ fn collect_complex_layout_children(
         if child_node_kind == NodeKind::Comment || (hide_whitespace && is_whitespace_node) {
             // return;
         }
-        // Recurse into `Display::Contents` nodes
+        // A `display:contents` node has no box: its children take its place, as
+        // children of THIS container, under this container's rules. It used to be
+        // handed to `collect_layout_children`, which treats each of those children
+        // as a container and collects *their* children -- one level too deep. On
+        // MDN, `main{display:contents}` in the page grid took the grid item inside
+        // it (`.layout__header`, `grid-area:header`) away too, and its heading and
+        // article became auto-placed grid items, the article in a 32px column.
         else if display_inside == DisplayInside::Contents {
-            collect_layout_children(doc, child_id, layout_children, anonymous_block_id)
+            collect_complex_layout_children(
+                doc,
+                child_id,
+                layout_children,
+                anonymous_block_id,
+                hide_whitespace,
+                needs_wrap,
+            )
         }
         // Push nodes that need wrapping into the current "anonymous block container".
         // If there is not an open one then we create one.
