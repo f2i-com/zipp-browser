@@ -6383,6 +6383,7 @@ dependencies = [
  "hayro",
  "html5ever",
  "image",
+ "keyboard-types 0.7.0",
  "lazy_static",
  "linebender_resource_handle",
  "mimalloc",

@@ -655,14 +655,29 @@ function __getHtmlClass() {
     } catch (e) { return ''; }
 }
 
-function __zippDispatchEvent(handlerNid, targetNid, type) {
+function __zippDispatchEvent(handlerNid, targetNid, type, details) {
     var byType = __eventHandlers[handlerNid];
     if (!byType) return false;
     var handlers = byType[type];
     if (!handlers || handlers.length === 0) return false;
-
     var target = __nodesById[targetNid] || __nodesById[handlerNid] || null;
-    var currentTarget = __nodesById[handlerNid] || null;
+    return __zippRunListeners(handlers, type, target, __nodesById[handlerNid] || null, 2, details);
+}
+
+// The document's listeners (and the window's, which the shim keeps there),
+// after the nodes'. 1: a listener ran; 2: it called preventDefault().
+function __zippDispatchToDocument(targetNid, type, details) {
+    var byType = __eventHandlers[document._id];
+    var handlers = byType && byType[type];
+    if (!handlers || handlers.length === 0) return 0;
+    var target = __nodesById[targetNid] || document.body || document;
+    return __zippRunListeners(handlers, type, target, document, 3, details) ? 3 : 1;
+}
+
+// Call `handlers` with one event; true when one called preventDefault().
+// `details` is the JSON the bridge sends (`event_details`): coordinates,
+// buttons, modifier keys, wheel deltas, the key.
+function __zippRunListeners(handlers, type, target, currentTarget, phase, details) {
     var defaultPrevented = false;
     var propagationStopped = false;
     var immediateStopped = false;
@@ -672,7 +687,7 @@ function __zippDispatchEvent(handlerNid, targetNid, type) {
         // Legacy alias some libraries still read.
         srcElement: target,
         currentTarget: currentTarget,
-        eventPhase: 2,
+        eventPhase: phase,
         bubbles: true,
         cancelable: true,
         isTrusted: true,
@@ -698,6 +713,15 @@ function __zippDispatchEvent(handlerNid, targetNid, type) {
     // React reads `nativeEvent` off its synthetic wrapper; point it at itself so
     // either access works.
     ev.nativeEvent = ev;
+    if (details) {
+        var more = JSON.parse(details);
+        for (var key in more) ev[key] = more[key];
+        ev.offsetX = ev.clientX; ev.offsetY = ev.clientY;
+        ev.movementX = 0; ev.movementY = 0;
+    }
+    // The list as it was when the event arrived: a listener that adds or
+    // removes others (a drag starting or ending) changes the next event's.
+    handlers = handlers.slice();
 
     for (var i = 0; i < handlers.length; i++) {
         // Never swallow this silently. A listener that throws is the difference
@@ -705,7 +729,9 @@ function __zippDispatchEvent(handlerNid, targetNid, type) {
         // React tore its own state down", and those need very different fixes.
         // Swallowing it cost real debugging time on the hamburger menu.
         try {
-            handlers[i](ev);
+            var h = handlers[i];
+            if (typeof h === "function") h.call(currentTarget, ev);
+            else if (h && typeof h.handleEvent === "function") h.handleEvent(ev);
         } catch (e) {
             env.log('error', 'listener for "' + type + '" threw: ' +
                 ((e && (e.stack || e.message)) || e));
@@ -1468,7 +1494,10 @@ fn run_zipp_js_inner(
     // the pipeline builds. Before this, the whole bundle was concatenated in as
     // a script and died at `import.meta is only valid in modules`.
     let mut module_entries: Vec<String> = Vec::new();
-    let mut inline_modules: Vec<String> = Vec::new();
+    // Inline modules' source, by the URL each is linked under (the page's, with
+    // a fragment of its own), so they join the graph in document order.
+    let mut inline_modules: HashMap<String, String> = HashMap::new();
+    let mut import_map = esm::ImportMap::default();
     let mut pos = 0;
     while let Some(start) = html[pos..].find("<script") {
         let abs = pos + start;
@@ -1491,18 +1520,22 @@ fn run_zipp_js_inner(
                     external_scripts.push((full, source));
                 }
             }
-        } else if is_js {
+        } else if is_js || ty == "importmap" {
             // INLINE script. These were skipped entirely, so a page whose
             // behaviour lives in a `<script>` block ran none of it — the tag was
             // parsed for `src`, found none, and moved on.
             let body_start = tag_end;
             if let Some(close) = html[body_start..].find("</script") {
                 let code = &html[body_start..body_start + close];
-                if !code.trim().is_empty() {
+                if ty == "importmap" {
+                    import_map.add(code, page_url, &resolve);
+                } else if !code.trim().is_empty() {
                     if ty == "module" {
                         // An inline module still needs linking; give it a URL of
                         // its own so relative specifiers resolve against the page.
-                        inline_modules.push(code.to_string());
+                        let url = format!("{page_url}#inline-module-{}", inline_modules.len());
+                        inline_modules.insert(url.clone(), code.to_string());
+                        module_entries.push(url);
                     } else {
                         external_scripts
                             .push((format!("{page_url}#inline{abs}"), code.to_string()));
@@ -1513,24 +1546,6 @@ fn run_zipp_js_inner(
             }
         }
         pos = tag_end;
-    }
-    // An inline module is rare and needs the linker; run it as a classic script
-    // when it has no import/export, which is the common case for a bootstrap
-    // snippet, and report it otherwise rather than silently dropping it.
-    // A module's top-level `await` is a syntax error in a script: run one that
-    // awaits as the body of an async function, which is what it amounts to.
-    for code in inline_modules {
-        if code.contains("import ") || code.contains("export ") || code.contains("import(") {
-            eprintln!("[JS] inline <script type=module> with imports is not linked yet");
-        } else if code.contains("await") {
-            let wrapped = format!(
-                "(async function () {{\n{code}\n}})().catch(function (e) {{ \
-                 console.error(\"module threw: \" + ((e && (e.stack || e.message)) || e)); }});"
-            );
-            external_scripts.push((format!("{page_url}#inline-module"), wrapped));
-        } else {
-            external_scripts.push((format!("{page_url}#inline-module"), code));
-        }
     }
     if external_scripts.is_empty() && module_entries.is_empty() {
         return None;
@@ -1604,7 +1619,13 @@ fn run_zipp_js_inner(
     // loaded at all — including the lazily `import()`ed route chunks.
     if !module_entries.is_empty() {
         let t_link = std::time::Instant::now();
-        let linked = esm::link_graph(&module_entries, &fetch, &resolve);
+        let fetch_module = |url: &str| match inline_modules.get(url) {
+            Some(code) => Ok(code.clone()),
+            None => fetch(url),
+        };
+        let resolve_module =
+            |base: &str, spec: &str| import_map.resolve(base, spec, &resolve).unwrap_or_else(|| resolve(base, spec));
+        let linked = esm::link_graph(&module_entries, &fetch_module, &resolve_module);
         eprintln!(
             "[ESM] Linked {} modules from {} entr{} in {}ms",
             linked.module_count,
@@ -1620,6 +1641,7 @@ fn run_zipp_js_inner(
 var __zippEsmDebug=true;
 ");
         }
+        full.push_str(&format!("\nvar __zippImportMap = {};\n", import_map.to_js()));
         full.push_str(esm::MODULE_RUNTIME_JS);
         full.push_str(&linked.source);
         // `ZIPP_DUMP_LINKED=<path>` writes the linked graph out. A rewrite bug
@@ -2044,6 +2066,7 @@ fn mount_chrome(doc: &mut HtmlDocument) {
 fn build_document(final_html: &str, config: DocumentConfig) -> HtmlDocument {
     let mut doc = HtmlDocument::from_html(final_html, config);
     mount_chrome(&mut doc);
+    canvas::forget_shown();
     apply_canvas_frames(&mut doc);
     doc
 }
@@ -2053,18 +2076,26 @@ fn build_document(final_html: &str, config: DocumentConfig) -> HtmlDocument {
 /// sized when the canvas has no size of its own, like any image. True when
 /// there were any.
 pub(crate) fn apply_canvas_frames(doc: &mut BaseDocument) -> bool {
+    show_canvas_frames(doc, canvas::take_frames())
+}
+
+/// After a re-render rebuilt the body: each canvas shows its frame again.
+pub(crate) fn reapply_canvas_frames(doc: &mut BaseDocument) {
+    show_canvas_frames(doc, canvas::shown_frames());
+}
+
+fn show_canvas_frames(doc: &mut BaseDocument, frames: Vec<(u32, canvas::Shown)>) -> bool {
     use zipp_dom::node::{ImageData, RasterImageData, SpecialElementData};
-    let frames = canvas::take_frames();
     if frames.is_empty() {
         return false;
     }
     let flids = event_bridge::build_flid_map(doc);
-    for frame in frames {
-        let Some(&node) = flids.get(&frame.flid) else {
+    for (flid, (width, height, rgba)) in frames {
+        let Some(&node) = flids.get(&flid) else {
             continue;
         };
         if let Some(element) = doc.get_node_mut(node).and_then(|n| n.element_data_mut()) {
-            let image = RasterImageData::new(frame.width, frame.height, Arc::new(frame.rgba));
+            let image = RasterImageData::new(width, height, rgba);
             element.special_data = SpecialElementData::Image(Box::new(ImageData::Raster(image)));
         }
     }

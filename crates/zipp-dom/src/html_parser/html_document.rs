@@ -143,7 +143,7 @@ impl HtmlDocument {
                     // whole subtree was dropped and re-parsed. Let it rebuild
                     // before the next event arrives, or only the FIRST
                     // interaction on a page ever works.
-                    handler.document_rerendered(&self.inner);
+                    handler.document_rerendered(&mut self.inner);
                     self.inner.shell_provider.request_redraw();
                 }
             }

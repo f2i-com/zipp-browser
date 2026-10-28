@@ -104,6 +104,8 @@ windows = { version = "0.62", features = [
 # WebGL (`webgl.rs`): OpenGL calls, and the batches page script sends.
 glow = "0.18"
 serde_json = "1"
+# Modifier keys on the events page script is given.
+keyboard-types = { workspace = true }
 # Image textures, decoded from their bytes.
 image = { workspace = true }
 windows-core = "0.62"

@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 
 use zipp_vm::embed::{JsValue, ScriptState};
-use zipp_dom::traits_events::{DomEvent, EventState};
+use zipp_dom::traits_events::{DomEvent, DomEventData, EventState, PointerCoords, PointerId, WheelDelta};
 use zipp_dom::{BaseDocument, Document, EventHandler, LocalName};
 
 // ---------------------------------------------------------------------------
@@ -130,6 +130,55 @@ impl JsEventBridge {
 // ---------------------------------------------------------------------------
 
 impl JsEventBridge {
+    /// After a click's listeners: settle the page, then see whether they
+    /// changed the DOM.
+    fn settle_after_click(&mut self) {
+        let Some(state) = self.js_state.as_mut() else {
+            return;
+        };
+        // React's setState is async — the handler has only
+        // queued the re-render at this point.
+        let _ = state.call_global(
+            "__zippDrainQueues",
+            &[JsValue::Number(50.0)],
+        );
+        // The shim's own queues and the VM's are separate,
+        // and draining one can feed the other, so alternate
+        // until both settle.
+        for _ in 0..8 {
+            state.run_microtasks();
+            let _ = state.call_global(
+                "__zippDrainQueues",
+                &[JsValue::Number(50.0), JsValue::Number(2.0)],
+            );
+        }
+        print_console(state);
+        if let Ok(JsValue::String(new_html)) =
+            state.call_global("__getRenderedHTML", &[])
+        {
+            if !new_html.is_empty() {
+                // `__getRenderedHTML` returns the page's own
+                // <body> element; its contents replace the
+                // document body's. Relative URLs need
+                // re-absolutising: the initial render did it,
+                // and without it images broke on the first
+                // click. The <html> attributes (the theme)
+                // travel separately, through
+                // `document_element_attributes`.
+                let rebuilt =
+                    crate::rerender_body(&new_html, &self.page_url);
+                eprintln!(
+                    "[EVENT] DOM updated after click ({} bytes)",
+                    rebuilt.len()
+                );
+                if let Ok(path) = std::env::var("ZIPP_DUMP_RERENDER") {
+                    let _ = std::fs::write(&path, &rebuilt);
+                }
+                self.pending_rerender = Some(rebuilt);
+            }
+        }
+    }
+
     /// Whether the page has a WebGL context, so needs its frames driven.
     pub fn has_webgl(&mut self) -> bool {
         let Some(state) = self.js_state.as_mut() else {
@@ -185,6 +234,8 @@ impl EventHandler for JsEventBridge {
         event_state: &mut EventState,
     ) {
         let event_name = event.data.name();
+        let details = event_details(&event.data);
+        let mut ran_listener = false;
 
         // The element actually under the pointer. `chain` is ordered target
         // first, so this is the click target regardless of which ancestor ends
@@ -235,8 +286,10 @@ impl EventHandler for JsEventBridge {
                                 JsValue::Number(f64::from(flid)),
                                 JsValue::Number(f64::from(target_flid)),
                                 JsValue::String(event_name.to_string()),
+                                JsValue::String(details.clone()),
                             ],
                         );
+                        ran_listener = true;
                         match &dispatched {
                             Err(e) => {
                                 eprintln!("[EVENT] handler for \"{event_name}\" failed: {e}")
@@ -259,51 +312,6 @@ impl EventHandler for JsEventBridge {
                         state.run_microtasks();
                         print_console(state);
 
-                        // For click events: settle the page, then see whether
-                        // the handler changed the DOM.
-                        if event_name == "click" {
-                            // React's setState is async — the handler has only
-                            // queued the re-render at this point.
-                            let _ = state.call_global(
-                                "__zippDrainQueues",
-                                &[JsValue::Number(50.0)],
-                            );
-                            // The shim's own queues and the VM's are separate,
-                            // and draining one can feed the other, so alternate
-                            // until both settle.
-                            for _ in 0..8 {
-                                state.run_microtasks();
-                                let _ = state.call_global(
-                                    "__zippDrainQueues",
-                                    &[JsValue::Number(50.0), JsValue::Number(2.0)],
-                                );
-                            }
-                            print_console(state);
-                            if let Ok(JsValue::String(new_html)) =
-                                state.call_global("__getRenderedHTML", &[])
-                            {
-                                if !new_html.is_empty() {
-                                    // `__getRenderedHTML` returns the page's own
-                                    // <body> element; its contents replace the
-                                    // document body's. Relative URLs need
-                                    // re-absolutising: the initial render did it,
-                                    // and without it images broke on the first
-                                    // click. The <html> attributes (the theme)
-                                    // travel separately, through
-                                    // `document_element_attributes`.
-                                    let rebuilt =
-                                        crate::rerender_body(&new_html, &self.page_url);
-                                    eprintln!(
-                                        "[EVENT] DOM updated after click ({} bytes)",
-                                        rebuilt.len()
-                                    );
-                                    if let Ok(path) = std::env::var("ZIPP_DUMP_RERENDER") {
-                                        let _ = std::fs::write(&path, &rebuilt);
-                                    }
-                                    self.pending_rerender = Some(rebuilt);
-                                }
-                            }
-                        }
                     } else {
                         eprintln!(
                             "[EVENT] Would call JS handler for \"{event_name}\" on node {node_id} (no live state)"
@@ -314,6 +322,38 @@ impl EventHandler for JsEventBridge {
             if event_state.propagation_is_stopped() {
                 break;
             }
+        }
+
+        // Then the document's own listeners, and the window's (which the shim
+        // keeps on the document): drag handlers that follow the pointer off
+        // their element listen there, as do a game's keys. Not for the toolbar,
+        // which is the browser's, not the page's.
+        if !event_state.propagation_is_stopped() && !in_chrome(_doc, chain) {
+            if let Some(state) = self.js_state.as_mut() {
+                let result = state.call_global(
+                    "__zippDispatchToDocument",
+                    &[
+                        JsValue::Number(f64::from(target_flid)),
+                        JsValue::String(event_name.to_string()),
+                        JsValue::String(details),
+                    ],
+                );
+                match result {
+                    Ok(JsValue::Number(n)) if n as u32 & 1 != 0 => {
+                        if n as u32 & 2 != 0 {
+                            event_state.prevent_default();
+                        }
+                        ran_listener = true;
+                        state.run_microtasks();
+                        print_console(state);
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("[EVENT] document handler for \"{event_name}\" failed: {e}"),
+                }
+            }
+        }
+        if ran_listener && event_name == "click" {
+            self.settle_after_click();
         }
     }
 
@@ -353,7 +393,9 @@ impl EventHandler for JsEventBridge {
     ///
     /// The event map is re-read from the VM at the same time: a re-render can
     /// mount new components, and those register their own listeners.
-    fn document_rerendered(&mut self, doc: &BaseDocument) {
+    fn document_rerendered(&mut self, doc: &mut BaseDocument) {
+        // The canvases are new nodes now: give them back the frames they showed.
+        crate::reapply_canvas_frames(doc);
         let flid_map = build_flid_map(doc);
         let event_map_json = self
             .js_state
@@ -370,6 +412,111 @@ impl EventHandler for JsEventBridge {
             .map(|(&flid, &blitz_id)| (blitz_id, flid))
             .collect();
     }
+}
+
+/// Whether an event happened in the browser's toolbar rather than the page.
+fn in_chrome(doc: &dyn Document, chain: &[usize]) -> bool {
+    let doc = doc.inner();
+    chain.iter().any(|&id| {
+        doc.get_node(id)
+            .and_then(|n| n.element_data())
+            .is_some_and(|el| el.id.as_ref().is_some_and(|id| &**id == "__zipp_chrome"))
+    })
+}
+
+/// What a listener reads off an event besides its type and target, as a JSON
+/// object for `__zippDispatchEvent`: where the pointer is, its buttons, the
+/// modifier keys, how far the wheel turned, which key.
+fn event_details(data: &DomEventData) -> String {
+    use keyboard_types::{Location, Modifiers};
+    use std::fmt::Write;
+    let mut out = String::from("{");
+    let coords = |out: &mut String, c: &PointerCoords| {
+        let _ = write!(
+            out,
+            "\"clientX\":{},\"clientY\":{},\"x\":{},\"y\":{},\"pageX\":{},\"pageY\":{},\"screenX\":{},\"screenY\":{},",
+            c.client_x, c.client_y, c.client_x, c.client_y, c.page_x, c.page_y, c.screen_x, c.screen_y
+        );
+    };
+    let mods = |out: &mut String, m: &Modifiers| {
+        let _ = write!(
+            out,
+            "\"altKey\":{},\"ctrlKey\":{},\"shiftKey\":{},\"metaKey\":{},",
+            m.contains(Modifiers::ALT),
+            m.contains(Modifiers::CONTROL),
+            m.contains(Modifiers::SHIFT),
+            m.contains(Modifiers::META)
+        );
+    };
+    match data {
+        DomEventData::PointerMove(p)
+        | DomEventData::PointerDown(p)
+        | DomEventData::PointerUp(p)
+        | DomEventData::PointerEnter(p)
+        | DomEventData::PointerLeave(p)
+        | DomEventData::PointerOver(p)
+        | DomEventData::PointerOut(p)
+        | DomEventData::MouseMove(p)
+        | DomEventData::MouseDown(p)
+        | DomEventData::MouseUp(p)
+        | DomEventData::MouseEnter(p)
+        | DomEventData::MouseLeave(p)
+        | DomEventData::MouseOver(p)
+        | DomEventData::MouseOut(p)
+        | DomEventData::Click(p)
+        | DomEventData::ContextMenu(p)
+        | DomEventData::DoubleClick(p) => {
+            coords(&mut out, &p.coords);
+            mods(&mut out, &p.mods);
+            let (id, kind) = match p.id {
+                PointerId::Mouse => (1, "mouse"),
+                PointerId::Pen => (2, "pen"),
+                PointerId::Finger(n) => (n.saturating_add(3), "touch"),
+            };
+            let _ = write!(
+                out,
+                "\"button\":{},\"buttons\":{},\"pointerId\":{id},\"pointerType\":\"{kind}\",\"isPrimary\":{},\"pressure\":{}",
+                p.button as u8,
+                p.buttons.bits(),
+                p.is_primary,
+                p.details.pressure
+            );
+        }
+        DomEventData::Wheel(w) => {
+            coords(&mut out, &w.coords);
+            mods(&mut out, &w.mods);
+            // The OS turns the wheel away from you as positive; the DOM calls
+            // that scrolling up, a negative delta, and Chrome counts a notch
+            // as 100 pixels.
+            let (dx, dy) = match w.delta {
+                WheelDelta::Lines(x, y) => (-x * 100.0, -y * 100.0),
+                WheelDelta::Pixels(x, y) => (-x, -y),
+            };
+            let _ = write!(out, "\"deltaX\":{dx},\"deltaY\":{dy},\"deltaZ\":0,\"deltaMode\":0,\"buttons\":{}", w.buttons.bits());
+        }
+        DomEventData::KeyDown(k) | DomEventData::KeyUp(k) | DomEventData::KeyPress(k) => {
+            mods(&mut out, &k.modifiers);
+            let location = match k.location {
+                Location::Standard => 0,
+                Location::Left => 1,
+                Location::Right => 2,
+                Location::Numpad => 3,
+            };
+            let key = serde_json::Value::String(k.key.to_string());
+            let code = serde_json::Value::String(k.code.to_string());
+            let _ = write!(
+                out,
+                "\"key\":{key},\"code\":{code},\"location\":{location},\"repeat\":{},\"isComposing\":{}",
+                k.is_auto_repeating, k.is_composing
+            );
+        }
+        _ => {}
+    }
+    if out.ends_with(',') {
+        out.pop();
+    }
+    out.push('}');
+    out
 }
 
 // ---------------------------------------------------------------------------

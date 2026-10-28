@@ -1363,6 +1363,9 @@ window.URL = URL;
 doc.defaultView=window;
 
 var document = doc;
+// `self` is the window: three.js drives its animation loop through
+// `self.requestAnimationFrame`, and without a binding `self` threw.
+var self = window;
 var setTimeout = window.setTimeout;
 var clearTimeout = window.clearTimeout;
 var setInterval = window.setInterval;

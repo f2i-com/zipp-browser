@@ -28,7 +28,7 @@ pub trait EventHandler {
     /// world (as the JS bridge does) has to rebuild here, or it will keep
     /// resolving events against nodes that no longer exist — the first
     /// interaction works and every one after it silently does nothing.
-    fn document_rerendered(&mut self, _doc: &BaseDocument) {}
+    fn document_rerendered(&mut self, _doc: &mut BaseDocument) {}
 
     /// The attributes the page has on its `<html>` element, if the handler can
     /// say, as `(name, value)` pairs.
@@ -81,7 +81,7 @@ impl EventHandler for Box<dyn EventHandler> {
         (**self).document_element_attributes()
     }
 
-    fn document_rerendered(&mut self, doc: &BaseDocument) {
+    fn document_rerendered(&mut self, doc: &mut BaseDocument) {
         (**self).document_rerendered(doc)
     }
 
@@ -100,7 +100,7 @@ impl EventHandler for &mut dyn EventHandler {
         (**self).document_element_attributes()
     }
 
-    fn document_rerendered(&mut self, doc: &BaseDocument) {
+    fn document_rerendered(&mut self, doc: &mut BaseDocument) {
         (**self).document_rerendered(doc)
     }
     fn handle_event(

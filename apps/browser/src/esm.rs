@@ -45,6 +45,73 @@ pub struct Linked {
     pub failures: Vec<(String, String)>,
 }
 
+/// A page's `<script type="importmap">`: what `import "three"` means.
+///
+/// Only `imports` is honoured (not `scopes`): an exact key, or else the
+/// longest key ending in `/` that prefixes the specifier. A key or specifier
+/// that looks like a URL (`/`, `./`, `../`, a scheme) is resolved first, as
+/// the spec says, so a map can also redirect URLs.
+#[derive(Default)]
+pub struct ImportMap {
+    /// Keys and the absolute URLs they map to, in order: the first map to
+    /// name a key keeps it.
+    imports: Vec<(String, String)>,
+}
+
+fn url_like(spec: &str) -> bool {
+    spec.starts_with('/')
+        || spec.starts_with("./")
+        || spec.starts_with("../")
+        || spec.split_once(':').is_some_and(|(scheme, _)| {
+            scheme.len() > 1 && scheme.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+        })
+}
+
+impl ImportMap {
+    /// Add one map's entries (its JSON), resolving against the page.
+    pub fn add(&mut self, json: &str, page_url: &str, resolve: &dyn Fn(&str, &str) -> String) {
+        let Ok(map) = serde_json::from_str::<serde_json::Value>(json) else {
+            eprintln!("[ESM] import map is not JSON");
+            return;
+        };
+        let Some(imports) = map.get("imports").and_then(|i| i.as_object()) else {
+            return;
+        };
+        for (key, target) in imports {
+            let Some(target) = target.as_str() else { continue };
+            let key = if url_like(key) { resolve(page_url, key) } else { key.clone() };
+            if !self.imports.iter().any(|(k, _)| *k == key) {
+                self.imports.push((key, resolve(page_url, target)));
+            }
+        }
+    }
+
+    /// `spec`, imported from `base`, as the map rewrites it; `None` when no
+    /// entry applies.
+    pub fn resolve(&self, base: &str, spec: &str, resolve: &dyn Fn(&str, &str) -> String) -> Option<String> {
+        if self.imports.is_empty() {
+            return None;
+        }
+        let key = if url_like(spec) { resolve(base, spec) } else { spec.to_string() };
+        if let Some((_, target)) = self.imports.iter().find(|(k, _)| *k == key) {
+            return Some(target.clone());
+        }
+        self.imports
+            .iter()
+            .filter(|(k, _)| k.ends_with('/') && key.starts_with(k.as_str()))
+            .max_by_key(|(k, _)| k.len())
+            .map(|(k, target)| format!("{target}{}", &key[k.len()..]))
+    }
+
+    /// The map as a JS object literal, for `import()` with a computed
+    /// specifier, which resolves at runtime (`__zippResolveModuleUrl`).
+    pub fn to_js(&self) -> String {
+        let entries: serde_json::Map<String, serde_json::Value> =
+            self.imports.iter().map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone()))).collect();
+        serde_json::Value::Object(entries).to_string()
+    }
+}
+
 /// Find dynamic `import(...)` and `import.meta` anywhere in the tree.
 ///
 /// Both are rewritten because neither can survive into a classic script: the VM
@@ -500,7 +567,19 @@ pub const MODULE_RUNTIME_JS: &str = r#"
 var __zippModuleDefs = {};
 var __zippModuleNs = {};
 function __zippDefine(url, fn) { __zippModuleDefs[url] = fn; }
+// The page's import map, if it has one (`ImportMap::resolve` at runtime).
 function __zippResolveModuleUrl(base, spec) {
+    var map = typeof __zippImportMap !== 'undefined' ? __zippImportMap : {};
+    var key = spec;
+    if (/^(\/|\.\.?\/|[a-z][a-z0-9+.-]+:)/i.test(spec)) {
+        try { key = String(new URL(spec, base)); } catch (e) {}
+    }
+    if (Object.prototype.hasOwnProperty.call(map, key)) return map[key];
+    var best = '';
+    for (var k in map) {
+        if (k.charAt(k.length - 1) === '/' && key.indexOf(k) === 0 && k.length > best.length) best = k;
+    }
+    if (best) return map[best] + key.slice(best.length);
     try { return String(new URL(spec, base)); } catch (e) { return spec; }
 }
 function __zippRunModule(url) {
@@ -579,6 +658,24 @@ mod tests {
 
     fn rw(src: &str) -> Rewritten {
         rewrite_module("http://x/a.js", src, &res).expect("parses")
+    }
+
+    #[test]
+    fn import_map_resolves_bare_and_prefixed_specifiers() {
+        let mut map = ImportMap::default();
+        map.add(
+            r#"{"imports": {"three": "./lib/three.module.js", "three/addons/": "./lib/jsm/",
+                "./old.js": "./new.js"}}"#,
+            "http://x/page.html",
+            &res,
+        );
+        let r = |spec: &str| map.resolve("http://x/page.html", spec, &res);
+        assert_eq!(r("three").as_deref(), Some("http://x/lib/three.module.js"));
+        assert_eq!(r("three/addons/controls/Orbit.js").as_deref(), Some("http://x/lib/jsm/controls/Orbit.js"));
+        assert_eq!(r("./old.js").as_deref(), Some("http://x/new.js"));
+        assert_eq!(r("./other.js"), None);
+        assert_eq!(r("react"), None);
+        assert_eq!(map.to_js().contains("\"three/addons/\":\"http://x/lib/jsm/\""), true);
     }
 
     #[test]

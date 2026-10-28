@@ -107,14 +107,21 @@ builds against): the whole JS API, with modules run by the
 [wasmi](https://github.com/wasmi-labs/wasmi) interpreter, so a page's
 `instantiateStreaming(fetch("x.wasm"))` works as written.
 
-On Windows a `<canvas>` can draw with WebGL 1 or WebGPU. The page's calls are
-batched and replayed off the window's thread -- WebGL on desktop OpenGL
-(`webgl.rs`), WebGPU on [wgpu](https://wgpu.rs) over Vulkan or Direct3D 12
-(`webgpu.rs`) -- into an offscreen target, read back at the end of each frame
-and painted as the canvas's image, whether the canvas is in the page's markup
-or made by script. The window drives `requestAnimationFrame` while a context is
-alive. `getContext("webgl2")` returns null, so a page falls
-back to WebGL 1.
+On Windows a `<canvas>` can draw with WebGL 1, WebGL 2 or WebGPU. The page's
+calls are batched and replayed off the window's thread -- WebGL on desktop
+OpenGL (`webgl.rs`), WebGPU on [wgpu](https://wgpu.rs) over Vulkan or Direct3D
+12 (`webgpu.rs`) -- into an offscreen target (multisampled when the context is
+antialiased), read back at the end of each frame and painted as the canvas's
+image, whether the canvas is in the page's markup or made by script. The window
+drives `requestAnimationFrame` while a context is alive. Current three.js
+(r186, WebGL 2 only) renders as Chrome does -- lighting, shadow maps, image
+textures, instancing, transparency -- and OrbitControls drags and zooms, since
+listeners get the pointer's coordinates, buttons and wheel deltas, and the
+document's and window's listeners hear events too.
+
+Module scripts may be inline, may import, and may use an import map
+(`<script type="importmap">`), so a page written as
+`import * as THREE from "three"` loads as written.
 
 ## Beyond HTML
 
