@@ -79,6 +79,20 @@ A few environment switches make a headless render exercise what a window does:
 - `ZIPP_COLOR_SCHEME=light|dark` overrides the OS colour scheme, which both
   CSS `prefers-color-scheme` and the page's `matchMedia` otherwise follow.
 
+## Beyond HTML
+
+A navigation is classified by its `Content-Type` (then file extension, then
+leading bytes), and anything that is not HTML becomes an ordinary page:
+
+- **PDF** -- every page rasterised with [hayro](https://github.com/LaurenzV/hayro)
+  (pure Rust) at the size it is shown, in a viewer with the file name, page
+  count and a Save button.
+- **Images** -- shown on their own, centred.
+- **Text, JSON, XML** -- shown as wrapped monospace text, not run through the
+  HTML parser.
+- **Anything else** -- saved to `Downloads` (never overwriting: `a (1).zip`),
+  with a page saying where it went.
+
 ## Fonts
 
 The Liberation faces are compiled into the binary, so `serif`, `sans-serif` and

@@ -40,6 +40,7 @@ use zipp_shell::{create_default_event_loop, ZippApp, ShellProxy, WindowConfig};
 
 mod esm;
 mod event_bridge;
+mod viewers;
 
 // ---------------------------------------------------------------------------
 // Global caches
@@ -826,7 +827,8 @@ fn json_quote(s: &str) -> String {
 fn prepare_page(url: &str, viewport: (u32, u32)) -> (String, Option<String>, Option<ScriptState>) {
     *CURRENT_URL.lock().unwrap() = url.to_string();
     let t_fetch = std::time::Instant::now();
-    let html = fetch(url)
+    // A PDF, image, text file or download comes back as a viewer page.
+    let html = viewers::fetch_document(url, true)
         .unwrap_or_else(|e| format!("<html><body><h1>Error</h1><p>{e}</p></body></html>"));
     let fetch_ms = t_fetch.elapsed().as_millis();
 
@@ -1590,6 +1592,23 @@ impl NavigationProvider for BrowserNavProvider {
         let mut url = options.url.to_string();
         eprintln!("[NAV] {url}");
 
+        // The PDF viewer's Save button: write the file to Downloads and show the
+        // viewer again with a note of where it went.
+        if let Some(target) = url.strip_prefix("zipp-save:") {
+            let target = target.to_string();
+            let proxy = self.proxy.clone();
+            std::thread::spawn(move || match viewers::save_pdf(&target) {
+                Ok(html) => proxy.send_event(zipp_shell::ShellEvent::NavigationLoad {
+                    contents: wrap_with_toolbar(&html, &target),
+                    url: target,
+                    retain_scroll_position: true,
+                    is_md: false,
+                }),
+                Err(e) => eprintln!("[DOWNLOAD] saving {target} failed: {e}"),
+            });
+            return;
+        }
+
         // A link to a fragment of the page already showing is a scroll, not a
         // navigation. This compared the fragment-less URL against the render
         // cache, keyed `https://lance.name` while the link resolved to
@@ -1651,7 +1670,7 @@ impl NavigationProvider for BrowserNavProvider {
                 }
 
                 eprintln!("[NAV] Loading {url}...");
-                let html = match fetch(&url) {
+                let html = match viewers::fetch_document(&url, true) {
                     Ok(h) => h,
                     Err(e) => {
                         eprintln!("[NAV] Fetch error: {e}");

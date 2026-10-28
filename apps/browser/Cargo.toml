@@ -63,6 +63,9 @@ url = { workspace = true, features = ["serde"], optional = true }
 reqwest = { workspace = true, features = ["blocking", "rustls-tls", "cookies"] }
 mimalloc = { version = "0.1.52", default-features = false }
 
+# PDF viewer: pure-Rust PDF rasteriser, one PNG per page (src/viewers.rs).
+hayro = "0.8.0"
+
 # Utilities
 base64 = "0.22"
 lazy_static = "1"
