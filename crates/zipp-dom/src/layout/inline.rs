@@ -151,6 +151,17 @@ impl BaseDocument {
             .take_inline_layout()
             .unwrap();
 
+        // A measurement must not disturb the laid-out text. Breaking lines here
+        // stores them on the node, and paint draws whatever is stored. When a
+        // parent measured this node under a min-content constraint and then
+        // asked for its final layout at a size it had already computed, Taffy
+        // answered that from cache: the lines stayed broken at the measuring
+        // width inside a correctly sized box. After a window resize a button
+        // label came out one word per line. Measure on a copy; keep the lines
+        // from the last real layout.
+        let measuring = inputs.run_mode == RunMode::ComputeSize;
+        let laid_out = measuring.then(|| inline_layout.clone());
+
         let style = &self.nodes[node_id].style;
 
         // Note: both horizontal and vertical percentage padding/borders are resolved against the container's inline size (i.e. width).
@@ -693,8 +704,9 @@ impl BaseDocument {
             height: height / scale,
         });
 
-        // Store sizes and positions of inline boxes
-        for line in inline_layout.layout.lines() {
+        // Store sizes and positions of inline boxes (a real layout only, for the
+        // same reason the lines are kept: a measurement must not move them).
+        for line in inline_layout.layout.lines().filter(|_| !measuring) {
             for item in line.items() {
                 if let parley::layout::PositionedLayoutItem::InlineBox(ibox) = item {
                     let node = &mut self.nodes[ibox.id as usize];
@@ -787,12 +799,12 @@ impl BaseDocument {
         // println!("known_dimensions: w: {:?} h: {:?}", inputs.known_dimensions.width, inputs.known_dimensions.height);
         // println!("\n");
 
-        // Put layout back
+        // Put layout back (the untouched one, if this was only a measurement)
         self.nodes[node_id]
             .data
             .downcast_element_mut()
             .unwrap()
-            .inline_layout_data = Some(inline_layout);
+            .inline_layout_data = Some(laid_out.unwrap_or(inline_layout));
 
         let measured_size = final_size;
 
