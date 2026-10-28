@@ -1,7 +1,7 @@
 # Zipp Browser
 
-A browser engine that runs page JavaScript on [zipp-lang](https://github.com/izuc/zipp-lang) —
-a clean-sheet JS engine with a register VM and a native x86-64 JIT.
+A browser engine that runs page JavaScript on [ZIPP](https://github.com/f2i-com/zipp.org) —
+a clean-sheet JS engine with a register VM and native x86-64/ARM64 JITs.
 
 Everything below the JS is real engine code, not a toy: **Stylo** (Firefox's
 style engine) for the CSS cascade, **Taffy** for flexbox/grid/block layout,
@@ -29,20 +29,29 @@ linked pages.
 | `crates/zipp-shell` | winit windowing, networking, the application shell |
 | `apps/browser` | The `zipp-browser` binary: JS integration, DOM shim, navigation |
 
-`zipp-vm` comes from the sibling [`zipp-lang`](https://github.com/izuc/zipp-lang)
-checkout via a path dependency, consumed through its `embed` module — a
-persistent VM that is compiled once, kept alive, and re-entered to dispatch DOM
-event handlers into the same global context.
+`zipp-vm` comes from [ZIPP](https://github.com/f2i-com/zipp.org) as a git
+dependency pinned to a release tag (`v0.0.30`), consumed through its `embed`
+module — a persistent VM that is compiled once, kept alive, and re-entered to
+dispatch DOM event handlers into the same global context.
 
 ## Building
 
-Needs a `zipp-lang` checkout beside this one:
-
 ```
-git clone git@github.com:izuc/zipp-lang.git
-git clone git@github.com:izuc/zipp-browser.git
+git clone git@github.com:f2i-com/zipp-browser.git
 cd zipp-browser
 cargo build --release
+```
+
+Cargo fetches ZIPP itself. To move to a newer engine, change the `tag` on
+`zipp-vm` in `apps/browser/Cargo.toml`.
+
+To build against a local `zipp.org` checkout instead (working on the engine and
+the browser together), keep the two checkouts side by side and put a patch in a
+`.cargo/config.toml` in their shared parent directory, outside both repos:
+
+```toml
+[patch."https://github.com/f2i-com/zipp.org"]
+zipp-vm = { path = "zipp.org/crates/zipp-vm" }
 ```
 
 ## Running
@@ -116,11 +125,6 @@ Honest list, not an exhaustive one:
 - **The DOM bridge is one-shot per render.** JS mutations are re-serialized and
   re-parsed rather than applied incrementally to the live tree. See
   `docs/DOM_BRIDGE_DESIGN.md`.
-- **Builtin statics ignore reassignment in zipp-vm** — `Object.keys = f` then
-  `Object.keys(x)` still calls the native, because the call site is lowered at
-  compile time. This breaks polyfills, and is why 4 of the bundled JS tests
-  fail.
-- `Error.prototype.stack` is empty in zipp-vm, so page errors have no traceback.
 - No scrolling-driven `IntersectionObserver`: observed elements are reported as
   intersecting immediately, which matches a fully-scrolled page rather than the
   initial viewport.

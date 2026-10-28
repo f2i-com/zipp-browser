@@ -28,7 +28,7 @@ use zipp_vm::embed::{compile_script, JsValue, ScriptState};
 
 // The JS compiler front end allocates heavily -- a HashSet<String> per scope on
 // every capture walk, Vec<(String, Reg)> scope chains -- so the allocator is on
-// the hot path for page load, not just for running code. zipp-lang adopted
+// the hot path for page load, not just for running code. ZIPP adopted
 // mimalloc for the same workload.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

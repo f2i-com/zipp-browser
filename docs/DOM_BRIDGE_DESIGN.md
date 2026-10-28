@@ -57,7 +57,7 @@ the browser DOM API. Key characteristics:
 
 ### Rust Side: Zipp VM
 
-Key APIs on `ScriptState` (from `zipp-vm/src/engine.rs`):
+Key APIs on `ScriptState` (from `zipp-vm/src/embed.rs`):
 
 - `compile_script(source) -> ScriptState` -- Parse and compile, returns VM ready to run.
 - `run_init()` -- Execute top-level code.

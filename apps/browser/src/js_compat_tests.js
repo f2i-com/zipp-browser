@@ -48,7 +48,7 @@ T("Map has", function() { var m = new Map(); m.set("a",1); return m.has("a") && 
 T("Set has", function() { var s = new Set(); s.add(1); return s.has(1) && !s.has(2); });
 T("Map delete", function() { var m = new Map(); m.set("a",1); m.delete("a"); return m.size === 0; });
 T("Set delete", function() { var s = new Set(); s.add(1); s.delete(1); return s.size === 0; });
-T("Map entries", function() { var m = new Map(); m.set("a",1); var e = m.entries(); return Array.isArray(e) && e.length === 1; });
+T("Map entries", function() { var m = new Map(); m.set("a",1); var it = m.entries(); var f = it.next(); return Array.isArray(f.value) && f.value[0] === "a" && f.value[1] === 1 && it.next().done === true; });
 
 // === Promise Advanced ===
 T("Promise constructor", function() { var p = new Promise(function(r){r(42);}); return p._state === "fulfilled" && p._value === 42; });

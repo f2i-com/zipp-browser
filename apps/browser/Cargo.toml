@@ -35,8 +35,8 @@ http2 = ["zipp-shell/http2"]
 
 [dependencies]
 # Parsing ES modules so their import/export statements can be rewritten by byte
-# span rather than pattern-matched out of minified source. Same version zipp-vm
-# already parses with, so this adds no new tree.
+# span rather than pattern-matched out of minified source. zipp-vm has its own
+# parser and does not expose it, so this is the browser's own dependency.
 oxc_allocator = "0.126.0"
 oxc_ast = "0.126.0"
 oxc_ast_visit = "0.126.0"
@@ -48,10 +48,11 @@ zipp-dom = { workspace = true, features = ["default", "woff-rust", "parallel-con
 zipp-renderer = { workspace = true, features = ["default"] }
 zipp-shell = { workspace = true, features = ["default", "http2"] }
 
-# Zipp JS engine — the zipp-lang register VM + x86-64 JIT, consumed through
+# Zipp JS engine — ZIPP's register VM + x86-64/ARM64 JIT, consumed through
 # its `embed` module (persistent VM: compile once, keep alive, eval + dispatch
-# event handlers into the same global context).
-zipp-vm = { path = "../../../zipp-lang/crates/zipp-vm" }
+# event handlers into the same global context). Pinned to a ZIPP release tag;
+# to build against a local zipp.org checkout instead, see the README.
+zipp-vm = { git = "https://github.com/f2i-com/zipp.org", tag = "v0.0.30" }
 
 # Linebender
 linebender_resource_handle = { workspace = true }
