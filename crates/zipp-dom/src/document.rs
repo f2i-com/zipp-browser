@@ -1360,6 +1360,20 @@ impl BaseDocument {
     }
 
     /// Set focus to a specific node. Returns `true` if focus actually changed.
+    /// Focus the text input at `node_id` with all of its text selected, ready to
+    /// be typed over -- what a browser does when you jump to its address bar.
+    pub fn focus_and_select_all(&mut self, node_id: usize) {
+        self.set_focus_to(node_id);
+        if let Some(input) = self.nodes[node_id]
+            .element_data_mut()
+            .and_then(|el| el.text_input_data_mut())
+        {
+            let mut font_ctx = self.font_ctx.lock().unwrap();
+            input.editor.driver(&mut font_ctx, &mut self.layout_ctx).select_all();
+        }
+        self.shell_provider.request_redraw();
+    }
+
     pub fn set_focus_to(&mut self, focus_node_id: usize) -> bool {
         if Some(focus_node_id) == self.focus_node_id {
             return false;

@@ -457,6 +457,19 @@ where
                             return;
                         }
 
+                        // Ctrl+L / F6: into the address bar, its text selected. The
+                        // browser's address bar is `input[name=__nav_url]`, the same
+                        // embedder convention as `zipp-nav:` above.
+                        if (key_code == KeyCode::KeyL && (ctrl | meta)) || key_code == KeyCode::F6 {
+                            let mut inner = self.doc.inner_mut();
+                            if let Ok(Some(address_bar)) = inner.query_selector("input[name=__nav_url]") {
+                                inner.focus_and_select_all(address_bar);
+                            }
+                            drop(inner);
+                            self.request_redraw();
+                            return;
+                        }
+
                         // Ctrl/Super keyboard shortcuts
                         if ctrl | meta {
                             match key_code {
