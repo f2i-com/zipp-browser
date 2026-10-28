@@ -52,7 +52,8 @@ zipp-shell = { workspace = true, features = ["default", "http2"] }
 # its `embed` module (persistent VM: compile once, keep alive, eval + dispatch
 # event handlers into the same global context). Pinned to a ZIPP release tag;
 # to build against a local zipp.org checkout instead, see the README.
-zipp-vm = { git = "https://github.com/f2i-com/zipp.org", tag = "v0.0.30" }
+# The `web-assembly` branch: the WebAssembly JS API (vm/webassembly).
+zipp-vm = { git = "https://github.com/f2i-com/zipp.org", branch = "web-assembly" }
 
 # Linebender
 linebender_resource_handle = { workspace = true }
@@ -93,6 +94,15 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Dxgi_Common",
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_OpenGL",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
 ] }
+# WebGL (`webgl.rs`): OpenGL calls, and the batches page script sends.
+glow = "0.18"
+serde_json = "1"
+# Image textures, decoded from their bytes.
+image = { workspace = true }
 windows-core = "0.62"
 

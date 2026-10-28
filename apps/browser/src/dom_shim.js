@@ -638,6 +638,28 @@ var loc = {
 };
 
 var _rafId=0, _tid=1000;
+// Animation-frame callbacks, `[id, fn]`, waiting for the next frame. A frame
+// runs them all (`__zippRunAnimationFrame`); a callback that asks for another
+// frame lands in the new queue, not in the one being run. They used to be
+// called at once, inside `requestAnimationFrame` itself, so a render loop --
+// every WebGL page has one -- recursed instead of animating.
+var __rafQueue = [];
+function __zippRunAnimationFrame(now) {
+    var batch = __rafQueue;
+    __rafQueue = [];
+    for (var i = 0; i < batch.length; i++) {
+        try { batch[i][1](now); }
+        catch (e) { env.log('error', 'animation frame callback threw: ' + ((e && (e.stack || e.message)) || e)); }
+    }
+    return batch.length;
+}
+// A URL from script, resolved against the page.
+function __zippAbsoluteUrl(u) {
+    u = String(u);
+    // Already absolute (the URL polyfill would join a `file:///C:/...` onto the base).
+    if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(u)) return u;
+    try { return new URL(u, __pageUrl).href; } catch (e) { return u; }
+}
 var __timerQueue = [];
 
 // MessageChannel - React's scheduler uses this for async work.
@@ -1148,8 +1170,8 @@ var window = {
     AbortController:AbortController,
     sessionStorage:sessionStorage, localStorage:localStorage,
     getComputedStyle:function(el){return el.style||{};},
-    requestAnimationFrame:function(fn){if(typeof fn==="function")fn(performance.now());return ++_rafId;},
-    cancelAnimationFrame:function(){},
+    requestAnimationFrame:function(fn){var id=++_rafId;if(typeof fn==="function")__rafQueue.push([id,fn]);return id;},
+    cancelAnimationFrame:function(id){for(var i=0;i<__rafQueue.length;i++){if(__rafQueue[i][0]===id){__rafQueue.splice(i,1);break;}}},
     // Queue timer callbacks for post-script execution (calling them synchronously
     // causes the IIFE dispatch loop to exit prematurely from deeply nested throws)
     setTimeout:function(fn,ms){_tid++;if(typeof fn==="function")__timerQueue.push(fn);return _tid;},
@@ -1241,7 +1263,14 @@ var window = {
                     text: function() { return Promise.resolve(responseBody); },
                     json: function() { return Promise.resolve(JSON.parse(responseBody)); },
                     blob: function() { return Promise.resolve(responseBody); },
-                    arrayBuffer: function() { return Promise.resolve(responseBody); },
+                    // The body as bytes, fetched again as such: the text above
+                    // went through UTF-8 and cannot give them back. What
+                    // `WebAssembly.instantiateStreaming(fetch(url))` reads.
+                    arrayBuffer: function() {
+                        return new Promise(function(res, rej) {
+                            try { res(__zippFetchBytes(String(url))); } catch (e) { rej(e); }
+                        });
+                    },
                     clone: function() { return this; },
                     redirected: false,
                     type: "basic"

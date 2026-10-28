@@ -76,6 +76,8 @@ pub struct JsEventBridge {
     /// The page URL, used to re-absolutise relative URLs and rebuild the
     /// browser chrome when a re-render replaces the document body.
     page_url: String,
+    /// When the page started, for its animation frames' timestamps.
+    started: std::time::Instant,
 }
 
 impl JsEventBridge {
@@ -102,6 +104,7 @@ impl JsEventBridge {
             js_state,
             pending_rerender: None,
             page_url: page_url.to_string(),
+            started: std::time::Instant::now(),
         }
     }
 
@@ -126,7 +129,52 @@ impl JsEventBridge {
 // EventHandler implementation
 // ---------------------------------------------------------------------------
 
+impl JsEventBridge {
+    /// Whether the page has a WebGL context, so needs its frames driven.
+    pub fn has_webgl(&mut self) -> bool {
+        let Some(state) = self.js_state.as_mut() else {
+            return false;
+        };
+        matches!(state.call_global("__zippWebGLContexts", &[]), Ok(JsValue::Number(n)) if n > 0.0)
+    }
+}
+
 impl EventHandler for JsEventBridge {
+    /// A frame for a page with a WebGL context: its `requestAnimationFrame`
+    /// callbacks, then each context's drawing read back into its canvas. Pages
+    /// without one are not driven: their animation frames run while they
+    /// settle and after events, as before.
+    fn animation_frame(&mut self, doc: &mut BaseDocument) -> bool {
+        let Some(state) = self.js_state.as_mut() else {
+            return false;
+        };
+        match state.call_global("__zippWebGLContexts", &[]) {
+            Ok(JsValue::Number(n)) if n > 0.0 => {}
+            _ => return false,
+        }
+        let now = self.started.elapsed().as_secs_f64() * 1000.0;
+        let flags = match state.call_global("__zippAnimationFrame", &[JsValue::Number(now)]) {
+            Ok(JsValue::Number(n)) => n as u32,
+            Ok(_) => 0,
+            Err(e) => {
+                eprintln!("[WEBGL] animation frame failed: {e}");
+                0
+            }
+        };
+        if crate::apply_canvas_frames(doc) {
+            doc.shell_provider.request_paint();
+        }
+        // The frame changed the DOM as well: lay the page out again.
+        if flags & 2 != 0 {
+            if let Ok(JsValue::String(html)) = state.call_global("__getRenderedHTML", &[]) {
+                if !html.is_empty() {
+                    self.pending_rerender = Some(crate::rerender_body(&html, &self.page_url));
+                }
+            }
+        }
+        flags & 1 != 0
+    }
+
     fn handle_event(
         &mut self,
         chain: &[usize],
@@ -224,7 +272,7 @@ impl EventHandler for JsEventBridge {
                                 state.run_microtasks();
                                 let _ = state.call_global(
                                     "__zippDrainQueues",
-                                    &[JsValue::Number(50.0)],
+                                    &[JsValue::Number(50.0), JsValue::Number(2.0)],
                                 );
                             }
                             if let Ok(JsValue::String(new_html)) =

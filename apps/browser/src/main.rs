@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use linebender_resource_handle::Blob;
 
 // -- internal (workspace) --
-use zipp_vm::embed::{compile_script, JsValue, ScriptState};
+use zipp_vm::embed::{compile_script, HostCtx, JsValue, ScriptState};
 
 // The JS compiler front end allocates heavily -- a HashSet<String> per scope on
 // every capture walk, Vec<(String, Reg)> scope chains -- so the allocator is on
@@ -34,7 +34,7 @@ use zipp_vm::embed::{compile_script, JsValue, ScriptState};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use zipp_dom::html_parser::{HtmlDocument, HtmlProvider};
 use zipp_dom::traits_src::navigation::{NavigationOptions, NavigationProvider};
-use zipp_dom::{DocumentConfig, FontContext};
+use zipp_dom::{BaseDocument, DocumentConfig, FontContext};
 use zipp_renderer::tinyskia::TinySkiaWindowRenderer;
 use zipp_shell::{create_default_event_loop, ZippApp, ShellProxy, WindowConfig};
 
@@ -42,6 +42,8 @@ mod esm;
 mod event_bridge;
 #[cfg(windows)]
 mod media;
+#[cfg(windows)]
+mod webgl;
 mod viewers;
 
 // ---------------------------------------------------------------------------
@@ -256,7 +258,7 @@ fn run_js_suite(tag: &str, tests: &str, max_failures: usize) -> bool {
             return false;
         }
     };
-    state.set_host_call(Box::new(browser_host_call));
+    state.set_host_call_ctx(Box::new(browser_host_call_ctx));
     eprintln!("[{tag}] Executing...");
     if let Err(e) = state.run_init() {
         eprintln!("[{tag}] Uncaught: {e}");
@@ -348,7 +350,7 @@ var result = t1 + " | " + t2 + " | " + t3 + " | " + t4;
             return;
         }
     };
-    state.set_host_call(Box::new(browser_host_call));
+    state.set_host_call_ctx(Box::new(browser_host_call_ctx));
     if let Err(e) = state.run_init() {
         eprintln!("[VM-TEST] Uncaught: {e}");
     }
@@ -537,19 +539,44 @@ var http = (function () {
     };
 })();
 
+// Bytes from the host. A binary host call (`browser_host_call_ctx`) copies
+// into this array, found by name, so it must be a top-level binding; it grows
+// by doubling, as the engine keeps every array it has copied into pinned.
+var __zippHostBytes = new Uint8Array(0);
+function __zippFetchBytes(url) {
+    var info = JSON.parse(__zippHostCall("http_bytes", url));
+    if (__zippHostBytes.length < info.len) {
+        __zippHostBytes = new Uint8Array(Math.max(info.len, __zippHostBytes.length * 2));
+    }
+    __zippHostCall("take_bytes");
+    return __zippHostBytes.slice(0, info.len).buffer;
+}
+
 // Run the shim's timer and microtask queues to quiescence, or until `rounds`
 // passes have gone by. React's setState is asynchronous, so a click handler
 // has typically only QUEUED the re-render when it returns; without this the
 // page would be read back before the update landed. Bounded because a page
 // can legitimately reschedule forever (a spinner, a poll loop).
 var __zippDrainStats = { rounds: 0, timers: 0, micro: 0 };
-function __zippDrainQueues(rounds) {
+function __zippDrainQueues(rounds, frames) {
     // Returns how many callbacks ran, so the host can stop settling once the
     // page is genuinely quiet instead of always burning a fixed number of
     // rounds.
     var did = 0;
+    // Up to `frames` animation frames run too, once the other queues are
+    // empty, so that work a page defers to `requestAnimationFrame` (a first
+    // WebGL frame, a menu opening after a click) lands before the page is read
+    // back. They do not count as work done: a page that redraws every frame
+    // would otherwise never settle. Its later frames come from the window
+    // (`__zippAnimationFrame`).
+    frames = frames || 0;
     for (var i = 0; i < rounds; i++) {
-        if (__timerQueue.length === 0 && __mcQueue.length === 0) break;
+        if (__timerQueue.length === 0 && __mcQueue.length === 0) {
+            if (__rafQueue.length === 0 || frames <= 0) break;
+            frames--;
+            __zippRunAnimationFrame(performance.now());
+            continue;
+        }
         // Report, never swallow. A page's real work happens in these callbacks
         // — React commits its first render from one — so an empty catch here
         // turns a broken app into a blank page with no explanation.
@@ -710,6 +737,86 @@ function __zippDispatchEvent(handlerNid, targetNid, type) {
 static NAV_PROVIDER: std::sync::OnceLock<Arc<dyn NavigationProvider>> =
     std::sync::OnceLock::new();
 
+thread_local! {
+    /// A binary body fetched by `http_bytes`, waiting for `take_bytes`.
+    static PENDING_BYTES: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A URL from page script, resolved against the page as the browser would.
+fn resolve_page_url(raw: &str) -> String {
+    let base = CURRENT_URL.lock().unwrap().clone();
+    url::Url::parse(&base)
+        .and_then(|b| b.join(raw))
+        .map(|u| u.to_string())
+        .unwrap_or_else(|_| raw.to_string())
+}
+
+/// GET a URL for page script, as bytes: http(s) through the shared client,
+/// `file:` from disk (a page opened from disk fetches its neighbours).
+fn fetch_bytes_for_page(url: &str) -> Result<(u16, Vec<u8>), String> {
+    if let Ok(parsed) = url::Url::parse(url) {
+        if parsed.scheme() == "file" {
+            let path = parsed.to_file_path().map_err(|_| format!("Error: GET {url}: not a file path"))?;
+            return match std::fs::read(&path) {
+                Ok(bytes) => Ok((200, bytes)),
+                Err(_) => Ok((404, Vec::new())),
+            };
+        }
+    }
+    let resp = HTTP_CLIENT.get(url).send().map_err(|e| format!("Error: GET {url}: {e}"))?;
+    let status = resp.status().as_u16();
+    let bytes = resp.bytes().map_err(|e| format!("Error: reading {url}: {e}"))?;
+    Ok((status, bytes.to_vec()))
+}
+
+/// The host channel with the VM at hand, for the calls that move bytes: a
+/// binary body goes into the shim's `__zippHostBytes` scratch array through
+/// the engine's typed-array region, not through a string. Every other call is
+/// `browser_host_call`'s.
+fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> Result<String, String> {
+    match kind {
+        // `fetch(url).arrayBuffer()`: fetch the body as bytes and keep it for
+        // `take_bytes`; report its status and length, so the shim can make the
+        // scratch array big enough first.
+        "http_bytes" => {
+            let url = resolve_page_url(args.first().map(String::as_str).unwrap_or_default());
+            let (status, bytes) = fetch_bytes_for_page(&url)?;
+            let len = bytes.len();
+            PENDING_BYTES.with(|p| *p.borrow_mut() = bytes);
+            Ok(format!(
+                "{{\"status\":{status},\"ok\":{},\"len\":{len}}}",
+                (200..300).contains(&status)
+            ))
+        }
+        // Copy the pending bytes into `__zippHostBytes`.
+        "take_bytes" => {
+            let (addr, count, kind) = ctx.typed_array_region("__zippHostBytes")?;
+            if kind != 1 {
+                return Err("TypeError: __zippHostBytes must be a Uint8Array".into());
+            }
+            PENDING_BYTES.with(|p| {
+                let bytes = std::mem::take(&mut *p.borrow_mut());
+                if bytes.len() > count {
+                    return Err("RangeError: __zippHostBytes is too small".to_string());
+                }
+                // SAFETY: the engine pinned the array: `count` bytes at `addr`,
+                // alive and in place for the rest of this call.
+                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len()) };
+                Ok(bytes.len().to_string())
+            })
+        }
+        // A WebGL context's batch of calls (webgl.rs).
+        #[cfg(windows)]
+        "gl" => webgl::host_call(ctx, args),
+        #[cfg(not(windows))]
+        "gl" => Err("Error: WebGL is not available on this platform".into()),
+        // An image's size, for `naturalWidth` and `load`.
+        #[cfg(windows)]
+        "image_info" => webgl::image_info(&resolve_page_url(args.first().map(String::as_str).unwrap_or_default())),
+        _ => browser_host_call(kind, args),
+    }
+}
+
 fn browser_host_call(kind: &str, args: &[String]) -> Result<String, String> {
     match kind {
         // Page `console.*`, via the shim's `env.log`.
@@ -727,6 +834,18 @@ fn browser_host_call(kind: &str, args: &[String]) -> Result<String, String> {
             let content_type =
                 if content_type.is_empty() { "application/json" } else { content_type };
 
+            // Relative to the page, as fetch resolves it; a page opened from
+            // disk reads its neighbours.
+            let resolved = resolve_page_url(url);
+            let url = resolved.as_str();
+            if method == "GET" && url.starts_with("file:") {
+                let (status, bytes) = fetch_bytes_for_page(url)?;
+                return Ok(format!(
+                    "{{\"status\":{status},\"ok\":{},\"body\":{}}}",
+                    status == 200,
+                    json_quote(&String::from_utf8_lossy(&bytes))
+                ));
+            }
             let req = match method {
                 "POST" => HTTP_CLIENT.post(url).header("Content-Type", content_type).body(body),
                 "PUT" => HTTP_CLIENT.put(url).header("Content-Type", content_type).body(body),
@@ -894,13 +1013,15 @@ fn attach_event_bridge(
     if !flid_map.is_empty() {
         eprintln!("[EVENT-BRIDGE] Mapped {} nodes with data-flid attributes", flid_map.len());
     }
-    let bridge = event_bridge::JsEventBridge::new(flid_map, &emap_json, js_state, url);
+    let mut bridge = event_bridge::JsEventBridge::new(flid_map, &emap_json, js_state, url);
     eprintln!(
         "[EVENT-BRIDGE] Bridge created with {} handler entries (live JS: {})",
         bridge.handler_count(),
         bridge.has_js_state(),
     );
-    if bridge.handler_count() > 0 {
+    // Also for a page with no listeners that draws with WebGL: the bridge is
+    // what runs its animation frames.
+    if bridge.handler_count() > 0 || bridge.has_webgl() {
         doc.set_event_handler(Box::new(bridge));
         eprintln!("[EVENT-BRIDGE] Event handler installed on document");
     }
@@ -955,7 +1076,7 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
             }
             for _ in 0..8 {
                 state.run_microtasks();
-                let _ = state.call_global("__zippDrainQueues", &[JsValue::Number(50.0)]);
+                let _ = state.call_global("__zippDrainQueues", &[JsValue::Number(50.0), JsValue::Number(2.0)]);
             }
             if let Ok(JsValue::String(updated)) = state.call_global("__getRenderedHTML", &[]) {
                 if !updated.is_empty() {
@@ -1396,7 +1517,8 @@ fn run_zipp_js_inner(
 
     let dom_shim = include_str!("dom_shim.js");
     let router_helpers = include_str!("router_helpers.js");
-    let dom_shim = &format!("{HOST_PRELUDE_JS}\n{dom_shim}");
+    let webgl_shim = include_str!("webgl_shim.js");
+    let dom_shim = &format!("{HOST_PRELUDE_JS}\n{dom_shim}\n{webgl_shim}");
     let shim = dom_shim.replace(
         "__PAGE_URL__",
         &page_url.replace('\\', "\\\\").replace('\'', "\\'"),
@@ -1505,7 +1627,7 @@ var __zippEsmDebug=true;
     };
     let compile_ms = t_compile.elapsed().as_millis();
     let t_init = std::time::Instant::now();
-    state.set_host_call(Box::new(browser_host_call));
+    state.set_host_call_ctx(Box::new(browser_host_call_ctx));
     if let Err(e) = state.run_init() {
         // An uncaught throw is not fatal: the shim may still have built enough
         // of a tree to render, so fall through and check. This matches how a
@@ -1533,9 +1655,11 @@ var __zippEsmDebug=true;
     let init_ms = t_init.elapsed().as_millis();
     let t_settle = std::time::Instant::now();
     let mut quiet = 0;
-    for _ in 0..32 {
+    for round in 0..32 {
         state.run_microtasks();
-        let ran = match state.call_global("__zippDrainQueues", &[JsValue::Number(50.0)]) {
+        // The first round may run two animation frames; see __zippDrainQueues.
+        let frames = if round == 0 { 2.0 } else { 0.0 };
+        let ran = match state.call_global("__zippDrainQueues", &[JsValue::Number(50.0), JsValue::Number(frames)]) {
             Ok(JsValue::Number(n)) => n,
             _ => 0.0,
         };
@@ -1543,6 +1667,12 @@ var __zippEsmDebug=true;
         if quiet >= 2 {
             break;
         }
+    }
+    // A page drawing with WebGL shows its first frame from the start: present
+    // it now, for the document `build_document` makes from this render.
+    if matches!(state.call_global("__zippWebGLContexts", &[]), Ok(JsValue::Number(n)) if n > 0.0) {
+        let _ = state.call_global("__zippAnimationFrame", &[JsValue::Number(0.0)]);
+        state.run_microtasks();
     }
     // Split so it is obvious whether time goes into compiling the script or
     // running it -- they need completely different fixes.
@@ -1885,11 +2015,44 @@ fn mount_chrome(doc: &mut HtmlDocument) {
     doc.mutate().append_children(root, &[chrome]);
 }
 
-/// Parse a page built by `render_page` and put its chrome in place.
+/// Parse a page built by `render_page` and put its chrome in place, with any
+/// WebGL frame the page drew while it settled.
 fn build_document(final_html: &str, config: DocumentConfig) -> HtmlDocument {
     let mut doc = HtmlDocument::from_html(final_html, config);
     mount_chrome(&mut doc);
+    apply_canvas_frames(&mut doc);
     doc
+}
+
+/// Show the WebGL frames presented since the last call: each becomes the
+/// image of its canvas element (found by `data-flid`), which is painted, and
+/// sized when the canvas has no size of its own, like any image. True when
+/// there were any.
+pub(crate) fn apply_canvas_frames(doc: &mut BaseDocument) -> bool {
+    #[cfg(windows)]
+    {
+        use zipp_dom::node::{ImageData, RasterImageData, SpecialElementData};
+        let frames = webgl::take_frames();
+        if frames.is_empty() {
+            return false;
+        }
+        let flids = event_bridge::build_flid_map(doc);
+        for frame in frames {
+            let Some(&node) = flids.get(&frame.flid) else {
+                continue;
+            };
+            if let Some(element) = doc.get_node_mut(node).and_then(|n| n.element_data_mut()) {
+                let image = RasterImageData::new(frame.width, frame.height, Arc::new(frame.rgba));
+                element.special_data = SpecialElementData::Image(Box::new(ImageData::Raster(image)));
+            }
+        }
+        true
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = doc;
+        false
+    }
 }
 
 /// Split a serialized `<body ...>...</body>` element into its attribute text
