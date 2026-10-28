@@ -364,6 +364,14 @@ impl BaseDocument {
 
             node.style = crate::stylo_bridge::to_taffy_style(style);
             node.display_constructed_as = style.clone_display();
+            // A table construction built as a block (no rows or cells, see
+            // `has_table_parts`) is laid out as one. It keeps `item_is_table`, so
+            // a block parent still sizes it to fit rather than stretching it.
+            if style.clone_display().inside() == style::values::specified::box_::DisplayInside::Table
+                && !node.flags.is_table_root()
+            {
+                node.style.display = taffy::Display::Block;
+            }
 
             // Flush background image from style to dedicated storage on the node
             // TODO: handle multiple background images

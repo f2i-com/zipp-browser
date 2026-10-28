@@ -279,6 +279,23 @@ impl BaseDocument {
                     return self.compute_inline_layout(usize::from(node_id), inputs, block_ctx);
                 }
 
+                // A `display:table` with no rows or cells is laid out as a block
+                // (see `table::has_table_parts`), but it is still as wide as its
+                // content -- its caption excluded, which spans the table without
+                // sizing it -- rather than as wide as its container. Settle that
+                // width first so the caption wraps to it, as in a real table.
+                let partless_table = node.display_constructed_as.inside()
+                    == style::values::specified::box_::DisplayInside::Table
+                    && !node.flags.is_table_root();
+                if partless_table && node.style.display == Display::Block && inputs.known_dimensions.width.is_none() {
+                    let width = self.partless_table_width(node_id, &inputs);
+                    let inputs = taffy::LayoutInput {
+                        known_dimensions: taffy::Size { width: Some(width), ..inputs.known_dimensions },
+                        ..inputs
+                    };
+                    return compute_block_layout(self, node_id, inputs, block_ctx);
+                }
+
                 // The default CSS file will set
                 match node.style.display {
                     Display::Block => compute_block_layout(self, node_id, inputs, block_ctx),
@@ -291,6 +308,63 @@ impl BaseDocument {
 
             _ => taffy::LayoutOutput::HIDDEN,
         }
+    }
+}
+
+impl BaseDocument {
+    /// The border-box width of a partless table: its widest non-caption child at
+    /// max-content, plus its own padding and border, clamped by its min/max width
+    /// and never wider than the space available.
+    fn partless_table_width(&mut self, node_id: NodeId, inputs: &taffy::LayoutInput) -> f32 {
+        use style::values::specified::box_::DisplayOutside;
+        use taffy::MaybeResolve as _;
+
+        let children: Vec<usize> = self.nodes[node_id.into()]
+            .layout_children
+            .borrow()
+            .clone()
+            .unwrap_or_default();
+        let mut content: f32 = 0.0;
+        for child in children {
+            if self.nodes[child].display_constructed_as.outside() == DisplayOutside::TableCaption {
+                continue;
+            }
+            let margin = self.nodes[child]
+                .style
+                .margin
+                .resolve_or_zero(inputs.parent_size.width, resolve_calc_value)
+                .horizontal_axis_sum();
+            let measured = self.compute_child_layout(
+                NodeId::from(child),
+                taffy::LayoutInput {
+                    run_mode: taffy::RunMode::ComputeSize,
+                    sizing_mode: taffy::SizingMode::InherentSize,
+                    axis: taffy::RequestedAxis::Horizontal,
+                    known_dimensions: taffy::Size::NONE,
+                    parent_size: taffy::Size::NONE,
+                    available_space: taffy::Size::MAX_CONTENT,
+                    vertical_margins_are_collapsible: taffy::Line::FALSE,
+                },
+            );
+            content = content.max(measured.size.width + margin);
+        }
+
+        let style = &self.nodes[node_id.into()].style;
+        let parent_width = inputs.parent_size.width;
+        let padding_border = (style.padding.resolve_or_zero(parent_width, resolve_calc_value)
+            + style.border.resolve_or_zero(parent_width, resolve_calc_value))
+        .horizontal_axis_sum();
+        let mut width = content + padding_border;
+        if let Some(max) = style.max_size.width.maybe_resolve(parent_width, resolve_calc_value) {
+            width = width.min(max);
+        }
+        if let Some(min) = style.min_size.width.maybe_resolve(parent_width, resolve_calc_value) {
+            width = width.max(min);
+        }
+        if let AvailableSpace::Definite(available) = inputs.available_space.width {
+            width = width.min(available);
+        }
+        width
     }
 }
 

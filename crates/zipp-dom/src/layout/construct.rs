@@ -212,7 +212,14 @@ pub(crate) fn collect_layout_children(
         },
     );
 
-    match container_display.inside() {
+    // A table with no rows or cells is one anonymous cell: build it as a block
+    // (see `has_table_parts`).
+    let container_inside = match container_display.inside() {
+        DisplayInside::Table if !super::table::has_table_parts(doc, container_node_id) => DisplayInside::Flow,
+        inside => inside,
+    };
+
+    match container_inside {
         DisplayInside::None => {}
         DisplayInside::Contents => {
             doc.nodes[container_node_id]

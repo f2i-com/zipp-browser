@@ -53,6 +53,32 @@ pub struct TableRow {
     pub height: f32,
 }
 
+/// Whether the `display:table` element at `node_id` has any table parts among
+/// its children: row groups, rows, cells or columns.
+///
+/// CSS wraps a table's other children in anonymous rows and cells. One with no
+/// parts at all is therefore a single anonymous cell holding everything, which
+/// lays out like a block -- and that is the common case: Wikipedia's image
+/// figures (`figure{display:table}` around an image and a caption), clearfix
+/// `::after{display:table}`. The table builder only collects real parts, so
+/// those came out empty: every Wikipedia article image was a zero-height box.
+pub(crate) fn has_table_parts(doc: &BaseDocument, node_id: usize) -> bool {
+    doc.nodes[node_id].children.iter().any(|&child| {
+        doc.nodes[child].primary_styles().is_some_and(|style| {
+            matches!(
+                style.clone_display().inside(),
+                DisplayInside::TableRowGroup
+                    | DisplayInside::TableHeaderGroup
+                    | DisplayInside::TableFooterGroup
+                    | DisplayInside::TableRow
+                    | DisplayInside::TableCell
+                    | DisplayInside::TableColumn
+                    | DisplayInside::TableColumnGroup
+            )
+        })
+    })
+}
+
 pub(crate) fn build_table_context(
     doc: &mut BaseDocument,
     table_root_node_id: usize,
