@@ -29,7 +29,7 @@ use style::properties::generated::longhands::position::computed_value::T as Posi
 use taffy::AvailableSpace;
 
 use crate::{
-    BaseDocument, NON_INCREMENTAL,
+    BaseDocument, NON_INCREMENTAL, NodeData,
     events::ScrollAnimationState,
     layout::{
         construct::{
@@ -181,11 +181,38 @@ impl BaseDocument {
         resolve_layout_children_recursive(self, self.root_node().id);
         reparent_out_of_flow_children(self, self.root_node().id);
 
+        // Hit-testing can land on an anonymous wrapper, so these ids may name
+        // one the rebuild above just freed. Indexing a freed slot panics
+        // ("invalid key") on the next mouse move; forget the id instead.
+        for id in [
+            &mut self.hover_node_id,
+            &mut self.focus_node_id,
+            &mut self.active_node_id,
+            &mut self.mousedown_node_id,
+        ] {
+            if id.is_some_and(|node_id| !self.nodes.contains(node_id)) {
+                *id = None;
+            }
+        }
+
         fn resolve_layout_children_recursive(doc: &mut BaseDocument, node_id: usize) {
             let mut damage = doc.nodes[node_id].damage().unwrap_or(ALL_DAMAGE);
             let _flags = doc.nodes[node_id].flags;
 
             if NON_INCREMENTAL || damage.intersects(CONSTRUCT_FC | CONSTRUCT_BOX) {
+                // The last collection's anonymous wrappers are replaced by the
+                // ones this one creates, so free them first: they live only in
+                // `layout_children`, and dropping that list left every one in
+                // the slab. Without the `incremental` feature this runs on every
+                // resolve -- every animation frame -- so an animated page
+                // leaked a few MB a second (7GB after a few minutes on
+                // lance.name). Freeing first also lets the new wrappers reuse
+                // the same slots.
+                let old_children = doc.nodes[node_id].layout_children.borrow_mut().take();
+                if let Some(old_children) = old_children {
+                    free_anonymous_wrappers(doc, old_children);
+                }
+
                 let mut layout_children = Vec::new();
                 let mut anonymous_block: Option<usize> = None;
                 collect_layout_children(doc, node_id, &mut layout_children, &mut anonymous_block);
@@ -217,6 +244,32 @@ impl BaseDocument {
             }
 
             doc.nodes[node_id].set_damage(damage);
+        }
+
+        /// Remove the anonymous block wrappers among `children` (and any nested
+        /// in them) from the slab. Pseudo-elements are anonymous blocks too, but
+        /// their owner keeps them across collections, so they stay.
+        fn free_anonymous_wrappers(doc: &mut BaseDocument, children: Vec<usize>) {
+            for child_id in children {
+                let Some(child) = doc.nodes.get(child_id) else {
+                    continue;
+                };
+                if !matches!(child.data, NodeData::AnonymousBlock(_)) {
+                    continue;
+                }
+                let is_pseudo = child.parent.and_then(|p| doc.nodes.get(p)).is_some_and(|owner| {
+                    owner.before == Some(child_id) || owner.after == Some(child_id)
+                });
+                if is_pseudo {
+                    continue;
+                }
+                let nested = doc.nodes[child_id].layout_children.borrow_mut().take();
+                if let Some(nested) = nested {
+                    free_anonymous_wrappers(doc, nested);
+                }
+                doc.nodes.remove(child_id);
+                doc.changed_nodes.remove(&child_id);
+            }
         }
     }
 
