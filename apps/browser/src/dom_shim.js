@@ -1280,8 +1280,27 @@ console.error = function(a,b,c,d) {
 
 // Global extraction
 var __fl_doc_ref = doc;
+// The style object's declarations as CSS text. React writes inline styles
+// through the object (`el.style.width = …`, and `setProperty` for `--custom`
+// properties), never through the attribute, so leaving this out of the
+// serialised HTML silently dropped every inline style a component set — the
+// project cards' `--project-accent` colour among them.
+function __styleText(style) {
+    var t = "";
+    for (var p in style) {
+        if (typeof style[p] !== "string" || style[p] === "" || p === "cssText" || p.indexOf("_") === 0) continue;
+        t += p.replace(/[A-Z]/g, function (m) { return "-" + m.toLowerCase(); }) + ":" + style[p] + ";";
+    }
+    return t;
+}
+
 function __serializeNode(node) {
-    if(node.nodeType===3) return node.data||"";
+    if(node.nodeType===3) {
+        // <style> and <script> are raw text: escaping would turn `a > b` into
+        // `a &gt; b`. Everywhere else, unescaped text re-parses as markup.
+        var ptag=node.parentNode&&node.parentNode.tagName?node.parentNode.tagName.toLowerCase():"";
+        return ptag==="style"||ptag==="script"?(node.data||""):__eh(node.data||"");
+    }
     if(node.nodeType===8) return "";
     if(node.nodeType!==1) {
         var h="";
@@ -1290,9 +1309,13 @@ function __serializeNode(node) {
     }
     var tag=(node.tagName||node.nodeName||"div").toLowerCase();
     var r="<"+tag;
-    if(node.id) r+=" id=\""+node.id+"\"";
-    if(node.className) r+=" class=\""+node.className+"\"";
-    for(var k in node.attributes){if(k==="id"||k==="class") continue; r+=" "+k+"=\""+node.attributes[k]+"\"";}
+    if(node.id) r+=" id=\""+__ea(node.id)+"\"";
+    if(node.className) r+=" class=\""+__ea(node.className)+"\"";
+    for(var k in node.attributes){if(k==="id"||k==="class"||k==="style") continue; r+=" "+k+"=\""+__ea(node.attributes[k])+"\"";}
+    // One style attribute: the author's text, then the object's declarations,
+    // which come later so a value JS changed wins.
+    var st=(node.attributes&&node.attributes.style?String(node.attributes.style).replace(/;?\s*$/,";"):"")+(node.style?__styleText(node.style):"");
+    if(st!==""&&st!==";") r+=" style=\""+__ea(st)+"\"";
     r+=" data-flid=\""+node._id+"\"";
     r+=">";
     // Serialize SVG elements with their attributes for Rust-side SVG rendering
