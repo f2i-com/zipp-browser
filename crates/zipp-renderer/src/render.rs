@@ -948,7 +948,17 @@ impl ElementCx<'_> {
                 Edge::Left => border.border_left_style,
             };
 
-            if color.components[3] > 0.0 {
+            // A zero-width edge paints nothing. Tailwind's preflight gives every
+            // element `border-width: 0` in an opaque colour, so without this
+            // nearly every box built four empty edge paths.
+            let edge_width = match edge {
+                Edge::Top => self.frame.border_width.y0,
+                Edge::Right => self.frame.border_width.x1,
+                Edge::Bottom => self.frame.border_width.y1,
+                Edge::Left => self.frame.border_width.x0,
+            };
+
+            if edge_width > 0.0 && color.components[3] > 0.0 {
                 // `dashed` and `dotted` used to fall through to a solid fill.
                 // The pattern is drawn clipped to the edge's own shape, so
                 // mitred and rounded corners stay correct without the dash

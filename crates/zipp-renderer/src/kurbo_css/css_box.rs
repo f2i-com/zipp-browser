@@ -516,9 +516,29 @@ impl BuildBezpath for BezPath {
 /// Get the start angle of the arc based on the border width and the radii
 #[inline]
 fn start_angle(bt_width: f64, br_width: f64, radii: Vec2) -> f64 {
+    use std::f64::consts::FRAC_PI_2;
+
+    // The formula below divides by zero when either side has no width, and
+    // the NaN it returned became a NaN point in the edge path — which panics
+    // tiny-skia's anti-aliased rasteriser and takes the whole browser down
+    // (`rounded-* border-l`, or any rounded box under Tailwind's preflight,
+    // which gives every element a zero-width border). Return the formula's
+    // own limits instead: a side with no width cedes the corner to its
+    // neighbour.
+    if br_width <= 0.0 {
+        return 0.0;
+    }
+    if bt_width <= 0.0 {
+        return FRAC_PI_2;
+    }
+
     // slope of the border intersection split
     let w = bt_width / br_width;
     let x = radii.y / (w * radii.x);
+    // A removable 0/0 at x == 2; the limit there is 2·atan(1/2).
+    if (x - 2.0).abs() < 1e-9 {
+        return 0.5f64.atan() * 2.0;
+    }
 
     /*
     Any point on an ellipse is given by:
@@ -553,4 +573,20 @@ fn start_angle(bt_width: f64, br_width: f64, radii: Vec2) -> f64 {
 fn should_solve_properly() {
     // 0.643501
     dbg!(start_angle(4.0, 1.0, Vec2 { x: 1.0, y: 2.0 }));
+}
+
+#[test]
+fn start_angle_is_finite_where_the_formula_divides_by_zero() {
+    use std::f64::consts::FRAC_PI_2;
+    let r = Vec2 { x: 8.0, y: 8.0 };
+    // Each degenerate case matches the formula's limit approaching it.
+    assert_eq!(start_angle(0.0, 1.0, r), FRAC_PI_2);
+    assert!((start_angle(1e-9, 1.0, r) - FRAC_PI_2).abs() < 1e-3);
+    assert_eq!(start_angle(1.0, 0.0, r), 0.0);
+    assert!(start_angle(1.0, 1e-9, r).abs() < 1e-3);
+    assert!(start_angle(0.0, 0.0, r).is_finite());
+    // x == 2: radii.y / (w * radii.x) with w = 1/2.
+    let at_two = start_angle(1.0, 2.0, Vec2 { x: 1.0, y: 1.0 });
+    let near_two = start_angle(1.0, 2.0, Vec2 { x: 1.0, y: 1.0 + 1e-6 });
+    assert!(at_two.is_finite() && (at_two - near_two).abs() < 1e-3);
 }

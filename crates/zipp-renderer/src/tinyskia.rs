@@ -219,6 +219,12 @@ fn affine_to_transform(affine: Affine) -> Transform {
 fn shape_to_path(shape: &impl Shape) -> Option<tiny_skia::Path> {
     let mut builder = PathBuilder::new();
     for element in shape.path_elements(0.1) {
+        // tiny-skia does not validate points: a NaN passes `finish()` (the
+        // bounds skip it) and then panics the anti-aliased rasteriser. A
+        // shape with a non-finite point cannot be drawn anyway, so skip it.
+        if !element.is_finite() {
+            return None;
+        }
         match element {
             kurbo::PathEl::MoveTo(p) => builder.move_to(p.x as f32, p.y as f32),
             kurbo::PathEl::LineTo(p) => builder.line_to(p.x as f32, p.y as f32),
