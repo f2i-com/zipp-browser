@@ -346,16 +346,24 @@ impl Gpu {
     }
 
     fn request_adapter(&mut self) -> Result<String, String> {
-        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
-        descriptor.flags = wgpu::InstanceFlags::empty();
-        let instance = wgpu::Instance::new(descriptor);
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: false,
-            compatible_surface: None,
-            apply_limit_buckets: false,
-        }))
-        .map_err(|e| e.to_string())?;
+        // One backend at a time: asking both at once took one to five seconds
+        // (Direct3D 12's enumeration, mostly), Vulkan alone a third of one.
+        let adapter = [wgpu::Backends::VULKAN, wgpu::Backends::DX12]
+            .into_iter()
+            .find_map(|backends| {
+                let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+                descriptor.backends = backends;
+                descriptor.flags = wgpu::InstanceFlags::empty();
+                let instance = wgpu::Instance::new(descriptor);
+                pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    force_fallback_adapter: false,
+                    compatible_surface: None,
+                    apply_limit_buckets: false,
+                }))
+                .ok()
+            })
+            .ok_or("no Vulkan or Direct3D 12 adapter")?;
         let info = adapter.get_info();
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("zipp-webgpu"),
