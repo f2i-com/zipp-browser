@@ -126,7 +126,10 @@ impl BaseDocument {
         let mut post_resource = Body::Empty;
 
         match (scheme, method) {
-            ("http" | "https" | "data", FormMethod::Get) => {
+            // `file:` is not in the spec's table, but browsers submit to it as to
+            // http: a page opened from disk keeps working forms (the address bar
+            // among them, whose form posts back to the current page).
+            ("http" | "https" | "data" | "file", FormMethod::Get) => {
                 let pairs = convert_to_list_of_name_value_pairs(entry);
                 let mut query = String::new();
                 url::form_urlencoded::Serializer::new(&mut query).extend_pairs(pairs);
