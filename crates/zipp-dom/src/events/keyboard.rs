@@ -54,6 +54,42 @@ pub(crate) fn handle_keypress<F: FnMut(DomEvent)>(
         }
     }
 
+    // Scrolling from the keyboard, as in any browser: arrows, Page Up/Down,
+    // Space (Shift+Space back) and Home/End -- unless a text field has the keys.
+    // This is keydown's default action, so a page that handled the key and
+    // called preventDefault never gets here.
+    if event.state.is_pressed() {
+        let has_focused_text_input = doc.focus_node_id.is_some_and(|id| {
+            doc.get_node(id)
+                .and_then(|n| n.element_data())
+                .is_some_and(|e| e.text_input_data().is_some())
+        });
+        if !has_focused_text_input {
+            const LINE: f64 = 40.0;
+            let viewport_height = doc.viewport.window_size.1 as f64 / doc.viewport.scale() as f64;
+            // A screenful, less a little overlap to keep your place.
+            let page = (viewport_height * 0.875).max(LINE);
+            let back = event.modifiers.contains(Modifiers::SHIFT);
+            let delta = match &event.key {
+                Key::ArrowDown => Some(LINE),
+                Key::ArrowUp => Some(-LINE),
+                Key::PageDown => Some(page),
+                Key::PageUp => Some(-page),
+                Key::Character(c) if c == " " => Some(if back { -page } else { page }),
+                Key::Home => Some(-doc.viewport_scroll().y),
+                Key::End => Some(f64::MAX / 4.0),
+                _ => None,
+            };
+            if let Some(delta) = delta {
+                // `scroll_viewport_by` takes a wheel delta: positive moves up.
+                if doc.scroll_viewport_by_has_changed(0.0, -delta) {
+                    doc.shell_provider.request_redraw();
+                }
+                return;
+            }
+        }
+    }
+
     if let Some(node_id) = doc.focus_node_id {
         if target != node_id {
             return;

@@ -66,7 +66,8 @@ zipp-browser --test-compat                        # language compatibility suite
 ```
 
 In the window, the toolbar's back, forward and reload buttons work, as do
-Alt+Left/Right, the mouse's back/forward buttons, and F5 or Ctrl+R. Every page,
+Alt+Left/Right, the mouse's back/forward buttons, and F5 or Ctrl+R; the arrow keys,
+Page Up/Down, Space and Home/End scroll the page. Every page,
 including one reached by a link or revisited from history, runs its own
 JavaScript and responds to clicks.
 
