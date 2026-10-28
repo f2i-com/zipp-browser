@@ -180,7 +180,12 @@ where
         let mut inner = self.doc.inner_mut();
         inner.set_viewport(viewport);
         inner.set_shell_provider(shell_provider);
+        // The new document set its title while it was parsed, before it had this
+        // window's shell provider -- so, as in `init`, find it and set it here, or
+        // the window keeps the first page's title for good.
+        let title = inner.find_title_node().map(|node| node.text_content());
         drop(inner);
+        self.window.set_title(title.as_deref().map(str::trim).unwrap_or_default());
 
         self.poll();
         self.request_redraw();
