@@ -331,7 +331,7 @@ class Element extends DOMNode {
     get textContent() { var t=""; for(var i=0;i<this.childNodes.length;i++){var c=this.childNodes[i]; if(c.nodeType===3)t+=c.data; else if(c.nodeType===1)t+=c.textContent;} return t; }
     set textContent(v) { this.childNodes=[]; if(v) this.appendChild(new Text(String(v))); }
     get innerHTML() { return __sc(this); }
-    set innerHTML(v) { this.childNodes=[]; if(v) this.appendChild(new Text(String(v))); }
+    set innerHTML(v) { this.childNodes=[]; if(v) this.appendChild(__markupText(String(v))); }
     get outerHTML() { return __sn(this); }
     get children() { return this.childNodes.filter(function(c){return c.nodeType===1;}); }
     // Attribute names are DOMStrings: WebIDL stringifies whatever it is given,
@@ -364,15 +364,21 @@ class Element extends DOMNode {
     before() { if(!this.parentNode) return; for(var i=0;i<arguments.length;i++) this.parentNode.insertBefore(arguments[i],this); }
     after() { if(!this.parentNode) return; var ref=this.nextSibling; for(var i=0;i<arguments.length;i++){if(ref)this.parentNode.insertBefore(arguments[i],ref);else this.parentNode.appendChild(arguments[i]);} }
     insertAdjacentElement(pos,el) { if(!el)return null; if(pos==="beforebegin"&&this.parentNode) this.parentNode.insertBefore(el,this); else if(pos==="afterbegin") this.insertBefore(el,this.firstChild); else if(pos==="beforeend") this.appendChild(el); else if(pos==="afterend"&&this.parentNode){var ns=this.nextSibling;if(ns)this.parentNode.insertBefore(el,ns);else this.parentNode.appendChild(el);} return el; }
-    insertAdjacentHTML(pos,html) { var t=new Text(html); this.insertAdjacentElement(pos,t); }
+    insertAdjacentHTML(pos,html) { this.insertAdjacentElement(pos,__markupText(String(html))); }
     getAttributeNames() { return Object.keys(this.attributes); }
     toggleAttribute(name,force) { if(force!==undefined){if(force)this.setAttribute(name,"");else this.removeAttribute(name);return force;} if(this.hasAttribute(name)){this.removeAttribute(name);return false;} this.setAttribute(name,""); return true; }
 }
 
 class Text extends DOMNode {
     constructor(d) { super(3,"#text"); this.data=String(d||""); this.textContent=this.data; this.nodeValue=this.data; }
-    cloneNode() { return new Text(this.data); }
+    cloneNode() { var t=new Text(this.data); t._html=this._html; return t; }
 }
+// The shim has no HTML parser: `innerHTML` and `insertAdjacentHTML` keep their
+// markup as a single text node that the serialisers emit verbatim, and the real
+// parser turns it into elements downstream. The `_html` mark is what separates
+// that from genuine text (`textContent`, `createTextNode`), which must be
+// escaped -- without it, `<b>` set through innerHTML rendered as literal tags.
+function __markupText(html) { var t=new Text(html); t._html=true; return t; }
 class Comment extends DOMNode {
     constructor(d) { super(8,"#comment"); this.data=String(d||""); }
 }
@@ -454,7 +460,7 @@ function _qs(root,sel,all) {
 }
 
 function __sn(node) {
-    if(node.nodeType===3) return __eh(node.data||"");
+    if(node.nodeType===3) return node._html ? (node.data||"") : __eh(node.data||"");
     if(node.nodeType===8) return "<!--"+(node.data||"")+"-->";
     if(node.nodeType!==1) return __sc(node);
     var tag=(node.tagName||node.nodeName||"div").toLowerCase();
@@ -1384,8 +1390,10 @@ function __styleText(style) {
 
 function __serializeNode(node) {
     if(node.nodeType===3) {
-        // <style> and <script> are raw text: escaping would turn `a > b` into
-        // `a &gt; b`. Everywhere else, unescaped text re-parses as markup.
+        // Markup set through innerHTML goes out as markup. Otherwise <style>
+        // and <script> are raw text, where escaping would turn `a > b` into
+        // `a &gt; b`; everywhere else unescaped text re-parses as markup.
+        if(node._html) return node.data||"";
         var ptag=node.parentNode&&node.parentNode.tagName?node.parentNode.tagName.toLowerCase():"";
         return ptag==="style"||ptag==="script"?(node.data||""):__eh(node.data||"");
     }

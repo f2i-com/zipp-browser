@@ -84,6 +84,12 @@ T("navigator", function() { return navigator.userAgent.length > 0; });
 T("fetch exists", function() { return typeof fetch === "function"; });
 T("XMLHttpRequest", function() { return typeof XMLHttpRequest === "function"; });
 
+// Serialisation: markup set through innerHTML round-trips as markup, while
+// real text is escaped, both when read back and in the rendered output.
+T("innerHTML round-trips markup", function() { var d = document.createElement("div"); d.innerHTML = "<b>x</b> &amp; y"; return d.innerHTML === "<b>x</b> &amp; y"; });
+T("textContent is escaped", function() { var d = document.createElement("div"); d.textContent = "a < b & c"; return d.innerHTML === "a &lt; b &amp; c"; });
+T("render keeps innerHTML markup", function() { var d = document.createElement("div"); d.innerHTML = "<i>hi</i>"; var t = document.createElement("p"); t.textContent = "1 < 2"; d.appendChild(t); var h = __serializeNode(d); return h.indexOf("<i>hi</i>") >= 0 && h.indexOf("1 &lt; 2") >= 0; });
+
 env.log("info", "");
 env.log("info", "=== JS TEST RESULTS: " + _p + "/" + (_p + _f) + " passed ===");
 if (_f > 0) { env.log("warn", _f + " failures:"); for (var i = 0; i < _e.length; i++) env.log("warn", "  " + _e[i]); }
