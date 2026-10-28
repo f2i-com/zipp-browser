@@ -438,6 +438,18 @@ impl LayoutPartialTree for BaseDocument {
     }
 }
 
+// A cached final layout is only good while the node's children still hold the
+// layouts that pass gave them, because a cache hit returns without visiting them.
+// Taffy's block layout breaks that: *measuring* a block (`RunMode::ComputeSize`)
+// lays out and commits its children too. So a block given its final layout at
+// one width, then measured at another -- an ancestor sizing itself, e.g. a
+// column flex `<body>` working out its items -- had its children left at the
+// measured width, and its next final layout at the first width hit the cache
+// and never put them back. On rust-lang.org every paragraph in a three-column
+// row ran on at max-content width, one line across all three columns.
+//
+// So an uncached measurement marks the node's final layout stale, and a stale
+// final layout is recomputed rather than served from the cache.
 impl taffy::CacheTree for BaseDocument {
     #[inline]
     fn cache_get(
@@ -445,7 +457,11 @@ impl taffy::CacheTree for BaseDocument {
         node_id: NodeId,
         inputs: &taffy::LayoutInput,
     ) -> Option<taffy::LayoutOutput> {
-        self.node_from_id(node_id).cache.get(inputs)
+        let node = self.node_from_id(node_id);
+        if inputs.run_mode == taffy::RunMode::PerformLayout && node.final_layout_stale {
+            return None;
+        }
+        node.cache.get(inputs)
     }
 
     #[inline]
@@ -455,7 +471,9 @@ impl taffy::CacheTree for BaseDocument {
         inputs: &taffy::LayoutInput,
         layout_output: taffy::LayoutOutput,
     ) {
-        self.node_from_id_mut(node_id)
+        let node = self.node_from_id_mut(node_id);
+        node.final_layout_stale = inputs.run_mode == taffy::RunMode::ComputeSize;
+        node
             .cache
             .store(inputs, layout_output);
     }

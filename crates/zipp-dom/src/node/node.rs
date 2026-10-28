@@ -127,6 +127,10 @@ pub struct Node {
     pub style: Style<Atom>,
     pub display_constructed_as: StyloDisplay,
     pub cache: Cache,
+    /// The cached final layout no longer matches the layouts of this node's
+    /// children: a measurement since then laid them out again (see
+    /// `cache_get` in the layout module).
+    pub(crate) final_layout_stale: bool,
     pub unrounded_layout: Layout,
     pub final_layout: Layout,
     pub scroll_offset: crate::Point<f64>,
@@ -188,6 +192,7 @@ impl Node {
             dirty_descendants: AtomicBool::new(true),
             display_constructed_as: StyloDisplay::Block,
             cache: Cache::new(),
+            final_layout_stale: false,
             unrounded_layout: Layout::new(),
             final_layout: Layout::new(),
             scroll_offset: crate::Point::ZERO,
