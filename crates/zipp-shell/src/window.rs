@@ -496,9 +496,13 @@ where
                     _ => MouseEventButton::Main,
                 };
 
+                // Clear on release rather than toggle. A press that never reached
+                // us (the click that activates the window, say) made XOR turn the
+                // button ON at release and leave it held, so every later mouse
+                // move read as a drag and swallowed the next click.
                 match state {
-                    ElementState::Pressed => self.buttons |= button.into(),
-                    ElementState::Released => self.buttons ^= button.into(),
+                    ElementState::Pressed => self.buttons.insert(button.into()),
+                    ElementState::Released => self.buttons.remove(button.into()),
                 }
 
                 if id != PointerId::Mouse {

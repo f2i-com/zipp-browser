@@ -405,8 +405,19 @@ pub(crate) fn handle_pointerup<F: FnMut(DomEvent)>(
     let drag_mode = doc.drag_mode.take();
 
     // Don't dispatch click if we were doing a text selection drag or panning
-    // the document with a touch
-    let do_click = drag_mode == DragMode::None;
+    // the document with a touch. A "selection drag" only starts 2px from the
+    // press, though, and a hand-held mouse drifts that far during an ordinary
+    // click — which then never fired, so buttons seemed to ignore real clicks
+    // while synthetic ones worked. Within a small slop it is still a click, as
+    // in Chrome; a genuine drag-select travels well past it.
+    const CLICK_SLOP: f32 = 6.0;
+    let near_press = (event.page_x() - doc.mousedown_position.x).abs() <= CLICK_SLOP
+        && (event.page_y() - doc.mousedown_position.y).abs() <= CLICK_SLOP;
+    let do_click = match drag_mode {
+        DragMode::None => true,
+        DragMode::Selecting => near_press,
+        DragMode::Panning(_) => false,
+    };
 
     let time_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
