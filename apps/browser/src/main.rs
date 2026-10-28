@@ -157,6 +157,7 @@ fn main() {
     // 7. Create Zipp document with fonts + networking + navigation
     let nav_provider = Arc::new(BrowserNavProvider {
         proxy: proxy.clone(),
+        current_url: std::sync::Mutex::new(url.clone()),
     });
     // Published so `browser_host_call` can drive a navigation the PAGE asked
     // for (`window.open`, `location.assign`) -- it is a free function with no
@@ -1517,6 +1518,9 @@ var __zippEsmDebug=true;
 /// Handles link clicks by loading pages internally.
 struct BrowserNavProvider {
     proxy: ShellProxy,
+    /// The page the window is showing. Every navigation passes through this
+    /// provider, so it is the one place that always knows.
+    current_url: std::sync::Mutex<String>,
 }
 
 /// Records navigations instead of performing them, for `--screenshot`.
@@ -1539,17 +1543,34 @@ impl NavigationProvider for BrowserNavProvider {
         let mut url = options.url.to_string();
         eprintln!("[NAV] {url}");
 
-        // Hash-only navigation: scroll to anchor (don't reload page)
-        // TODO: implement actual scroll-to-anchor in blitz-dom
-        if url.contains('#') {
-            let base = url.split('#').next().unwrap_or(&url);
-            // If the base URL matches the current page, skip navigation
-            // For now, just ignore hash-only links to avoid unnecessary reloads
-            if base.is_empty() || RENDERED_CACHE.lock().unwrap().contains_key(base) {
-                eprintln!("[NAV] Hash navigation (scroll) - skipping reload");
-                return;
+        // A link to a fragment of the page already showing is a scroll, not a
+        // navigation. This compared the fragment-less URL against the render
+        // cache, keyed `https://lance.name` while the link resolved to
+        // `https://lance.name/#about`, so it never matched: every in-page nav
+        // link reloaded the page, which left it with no live JS and nothing
+        // on it responding. Parsed URLs compare equal across that slash.
+        if let Ok(target) = url::Url::parse(&url) {
+            if let Some(fragment) = target.fragment() {
+                let current = self.current_url.lock().unwrap().clone();
+                let same_document = url::Url::parse(&current).is_ok_and(|mut current| {
+                    let mut target = target.clone();
+                    current.set_fragment(None);
+                    target.set_fragment(None);
+                    current == target
+                });
+                if same_document {
+                    let fragment = urlencoding::decode(fragment)
+                        .map(|f| f.into_owned())
+                        .unwrap_or_else(|_| fragment.to_string());
+                    eprintln!("[NAV] Same-document link -> scroll to #{fragment}");
+                    self.proxy
+                        .send_event(zipp_shell::ShellEvent::ScrollToFragment { fragment });
+                    return;
+                }
             }
-            // Strip hash for fetching (server doesn't need it)
+        }
+        // Another document: the server never sees the fragment.
+        if let Some((base, _)) = url.split_once('#') {
             url = base.to_string();
         }
 
@@ -1564,6 +1585,7 @@ impl NavigationProvider for BrowserNavProvider {
             }
         }
 
+        *self.current_url.lock().unwrap() = url.clone();
         let proxy = self.proxy.clone();
 
         std::thread::Builder::new()

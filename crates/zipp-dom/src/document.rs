@@ -1809,6 +1809,28 @@ impl BaseDocument {
         }
     }
 
+    /// Scroll the viewport so the element a URL fragment names is at the top:
+    /// the default action of a same-document link (`<a href="#about">`).
+    ///
+    /// An empty fragment, or `top` when nothing has that id, means the top of
+    /// the document. Returns `false`, leaving the scroll alone, when nothing
+    /// matches.
+    pub fn scroll_to_fragment(&mut self, fragment: &str) -> bool {
+        let target_y = match self.get_element_by_id(fragment) {
+            Some(node_id) => match self.get_node(node_id) {
+                Some(node) => node.absolute_position(0.0, 0.0).y as f64,
+                None => return false,
+            },
+            None if fragment.is_empty() || fragment.eq_ignore_ascii_case("top") => 0.0,
+            None => return false,
+        };
+        // `scroll_viewport_by` subtracts its delta (wheel convention) and clamps
+        // to the scrollable extent, so a target near the end stops at the end.
+        let current_y = self.viewport_scroll.y;
+        self.scroll_viewport_by(0.0, current_y - target_y);
+        true
+    }
+
     /// Get the current viewport scroll offset.
     pub fn viewport_scroll(&self) -> crate::Point<f64> {
         self.viewport_scroll

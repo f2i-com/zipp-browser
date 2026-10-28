@@ -32,6 +32,10 @@ pub enum ShellEvent {
     /// Navigate to another URL (triggered by e.g. clicking a link)
     Navigate(Box<NavigationOptions>),
 
+    /// Scroll the current document to the element a URL fragment names, without
+    /// navigating: a same-document link. Reloading instead threw away the
+    /// page's live JS, so nothing on it responded after the first nav click.
+    ScrollToFragment { fragment: String },
     /// Navigate to another URL (triggered by e.g. clicking a link)
     NavigationLoad {
         url: String,

@@ -87,6 +87,21 @@ where
             ShellEvent::Navigate(_opts) => {
                 // Handled by embedder's NavigationProvider
             }
+            ShellEvent::ScrollToFragment { fragment } => {
+                if let Some((_, view)) = self.windows.iter_mut().next() {
+                    // Lay out first. The click that followed the link usually
+                    // re-rendered the page too, and its brand-new nodes have no
+                    // geometry until the next resolve: the target reads as y=0
+                    // and the "scroll" lands back at the top.
+                    let animation_time = view.current_animation_time();
+                    view.doc.inner_mut().resolve(animation_time);
+                    let found = view.doc.inner_mut().scroll_to_fragment(&fragment);
+                    if !found {
+                        eprintln!("[NAV] No element for #{fragment}; staying put");
+                    }
+                    view.request_redraw();
+                }
+            }
             ShellEvent::NavigationLoad { url, contents, retain_scroll_position, .. } => {
                 let t0 = std::time::Instant::now();
                 if let Some((_, view)) = self.windows.iter_mut().next() {
