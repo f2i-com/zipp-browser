@@ -398,6 +398,13 @@ impl Gpu {
     fn exec(&mut self, op: &str, cmd: &Json, payload: &[u8], reply: &mut Reply) -> Result<String, String> {
         let a = |i: usize| cmd.get(i);
         let id = |i: usize| u32_of(cmd.get(i), 0);
+        // A new page: what the last one made goes (the device stays).
+        if op == "reset" {
+            let device = self.device.take();
+            let adapter_info = self.adapter_info.take();
+            *self = Gpu { device, adapter_info, ..Gpu::default() };
+            return Ok(String::new());
+        }
         if op == "requestAdapter" {
             if let Some(info) = &self.adapter_info {
                 return Ok(info.clone());

@@ -12,6 +12,11 @@
 //
 // The promise-returning calls (`requestAdapter`, `requestDevice`, `mapAsync`,
 // `onSubmittedWorkDone`) do their work at once and resolve.
+//
+// Nothing tells the host when a GPU object is garbage, so what pages make
+// every frame is made once: a texture's views and the device's bind groups
+// are kept by descriptor and handed out again. A page's first batch starts
+// with `reset`, which drops everything the previous page made.
 var GPUBufferUsage = { MAP_READ: 1, MAP_WRITE: 2, COPY_SRC: 4, COPY_DST: 8, INDEX: 16, VERTEX: 32, UNIFORM: 64, STORAGE: 128, INDIRECT: 256, QUERY_RESOLVE: 512 };
 var GPUTextureUsage = { COPY_SRC: 1, COPY_DST: 2, TEXTURE_BINDING: 4, STORAGE_BINDING: 8, RENDER_ATTACHMENT: 16 };
 var GPUShaderStage = { VERTEX: 1, FRAGMENT: 2, COMPUTE: 4 };
@@ -58,7 +63,7 @@ var __zippWebGPU = (function () {
   }
 
   // ---- The batch ------------------------------------------------------------
-  var cmds = [], parts = [], partLen = 0;
+  var cmds = [["reset"]], parts = [], partLen = 0;
   function cmd(c) { cmds.push(c); }
   function bytes(u8) { var at = partLen; parts.push(u8); partLen += u8.length; return at; }
   function flush(need) {
@@ -132,8 +137,12 @@ var __zippWebGPU = (function () {
 
   // ---- Textures --------------------------------------------------------------
   GPUTexture.prototype.createView = function (desc) {
+    var d = ser(desc || {}), key = JSON.stringify(d);
+    var views = this._views || (this._views = {});
+    if (views[key]) return views[key];
     var v = make(GPUTextureView);
-    cmd(["createView", this._id, v._id, ser(desc || {})]);
+    cmd(["createView", this._id, v._id, d]);
+    views[key] = v;
     return v;
   };
   GPUTexture.prototype.destroy = function () { cmd(["destroy", this._id]); };
@@ -233,7 +242,15 @@ var __zippWebGPU = (function () {
   D.createShaderModule = function (desc) { var m = make(GPUShaderModule); cmd(["createShaderModule", m._id, String(desc.code)]); return m; };
   D.createBindGroupLayout = function (desc) { var l = make(GPUBindGroupLayout); cmd(["createBindGroupLayout", l._id, ser(desc)]); return l; };
   D.createPipelineLayout = function (desc) { var l = make(GPUPipelineLayout); cmd(["createPipelineLayout", l._id, ser(desc)]); return l; };
-  D.createBindGroup = function (desc) { var g = make(GPUBindGroup); cmd(["createBindGroup", g._id, ser(desc)]); return g; };
+  var bindGroups = {};
+  D.createBindGroup = function (desc) {
+    var d = ser(desc), key = JSON.stringify(d);
+    if (bindGroups[key]) return bindGroups[key];
+    var g = make(GPUBindGroup);
+    cmd(["createBindGroup", g._id, d]);
+    bindGroups[key] = g;
+    return g;
+  };
   D.createRenderPipeline = function (desc) { var p = make(GPURenderPipeline); cmd(["createRenderPipeline", p._id, ser(desc)]); return p; };
   D.createComputePipeline = function (desc) { var p = make(GPUComputePipeline); cmd(["createComputePipeline", p._id, ser(desc)]); return p; };
   D.createRenderPipelineAsync = function (desc) { return resolved(this.createRenderPipeline(desc)); };
@@ -300,6 +317,8 @@ var __zippWebGPU = (function () {
     if (!this._texture) {
       this._texture = make(GPUTexture, { format: this._format });
     }
+    // A resized canvas gets a new texture on the host, so new views of it.
+    if (this._texture.width !== this.canvas.width || this._texture.height !== this.canvas.height) this._texture._views = null;
     this._texture.width = this.canvas.width;
     this._texture.height = this.canvas.height;
     if (!this._used) cmd(["canvasTexture", this._cid, this._texture._id, this.canvas.width, this.canvas.height]);
