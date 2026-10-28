@@ -53,6 +53,15 @@ impl BaseDocument {
         inputs: taffy::tree::LayoutInput,
         block_ctx: Option<&mut BlockContext<'_>>,
     ) -> taffy::tree::LayoutOutput {
+        // Whether this node's layout parent is a block container. Taffy's block
+        // layout stretch-fits every child to the container's width, which is
+        // right for a block box and wrong for a replaced element (below).
+        let in_block_container = self.nodes[node_id.into()]
+            .layout_parent
+            .get()
+            .and_then(|parent| self.nodes.get(parent))
+            .is_some_and(|parent| parent.style.display == Display::Block);
+
         let node = &mut self.nodes[node_id.into()];
 
         let font_styles = node.primary_styles().map(|style| {
@@ -209,8 +218,22 @@ impl BaseDocument {
                         attr_size,
                     };
 
+                    // CSS 2.2 §10.3.4: a block-level replaced element with
+                    // `width:auto` takes its intrinsic width; it does not
+                    // stretch like a block box. Taffy hands a block container's
+                    // children the stretched width as a known size, so an
+                    // `<img style="display:block">` -- every image under the
+                    // common `img{display:block;max-width:100%}` reset -- came
+                    // out as wide as its container. Treat that width as the
+                    // space available instead (it still caps the image); auto
+                    // margins then centre the narrower box as usual.
+                    let known_dimensions = if in_block_container && node.style.size.width.is_auto() {
+                        taffy::Size { width: None, ..inputs.known_dimensions }
+                    } else {
+                        inputs.known_dimensions
+                    };
                     let computed = replaced_measure_function(
-                        inputs.known_dimensions,
+                        known_dimensions,
                         inputs.parent_size,
                         inputs.available_space,
                         &replaced_context,
