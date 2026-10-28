@@ -17,7 +17,7 @@ mod window;
 #[cfg(feature = "accessibility")]
 mod accessibility;
 
-pub use crate::application::ZippApp;
+pub use crate::application::{DocumentBuilder, ZippApp};
 pub use crate::event::{ShellEvent, ShellProxy};
 pub use crate::window::{View, WindowConfig};
 

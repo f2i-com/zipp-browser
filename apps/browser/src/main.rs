@@ -55,7 +55,11 @@ lazy_static::lazy_static! {
     /// `location.assign` from the page can be resolved against it.
     static ref CURRENT_URL: Mutex<String> = Mutex::new(String::new());
     /// Fully rendered HTML keyed by URL (skip JS re-compilation on revisit).
-    static ref RENDERED_CACHE: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
+    /// Pages as fetched, before their JS runs: what a navigation to the same URL
+    /// starts from instead of the network. It holds the fetched page rather than
+    /// the rendered one so that a revisited page still gets a live script and an
+    /// event bridge, not a frozen snapshot.
+    static ref PAGE_CACHE: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
     /// Shared blocking HTTP client -- reused across all fetch() calls to
     /// take advantage of connection pooling and avoid per-request TLS setup.
     static ref HTTP_CLIENT: reqwest::blocking::Client = reqwest::blocking::Client::builder()
@@ -132,14 +136,18 @@ fn main() {
 
     // 1-3. Fetch, run the page's JS, post-process. The ScriptState is !Send, so
     //      this stays on the main thread to keep it alive for event dispatch.
-    let (final_html, event_map_json, js_state) = prepare_page(&url, INITIAL_WINDOW_SIZE);
+    let t_fetch = std::time::Instant::now();
+    let html = match viewers::fetch_document(&url, true) {
+        Ok(html) => {
+            PAGE_CACHE.lock().unwrap().insert(url.clone(), html.clone());
+            html
+        }
+        Err(e) => error_page(&url, &e),
+    };
+    let fetch_ms = t_fetch.elapsed().as_millis();
+    let (final_html, event_map_json, js_state) =
+        render_page(&url, &html, INITIAL_WINDOW_SIZE, Some(fetch_ms));
     eprintln!("[BROWSER] Ready ({} bytes)", final_html.len());
-
-    // Cache the initial page for instant back-navigation
-    RENDERED_CACHE
-        .lock()
-        .unwrap()
-        .insert(url.clone(), final_html.clone());
 
     // 4. Load fonts manually (system font API doesn't work on RDP)
     let font_ctx = load_fonts();
@@ -176,26 +184,7 @@ fn main() {
         ..Default::default()
     };
     let mut doc = HtmlDocument::from_html(&final_html, config);
-
-    // Build JS-node-ID -> blitz-dom-node-ID mapping from data-flid attributes
-    // and wire the event bridge into the document so that DOM events call
-    // actual JS handlers via the live ScriptState.
-    if let Some(ref emap_json) = event_map_json {
-        let flid_map = event_bridge::build_flid_map(doc.as_ref());
-        if !flid_map.is_empty() {
-            eprintln!("[EVENT-BRIDGE] Mapped {} nodes with data-flid attributes", flid_map.len());
-        }
-        let bridge = event_bridge::JsEventBridge::new(flid_map, emap_json, js_state, &url);
-        eprintln!(
-            "[EVENT-BRIDGE] Bridge created with {} handler entries (live JS: {})",
-            bridge.handler_count(),
-            bridge.has_js_state(),
-        );
-        if bridge.handler_count() > 0 {
-            doc.set_event_handler(Box::new(bridge));
-            eprintln!("[EVENT-BRIDGE] Event handler installed on document");
-        }
-    }
+    attach_event_bridge(&mut doc, event_map_json, js_state, &url);
 
     // Pre-render linked pages in background for instant navigation
     let prerender_url = url.clone();
@@ -206,6 +195,17 @@ fn main() {
 
     // 8. Open window with tiny-skia renderer
     let mut app = ZippApp::new(proxy, receiver);
+    // Navigations come back here, on the main thread, to be built: the page's
+    // JS runs and its event bridge is attached exactly as for the first page.
+    // The fetching thread can do neither -- the script state is not `Send` --
+    // which is why every page reached by a link used to render and then
+    // respond to nothing.
+    app.set_document_builder(Box::new(|url, html, config, viewport| {
+        let (final_html, event_map_json, js_state) = render_page(&url, &html, viewport, None);
+        let mut doc = HtmlDocument::from_html(&final_html, config);
+        attach_event_bridge(&mut doc, event_map_json, js_state, &url);
+        Box::new(doc)
+    }));
     let renderer = TinySkiaWindowRenderer::new();
     let window = WindowConfig::with_size(Box::new(doc) as _, renderer, INITIAL_WINDOW_SIZE);
     app.add_window(window);
@@ -372,8 +372,13 @@ fn looks_like_page(href: &str) -> bool {
     }
 }
 
-/// Extract same-origin links from rendered HTML and pre-render them into
-/// `RENDERED_CACHE` so that navigation is instant on revisit.
+/// Prefetch the same-origin pages `html` links to into `PAGE_CACHE`, so that
+/// following one starts without a network round trip.
+///
+/// Only the fetch: the page's JS runs when it is navigated to, on the main
+/// thread, so it arrives live. This used to run every linked page's script in
+/// the background to cache a rendered snapshot -- a frozen one, which is what a
+/// cached page then showed.
 fn prerender_linked_pages(html: &str, base_url: &str) {
     let mut links = Vec::new();
     let mut pos = 0;
@@ -394,37 +399,16 @@ fn prerender_linked_pages(html: &str, base_url: &str) {
         .unwrap_or_default();
 
     for link in &links {
-        if !link.starts_with(&base) {
-            continue;
-        }
-        if RENDERED_CACHE.lock().unwrap().contains_key(link) {
+        if !link.starts_with(&base) || PAGE_CACHE.lock().unwrap().contains_key(link) {
             continue;
         }
         eprintln!("[PRERENDER] {link}");
-        let html = match fetch(link) {
-            Ok(h) => h,
-            Err(_) => continue,
-        };
-        let rendered = if html.contains("<script") {
-            // Prerender only needs the HTML, discard the ScriptState.
-            run_zipp_js(&html, link, INITIAL_WINDOW_SIZE)
-                .map(|(h, _emap, _state)| h)
-                .unwrap_or(html)
-        } else {
-            html
-        };
-        let rendered = inline_css(&rendered, link);
-        let rendered = inline_images(&rendered, link);
-        let final_html = wrap_with_toolbar(&rendered, link);
-        RENDERED_CACHE
-            .lock()
-            .unwrap()
-            .insert(link.clone(), final_html);
+        // Downloads off: a background prefetch must never write a file.
+        if let Ok(page) = viewers::fetch_document(link, false) {
+            PAGE_CACHE.lock().unwrap().insert(link.clone(), page);
+        }
     }
-    eprintln!(
-        "[PRERENDER] Done -- {} pages cached",
-        RENDERED_CACHE.lock().unwrap().len()
-    );
+    eprintln!("[PRERENDER] Done -- {} pages cached", PAGE_CACHE.lock().unwrap().len());
 }
 
 // ---------------------------------------------------------------------------
@@ -825,13 +809,24 @@ fn json_quote(s: &str) -> String {
 /// Returns the final HTML, the JS event map (when the page ran script), and the
 /// live `ScriptState` that keeps event handlers callable.
 fn prepare_page(url: &str, viewport: (u32, u32)) -> (String, Option<String>, Option<ScriptState>) {
-    *CURRENT_URL.lock().unwrap() = url.to_string();
     let t_fetch = std::time::Instant::now();
     // A PDF, image, text file or download comes back as a viewer page.
-    let html = viewers::fetch_document(url, true)
-        .unwrap_or_else(|e| format!("<html><body><h1>Error</h1><p>{e}</p></body></html>"));
+    let html = viewers::fetch_document(url, true).unwrap_or_else(|e| error_page(url, &e));
     let fetch_ms = t_fetch.elapsed().as_millis();
+    render_page(url, &html, viewport, Some(fetch_ms))
+}
 
+/// Run a fetched page's JS and post-process it into the HTML the renderer sees:
+/// the second half of [`prepare_page`], and all of a navigation's work on the
+/// main thread. `fetch_ms` is `None` when the fetch happened elsewhere.
+fn render_page(
+    url: &str,
+    html: &str,
+    viewport: (u32, u32),
+    fetch_ms: Option<u128>,
+) -> (String, Option<String>, Option<ScriptState>) {
+    *CURRENT_URL.lock().unwrap() = url.to_string();
+    let html = html.to_string();
     let t_js = std::time::Instant::now();
     let (rendered, event_map_json, js_state) = if html.contains("<script") {
         match run_zipp_js(&html, url, viewport) {
@@ -854,11 +849,54 @@ fn prepare_page(url: &str, viewport: (u32, u32)) -> (String, Option<String>, Opt
     let out = wrap_with_toolbar(&out, url);
     let post_ms = t_post.elapsed().as_millis();
 
+    let fetch = fetch_ms.map(|ms| format!("{ms}ms")).unwrap_or_else(|| "-".to_string());
     eprintln!(
-        "[PERF] Page: fetch={fetch_ms}ms js={js_ms}ms post={post_ms}ms ({} bytes)",
+        "[PERF] Page: fetch={fetch} js={js_ms}ms post={post_ms}ms ({} bytes)",
         out.len()
     );
     (out, event_map_json, js_state)
+}
+
+/// The page shown when a load fails.
+fn error_page(url: &str, error: &str) -> String {
+    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    format!(
+        r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Can't load page</title><style>
+body{{margin:0;background:#f8f9fa;font:15px Arial,sans-serif;color:#202124}}
+.err{{max-width:640px;margin:72px auto;padding:0 24px}} h1{{font-size:24px;font-weight:600;margin:0 0 12px}}
+p{{line-height:1.5;overflow-wrap:anywhere}} .k{{color:#5f6368}}
+</style></head><body><div class="err"><h1>This page can't be loaded</h1><p>{}</p><p class="k">{}</p></div></body></html>"#,
+        esc(url),
+        esc(error)
+    )
+}
+
+/// Map the page's JS nodes onto the document (by `data-flid`) and install the
+/// event bridge, so DOM events reach the page's handlers through its live
+/// script. A page that ran no script, or registered no handlers, gets none.
+fn attach_event_bridge(
+    doc: &mut HtmlDocument,
+    event_map_json: Option<String>,
+    js_state: Option<ScriptState>,
+    url: &str,
+) {
+    let Some(emap_json) = event_map_json else {
+        return;
+    };
+    let flid_map = event_bridge::build_flid_map(doc.as_ref());
+    if !flid_map.is_empty() {
+        eprintln!("[EVENT-BRIDGE] Mapped {} nodes with data-flid attributes", flid_map.len());
+    }
+    let bridge = event_bridge::JsEventBridge::new(flid_map, &emap_json, js_state, url);
+    eprintln!(
+        "[EVENT-BRIDGE] Bridge created with {} handler entries (live JS: {})",
+        bridge.handler_count(),
+        bridge.has_js_state(),
+    );
+    if bridge.handler_count() > 0 {
+        doc.set_event_handler(Box::new(bridge));
+        eprintln!("[EVENT-BRIDGE] Event handler installed on document");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1599,7 +1637,7 @@ impl NavigationProvider for BrowserNavProvider {
             let proxy = self.proxy.clone();
             std::thread::spawn(move || match viewers::save_pdf(&target) {
                 Ok(html) => proxy.send_event(zipp_shell::ShellEvent::NavigationLoad {
-                    contents: wrap_with_toolbar(&html, &target),
+                    contents: html,
                     url: target,
                     retain_scroll_position: true,
                     is_md: false,
@@ -1657,55 +1695,32 @@ impl NavigationProvider for BrowserNavProvider {
         std::thread::Builder::new()
             .stack_size(64 * 1024 * 1024)
             .spawn(move || {
-                // Check rendered cache first (instant for revisited pages)
-                if let Some(cached) = RENDERED_CACHE.lock().unwrap().get(&url) {
-                    eprintln!("[NAV] Cache hit for {url}");
-                    proxy.send_event(zipp_shell::ShellEvent::NavigationLoad {
-                        url,
-                        contents: cached.clone(),
-                        retain_scroll_position: false,
-                        is_md: false,
-                    });
-                    return;
-                }
-
-                eprintln!("[NAV] Loading {url}...");
-                let html = match viewers::fetch_document(&url, true) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        eprintln!("[NAV] Fetch error: {e}");
-                        format!("<html><body><h1>Error</h1><p>{e}</p></body></html>")
+                // Only the fetch happens here. The page's JS runs on the main
+                // thread, in the document builder, so that its live state can
+                // stay attached to the document it rendered.
+                let cached = PAGE_CACHE.lock().unwrap().get(&url).cloned();
+                let contents = match cached {
+                    Some(html) => {
+                        eprintln!("[NAV] Cache hit for {url}");
+                        html
+                    }
+                    None => {
+                        eprintln!("[NAV] Loading {url}...");
+                        match viewers::fetch_document(&url, true) {
+                            Ok(html) => {
+                                PAGE_CACHE.lock().unwrap().insert(url.clone(), html.clone());
+                                html
+                            }
+                            Err(e) => {
+                                eprintln!("[NAV] Fetch error: {e}");
+                                error_page(&url, &e)
+                            }
+                        }
                     }
                 };
-
-                let rendered = if html.contains("<script") {
-                    // During navigation we extract just the HTML; the
-                    // ScriptState is discarded since we can't move it
-                    // across threads (!Send due to Rc).
-                    run_zipp_js(&html, &url, INITIAL_WINDOW_SIZE)
-                        .map(|(h, _emap, _state)| h)
-                        .unwrap_or(html)
-                } else {
-                    html
-                };
-
-                // Post-process: strip noscript, toggle JS classes, make URLs absolute
-                let rendered = strip_noscript(&rendered);
-                let rendered = rendered
-                    .replace("class=\"no-js", "class=\"js")
-                    .replace("class=\"client-nojs", "class=\"client-js");
-                let rendered = inline_images(&rendered, &url);
-                let final_html = wrap_with_toolbar(&rendered, &url);
-
-                // Cache for instant revisits
-                RENDERED_CACHE
-                    .lock()
-                    .unwrap()
-                    .insert(url.clone(), final_html.clone());
-
                 proxy.send_event(zipp_shell::ShellEvent::NavigationLoad {
                     url,
-                    contents: final_html,
+                    contents,
                     retain_scroll_position: false,
                     is_md: false,
                 });
@@ -1895,53 +1910,6 @@ fn toolbar_body_themed(page_html: &str, current_url: &str, html_class: &str) -> 
   </div>
 </div>"#
     )
-}
-
-// ---------------------------------------------------------------------------
-// CSS inlining
-// ---------------------------------------------------------------------------
-
-/// Replace external `<link rel="stylesheet">` tags with inline `<style>` blocks.
-fn inline_css(html: &str, base_url: &str) -> String {
-    let mut result = html.to_string();
-
-    while let Some(link_start) = result.find("<link") {
-        let link_end = match result[link_start..].find('>') {
-            Some(e) => link_start + e + 1,
-            None => break,
-        };
-        let tag = result[link_start..link_end].to_string();
-
-        if !tag.contains("stylesheet") {
-            // Not a stylesheet -- skip by replacing with a comment marker
-            let mut replacement = String::with_capacity(tag.len() + 9);
-            replacement.push_str("<!--link");
-            replacement.push_str(&tag[1..tag.len() - 1]);
-            replacement.push_str("-->");
-            result.replace_range(link_start..link_end, &replacement);
-            continue;
-        }
-
-        if let Some(href) = attr(&tag, "href") {
-            let full_url = resolve(base_url, &href);
-            if let Ok(css) = fetch(&full_url) {
-                if !css.is_empty() && !css.starts_with("<!") {
-                    // Pass CSS through unchanged - Stylo + Taffy handle it natively
-                    let mut replacement = String::with_capacity(css.len() + 15);
-                    replacement.push_str("<style>");
-                    replacement.push_str(&css);
-                    replacement.push_str("</style>");
-                    result.replace_range(link_start..link_end, &replacement);
-                    continue;
-                }
-            }
-        }
-        break; // Avoid infinite loop
-    }
-
-    // Restore comment markers back to tags
-    result = result.replace("<!--link", "<").replace("-->", ">");
-    result
 }
 
 // ---------------------------------------------------------------------------

@@ -137,14 +137,6 @@ Honest list, not an exhaustive one:
 - **Intrinsic sizing keywords** (`max-content`, `min-content`, `fit-content`,
   `stretch`) collapse to `auto` in the Stylo→Taffy conversion. Lowering them
   properly currently hits an `unreachable!()` in Taffy's resolver.
-- **A real navigation drops the page's JavaScript.** In-page routing is fine —
-  a framework that cancels the click (React Router does) keeps its live VM, so
-  SPA links work, and a link to a fragment of the current page (`#about`)
-  scrolls in place. But an address-bar navigation or a link to another document
-  replaces the document with fetched or prerendered HTML and installs no event
-  bridge, so that page renders correctly and responds to nothing. Fixing it
-  means running the new page's JS and attaching a bridge to the new document in
-  the navigation path.
 - **An animating page costs about one CPU core.** Without the `incremental`
   feature (which does not currently build), every frame restyles, rebuilds the
   whole box tree -- re-parsing every inline SVG -- and lays out again, so a

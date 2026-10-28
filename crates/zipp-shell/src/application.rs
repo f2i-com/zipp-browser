@@ -18,12 +18,22 @@ use winit::window::WindowId;
 use winit::platform::macos::ApplicationHandlerExtMacOS;
 
 use crate::{View, WindowConfig};
+use zipp_dom::{Document, DocumentConfig};
+
+/// Builds the document for a navigation, on the main thread: `(url, contents,
+/// config, viewport)`, the viewport in CSS pixels.
+///
+/// Set by an embedder whose documents need more than parsing -- the browser runs
+/// the page's JavaScript here and attaches its event bridge, which cannot happen
+/// on the thread that fetched the page because the script state is not `Send`.
+pub type DocumentBuilder = Box<dyn FnMut(String, String, DocumentConfig, (u32, u32)) -> Box<dyn Document>>;
 
 pub struct ZippApp<Rend: WindowRenderer> {
     pub windows: HashMap<WindowId, View<Rend>>,
     pub pending_windows: Vec<WindowConfig<Rend>>,
     pub proxy: ShellProxy,
     pub event_queue: Receiver<ShellEvent>,
+    document_builder: Option<DocumentBuilder>,
 }
 
 impl<Rend: WindowRenderer> ZippApp<Rend> 
@@ -36,7 +46,14 @@ where
             pending_windows: Vec::new(),
             proxy,
             event_queue,
+            document_builder: None,
         }
+    }
+
+    /// Have navigations build their document with `builder` rather than by
+    /// parsing `NavigationLoad::contents` as finished HTML.
+    pub fn set_document_builder(&mut self, builder: DocumentBuilder) {
+        self.document_builder = Some(builder);
     }
 
     pub fn add_window(&mut self, window_config: WindowConfig<Rend>) {
@@ -107,9 +124,19 @@ where
                 if let Some((_, view)) = self.windows.iter_mut().next() {
                     let config = view.doc.inner().clone_config_for_navigation(url.clone());
                     let t1 = std::time::Instant::now();
-                    let doc = zipp_dom::html_parser::HtmlDocument::from_html(&contents, config);
+                    let doc: Box<dyn Document> = match self.document_builder.as_mut() {
+                        Some(build) => {
+                            let inner = view.doc.inner();
+                            let scale = inner.viewport().scale_f64();
+                            let (w, h) = inner.viewport().window_size;
+                            drop(inner);
+                            let css = ((w as f64 / scale) as u32, (h as f64 / scale) as u32);
+                            build(url.clone(), contents.clone(), config, css)
+                        }
+                        None => Box::new(zipp_dom::html_parser::HtmlDocument::from_html(&contents, config)),
+                    };
                     let t2 = std::time::Instant::now();
-                    view.replace_document(Box::new(doc), retain_scroll_position);
+                    view.replace_document(doc, retain_scroll_position);
                     let t3 = std::time::Instant::now();
                     view.request_redraw();
                     eprintln!("[PERF] Nav: config={:.0}ms parse={:.0}ms replace={:.0}ms total={:.0}ms ({} bytes)",
