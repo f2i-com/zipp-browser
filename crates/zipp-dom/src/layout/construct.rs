@@ -146,10 +146,19 @@ pub(crate) fn collect_layout_children(
                 doc.nodes[id].remove_damage(CONSTRUCT_BOX | CONSTRUCT_DESCENDENT | CONSTRUCT_FC);
             });
 
-            eprintln!("[SVG] Parsing: {}", &outer_html[..outer_html.len().min(200)]);
+            // Opt-in (`ZIPP_DEBUG_SVG=1`). Construction reruns on every restyle
+            // that damages the box, so on an icon-heavy page these lines ran to
+            // ~170k a minute — a real cost on a Windows console, not just noise.
+            static DEBUG_SVG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let debug_svg = *DEBUG_SVG.get_or_init(|| std::env::var_os("ZIPP_DEBUG_SVG").is_some());
+            if debug_svg {
+                eprintln!("[SVG] Parsing: {}", &outer_html[..outer_html.floor_char_boundary(200)]);
+            }
             match crate::util::parse_svg(outer_html.as_bytes()) {
                 Ok(svg) => {
-                    eprintln!("[SVG] OK: {}x{}", svg.size().width(), svg.size().height());
+                    if debug_svg {
+                        eprintln!("[SVG] OK: {}x{}", svg.size().width(), svg.size().height());
+                    }
                     doc.get_node_mut(container_node_id)
                         .unwrap()
                         .element_data_mut()
@@ -157,7 +166,9 @@ pub(crate) fn collect_layout_children(
                         .special_data = SpecialElementData::Image(Box::new(svg.into()));
                 }
                 Err(err) => {
-                    eprintln!("[SVG] Parse error: {err}");
+                    if debug_svg {
+                        eprintln!("[SVG] Parse error: {err}");
+                    }
                     #[cfg(feature = "tracing")]
                     tracing::warn!(
                         node_id = container_node_id,

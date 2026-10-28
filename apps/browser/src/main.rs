@@ -348,6 +348,26 @@ var result = t1 + " | " + t2 + " | " + t3 + " | " + t4;
     }
 }
 
+/// Whether a link plausibly leads to another page rather than a resource.
+///
+/// Every `href` used to qualify, so prerendering fetched the page's own
+/// stylesheet, its favicon and a linked PDF as if each were a document — and
+/// ran the "page's" JS over them. A path whose last segment carries a file
+/// extension other than a page-like one is a resource.
+fn looks_like_page(href: &str) -> bool {
+    let Ok(url) = url::Url::parse(href) else {
+        return false;
+    };
+    let last = url.path().rsplit('/').next().unwrap_or("");
+    match last.rsplit_once('.') {
+        None => true,
+        Some((_, ext)) => matches!(
+            ext.to_ascii_lowercase().as_str(),
+            "html" | "htm" | "xhtml" | "shtml" | "php" | "asp" | "aspx" | "jsp"
+        ),
+    }
+}
+
 /// Extract same-origin links from rendered HTML and pre-render them into
 /// `RENDERED_CACHE` so that navigation is instant on revisit.
 fn prerender_linked_pages(html: &str, base_url: &str) {
@@ -357,7 +377,7 @@ fn prerender_linked_pages(html: &str, base_url: &str) {
         let start = pos + idx + 6;
         if let Some(end) = html[start..].find('"') {
             let href = &html[start..start + end];
-            if href.starts_with("http") && !links.contains(&href.to_string()) {
+            if href.starts_with("http") && looks_like_page(href) && !links.contains(&href.to_string()) {
                 links.push(href.to_string());
             }
         }
@@ -2114,5 +2134,22 @@ fn head_content(html: &str) -> String {
             result
         }
         _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prerender_only_follows_page_links() {
+        assert!(looks_like_page("https://lance.name"));
+        assert!(looks_like_page("https://lance.name/about/"));
+        assert!(looks_like_page("https://example.com/post.html"));
+        assert!(looks_like_page("https://example.com/v1.2/notes"));
+        assert!(!looks_like_page("https://lance.name/assets/index-Car7W7dH.css"));
+        assert!(!looks_like_page("https://lance.name/favicon.svg"));
+        assert!(!looks_like_page("https://lance.name/downloads/Lance-Baker-Resume.pdf"));
+        assert!(!looks_like_page("not a url"));
     }
 }
