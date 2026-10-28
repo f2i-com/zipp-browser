@@ -6,7 +6,7 @@
 //! batches: one OpenGL context per canvas, on a hidden window, each drawing
 //! into an offscreen framebuffer that stands in for the canvas's default one
 //! (`bindFramebuffer(null)` binds it). A `present` at the end of a frame reads
-//! that framebuffer back; the frame goes to [`take_frames`], and the page's
+//! that framebuffer back; the frame goes to `canvas::take_frames`, and the page's
 //! canvas element gets it as its image (`apply_canvas_frames` in main.rs).
 //!
 //! The GL thread keeps OpenGL off the window's thread, which never has a GL
@@ -37,13 +37,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{PCSTR, s, w};
 use zipp_vm::embed::HostCtx;
 
-/// A frame read back from a canvas: its element's `data-flid`, size and RGBA.
-pub(crate) struct Frame {
-    pub flid: u32,
-    pub width: u32,
-    pub height: u32,
-    pub rgba: Vec<u8>,
-}
+use crate::canvas::Frame;
 
 struct Batch {
     context: u32,
@@ -64,12 +58,6 @@ struct Reply {
 
 thread_local! {
     static GL_THREAD: RefCell<Option<Sender<Batch>>> = const { RefCell::new(None) };
-    static FRAMES: RefCell<Vec<Frame>> = const { RefCell::new(Vec::new()) };
-}
-
-/// The frames presented since the last call, for the canvases to show.
-pub(crate) fn take_frames() -> Vec<Frame> {
-    FRAMES.with(|f| std::mem::take(&mut *f.borrow_mut()))
 }
 
 /// `__zippHostCall("gl", context, batch, payloadLength)`.
@@ -115,11 +103,7 @@ pub(crate) fn host_call(ctx: &mut dyn HostCtx, args: &[String]) -> Result<String
         }
     }
     if let Some(frame) = reply.frame {
-        FRAMES.with(|f| {
-            let mut frames = f.borrow_mut();
-            frames.retain(|old| old.flid != frame.flid);
-            frames.push(frame);
-        });
+        crate::canvas::push_frame(frame);
     }
     Ok(reply.result)
 }

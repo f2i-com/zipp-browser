@@ -1262,7 +1262,9 @@ var window = {
                     headers: { get: function(name) { return null; }, has: function(name) { return false; }, forEach: function() {} },
                     text: function() { return Promise.resolve(responseBody); },
                     json: function() { return Promise.resolve(JSON.parse(responseBody)); },
-                    blob: function() { return Promise.resolve(responseBody); },
+                    // A Blob that remembers where it came from, so that
+                    // `createImageBitmap(blob)` can decode the image.
+                    blob: function() { var b = new Blob([responseBody]); b._url = __zippAbsoluteUrl(String(url)); return Promise.resolve(b); },
                     // The body as bytes, fetched again as such: the text above
                     // went through UTF-8 and cannot give them back. What
                     // `WebAssembly.instantiateStreaming(fetch(url))` reads.

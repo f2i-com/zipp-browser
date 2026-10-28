@@ -100,6 +100,21 @@ with `controls`, the bar along the bottom also seeks and mutes. A muted
 `ZIPP_DEBUG_MEDIA=1` logs the engine's events. Elsewhere -- other platforms,
 `--screenshot` -- a video shows its poster.
 
+## WebAssembly, WebGL and WebGPU
+
+`WebAssembly` is zipp-vm's own (its `web-assembly` branch, which this branch
+builds against): the whole JS API, with modules run by the
+[wasmi](https://github.com/wasmi-labs/wasmi) interpreter, so a page's
+`instantiateStreaming(fetch("x.wasm"))` works as written.
+
+On Windows a `<canvas>` can draw with WebGL 1 or WebGPU. The page's calls are
+batched and replayed off the window's thread -- WebGL on desktop OpenGL
+(`webgl.rs`), WebGPU on [wgpu](https://wgpu.rs) over Vulkan or Direct3D 12
+(`webgpu.rs`) -- into an offscreen target, read back at the end of each frame
+and painted as the canvas's image. The window drives `requestAnimationFrame`
+while a context is alive. `getContext("webgl2")` returns null, so a page falls
+back to WebGL 1.
+
 ## Beyond HTML
 
 A navigation is classified by its `Content-Type` (then file extension, then

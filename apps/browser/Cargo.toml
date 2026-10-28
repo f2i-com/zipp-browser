@@ -105,4 +105,7 @@ serde_json = "1"
 # Image textures, decoded from their bytes.
 image = { workspace = true }
 windows-core = "0.62"
+# WebGPU (`webgpu.rs`): wgpu implements it; pollster waits on its futures.
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "wgsl", "vulkan", "dx12"] }
+pollster = "1"
 

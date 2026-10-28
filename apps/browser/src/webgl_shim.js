@@ -14,7 +14,10 @@
 // Page script, like the host (`ScriptState::call_global`), finds globals by
 // the program's top-level bindings, not by properties set on `globalThis`
 // later: hence the `var`s here, set from what the layer returns.
-var __zippAnimationFrame, __zippWebGLContexts;
+var __zippAnimationFrame, __zippWebGLContexts, createImageBitmap;
+// Every canvas context that draws frames (WebGL here, WebGPU in
+// webgpu_shim.js): each has a `_present()` the frame calls at its end.
+var __zippCanvasContexts = [];
 var __zippWebGL = (function () {
   "use strict";
 
@@ -119,7 +122,6 @@ var __zippWebGL = (function () {
   function idOf(o) { return o == null ? 0 : o._id; }
 
   // ---- The context ---------------------------------------------------------
-  var contexts = [];
   var nextContext = 1;
 
   function bytesOf(data) {
@@ -148,7 +150,7 @@ var __zippWebGL = (function () {
     this._program = null;
     this._uniforms = {};
     this._ext = {};
-    contexts.push(this);
+    __zippCanvasContexts.push(this);
     this._cmd(["create", canvas._id, canvas.width, canvas.height]);
   }
   var P = WebGLRenderingContext.prototype;
@@ -451,16 +453,20 @@ var __zippWebGL = (function () {
   Element.prototype.getContext = function (type, attributes) {
     if (this.tagName !== "CANVAS") return undefined;
     type = String(type);
+    // A page animating a canvas times its frames with performance.now(); the
+    // shim's own is a slow counter that keeps React's scheduler from yielding.
+    // Make it the real clock once there is something to animate.
+    if ((type === "webgl" || type === "experimental-webgl" || type === "webgpu") && __zippCanvasContexts.length === 0) {
+      var t0 = Date.now();
+      performance.now = function () { return Date.now() - t0; };
+    }
     if (type === "webgl" || type === "experimental-webgl") {
-      // A page animating with WebGL times its frames with performance.now();
-      // the shim's own is a slow counter that keeps React's scheduler from
-      // yielding. Make it the real clock once there is something to animate.
-      if (contexts.length === 0) {
-        var t0 = Date.now();
-        performance.now = function () { return Date.now() - t0; };
-      }
       if (!this._zippCanvasContext) this._zippCanvasContext = new WebGLRenderingContext(this, attributes);
       return this._zippCanvasContext;
+    }
+    if (type === "webgpu" && typeof __zippWebGPUContext === "function") {
+      if (!this._zippGPUContext) this._zippGPUContext = __zippWebGPUContext(this);
+      return this._zippGPUContext;
     }
     return null;
   };
@@ -514,6 +520,26 @@ var __zippWebGL = (function () {
     img.complete = false;
     return img;
   };
+  // `img.decode()`: the image is ready as soon as its `src` is.
+  Element.prototype.decode = function () { return Promise.resolve(); };
+  // An ImageBitmap stands for its image's URL, as `src`; uploads from it
+  // (`texImage2D`, `copyExternalImageToTexture`) fetch and decode on the host.
+  function ImageBitmap(src, size) { this.src = src; this.width = size[0]; this.height = size[1]; }
+  ImageBitmap.prototype.close = function () {};
+  createImageBitmap = function (source) {
+    if (source instanceof ImageBitmap) return Promise.resolve(source);
+    if (source && source.tagName === "IMG") {
+      return Promise.resolve(new ImageBitmap(__zippAbsoluteUrl(source.getAttribute("src") || ""), imageSize(source)));
+    }
+    // A Blob from `fetch(url).then(r => r.blob())` remembers its URL.
+    if (source && source._url) {
+      var info = null;
+      try { info = JSON.parse(__zippHostCall("image_info", source._url)); } catch (e) {}
+      return Promise.resolve(new ImageBitmap(source._url, info && info.width > 0 ? [info.width, info.height] : [0, 0]));
+    }
+    return Promise.reject(new TypeError("createImageBitmap: unsupported source"));
+  };
+  window.createImageBitmap = createImageBitmap;
 
   // ---- Frames ---------------------------------------------------------------
   // One animation frame, driven by the window while a WebGL context lives:
@@ -524,12 +550,12 @@ var __zippWebGL = (function () {
     var mutations = __domMutations;
     __zippRunAnimationFrame(now);
     __zippDrainQueues(8);
-    for (var i = 0; i < contexts.length; i++) {
-      try { contexts[i]._present(); } catch (e) { console.error("WebGL: " + e); }
+    for (var i = 0; i < __zippCanvasContexts.length; i++) {
+      try { __zippCanvasContexts[i]._present(); } catch (e) { console.error("canvas: " + e); }
     }
-    return (__rafQueue.length > 0 && contexts.length > 0 ? 1 : 0) | (__domMutations !== mutations ? 2 : 0);
+    return (__rafQueue.length > 0 && __zippCanvasContexts.length > 0 ? 1 : 0) | (__domMutations !== mutations ? 2 : 0);
   };
-  __zippWebGLContexts = function () { return contexts.length; };
+  __zippWebGLContexts = function () { return __zippCanvasContexts.length; };
 
   var exported = {
     Image: window.Image, WebGLRenderingContext: WebGLRenderingContext, WebGLBuffer: WebGLBuffer,

@@ -42,8 +42,11 @@ mod esm;
 mod event_bridge;
 #[cfg(windows)]
 mod media;
+mod canvas;
 #[cfg(windows)]
 mod webgl;
+#[cfg(windows)]
+mod webgpu;
 mod viewers;
 
 // ---------------------------------------------------------------------------
@@ -810,6 +813,11 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
         "gl" => webgl::host_call(ctx, args),
         #[cfg(not(windows))]
         "gl" => Err("Error: WebGL is not available on this platform".into()),
+        // A WebGPU batch (webgpu.rs).
+        #[cfg(windows)]
+        "gpu" => webgpu::host_call(ctx, args),
+        #[cfg(not(windows))]
+        "gpu" => Err("Error: WebGPU is not available on this platform".into()),
         // An image's size, for `naturalWidth` and `load`.
         #[cfg(windows)]
         "image_info" => webgl::image_info(&resolve_page_url(args.first().map(String::as_str).unwrap_or_default())),
@@ -1518,7 +1526,8 @@ fn run_zipp_js_inner(
     let dom_shim = include_str!("dom_shim.js");
     let router_helpers = include_str!("router_helpers.js");
     let webgl_shim = include_str!("webgl_shim.js");
-    let dom_shim = &format!("{HOST_PRELUDE_JS}\n{dom_shim}\n{webgl_shim}");
+    let webgpu_shim = include_str!("webgpu_shim.js");
+    let dom_shim = &format!("{HOST_PRELUDE_JS}\n{dom_shim}\n{webgl_shim}\n{webgpu_shim}");
     let shim = dom_shim.replace(
         "__PAGE_URL__",
         &page_url.replace('\\', "\\\\").replace('\'', "\\'"),
@@ -2024,35 +2033,27 @@ fn build_document(final_html: &str, config: DocumentConfig) -> HtmlDocument {
     doc
 }
 
-/// Show the WebGL frames presented since the last call: each becomes the
+/// Show the WebGL and WebGPU frames presented since the last call: each becomes the
 /// image of its canvas element (found by `data-flid`), which is painted, and
 /// sized when the canvas has no size of its own, like any image. True when
 /// there were any.
 pub(crate) fn apply_canvas_frames(doc: &mut BaseDocument) -> bool {
-    #[cfg(windows)]
-    {
-        use zipp_dom::node::{ImageData, RasterImageData, SpecialElementData};
-        let frames = webgl::take_frames();
-        if frames.is_empty() {
-            return false;
-        }
-        let flids = event_bridge::build_flid_map(doc);
-        for frame in frames {
-            let Some(&node) = flids.get(&frame.flid) else {
-                continue;
-            };
-            if let Some(element) = doc.get_node_mut(node).and_then(|n| n.element_data_mut()) {
-                let image = RasterImageData::new(frame.width, frame.height, Arc::new(frame.rgba));
-                element.special_data = SpecialElementData::Image(Box::new(ImageData::Raster(image)));
-            }
-        }
-        true
+    use zipp_dom::node::{ImageData, RasterImageData, SpecialElementData};
+    let frames = canvas::take_frames();
+    if frames.is_empty() {
+        return false;
     }
-    #[cfg(not(windows))]
-    {
-        let _ = doc;
-        false
+    let flids = event_bridge::build_flid_map(doc);
+    for frame in frames {
+        let Some(&node) = flids.get(&frame.flid) else {
+            continue;
+        };
+        if let Some(element) = doc.get_node_mut(node).and_then(|n| n.element_data_mut()) {
+            let image = RasterImageData::new(frame.width, frame.height, Arc::new(frame.rgba));
+            element.special_data = SpecialElementData::Image(Box::new(ImageData::Raster(image)));
+        }
     }
+    true
 }
 
 /// Split a serialized `<body ...>...</body>` element into its attribute text

@@ -161,6 +161,8 @@ impl EventHandler for JsEventBridge {
                 0
             }
         };
+        state.run_microtasks();
+        print_console(state);
         if crate::apply_canvas_frames(doc) {
             doc.shell_provider.request_paint();
         }
@@ -255,6 +257,7 @@ impl EventHandler for JsEventBridge {
                         // nothing, which is how the menu opened but would not
                         // close.
                         state.run_microtasks();
+                        print_console(state);
 
                         // For click events: settle the page, then see whether
                         // the handler changed the DOM.
@@ -275,6 +278,7 @@ impl EventHandler for JsEventBridge {
                                     &[JsValue::Number(50.0), JsValue::Number(2.0)],
                                 );
                             }
+                            print_console(state);
                             if let Ok(JsValue::String(new_html)) =
                                 state.call_global("__getRenderedHTML", &[])
                             {
@@ -377,6 +381,18 @@ impl EventHandler for JsEventBridge {
 ///
 /// The JSON format is: `{"42": ["click","mousedown"], "99": ["click"]}`
 /// We do minimal hand-parsing to avoid pulling in serde_json.
+/// What the page logged since the last call (its `console`, the shim's
+/// reports of callbacks that threw). The first render prints its own; this is
+/// everything after, which would otherwise pile up unseen.
+fn print_console(state: &mut ScriptState) {
+    for line in state.take_output() {
+        eprintln!("[JS] {line}");
+    }
+    for line in state.take_errput() {
+        eprintln!("[JS] {line}");
+    }
+}
+
 fn parse_event_map(
     flid_map: &HashMap<u32, usize>,
     json: &str,
