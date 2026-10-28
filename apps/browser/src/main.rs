@@ -1389,11 +1389,6 @@ fn run_zipp_js_inner(
         return None;
     }
 
-    let base = url::Url::parse(page_url)
-        .ok()
-        .map(|u| format!("{}://{}", u.scheme(), u.host_str().unwrap_or("")))
-        .unwrap_or_default();
-
     let dom_shim = include_str!("dom_shim.js");
     let router_helpers = include_str!("router_helpers.js");
     let dom_shim = &format!("{HOST_PRELUDE_JS}\n{dom_shim}");
@@ -1569,13 +1564,13 @@ var __zippEsmDebug=true;
                 .find("<body>")
                 .map(|s| &rendered[s + 6..rendered.rfind("</body>").unwrap_or(rendered.len())])
                 .unwrap_or(&rendered);
-            let inner = make_urls_absolute(inner, &base);
+            let inner = make_urls_absolute(inner, page_url);
             let inner = inner
                 .replace("\\xa9", "\u{00A9}")
                 .replace("\\u2019", "\u{2019}")
                 .replace("\\u2018", "\u{2018}")
                 .replace("\\u2014", "\u{2014}");
-            let head = make_urls_absolute(&head_content(html), &base);
+            let head = make_urls_absolute(&head_content(html), page_url);
             eprintln!("[JS] Rendered {} bytes", inner.len());
             // `ZIPP_DUMP_ROOT=<path>` writes what the page's JS actually built.
             // For a client-rendered app this IS the page; without it a short
@@ -1905,11 +1900,7 @@ pub(crate) fn rerender_body_themed(
         }
         _ => rendered_body,
     };
-    let base = url::Url::parse(page_url)
-        .ok()
-        .map(|u| format!("{}://{}", u.scheme(), u.host_str().unwrap_or("")))
-        .unwrap_or_default();
-    toolbar_body_themed(&make_urls_absolute(inner, &base), page_url, html_class)
+    toolbar_body_themed(&make_urls_absolute(inner, page_url), page_url, html_class)
 }
 
 /// The `<body>` contents: the browser chrome followed by the page.
@@ -2036,58 +2027,62 @@ fn inline_images(html: &str, base_url: &str) -> String {
 // URL helpers
 // ---------------------------------------------------------------------------
 
-fn make_urls_absolute(html: &str, base: &str) -> String {
-    // Pre-compute replacement strings once
-    let src_replacement = {
-        let mut s = String::with_capacity(5 + base.len() + 1);
-        s.push_str("src=\"");
-        s.push_str(base);
-        s.push('/');
-        s
+/// Resolve every `src` and `href` attribute in `html` against `page_url`, as
+/// the document itself would: `//cdn.example/x.png`, `/x.png`, `x.png` and
+/// `../x.png` alike. Fragment-only (`#top`) and already-absolute values
+/// (`https:`, `data:`, `mailto:`, ...) are left as they are.
+///
+/// This used to splice the page's origin in front of anything starting with
+/// `/`, so a protocol-relative `//upload.wikimedia.org/...` became
+/// `https://en.wikipedia.org//upload.wikimedia.org/...` -- why Wikipedia's
+/// article images never loaded. It also matched inside `data-src="`, and put
+/// bare relative paths at the site root rather than beside the page.
+fn make_urls_absolute(html: &str, page_url: &str) -> String {
+    let Ok(base) = url::Url::parse(page_url) else {
+        return html.to_string();
     };
-    let href_replacement = {
-        let mut s = String::with_capacity(6 + base.len() + 1);
-        s.push_str("href=\"");
-        s.push_str(base);
-        s.push('/');
-        s
-    };
-    let base_slash = {
-        let mut s = String::with_capacity(base.len() + 1);
-        s.push_str(base);
-        s.push('/');
-        s
-    };
-
-    let result = html
-        .replace("src=\"/", &src_replacement)
-        .replace("href=\"/", &href_replacement);
-
-    // Also handle bare relative filenames (e.g. src="image.jpg")
-    let mut out = String::with_capacity(result.len());
+    let mut out = String::with_capacity(html.len() + 256);
+    let mut copied = 0;
     let mut pos = 0;
-    while pos < result.len() {
-        if let Some(idx) = result[pos..].find("src=\"") {
-            let abs = pos + idx;
-            out.push_str(&result[pos..abs + 5]);
-            let val_start = abs + 5;
-            if let Some(end) = result[val_start..].find('"') {
-                let val = &result[val_start..val_start + end];
-                if !val.starts_with("http") && !val.starts_with("data:") && !val.starts_with("//")
-                {
-                    out.push_str(&base_slash);
-                }
-                out.push_str(val);
-                pos = val_start + end;
-            } else {
-                pos = val_start;
-            }
-        } else {
-            out.push_str(&result[pos..]);
+    while let Some(found) = html[pos..].find("=\"") {
+        let eq = pos + found;
+        let value_start = eq + 2;
+        let Some(len) = html[value_start..].find('"') else {
             break;
+        };
+        let value_end = value_start + len;
+        // The attribute name runs back from `=` to the whitespace before it, so
+        // `data-src` is not mistaken for `src`.
+        let name_start = html[..eq]
+            .rfind(|c: char| c.is_ascii_whitespace())
+            .map_or(eq, |ws| ws + 1);
+        let name = &html[name_start..eq];
+        if name.eq_ignore_ascii_case("src") || name.eq_ignore_ascii_case("href") {
+            if let Some(absolute) = absolutize(&base, &html[value_start..value_end]) {
+                out.push_str(&html[copied..value_start]);
+                out.push_str(&absolute);
+                copied = value_end;
+            }
         }
+        pos = value_end + 1;
     }
+    out.push_str(&html[copied..]);
     out
+}
+
+/// `value` resolved against `base`, or `None` to leave it untouched.
+fn absolutize(base: &url::Url, value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.starts_with('#') {
+        return None;
+    }
+    // Already absolute: a scheme before any `/`, `?` or `#`.
+    let scheme_end = value.find(':');
+    let path_start = value.find(['/', '?', '#']);
+    if scheme_end.is_some_and(|colon| path_start.is_none_or(|p| colon < p)) {
+        return None;
+    }
+    base.join(value).ok().map(|u| u.to_string())
 }
 
 /// Whether the OS asks apps for a dark colour scheme.
@@ -2229,6 +2224,16 @@ fn head_content(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn urls_resolve_against_the_page() {
+        let page = "https://en.wikipedia.org/wiki/Web_browser";
+        let html = r##"<img src="//upload.wikimedia.org/a.png"><img data-src="/lazy.png" src="/b.png"><a href="#top">t</a><a href="mailto:x@y.z">m</a><img src="c.png"><a href="../d">d</a><img src="data:image/png;base64,AA">"##;
+        assert_eq!(
+            make_urls_absolute(html, page),
+            r##"<img src="https://upload.wikimedia.org/a.png"><img data-src="/lazy.png" src="https://en.wikipedia.org/b.png"><a href="#top">t</a><a href="mailto:x@y.z">m</a><img src="https://en.wikipedia.org/wiki/c.png"><a href="https://en.wikipedia.org/d">d</a><img src="data:image/png;base64,AA">"##
+        );
+    }
 
     #[test]
     fn prerender_only_follows_page_links() {
