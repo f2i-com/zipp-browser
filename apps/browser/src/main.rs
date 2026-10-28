@@ -1769,9 +1769,16 @@ fn toolbar_body_themed(page_html: &str, current_url: &str, html_class: &str) -> 
     // replaced elements (an `<img width=64>` came out viewport-wide), each one
     // established its own BFC, and adjacent margins stopped collapsing. None of
     // that is how the element would behave in the document the author wrote.
+    //
+    // The toolbar is its own top stacking layer. Out-of-flow page boxes anchor to
+    // the content wrapper, so anything a page parks just above its viewport —
+    // a skip link at `translateY(-150%)`, a header slid out of view — lands in
+    // the toolbar's band. A real browser clips that at the viewport edge; here
+    // the chrome has to cover it, or a `z-index:100` skip link paints over the
+    // URL bar.
     format!(
         r#"<div{class_attr} style="display:flex;flex-direction:column;margin:0;padding:0;width:100%;min-height:100vh">
-  <form action="{current_url}" method="GET" style="color:#212529;height:42px;min-height:42px;background:#f8f9fa;border-bottom:1px solid #dee2e6;display:flex;align-items:center;padding:4px 8px;gap:6px;font-family:Arial,sans-serif;box-sizing:border-box;width:100%;margin:0;flex-shrink:0">
+  <form action="{current_url}" method="GET" style="color:#212529;height:42px;min-height:42px;background:#f8f9fa;border-bottom:1px solid #dee2e6;display:flex;align-items:center;padding:4px 8px;gap:6px;font-family:Arial,sans-serif;box-sizing:border-box;width:100%;margin:0;flex-shrink:0;position:relative;z-index:2147483647">
     <span style="font-size:16px;color:#495057;padding:0 4px;cursor:pointer">◀</span>
     <span style="font-size:16px;color:#495057;padding:0 4px;cursor:pointer">▶</span>
     <input type="text" name="__nav_url" value="{current_url}" style="width:90%;height:32px;padding:0 12px;border:1px solid #ced4da;border-radius:8px;font-size:14px;background:white;color:#212529;outline:none;box-sizing:border-box" />
