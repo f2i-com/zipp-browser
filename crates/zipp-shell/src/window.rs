@@ -25,6 +25,7 @@ use winit::keyboard::PhysicalKey;
 
 use std::any::Any;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Waker;
 use std::time::Instant;
 use winit::event::{ButtonSource, ElementState, MouseButton};
@@ -85,6 +86,9 @@ pub struct View<Rend: WindowRenderer> {
     pub animation_timer: Option<Instant>,
     pub is_visible: bool,
     pub safe_area_insets: PhysicalInsets<u32>,
+    /// Whether the next redraw must restyle and lay out the document first.
+    /// Set by every redraw request except a paint-only one (see `redraw`).
+    pub needs_resolve: Arc<AtomicBool>,
 
     #[cfg(feature = "accessibility")]
     /// Accessibility adapter for `accesskit`.
@@ -130,7 +134,9 @@ where
         let viewport = Viewport::new(size.width, size.height, scale, color_scheme);
 
         // Create shell provider
-        let shell_provider = WindowShellProvider::new(winit_window.clone());
+        let needs_resolve = Arc::new(AtomicBool::new(true));
+        let shell_provider =
+            WindowShellProvider::with_resolve_flag(winit_window.clone(), needs_resolve.clone());
 
         let mut doc = config.doc;
         let mut inner = doc.inner_mut();
@@ -158,6 +164,7 @@ where
             theme_override: None,
             buttons: MouseEventButtons::None,
             safe_area_insets,
+            needs_resolve,
             pointer_pos: Default::default(),
             is_visible: winit_window.is_visible().unwrap_or(true),
             #[cfg(feature = "accessibility")]
@@ -290,6 +297,7 @@ where
 
     #[inline]
     pub fn request_redraw(&self) {
+        self.needs_resolve.store(true, Ordering::Release);
         if self.renderer.is_active() {
             self.window.request_redraw();
             #[cfg(target_os = "ios")]
@@ -304,7 +312,16 @@ where
         let is_visible = self.is_visible;
 
         let mut inner = self.doc.inner_mut();
-        inner.resolve(animation_time);
+        // Restyle and lay out only when something asked for it. Without the
+        // non-default `incremental` feature a resolve rebuilds the box tree and
+        // lays out the whole page, 20-50ms on a big one -- too much to repeat
+        // for a change only paint can see, like a video frame, or for the OS
+        // asking for the window to be drawn again. Every ordinary redraw request
+        // (input, resize, a loaded resource, a DOM change) sets the flag; a
+        // running CSS animation resolves every frame as before.
+        if self.needs_resolve.swap(false, Ordering::AcqRel) || inner.is_animating() {
+            inner.resolve(animation_time);
+        }
 
         let (width, height) = inner.viewport().window_size;
         let scale = inner.viewport().scale_f64();

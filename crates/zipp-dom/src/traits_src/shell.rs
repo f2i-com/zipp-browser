@@ -9,7 +9,14 @@ pub struct ClipboardError;
 /// Abstraction over windowing / operating system ("shell") functionality that allows a Zipp document
 /// to access that functionality without depending on a specific shell environment.
 pub trait ShellProvider: Send + Sync + 'static {
+    /// Redraw the document after restyling and laying it out again: the
+    /// request for any change to the DOM, its styles or its resources.
     fn request_redraw(&self) {}
+    /// Repaint the document as it is laid out, without restyling or layout:
+    /// for a change only paint can see, such as a new video frame.
+    fn request_paint(&self) {
+        self.request_redraw()
+    }
     fn set_cursor(&self, icon: CursorIcon) {
         let _ = icon;
     }

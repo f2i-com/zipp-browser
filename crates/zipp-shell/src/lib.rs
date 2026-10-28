@@ -90,16 +90,31 @@ pub fn current_android_app() -> android_activity::AndroidApp {
 /// control, clipboard access, and file dialogs to the underlying window.
 pub struct WindowShellProvider {
     window: Arc<dyn Window>,
+    /// Shared with the window's [`View`]: set by every request that needs the
+    /// document restyled and laid out before it is painted again.
+    needs_resolve: Arc<std::sync::atomic::AtomicBool>,
 }
 impl WindowShellProvider {
     /// Wraps an existing window handle.
     pub fn new(window: Arc<dyn Window>) -> Self {
-        Self { window }
+        Self::with_resolve_flag(window, Arc::new(std::sync::atomic::AtomicBool::new(true)))
+    }
+
+    /// Wraps a window handle, sharing the view's "needs resolve" flag.
+    pub fn with_resolve_flag(
+        window: Arc<dyn Window>,
+        needs_resolve: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self { window, needs_resolve }
     }
 }
 
 impl ShellProvider for WindowShellProvider {
     fn request_redraw(&self) {
+        self.needs_resolve.store(true, std::sync::atomic::Ordering::Release);
+        self.window.request_redraw();
+    }
+    fn request_paint(&self) {
         self.window.request_redraw();
     }
     fn set_cursor(&self, icon: CursorIcon) {
