@@ -339,7 +339,16 @@ impl BaseDocument {
                 // we need to store both a min-content and max-content size on each box.
                 let content_sizes = inline_layout.layout.calculate_content_widths();
                 let min_content_width = content_sizes.min;
-                let max_content_width = content_sizes.max;
+                // Parley's estimate closes a line at a hard break with the
+                // break's own cluster still counted, and with letter-spacing that
+                // zero-width cluster has a NEGATIVE advance. A line ending in
+                // `<br>` under `letter-spacing:-2px` measured 2px narrower than
+                // the breaker then needed, so a heading sized to fit its text
+                // wrapped its last word. Measure max-content the way the text
+                // will actually be broken: with no limit, lines end only at hard
+                // breaks. (The real break below runs again at the final width.)
+                inline_layout.layout.break_all_lines(None);
+                let max_content_width = content_sizes.max.max(inline_layout.layout.width());
 
                 #[cfg(feature = "floats")]
                 let float_width = match available_space.width {
