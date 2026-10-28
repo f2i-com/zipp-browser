@@ -76,9 +76,12 @@ lazy_static::lazy_static! {
 /// Viewport the page's JavaScript is told about on the windowed path.
 ///
 /// The window does not exist yet when the page's script runs, so this is the
-/// size the shim reports for `window.innerWidth`/`innerHeight`. CSS is laid out
-/// against the real window (the Stylo device is rebuilt from it, and again on
-/// every resize), so only JS that branches on the reported size is affected.
+/// size the shim reports for `window.innerWidth`/`innerHeight` and answers
+/// `matchMedia` against — and the window opens at it, so that JS and CSS agree
+/// on load. It used to open at the platform default (800x600) while the
+/// script was told 1280x800: a page branching on a breakpoint in JS chose one
+/// layout while its CSS chose another. CSS is laid out against the real window
+/// (the Stylo device is rebuilt from it, and again on every resize).
 const INITIAL_WINDOW_SIZE: (u32, u32) = (1280, 800);
 
 /// Seconds to advance the animation clock before a headless screenshot, so CSS
@@ -203,7 +206,7 @@ fn main() {
     // 8. Open window with tiny-skia renderer
     let mut app = ZippApp::new(proxy, receiver);
     let renderer = TinySkiaWindowRenderer::new();
-    let window = WindowConfig::new(Box::new(doc) as _, renderer);
+    let window = WindowConfig::with_size(Box::new(doc) as _, renderer, INITIAL_WINDOW_SIZE);
     app.add_window(window);
 
     eprintln!("[BROWSER] Window opened");

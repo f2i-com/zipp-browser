@@ -45,6 +45,14 @@ impl<Rend: WindowRenderer> WindowConfig<Rend> {
         Self::with_attributes(doc, renderer, WindowAttributes::default())
     }
 
+    /// A window that opens at `size` (logical pixels) rather than the
+    /// platform's default — 800x600 on Windows.
+    pub fn with_size(doc: Box<dyn Document>, renderer: Rend, size: (u32, u32)) -> Self {
+        let attributes = WindowAttributes::default()
+            .with_surface_size(winit::dpi::LogicalSize::new(size.0, size.1));
+        Self::with_attributes(doc, renderer, attributes)
+    }
+
     pub fn with_attributes(
         doc: Box<dyn Document>,
         renderer: Rend,

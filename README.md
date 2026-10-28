@@ -131,6 +131,10 @@ Honest list, not an exhaustive one:
   bridge, so that page renders correctly and responds to nothing. Fixing it
   means running the new page's JS and attaching a bridge to the new document in
   the navigation path.
+- **A window resize does not reach the page's JavaScript.** CSS re-lays out
+  for the new size, but `window.innerWidth`, `matchMedia` and `resize` events
+  stay at the size the page loaded with, so layout a script chooses in JS
+  keeps its load-time breakpoint until the page is reloaded.
 - **Client-side routing does not update the address bar.** The URL shown stays
   the one that was loaded, even after in-page navigation.
 - **The DOM bridge is one-shot per render.** JS mutations are re-serialized and
