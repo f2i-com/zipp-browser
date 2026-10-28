@@ -89,6 +89,8 @@ pub struct View<Rend: WindowRenderer> {
     /// Whether the next redraw must restyle and lay out the document first.
     /// Set by every redraw request except a paint-only one (see `redraw`).
     pub needs_resolve: Arc<AtomicBool>,
+    /// When the page's next animation frame is due, while it wants frames.
+    pub next_animation_frame: Option<Instant>,
 
     #[cfg(feature = "accessibility")]
     /// Accessibility adapter for `accesskit`.
@@ -165,6 +167,7 @@ where
             buttons: MouseEventButtons::None,
             safe_area_insets,
             needs_resolve,
+            next_animation_frame: None,
             pointer_pos: Default::default(),
             is_visible: winit_window.is_visible().unwrap_or(true),
             #[cfg(feature = "accessibility")]
@@ -311,6 +314,21 @@ where
         let animation_time = self.current_animation_time();
         let is_visible = self.is_visible;
 
+        // A page drawing frame by frame (a WebGL canvas) gets its next frame
+        // when one is due, about every 16ms, whatever else asked for this
+        // redraw. Its new pictures need only a repaint; a DOM change it made
+        // asks for a full redraw itself.
+        const FRAME: std::time::Duration = std::time::Duration::from_millis(16);
+        let now = Instant::now();
+        let animating = match self.next_animation_frame {
+            Some(due) if now < due => true,
+            _ => {
+                let wants_more = self.doc.animation_frame();
+                self.next_animation_frame = wants_more.then(|| now + FRAME);
+                wants_more
+            }
+        };
+
         let mut inner = self.doc.inner_mut();
         // Restyle and lay out only when something asked for it. Without the
         // non-default `incremental` feature a resolve rebuilds the box tree and
@@ -339,6 +357,18 @@ where
 
         if !is_blocked && is_visible && is_animating {
             self.request_redraw();
+        } else if animating && is_visible {
+            // Wait out the rest of the frame, then come back for the next one
+            // (a repaint, not a resolve).
+            if let Some(due) = self.next_animation_frame {
+                let left = due.saturating_duration_since(Instant::now());
+                if !left.is_zero() {
+                    std::thread::sleep(left.min(FRAME));
+                }
+            }
+            if self.renderer.is_active() {
+                self.window.request_redraw();
+            }
         }
     }
 

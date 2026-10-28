@@ -40,6 +40,13 @@ pub trait EventHandler {
     fn document_element_attributes(&mut self) -> Option<Vec<(String, String)>> {
         None
     }
+
+    /// One animation frame, for a page drawing frame by frame (a WebGL canvas
+    /// driven by `requestAnimationFrame`): run it, and say whether another is
+    /// wanted. A DOM change it makes comes back through `take_pending_rerender`.
+    fn animation_frame(&mut self, _doc: &mut BaseDocument) -> bool {
+        false
+    }
 }
 
 pub struct NoopEventHandler;
@@ -76,6 +83,10 @@ impl EventHandler for Box<dyn EventHandler> {
 
     fn document_rerendered(&mut self, doc: &BaseDocument) {
         (**self).document_rerendered(doc)
+    }
+
+    fn animation_frame(&mut self, doc: &mut BaseDocument) -> bool {
+        (**self).animation_frame(doc)
     }
 }
 

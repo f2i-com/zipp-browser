@@ -149,6 +149,12 @@ pub trait Document: Any + 'static {
     fn inner_mut(&mut self) -> DocGuardMut<'_>;
 
     /// Update the [`Document`] in response to a [`UiEvent`] (click, keypress, etc).
+    /// Run the page's next animation frame, if it draws frame by frame; true
+    /// while it wants more (see `EventHandler::animation_frame`).
+    fn animation_frame(&mut self) -> bool {
+        false
+    }
+
     fn handle_ui_event(&mut self, event: UiEvent) {
         let mut doc = self.inner_mut();
         let mut driver = EventDriver::new(&mut *doc, NoopEventHandler);

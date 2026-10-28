@@ -54,6 +54,34 @@ impl Document for HtmlDocument {
             driver.handle_ui_event(event);
         }
 
+        self.apply_pending_rerender();
+    }
+
+    fn animation_frame(&mut self) -> bool {
+        let Some(handler) = self.event_handler.as_mut() else {
+            return false;
+        };
+        let wants_more = handler.animation_frame(&mut self.inner);
+        self.apply_pending_rerender();
+        wants_more
+    }
+
+    fn poll(&mut self, _task_context: Option<std::task::Context>) -> bool {
+        let pending_before = self.inner.pending_images.len();
+        self.inner.handle_messages();
+        let pending_after = self.inner.pending_images.len();
+        // Request redraw whenever any image finishes loading
+        if pending_before != pending_after {
+            self.inner.shell_provider.request_redraw();
+        }
+        pending_after > 0
+    }
+}
+
+impl HtmlDocument {
+    /// Apply a re-render the event handler produced: the page's script changed
+    /// the DOM (in an event handler, or an animation frame).
+    fn apply_pending_rerender(&mut self) {
         // Check if the event handler produced new HTML (e.g. React state update)
         if let Some(ref mut handler) = self.event_handler {
             if let Some(html) = handler.take_pending_rerender() {
@@ -120,17 +148,7 @@ impl Document for HtmlDocument {
                 }
             }
         }
-    }
 
-    fn poll(&mut self, _task_context: Option<std::task::Context>) -> bool {
-        let pending_before = self.inner.pending_images.len();
-        self.inner.handle_messages();
-        let pending_after = self.inner.pending_images.len();
-        // Request redraw whenever any image finishes loading
-        if pending_before != pending_after {
-            self.inner.shell_provider.request_redraw();
-        }
-        pending_after > 0
     }
 }
 
