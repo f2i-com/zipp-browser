@@ -40,6 +40,8 @@ use zipp_shell::{create_default_event_loop, ZippApp, ShellProxy, WindowConfig};
 
 mod esm;
 mod event_bridge;
+#[cfg(windows)]
+mod media;
 mod viewers;
 
 // ---------------------------------------------------------------------------
@@ -182,6 +184,10 @@ fn main() {
         net_provider: Some(net_provider as _),
         navigation_provider: Some(nav_provider as _),
         html_parser_provider: Some(Arc::new(HtmlProvider) as _),
+        // Videos play in the window only; screenshots and tests show posters.
+        // Pages reached by navigation inherit it with the rest of the config.
+        #[cfg(windows)]
+        media_provider: Some(Arc::new(media::MediaFoundationProvider::new()) as _),
         ..Default::default()
     };
     let mut doc = build_document(&final_html, config);

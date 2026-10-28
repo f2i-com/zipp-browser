@@ -85,6 +85,21 @@ A few environment switches make a headless render exercise what a window does:
 - `ZIPP_COLOR_SCHEME=light|dark` overrides the OS colour scheme, which both
   CSS `prefers-color-scheme` and the page's `matchMedia` otherwise follow.
 
+## Video
+
+On Windows, `<video>` plays through Media Foundation's media engine -- the
+component Windows provides for HTML media -- so it gets the system's codecs
+(H.264, VP9, AV1, MPEG-4, ... in MP4, WebM and QuickTime), sound, and network
+streaming. Each new frame is copied out at the size it is shown and painted
+like an image, without restyling or laying out the page. Sources are tried in
+order, as the spec says, falling through to the next when one will not load or
+decode (Wikipedia's VP8 originals, for one). Click the video to play or pause;
+with `controls`, the bar along the bottom also seeks and mutes. A muted
+`autoplay` video starts by itself, one with sound waits for a click.
+`ZIPP_MUTE_MEDIA=1` mutes every player (for automated runs);
+`ZIPP_DEBUG_MEDIA=1` logs the engine's events. Elsewhere -- other platforms,
+`--screenshot` -- a video shows its poster.
+
 ## Beyond HTML
 
 A navigation is classified by its `Content-Type` (then file extension, then
