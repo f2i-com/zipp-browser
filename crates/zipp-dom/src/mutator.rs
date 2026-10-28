@@ -287,7 +287,9 @@ impl DocumentMutator<'_> {
 
         if (tag, attr) == tag_and_attr!("input", "checked") {
             set_input_checked_state(element, value.to_string());
-        } else if (tag, attr) == tag_and_attr!("img", "src") {
+        } else if (tag, attr) == tag_and_attr!("img", "src")
+            || (tag, attr) == tag_and_attr!("video", "poster")
+        {
             self.load_image(node_id);
         } else if (tag, attr) == tag_and_attr!("canvas", "src") {
             self.load_custom_paint_src(node_id);
@@ -606,7 +608,9 @@ impl<'doc> DocumentMutator<'doc> {
             match tag {
                 "title" => self.title_node = Some(node_id),
                 "link" => self.eager_op_queue.push(SpecialOp::LoadStylesheet(node_id)),
-                "img" => self.eager_op_queue.push(SpecialOp::LoadImage(node_id)),
+                // A <video> is drawn as its poster frame: there is no
+                // playback, and the poster is what a browser shows until play.
+                "img" | "video" => self.eager_op_queue.push(SpecialOp::LoadImage(node_id)),
                 "canvas" => self
                     .eager_op_queue
                     .push(SpecialOp::LoadCustomPaintSource(node_id)),
@@ -781,7 +785,11 @@ impl<'doc> DocumentMutator<'doc> {
 
     fn load_image(&mut self, target_id: usize) {
         let node = &self.doc.nodes[target_id];
-        if let Some(raw_src) = node.attr(local_name!("src")) {
+        let is_video = node
+            .element_data()
+            .is_some_and(|el| el.name.local == local_name!("video"));
+        let url_attr = if is_video { local_name!("poster") } else { local_name!("src") };
+        if let Some(raw_src) = node.attr(url_attr) {
             if !raw_src.is_empty() {
                 let src = self.doc.resolve_url(raw_src);
                 let src_string = src.as_str();

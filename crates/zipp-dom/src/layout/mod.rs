@@ -175,6 +175,7 @@ impl BaseDocument {
                 }
 
                 if *element_data.name.local == *"img"
+                    || *element_data.name.local == *"video"
                     || *element_data.name.local == *"canvas"
                     || (cfg!(feature = "svg") && *element_data.name.local == *"svg")
                 {

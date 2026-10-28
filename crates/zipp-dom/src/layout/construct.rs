@@ -752,6 +752,7 @@ pub(crate) fn find_inline_layout_embedded_boxes(
                         let tag_name = &element_data.name.local;
 
                         if *tag_name == local_name!("img")
+                            || *tag_name == local_name!("video")
                             || *tag_name == local_name!("svg")
                             || *tag_name == local_name!("input")
                             || *tag_name == local_name!("textarea")
@@ -948,6 +949,7 @@ pub(crate) fn build_inline_layout_into(
                         let tag_name = &element_data.name.local;
 
                         if *tag_name == local_name!("img")
+                            || *tag_name == local_name!("video")
                             || *tag_name == local_name!("svg")
                             || *tag_name == local_name!("input")
                             || *tag_name == local_name!("textarea")
