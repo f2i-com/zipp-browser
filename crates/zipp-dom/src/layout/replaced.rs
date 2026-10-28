@@ -80,11 +80,20 @@ pub fn replaced_measure_function(
         .min_size
         .maybe_resolve(parent_size, resolve_calc_value)
         .maybe_sub(box_sizing_adjustment);
+    // The space available caps the width only. Available HEIGHT is no limit on a
+    // replaced element -- an image overflows a short box -- and treating it as
+    // one shrank every absolutely positioned image or SVG whose containing block
+    // was 0px tall (all its content out of flow): the height clamp, carried
+    // across by the aspect ratio, made it 0x0.
+    let available_width = taffy::Size {
+        width: available_space.width.into_option(),
+        height: None,
+    };
     let max_size = style
         .max_size
         .maybe_resolve(basis_for_max_and_preferred, resolve_calc_value)
-        .or(available_space.into_options())
-        .maybe_min(available_space.into_options())
+        .or(available_width)
+        .maybe_min(available_width)
         .maybe_max(min_size)
         .maybe_sub(box_sizing_adjustment);
     let attr_size = image_context.attr_size;
