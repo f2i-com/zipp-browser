@@ -1240,7 +1240,7 @@ impl PaintScene for TinySkiaPainter {
     /// shape is rasterized through tiny-skia with the active clip mask applied.
     fn fill<'a>(
         &mut self,
-        _style: Fill,
+        style: Fill,
         transform: Affine,
         brush: impl Into<anyrender::PaintRef<'a>>,
         brush_transform: Option<Affine>,
@@ -1265,8 +1265,15 @@ impl PaintScene for TinySkiaPainter {
                     let bounds = device_bounds(shape, transform);
                     self.mark_dirty(bounds);
                     let mask = self.clip_mask_for(bounds);
+                    // The fill rule was ignored -- everything filled as nonzero --
+                    // so an `fill-rule="evenodd"` SVG lost its holes: rust-lang.org's
+                    // logo drew as a solid disc, and many icon sets are evenodd.
+                    let rule = match style {
+                        Fill::NonZero => FillRule::Winding,
+                        Fill::EvenOdd => FillRule::EvenOdd,
+                    };
                     self.pixmap
-                        .fill_path(&path, &paint, FillRule::Winding, ts, mask.as_deref());
+                        .fill_path(&path, &paint, rule, ts, mask.as_deref());
                 }
             }
         }
@@ -1283,11 +1290,33 @@ impl PaintScene for TinySkiaPainter {
     ) {
         let paint_ref = brush.into();
         if let Some(path) = shape_to_path(shape) {
+            // The stroke's own caps, join and dashes. These were fixed at round
+            // and solid, so an SVG's `stroke-linecap="butt"`, mitred corners and
+            // `stroke-dasharray` all drew the same rounded, unbroken line.
+            // (kurbo's defaults are round, so a plain `Stroke::new` is unchanged.)
+            let cap = |cap: kurbo::Cap| match cap {
+                kurbo::Cap::Butt => tiny_skia::LineCap::Butt,
+                kurbo::Cap::Square => tiny_skia::LineCap::Square,
+                kurbo::Cap::Round => tiny_skia::LineCap::Round,
+            };
+            let dash = if style.dash_pattern.is_empty() {
+                None
+            } else {
+                tiny_skia::StrokeDash::new(
+                    style.dash_pattern.iter().map(|d| *d as f32).collect(),
+                    style.dash_offset as f32,
+                )
+            };
             let stroke = tiny_skia::Stroke {
                 width: style.width as f32,
-                line_cap: tiny_skia::LineCap::Round,
-                line_join: tiny_skia::LineJoin::Round,
-                ..Default::default()
+                miter_limit: style.miter_limit as f32,
+                line_cap: cap(style.start_cap),
+                line_join: match style.join {
+                    kurbo::Join::Bevel => tiny_skia::LineJoin::Bevel,
+                    kurbo::Join::Miter => tiny_skia::LineJoin::Miter,
+                    kurbo::Join::Round => tiny_skia::LineJoin::Round,
+                },
+                dash,
             };
             let ts = affine_to_transform(transform);
             let paint = make_brush_paint(&paint_ref, brush_space(brush_transform));
