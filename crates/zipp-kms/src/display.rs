@@ -156,9 +156,16 @@ impl Display {
         })
     }
 
-    /// The size the application draws at, in pixels.
+    /// The size the application draws at, in pixels: the mode's, or wider
+    /// where the driver pads its rows.
     pub fn size(&self) -> (u32, u32) {
         self.size
+    }
+
+    /// The size of what is shown: the mode's. Input and layout go by this.
+    pub fn visible_size(&self) -> (u32, u32) {
+        let (w, h) = self.mode.size();
+        (w as u32, h as u32)
     }
 
     pub(crate) fn pointer_moved(&self, x: i32, y: i32) {

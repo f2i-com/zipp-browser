@@ -1,11 +1,15 @@
-//! Keyboards, mice, tablets and touchscreens, read straight from
+//! Keyboards, mice, touchpads, tablets and touchscreens, read straight from
 //! `/dev/input/event*`, with devices plugged in later picked up through
 //! inotify.
 //!
-//! Every device is read the same way, by event type rather than by what the
-//! device claims to be: keys are keys, relative motion moves the pointer,
-//! absolute motion places it, and a touch is a left click where it lands.
+//! Keys are keys and relative motion moves the pointer, whatever the device.
+//! What absolute X/Y mean depends on the device, which the kernel says
+//! (its properties and the keys it has): a touchscreen's place the pointer
+//! where the finger is and a touch is a left click; a touchpad's move it the
+//! way a mouse does; a tablet's (QEMU's, a pen tablet) place it; anything
+//! else's (a gamepad's sticks) are not the pointer's business.
 
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -38,9 +42,15 @@ const ABS_MT_POSITION_Y: u16 = 0x36;
 const BTN_MISC: u16 = 0x100;
 const BTN_LEFT: u16 = 0x110;
 const BTN_TASK: u16 = 0x117;
+const BTN_TOOL_PEN: u16 = 0x140;
+const BTN_TOOL_FINGER: u16 = 0x145;
 const BTN_TOUCH: u16 = 0x14a;
+const BTN_STYLUS: u16 = 0x14b;
 const KEY_OK: u16 = 0x160;
+const KEY_MAX: usize = 0x2ff;
 const KEY_CAPSLOCK: u16 = 58;
+const INPUT_PROP_POINTER: usize = 0;
+const INPUT_PROP_DIRECT: usize = 1;
 
 #[repr(C)]
 struct InputEvent {
@@ -66,18 +76,49 @@ fn eviocg(nr: u64, size: u64) -> libc::c_ulong {
     ((2u64 << 30) | (size << 16) | ((b'E' as u64) << 8) | nr) as libc::c_ulong
 }
 
+/// A bitmap the kernel fills in (EVIOCGBIT, EVIOCGPROP, EVIOCGKEY).
+fn bits<const N: usize>(fd: RawFd, nr: u64) -> [u8; N] {
+    let mut bits = [0u8; N];
+    unsafe { libc::ioctl(fd, eviocg(nr, N as u64), bits.as_mut_ptr()) };
+    bits
+}
+
+fn bit(bits: &[u8], n: usize) -> bool {
+    bits.get(n / 8).is_some_and(|b| b & (1 << (n % 8)) != 0)
+}
+
+/// What a device's absolute X and Y are.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Absolute {
+    /// Where on the screen: a finger, so a touch is a click.
+    Touchscreen,
+    /// Where on the screen, with buttons of its own: a tablet, or QEMU's.
+    Tablet,
+    /// Motion, as a mouse's is.
+    Touchpad,
+    /// Not the pointer at all (a gamepad), or no absolute axes.
+    Ignored,
+}
+
 struct Device {
     file: File,
     path: PathBuf,
-    /// The ranges of absolute X and Y, for a device that has them.
+    absolute: Absolute,
+    /// The ranges of absolute X and Y, for a device whose they matter.
     abs_range: Option<((i32, i32), (i32, i32))>,
     /// Whether the position comes from the multi-touch axes only.
     mt_only: bool,
+    /// Keys and buttons pressed, by code: what SYN_DROPPED may leave stuck.
+    pressed: BTreeSet<u16>,
+    /// Events were dropped: ignore the rest of the report, then resync.
+    dropped: bool,
     // What has arrived since the last SYN_REPORT.
     rel: (i32, i32),
     wheel: (i32, i32),
     abs: (Option<i32>, Option<i32>),
     touch: Option<bool>,
+    /// A touchpad's last position while a finger is down, for its motion.
+    pad_last: Option<(i32, i32)>,
 }
 
 impl Device {
@@ -92,17 +133,30 @@ impl Device {
             let ok = unsafe { libc::ioctl(fd, eviocg(0x40 + axis as u64, size_of::<AbsInfo>() as u64), &mut info) } >= 0;
             (ok && info.maximum > info.minimum).then_some((info.minimum, info.maximum))
         };
-        let has_abs = {
-            let mut bits = [0u8; 8];
-            let ok = unsafe { libc::ioctl(fd, eviocg(0x20 + EV_ABS as u64, bits.len() as u64), bits.as_mut_ptr()) } >= 0;
-            ok && bits[0] & 0b11 == 0b11
-        };
-        let (abs_range, mt_only) = match (has_abs, range(ABS_X), range(ABS_Y)) {
+        let abs_bits: [u8; 8] = bits(fd, 0x20 + EV_ABS as u64);
+        let keys: [u8; KEY_MAX / 8 + 1] = bits(fd, 0x20 + EV_KEY as u64);
+        let props: [u8; 4] = bits(fd, 0x09);
+        let (abs_range, mt_only) = match (abs_bits[0] & 0b11 == 0b11, range(ABS_X), range(ABS_Y)) {
             (true, Some(x), Some(y)) => (Some((x, y)), false),
             _ => match (range(ABS_MT_POSITION_X), range(ABS_MT_POSITION_Y)) {
                 (Some(x), Some(y)) => (Some((x, y)), true),
                 _ => (None, false),
             },
+        };
+        let key = |code: u16| bit(&keys, code as usize);
+        let absolute = if abs_range.is_none() {
+            Absolute::Ignored
+        } else if bit(&props, INPUT_PROP_DIRECT) {
+            Absolute::Touchscreen
+        } else if bit(&props, INPUT_PROP_POINTER) || key(BTN_TOOL_FINGER) {
+            Absolute::Touchpad
+        } else if key(BTN_TOUCH) {
+            // An older touchscreen that does not say it is one.
+            Absolute::Touchscreen
+        } else if key(BTN_LEFT) || key(BTN_TOOL_PEN) || key(BTN_STYLUS) {
+            Absolute::Tablet
+        } else {
+            Absolute::Ignored
         };
         let mut name = [0u8; 128];
         let len = unsafe { libc::ioctl(fd, eviocg(0x06, name.len() as u64), name.as_mut_ptr()) };
@@ -111,12 +165,27 @@ impl Device {
         } else {
             String::new()
         };
-        eprintln!(
-            "[kms] input {}: {name}{}",
-            path.display(),
-            if abs_range.is_some() { " (absolute)" } else { "" }
-        );
-        Ok(Device { file, path: path.to_path_buf(), abs_range, mt_only, rel: (0, 0), wheel: (0, 0), abs: (None, None), touch: None })
+        let kind = match absolute {
+            Absolute::Touchscreen => " (touchscreen)",
+            Absolute::Tablet => " (absolute)",
+            Absolute::Touchpad => " (touchpad)",
+            Absolute::Ignored => "",
+        };
+        eprintln!("[kms] input {}: {name}{kind}", path.display());
+        Ok(Device {
+            file,
+            path: path.to_path_buf(),
+            abs_range: abs_range.filter(|_| absolute != Absolute::Ignored),
+            absolute,
+            mt_only,
+            pressed: BTreeSet::new(),
+            dropped: false,
+            rel: (0, 0),
+            wheel: (0, 0),
+            abs: (None, None),
+            touch: None,
+            pad_last: None,
+        })
     }
 }
 
@@ -132,13 +201,11 @@ pub(crate) struct Input {
 }
 
 impl Input {
+    /// Input for a screen of `screen` pixels: the pointer stays on it.
     pub(crate) fn new(screen: (u32, u32)) -> Input {
         let inotify = unsafe {
             let fd = libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC);
-            (fd >= 0).then(|| {
-                libc::inotify_add_watch(fd, c"/dev/input".as_ptr(), libc::IN_CREATE | libc::IN_ATTRIB);
-                OwnedFd::from_raw_fd(fd)
-            })
+            (fd >= 0).then(|| OwnedFd::from_raw_fd(fd))
         };
         let mut input = Input {
             devices: Vec::new(),
@@ -149,8 +216,21 @@ impl Input {
             mods: ModifiersKeys::empty(),
             caps: false,
         };
+        input.watch();
         input.scan();
         input
+    }
+
+    /// Watch /dev/input for new devices, and /dev for /dev/input itself:
+    /// devtmpfs makes it with the first input device and removes it with the
+    /// last, and a watch on a removed directory is silently gone.
+    fn watch(&self) {
+        if let Some(inotify) = &self.inotify {
+            unsafe {
+                libc::inotify_add_watch(inotify.as_raw_fd(), c"/dev".as_ptr(), libc::IN_CREATE);
+                libc::inotify_add_watch(inotify.as_raw_fd(), c"/dev/input".as_ptr(), libc::IN_CREATE | libc::IN_ATTRIB);
+            }
+        }
     }
 
     /// Open every event device not already open.
@@ -182,6 +262,7 @@ impl Input {
             let mut buf = [0u8; 4096];
             let n = unsafe { libc::read(inotify.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
             if n > 0 {
+                self.watch();
                 self.scan();
             }
         }
@@ -209,17 +290,42 @@ impl Input {
         }
         for index in gone.into_iter().rev() {
             eprintln!("[kms] input {} removed", self.devices[index].path.display());
+            // Whatever it held down is let go.
+            self.release_all(index, out);
             self.devices.remove(index);
         }
     }
 
     fn event(&mut self, index: usize, event: InputEvent, out: &mut Vec<WindowEvent>) {
-        let device_id = Some(DeviceId::from_raw(self.devices[index].file.as_raw_fd() as i64));
         let device = &mut self.devices[index];
+        if device.dropped {
+            // The kernel's buffer overflowed: the rest of this report is not
+            // to be trusted. At its end, what is really down is read back.
+            if (event.kind, event.code) == (EV_SYN, SYN_REPORT) {
+                device.dropped = false;
+                self.resync(index, out);
+            }
+            return;
+        }
+        let device_id = Some(DeviceId::from_raw(device.file.as_raw_fd() as i64));
+        if event.kind == EV_KEY {
+            match event.value {
+                0 => device.pressed.remove(&event.code),
+                1 => device.pressed.insert(event.code),
+                _ => false,
+            };
+        }
         match (event.kind, event.code) {
+            (EV_KEY, BTN_TOUCH) if device.absolute == Absolute::Touchpad => {
+                if event.value == 0 {
+                    device.pad_last = None;
+                }
+            }
             (EV_KEY, BTN_TOUCH) if device.abs_range.is_some() => {
                 device.touch = Some(event.value != 0);
-                self.touched = true;
+                if device.absolute == Absolute::Touchscreen {
+                    self.touched = true;
+                }
             }
             (EV_KEY, BTN_LEFT..=BTN_TASK) => {
                 let button = match event.code - BTN_LEFT {
@@ -249,11 +355,36 @@ impl Input {
             (EV_ABS, ABS_MT_POSITION_Y) if device.mt_only => device.abs.1 = Some(event.value),
             (EV_SYN, SYN_REPORT) => self.flush(index, device_id, out),
             (EV_SYN, SYN_DROPPED) => {
+                device.dropped = true;
                 device.rel = (0, 0);
                 device.wheel = (0, 0);
+                device.abs = (None, None);
+                device.touch = None;
             }
             _ => {}
         }
+    }
+
+    /// After dropped events: release whatever is no longer down, by asking
+    /// the kernel which keys and buttons are (EVIOCGKEY).
+    fn resync(&mut self, index: usize, out: &mut Vec<WindowEvent>) {
+        let device = &self.devices[index];
+        let down: [u8; KEY_MAX / 8 + 1] = bits(device.file.as_raw_fd(), 0x18);
+        let released: Vec<u16> = device.pressed.iter().copied().filter(|&c| !bit(&down, c as usize)).collect();
+        for code in released {
+            self.event(index, release(code), out);
+        }
+        self.event(index, report(), out);
+        self.devices[index].pad_last = None;
+    }
+
+    /// Release everything a device holds down (it went away).
+    fn release_all(&mut self, index: usize, out: &mut Vec<WindowEvent>) {
+        let held: Vec<u16> = self.devices[index].pressed.iter().copied().collect();
+        for code in held {
+            self.event(index, release(code), out);
+        }
+        self.event(index, report(), out);
     }
 
     /// One SYN_REPORT's worth of motion, wheel and touch, as events.
@@ -269,13 +400,34 @@ impl Input {
             moved = true;
         }
         if let (Some(((x0, x1), (y0, y1))), (ax, ay)) = (device.abs_range, device.abs) {
-            if let Some(x) = ax {
-                self.pointer.0 = ((x - x0) as f64 * (w - 1.0) / (x1 - x0) as f64).clamp(0.0, w - 1.0);
-                moved = true;
-            }
-            if let Some(y) = ay {
-                self.pointer.1 = ((y - y0) as f64 * (h - 1.0) / (y1 - y0) as f64).clamp(0.0, h - 1.0);
-                moved = true;
+            if device.absolute == Absolute::Touchpad {
+                // Where the finger is now against where it was: the pad's
+                // width crossed is the screen's width crossed.
+                let last = device.pad_last.unwrap_or((ax.unwrap_or(0), ay.unwrap_or(0)));
+                let now = (ax.unwrap_or(last.0), ay.unwrap_or(last.1));
+                if device.pad_last.is_some() {
+                    // The same scale both ways: a pad's units are square.
+                    let scale = w / (x1 - x0) as f64;
+                    let (dx, dy) = ((now.0 - last.0) as f64 * scale, (now.1 - last.1) as f64 * scale);
+                    if dx != 0.0 || dy != 0.0 {
+                        self.touched = false;
+                        self.pointer.0 = (self.pointer.0 + dx).clamp(0.0, w - 1.0);
+                        self.pointer.1 = (self.pointer.1 + dy).clamp(0.0, h - 1.0);
+                        moved = true;
+                    }
+                }
+                if ax.is_some() || ay.is_some() {
+                    device.pad_last = Some(now);
+                }
+            } else {
+                if let Some(x) = ax {
+                    self.pointer.0 = ((x - x0) as f64 * (w - 1.0) / (x1 - x0) as f64).clamp(0.0, w - 1.0);
+                    moved = true;
+                }
+                if let Some(y) = ay {
+                    self.pointer.1 = ((y - y0) as f64 * (h - 1.0) / (y1 - y0) as f64).clamp(0.0, h - 1.0);
+                    moved = true;
+                }
             }
             device.abs = (None, None);
         }
@@ -365,4 +517,14 @@ impl Input {
     fn position(&self) -> PhysicalPosition<f64> {
         PhysicalPosition::new(self.pointer.0, self.pointer.1)
     }
+}
+
+/// A key or button's release, as the kernel would send it.
+fn release(code: u16) -> InputEvent {
+    InputEvent { time: libc::timeval { tv_sec: 0, tv_usec: 0 }, kind: EV_KEY, code, value: 0 }
+}
+
+/// The end of a report: what came before it takes effect.
+fn report() -> InputEvent {
+    InputEvent { time: libc::timeval { tv_sec: 0, tv_usec: 0 }, kind: EV_SYN, code: SYN_REPORT, value: 0 }
 }

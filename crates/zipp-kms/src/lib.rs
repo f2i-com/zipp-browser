@@ -40,6 +40,7 @@ use winit_core::event_loop::{
 use winit_core::monitor::MonitorHandle;
 use winit_core::window::{Theme, Window, WindowAttributes, WindowId};
 
+mod console;
 mod display;
 mod input;
 mod keymap;
@@ -173,6 +174,7 @@ impl ActiveEventLoop for Target {
 pub struct EventLoop {
     target: Target,
     input: input::Input,
+    _console: Option<console::Console>,
 }
 
 impl EventLoop {
@@ -181,7 +183,7 @@ impl EventLoop {
     /// `ZIPP_COLOR_SCHEME=dark` the theme the window reports.
     pub fn new() -> io::Result<EventLoop> {
         let display = Display::open()?;
-        let input = input::Input::new(display.size);
+        let input = input::Input::new(display.visible_size());
         let wake_fd = unsafe {
             let fd = libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC);
             if fd < 0 {
@@ -208,12 +210,13 @@ impl EventLoop {
                 window: Cell::new(None),
             },
             input,
+            _console: console::Console::take(),
         })
     }
 
     /// The screen's size in pixels: what the application should lay out for.
     pub fn size(&self) -> (u32, u32) {
-        self.target.shared.display.size
+        self.target.shared.display.visible_size()
     }
 
     pub fn scale_factor(&self) -> f64 {
