@@ -157,6 +157,31 @@ fn main() {
         std::process::exit(if ok { 0 } else { 1 });
     }
 
+    // `--kiosk <url>`: the page is the whole screen, with no toolbar. On Linux
+    // the screen is taken through DRM/KMS with input from evdev (zipp-kms), so
+    // no display server is needed: zipp-linux runs the browser this way. The
+    // screen is opened first because its size is the viewport the page's
+    // script is told about on its first run.
+    let kiosk = arg == "--kiosk";
+    let arg = if kiosk { std::env::args().nth(2).unwrap_or_default() } else { arg };
+    #[cfg(not(target_os = "linux"))]
+    if kiosk {
+        eprintln!("[BROWSER] --kiosk runs on Linux's DRM/KMS only");
+        std::process::exit(2);
+    }
+    #[cfg(target_os = "linux")]
+    let kms = kiosk.then(open_kms);
+    #[cfg(target_os = "linux")]
+    let viewport = kms.as_ref().map_or(INITIAL_WINDOW_SIZE, |kms| {
+        let (w, h) = kms.size();
+        ((w as f64 / kms.scale_factor()) as u32, (h as f64 / kms.scale_factor()) as u32)
+    });
+    #[cfg(not(target_os = "linux"))]
+    let viewport = INITIAL_WINDOW_SIZE;
+    if kiosk {
+        NO_CHROME.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     let url = if arg.is_empty() { "https://lance.name".to_string() } else { arg };
     eprintln!("[BROWSER] Loading {url}");
     // The window's page runs on this thread: its console is the one shown,
@@ -176,7 +201,7 @@ fn main() {
     };
     let fetch_ms = t_fetch.elapsed().as_millis();
     let (final_html, event_map_json, js_state) =
-        render_page(&url, &html, INITIAL_WINDOW_SIZE, Some(fetch_ms));
+        render_page(&url, &html, viewport, Some(fetch_ms));
     eprintln!("[BROWSER] Ready ({} bytes)", final_html.len());
 
     // 4. Load fonts manually (system font API doesn't work on RDP)
@@ -190,8 +215,14 @@ fn main() {
     let _guard = rt.enter();
 
     // 6. Create window and net provider
-    let event_loop = create_default_event_loop();
-    let (proxy, receiver) = ShellProxy::new(event_loop.create_proxy());
+    #[cfg(target_os = "linux")]
+    let screen = match kms {
+        Some(kms) => Screen::Kiosk(kms),
+        None => Screen::Window(create_default_event_loop()),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let screen = Screen::Window(create_default_event_loop());
+    let (proxy, receiver) = ShellProxy::new(screen.create_proxy());
     // A worker that has sent its page something wakes the window, whose event
     // bridge hands it over (`JsEventBridge::run_tasks`).
     let wake_proxy = std::sync::Mutex::new(proxy.clone());
@@ -270,9 +301,44 @@ fn main() {
     // here covers every callback the loop dispatches, including the re-render
     // that follows a JS event handler.
     stacker::maybe_grow(64 * 1024 * 1024, 256 * 1024 * 1024, || {
-        event_loop.run_app(app).unwrap();
+        screen.run_app(app);
     });
     save_profile();
+}
+
+/// What the browser's window runs on: the desktop's windowing system, or
+/// (`--kiosk`, Linux) the screen itself.
+enum Screen {
+    Window(zipp_shell::EventLoop),
+    #[cfg(target_os = "linux")]
+    Kiosk(zipp_kms::EventLoop),
+}
+
+impl Screen {
+    fn create_proxy(&self) -> zipp_shell::EventLoopProxy {
+        match self {
+            Screen::Window(event_loop) => event_loop.create_proxy(),
+            #[cfg(target_os = "linux")]
+            Screen::Kiosk(event_loop) => event_loop.create_proxy(),
+        }
+    }
+
+    fn run_app(self, app: ZippApp<TinySkiaWindowRenderer>) {
+        match self {
+            Screen::Window(event_loop) => event_loop.run_app(app).unwrap(),
+            #[cfg(target_os = "linux")]
+            Screen::Kiosk(event_loop) => event_loop.run_app(app).unwrap(),
+        }
+    }
+}
+
+/// The screen for `--kiosk`: the first DRM device with a connected output.
+#[cfg(target_os = "linux")]
+fn open_kms() -> zipp_kms::EventLoop {
+    zipp_kms::EventLoop::new().unwrap_or_else(|e| {
+        eprintln!("[BROWSER] cannot take the screen: {e}");
+        std::process::exit(1);
+    })
 }
 
 /// Before the browser exits: write out what is waiting to be saved to the

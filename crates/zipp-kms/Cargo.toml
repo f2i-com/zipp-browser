@@ -1,0 +1,19 @@
+[package]
+name = "zipp-kms"
+description = "A winit event loop on Linux DRM/KMS and evdev: an application full screen with no display server"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Linux only: elsewhere the crate is empty, so a workspace build still works.
+[target.'cfg(target_os = "linux")'.dependencies]
+winit-core = "=0.31.0-beta.2"
+dpi = "0.1.2"
+drm = "0.14"
+drm-ffi = "0.9"
+libc = "0.2"
+raw-window-handle = "0.6"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+softbuffer = { version = "0.4", default-features = false, features = ["kms"] }

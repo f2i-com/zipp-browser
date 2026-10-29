@@ -7018,6 +7018,7 @@ dependencies = [
  "windows-sys 0.61.2",
  "winit",
  "zipp-dom",
+ "zipp-kms",
  "zipp-renderer",
  "zipp-shell",
  "zipp-vm",
@@ -7068,6 +7069,19 @@ dependencies = [
  "woff",
  "wuff",
  "xml5ever",
+]
+
+[[package]]
+name = "zipp-kms"
+version = "0.1.0"
+dependencies = [
+ "dpi",
+ "drm",
+ "drm-ffi",
+ "libc",
+ "raw-window-handle",
+ "softbuffer",
+ "winit-core",
 ]
 
 [[package]]

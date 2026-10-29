@@ -106,6 +106,11 @@ embed-resource = "3.0.12"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread"], optional = true }
 
+# `--kiosk`: the whole screen through DRM/KMS, input from evdev, no display
+# server (zipp-linux).
+[target.'cfg(target_os = "linux")'.dependencies]
+zipp-kms = { path = "../../crates/zipp-kms" }
+
 # Reading the OS colour scheme before the window exists (`system_prefers_dark`).
 # Already in the tree through winit; this only adds the registry bindings.
 [target.'cfg(windows)'.dependencies]

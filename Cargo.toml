@@ -3,6 +3,7 @@ members = [
     "crates/zipp-dom",
     "crates/zipp-renderer",
     "crates/zipp-shell",
+    "crates/zipp-kms",
     "apps/browser",
 ]
 resolver = "2"
