@@ -45,11 +45,9 @@ cargo build --release
 Cargo fetches ZIPP itself, from its `dev` branch at the commit `Cargo.lock`
 pins; `cargo update -p zipp-vm` moves to the newest.
 
-zipp-vm's WebAssembly interpreter dispatches by tail calls, which needs the
-release profile's fat LTO and single codegen unit. An optimised build without
-them -- a fast incremental one for working on the browser -- needs
-`--features zipp-vm/wasm-portable-dispatch`, or a long-running module (the
-zipp.org playground's engine) overflows its thread's stack.
+WebAssembly is compiled to machine code by Wasmtime (zipp-vm's `wasm-jit`
+feature), which adds some minutes to a release build and about 9 MB to the
+binary.
 
 To build against a local `zipp.org` checkout instead (working on the engine and
 the browser together), keep the two checkouts side by side and put a patch in a
@@ -122,12 +120,15 @@ with `controls`, the bar along the bottom also seeks and mutes. A muted
 ## WebAssembly, workers, Canvas 2D, WebGL and WebGPU
 
 `WebAssembly` is zipp-vm's own (on its `dev` branch, which this builds against): the whole JS
-API, with modules run by the [wasmi](https://github.com/wasmi-labs/wasmi)
-interpreter, so a page's `instantiateStreaming(fetch("x.wasm"))` works as
-written, and wasm-bindgen's output -- `externref` values and tables included --
-loads as it does in a browser. The zipp.org playground runs: its ZIPP engine,
-8.6 MB of WebAssembly, starts in a worker and runs Python and JavaScript
-programs that draw on a 2D canvas.
+API, with modules compiled to machine code by
+[Wasmtime](https://github.com/bytecodealliance/wasmtime)'s Cranelift, so a
+page's `instantiateStreaming(fetch("x.wasm"))` works as written, and
+wasm-bindgen's output -- `externref` values and tables included -- loads as it
+does in a browser. A module is compiled once per process, whichever worker
+asks. The zipp.org playground runs: its ZIPP engine, 8.6 MB of WebAssembly,
+compiles in about 0.5 s and starts in a worker in 0.8 s, and runs Python and
+JavaScript programs that draw on a 2D canvas -- or compute on the GPU, as
+workers have WebGPU.
 
 `new Worker(url)`, classic or `{ type: "module" }`, runs on a thread of its own
 in a VM of its own (`worker.rs`, its global scope `worker_shim.js`): its module
@@ -221,11 +222,11 @@ Honest list, not an exhaustive one:
   their changes and listeners go unseen (example.com's translations, a
   hand-written menu toggle): the shim re-serialises SVG lossily, so showing its
   tree for every page would cost them their icons.
-- **WebAssembly is interpreted.** wasmi runs modules without a JIT: the
-  zipp.org playground's engine takes about 1.5 s to start in a release build
-  (where Chrome takes well under one), and Python heavy at start-up runs some
-  ten times slower than in Chrome -- the Game of Life sample sets up in 2.7 s
-  and draws about 2 frames a second. Simple programs run at full frame rate.
+- **Heavy WebAssembly is still slower than in Chrome.** Cranelift's code
+  runs the zipp.org playground's engine about ten times faster than the
+  interpreter it replaced, but its Game of Life draws 13 frames a second where
+  Chrome draws 27, and the engine starts in 0.8 s where Chrome's is ready in
+  0.7 s after the page loads.
 - **A worker cannot be stopped mid-task.** zipp-vm cannot interrupt running
   script, so `terminate()` takes effect between tasks; a worker stuck in a loop
   keeps its thread busy until the browser exits, though the page no longer

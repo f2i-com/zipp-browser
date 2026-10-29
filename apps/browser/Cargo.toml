@@ -57,8 +57,10 @@ winit = { workspace = true }
 # event handlers into the same global context). ZIPP's `dev` branch, which has
 # the WebAssembly JS API (vm/webassembly); Cargo.lock pins the commit, and
 # `cargo update -p zipp-vm` moves to the newest. To build against a local
-# zipp.org checkout instead, see the README.
-zipp-vm = { git = "https://github.com/f2i-com/zipp.org", branch = "dev" }
+# zipp.org checkout instead, see the README. WebAssembly compiled to machine
+# code (`wasm-jit`, Wasmtime) rather than interpreted: the zipp.org
+# playground's engine runs some ten times faster.
+zipp-vm = { git = "https://github.com/f2i-com/zipp.org", branch = "dev", features = ["wasm-jit"] }
 
 # Linebender
 linebender_resource_handle = { workspace = true }
