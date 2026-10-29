@@ -89,6 +89,8 @@ color = "0.3"
 svgtypes = "0.16"
 # Images decoded from their bytes: `naturalWidth`, and WebGL textures.
 image = { workspace = true }
+# Audio files decoded for Web Audio and `<audio>` (`audio.rs`).
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "ogg", "vorbis", "flac", "wav", "pcm"] }
 
 # Utilities
 base64 = "0.22"
@@ -116,6 +118,8 @@ wgpu = { version = "30.0.1", default-features = false, features = ["std", "parki
 libloading = "0.8"
 # WebUSB (`usb.rs`): usbfs's ioctls, poll and eventfd.
 libc = "0.2"
+# Sound out through ALSA (`audio.rs`).
+alsa = "0.9"
 
 # Reading the OS colour scheme before the window exists (`system_prefers_dark`).
 # Already in the tree through winit; this only adds the registry bindings.

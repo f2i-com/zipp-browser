@@ -44,6 +44,7 @@ mod seed;
 mod site_storage;
 #[cfg(windows)]
 mod media;
+mod audio;
 mod canvas;
 #[cfg(target_os = "linux")]
 mod usb;
@@ -1236,6 +1237,8 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
         // A WebGPU batch (webgpu.rs).
         #[cfg(any(windows, target_os = "linux"))]
         "gpu" => webgpu::host_call(ctx, args),
+        // Web Audio's output, and decoding (audio.rs).
+        "audio" => audio::host_call(ctx, args),
         // WebUSB (usb.rs).
         #[cfg(target_os = "linux")]
         "usb" => usb::host_call(args),
@@ -2097,8 +2100,9 @@ fn run_zipp_js_inner(
     let webgl_shim = include_str!("webgl_shim.js");
     let webgpu_shim = include_str!("webgpu_shim.js");
     let webusb_shim = include_str!("webusb_shim.js");
+    let webaudio_shim = include_str!("webaudio_shim.js");
     let dom_shim = &format!(
-        "{HOST_PRELUDE_JS}\n{dom_shim}\n{}\n{}\n{}\n{webgl_shim}\n{}\n{webgpu_shim}\n{webusb_shim}",
+        "{HOST_PRELUDE_JS}\n{dom_shim}\n{}\n{}\n{}\n{webgl_shim}\n{}\n{webgpu_shim}\n{webusb_shim}\n{webaudio_shim}",
         include_str!("clone.js"),
         include_str!("indexeddb_shim.js"),
         include_str!("worker_page.js"),
