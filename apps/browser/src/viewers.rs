@@ -342,6 +342,9 @@ pub(crate) fn image_info(url: &str) -> Result<String, String> {
 
 /// `file:///C:/x`, `file://C:/x` and `file:///c%3A/x` alike.
 pub(crate) fn local_path(path: &str) -> PathBuf {
+    // A file URL's query and fragment are not part of the path (`app.js?v=2`
+    // is app.js); a `?` or `#` in a file's name is percent-encoded.
+    let path = path.split(['?', '#']).next().unwrap_or_default();
     let path = path.trim_start_matches('/');
     let path = urlencoding::decode(path).map(|c| c.into_owned()).unwrap_or_else(|_| path.to_string());
     // Off Windows a file URL's path is absolute: `file:///app/x` is `/app/x`,

@@ -257,6 +257,7 @@ fn program(url: &str, module: bool) -> Result<String, String> {
     }
     let linked = crate::esm::link_graph(&[url.to_string()], &crate::fetch, &crate::resolve);
     for (failed, e) in &linked.failures {
+        eprintln!("[ESM] FAILED {failed}: {e}");
         console::push(Level::Error, format!("module {failed} failed to load: {e}"));
     }
     if linked.module_count == 0 {
