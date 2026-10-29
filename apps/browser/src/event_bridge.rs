@@ -31,17 +31,21 @@ use zipp_dom::{BaseDocument, Document, EventHandler, LocalName};
 /// Run the page's event loop until it is quiet, as a browser does: one task
 /// at a time -- a due timer, a posted message, and up to `frames` animation
 /// frames once nothing else is due -- with the VM's microtasks run after each
-/// (`__zippRunTask`). Stops after `max_tasks`, as a page may reschedule
-/// forever. Returns how many tasks ran, frames not counted.
+/// (`__zippRunTask`). Stops after `max_tasks`, or once `budget` has passed,
+/// as a page may reschedule forever -- an app animating on a timer chain whose
+/// every step was slow kept a page from appearing for three minutes. What is
+/// left runs as the window's timers come due. Returns how many tasks ran,
+/// frames not counted.
 ///
 /// The page's timers used to run in batches, the VM's microtasks only between
 /// batches, so an `await` continuation ran after every timer that was due
 /// rather than before the next one -- out of order, and late enough that an
 /// IndexedDB transaction would commit under it.
-pub(crate) fn run_page_tasks(state: &mut ScriptState, max_tasks: usize, mut frames: u32) -> usize {
+pub(crate) fn run_page_tasks(state: &mut ScriptState, max_tasks: usize, mut frames: u32, budget: std::time::Duration) -> usize {
+    let start = Instant::now();
     state.run_microtasks();
     let mut ran = 0;
-    while ran < max_tasks {
+    while ran < max_tasks && start.elapsed() < budget {
         match state.call_global("__zippRunTask", &[JsValue::Bool(frames > 0)]) {
             Ok(JsValue::Number(n)) if n == 1.0 => ran += 1,
             Ok(JsValue::Number(n)) if n == 2.0 => frames = frames.saturating_sub(1),
@@ -209,7 +213,7 @@ impl JsEventBridge {
         };
         // React's setState is async — the handler has only
         // queued the re-render at this point.
-        run_page_tasks(state, 400, 2);
+        run_page_tasks(state, 400, 2, std::time::Duration::from_secs(1));
         print_console(state);
         if let Ok(JsValue::String(new_html)) =
             state.call_global("__getRenderedHTML", &[])
@@ -397,7 +401,7 @@ impl JsEventBridge {
         let Some(state) = self.js_state.as_mut() else {
             return;
         };
-        run_page_tasks(state, 250, 0);
+        run_page_tasks(state, 250, 0, std::time::Duration::from_millis(250));
         print_console(state);
         if let Ok(JsValue::String(html)) = state.call_global("__getRenderedHTML", &[])
             && !html.is_empty()
@@ -902,6 +906,36 @@ pub(crate) fn layout_rect(nid: &str) -> String {
             size.width,
             size.height
         )
+    })
+}
+
+/// The boxes of the script's node `nid` from the last layout, as JSON
+/// `[borderW, borderH, clientW, clientH, contentW, contentH]` -- what
+/// `offsetWidth`, `clientWidth` and a ResizeObserver's content box read; ""
+/// when there is no layout to read.
+pub(crate) fn layout_box(nid: &str) -> String {
+    let Ok(nid) = nid.parse::<u32>() else {
+        return String::new();
+    };
+    LAYOUT_DOC.with(|d| {
+        let ptr = d.get();
+        if ptr.is_null() {
+            return String::new();
+        }
+        // SAFETY: as in `layout_rect`.
+        let doc = unsafe { &*ptr };
+        let Ok(Some(id)) = doc.query_selector(&format!("[data-flid=\"{nid}\"]")) else {
+            return String::new();
+        };
+        let Some(node) = doc.get_node(id) else {
+            return String::new();
+        };
+        let l = &node.final_layout;
+        let client_w = (l.size.width - l.border.left - l.border.right - l.scrollbar_size.width).max(0.0);
+        let client_h = (l.size.height - l.border.top - l.border.bottom - l.scrollbar_size.height).max(0.0);
+        let content_w = (client_w - l.padding.left - l.padding.right).max(0.0);
+        let content_h = (client_h - l.padding.top - l.padding.bottom).max(0.0);
+        format!("[{},{},{client_w},{client_h},{content_w},{content_h}]", l.size.width, l.size.height)
     })
 }
 

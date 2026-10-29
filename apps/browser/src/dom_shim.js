@@ -680,6 +680,7 @@ var SVGElement = class SVGElement extends Element {};
 // The shim's own, for the elements it makes: a page may replace the global
 // `HTMLElement` (GitHub's custom-element adapter does).
 var __HTMLElementClass = HTMLElement;
+__reflectLater();
 var __htmlInterfaces = { a: HTMLAnchorElement, area: HTMLAreaElement, audio: HTMLAudioElement, video: HTMLVideoElement, br: HTMLBRElement, base: HTMLBaseElement, body: HTMLBodyElement, button: HTMLButtonElement, canvas: HTMLCanvasElement, dl: HTMLDListElement, data: HTMLDataElement, datalist: HTMLDataListElement, details: HTMLDetailsElement, div: HTMLDivElement, embed: HTMLEmbedElement, fieldset: HTMLFieldSetElement, hr: HTMLHRElement, head: HTMLHeadElement, h1: HTMLHeadingElement, h2: HTMLHeadingElement, h3: HTMLHeadingElement, h4: HTMLHeadingElement, h5: HTMLHeadingElement, h6: HTMLHeadingElement, html: HTMLHtmlElement, iframe: HTMLIFrameElement, img: HTMLImageElement, input: HTMLInputElement, li: HTMLLIElement, label: HTMLLabelElement, legend: HTMLLegendElement, link: HTMLLinkElement, map: HTMLMapElement, menu: HTMLMenuElement, meta: HTMLMetaElement, meter: HTMLMeterElement, ins: HTMLModElement, del: HTMLModElement, ol: HTMLOListElement, object: HTMLObjectElement, optgroup: HTMLOptGroupElement, option: HTMLOptionElement, output: HTMLOutputElement, p: HTMLParagraphElement, picture: HTMLPictureElement, pre: HTMLPreElement, listing: HTMLPreElement, xmp: HTMLPreElement, progress: HTMLProgressElement, q: HTMLQuoteElement, blockquote: HTMLQuoteElement, script: HTMLScriptElement, select: HTMLSelectElement, slot: HTMLSlotElement, source: HTMLSourceElement, span: HTMLSpanElement, style: HTMLStyleElement, caption: HTMLTableCaptionElement, td: HTMLTableCellElement, th: HTMLTableCellElement, col: HTMLTableColElement, colgroup: HTMLTableColElement, table: HTMLTableElement, tr: HTMLTableRowElement, thead: HTMLTableSectionElement, tbody: HTMLTableSectionElement, tfoot: HTMLTableSectionElement, template: HTMLTemplateElement, textarea: HTMLTextAreaElement, time: HTMLTimeElement, title: HTMLTitleElement, track: HTMLTrackElement, ul: HTMLUListElement, dialog: HTMLDialogElement, form: HTMLFormElement };
 
 // --- Links, shadow roots, element internals, templates, fonts ---
@@ -972,6 +973,90 @@ Object.defineProperty(Element.prototype, "value", {
         this._value = v;
     }
 });
+// Attributes their properties reflect, as an element's IDL attributes do:
+// `script.type`, `link.rel`, `input.name`, `meta.content`... They were
+// undefined, so a script asking `el.type === "application/json"` of the
+// JSON `<script>` holding its settings concluded there was none (softn.com's
+// apps then fetched a config that does not exist, and failed to open).
+// Strings read "" when the attribute is absent, unless a default is given.
+function __reflectAttr(classes, prop, attr, kind, dflt) {
+    classes.forEach(function (cls) {
+        if (!cls || Object.prototype.hasOwnProperty.call(cls.prototype, prop)) return;
+        Object.defineProperty(cls.prototype, prop, {
+            configurable: true, enumerable: true,
+            get: kind === "bool"
+                ? function () { return this.hasAttribute(attr); }
+                : kind === "int"
+                ? function () { var v = parseInt(this.getAttribute(attr), 10); return isNaN(v) ? dflt : v; }
+                : function () { var v = this.getAttribute(attr); return v === null ? (dflt === undefined ? "" : dflt) : v; },
+            set: kind === "bool"
+                ? function (v) { if (v) this.setAttribute(attr, ""); else this.removeAttribute(attr); }
+                : function (v) { this.setAttribute(attr, String(v)); }
+        });
+    });
+}
+function __reflectLater() {
+    var E = __HTMLElementClass;
+    __reflectAttr([E], "title", "title"); __reflectAttr([E], "lang", "lang"); __reflectAttr([E], "dir", "dir");
+    __reflectAttr([E], "accessKey", "accesskey"); __reflectAttr([E], "slot", "slot"); __reflectAttr([E], "inert", "inert", "bool");
+    __reflectAttr([E], "draggable", "draggable", "bool"); __reflectAttr([E], "spellcheck", "spellcheck", "bool");
+    __reflectAttr([E], "autofocus", "autofocus", "bool"); __reflectAttr([E], "contentEditable", "contenteditable", "", "inherit");
+    __reflectAttr([E], "tabIndex", "tabindex", "int", -1); __reflectAttr([E], "nonce", "nonce");
+    __reflectAttr([HTMLScriptElement, HTMLStyleElement, HTMLLinkElement, HTMLSourceElement, HTMLEmbedElement, HTMLObjectElement, HTMLOListElement], "type", "type");
+    __reflectAttr([HTMLButtonElement], "type", "type", "", "submit");
+    __reflectAttr([HTMLInputElement], "type", "type", "", "text");
+    __reflectAttr([HTMLInputElement, HTMLButtonElement, HTMLSelectElement, HTMLTextAreaElement, HTMLFormElement, HTMLIFrameElement,
+        HTMLMetaElement, HTMLMapElement, HTMLOutputElement, HTMLFieldSetElement, HTMLSlotElement, HTMLObjectElement, HTMLImageElement, HTMLAnchorElement], "name", "name");
+    __reflectAttr([HTMLAnchorElement, HTMLAreaElement, HTMLLinkElement], "rel", "rel");
+    __reflectAttr([HTMLAnchorElement, HTMLAreaElement, HTMLFormElement, HTMLBaseElement], "target", "target");
+    __reflectAttr([HTMLAnchorElement, HTMLAreaElement], "download", "download");
+    __reflectAttr([HTMLAnchorElement, HTMLLinkElement], "hreflang", "hreflang");
+    __reflectAttr([HTMLImageElement, HTMLAreaElement, HTMLInputElement], "alt", "alt");
+    __reflectAttr([HTMLImageElement, HTMLSourceElement, HTMLLinkElement], "srcset", "srcset");
+    __reflectAttr([HTMLImageElement, HTMLSourceElement, HTMLLinkElement], "sizes", "sizes");
+    __reflectAttr([HTMLImageElement, HTMLIFrameElement], "loading", "loading", "", "eager");
+    __reflectAttr([HTMLImageElement], "decoding", "decoding", "", "auto");
+    __reflectAttr([HTMLMetaElement], "content", "content");
+    __reflectAttr([HTMLMetaElement], "httpEquiv", "http-equiv");
+    __reflectAttr([HTMLMetaElement, HTMLScriptElement], "charset", "charset");
+    __reflectAttr([HTMLScriptElement], "async", "async", "bool"); __reflectAttr([HTMLScriptElement], "defer", "defer", "bool");
+    __reflectAttr([HTMLScriptElement], "noModule", "nomodule", "bool");
+    __reflectAttr([HTMLScriptElement, HTMLLinkElement, HTMLImageElement, HTMLMediaElement], "crossOrigin", "crossorigin", "", null);
+    __reflectAttr([HTMLScriptElement, HTMLLinkElement], "integrity", "integrity");
+    __reflectAttr([HTMLScriptElement, HTMLLinkElement, HTMLAnchorElement, HTMLAreaElement, HTMLImageElement, HTMLIFrameElement], "referrerPolicy", "referrerpolicy");
+    __reflectAttr([HTMLLinkElement, HTMLStyleElement, HTMLSourceElement], "media", "media");
+    __reflectAttr([HTMLLinkElement], "as", "as");
+    __reflectAttr([HTMLInputElement, HTMLTextAreaElement], "placeholder", "placeholder");
+    __reflectAttr([HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLFormElement], "autocomplete", "autocomplete");
+    __reflectAttr([HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement], "required", "required", "bool");
+    __reflectAttr([HTMLInputElement, HTMLTextAreaElement], "readOnly", "readonly", "bool");
+    __reflectAttr([HTMLInputElement], "accept", "accept"); __reflectAttr([HTMLInputElement], "pattern", "pattern");
+    __reflectAttr([HTMLInputElement, HTMLMeterElement, HTMLProgressElement], "max", "max");
+    __reflectAttr([HTMLInputElement, HTMLMeterElement], "min", "min"); __reflectAttr([HTMLInputElement], "step", "step");
+    __reflectAttr([HTMLInputElement, HTMLTextAreaElement], "maxLength", "maxlength", "int", -1);
+    __reflectAttr([HTMLInputElement, HTMLTextAreaElement], "minLength", "minlength", "int", -1);
+    __reflectAttr([HTMLInputElement, HTMLSelectElement], "size", "size", "int", 20);
+    __reflectAttr([HTMLTextAreaElement], "rows", "rows", "int", 2); __reflectAttr([HTMLTextAreaElement], "cols", "cols", "int", 20);
+    __reflectAttr([HTMLInputElement, HTMLTextAreaElement], "inputMode", "inputmode");
+    __reflectAttr([HTMLLabelElement, HTMLOutputElement], "htmlFor", "for");
+    __reflectAttr([HTMLFormElement], "method", "method", "", "get"); __reflectAttr([HTMLFormElement], "enctype", "enctype", "", "application/x-www-form-urlencoded");
+    __reflectAttr([HTMLFormElement], "noValidate", "novalidate", "bool");
+    __reflectAttr([HTMLTableCellElement], "colSpan", "colspan", "int", 1); __reflectAttr([HTMLTableCellElement], "rowSpan", "rowspan", "int", 1);
+    __reflectAttr([HTMLTableCellElement], "headers", "headers"); __reflectAttr([HTMLTableCellElement], "scope", "scope");
+    __reflectAttr([HTMLMediaElement], "autoplay", "autoplay", "bool"); __reflectAttr([HTMLMediaElement], "loop", "loop", "bool");
+    __reflectAttr([HTMLMediaElement], "muted", "muted", "bool"); __reflectAttr([HTMLMediaElement], "controls", "controls", "bool");
+    __reflectAttr([HTMLMediaElement], "preload", "preload", "", "auto"); __reflectAttr([HTMLVideoElement], "poster", "poster");
+    __reflectAttr([HTMLVideoElement], "playsInline", "playsinline", "bool");
+    __reflectAttr([HTMLIFrameElement], "allow", "allow"); __reflectAttr([HTMLIFrameElement], "sandbox", "sandbox");
+    __reflectAttr([HTMLTimeElement], "dateTime", "datetime");
+    __reflectAttr([HTMLDetailsElement, HTMLDialogElement], "open", "open", "bool");
+    __reflectAttr([HTMLOListElement], "reversed", "reversed", "bool"); __reflectAttr([HTMLOListElement], "start", "start", "int", 1);
+    __reflectAttr([HTMLQuoteElement, HTMLModElement], "cite", "cite");
+    __reflectAttr([HTMLTrackElement], "kind", "kind", "", "subtitles"); __reflectAttr([HTMLTrackElement], "srclang", "srclang");
+    __reflectAttr([HTMLTrackElement, HTMLOptGroupElement, HTMLOptionElement], "label", "label");
+    __reflectAttr([HTMLOptionElement], "defaultSelected", "selected", "bool");
+}
+
 // Boolean attributes their properties reflect: `el.hidden = true` must hide
 // it (a menu, a placeholder), and `button.disabled` must reach `:disabled`.
 ["hidden", "disabled"].forEach(function (name) {
@@ -1440,20 +1525,82 @@ doc.adoptNode = function(node) { node.ownerDocument=doc; return node; };
 doc.importNode = function(node,deep) { return node.cloneNode(deep); };
 doc.title = '__PAGE_TITLE__';
 
-// Layout sizes. Nothing is laid out here, so they are 0 -- except a canvas's,
-// which is its drawing buffer's, as it is when no CSS sizes it: pages size a
-// canvas from its `clientWidth`, and 0 left it empty.
-["offsetWidth", "offsetHeight", "clientWidth", "clientHeight"].forEach(function (p) {
-    var dim = p.indexOf("Width") > 0 ? "width" : "height", store = "_" + p;
+// Layout sizes: the element's boxes as the page was last laid out (the
+// host's `box`). Before the first layout there are none, and they are 0 --
+// except a canvas's, which is its drawing buffer's, as it is when no CSS sizes
+// it: pages size a canvas from its `clientWidth`, and 0 left it empty.
+function __zippBox(el) {
+    try { var s = __zippHostCall("box", String(el._id)); return s ? JSON.parse(s) : null; } catch (e) { return null; }
+}
+[["offsetWidth", 0], ["offsetHeight", 1], ["clientWidth", 2], ["clientHeight", 3]].forEach(function (pi) {
+    var p = pi[0], dim = p.indexOf("Width") > 0 ? "width" : "height", store = "_" + p;
     Object.defineProperty(Element.prototype, p, {
         configurable: true,
         get: function () {
             if (this[store] !== undefined) return this[store];
+            var b = __zippBox(this);
+            if (b) return Math.round(b[pi[1]]);
             return this.tagName === "CANVAS" ? (Number(this[dim]) || 0) : 0;
         },
         set: function (v) { this[store] = v; },
     });
 });
+
+// ResizeObserver: each observed element's size, reported when it first has
+// one from the layout and whenever it changes after -- checked as the page's
+// tasks run, a timer keeping watch while anything is observed. The stand-in
+// never called back, so a WebGL app sizing its canvas to its container (three.js
+// does) drew into a canvas of 1 by 1.
+var __resizeObservers = [];
+var __resizeTimer = 0;
+function __zippResizeEntry(el, b) {
+    var size = function (w, h) { return [{ inlineSize: w, blockSize: h }]; };
+    return {
+        target: el,
+        contentRect: { x: 0, y: 0, width: b[4], height: b[5], top: 0, left: 0, right: b[4], bottom: b[5] },
+        contentBoxSize: size(b[4], b[5]), borderBoxSize: size(b[0], b[1]),
+        devicePixelContentBoxSize: size(b[4] * (window.devicePixelRatio || 1), b[5] * (window.devicePixelRatio || 1)),
+    };
+}
+function __zippDeliverResizeObservations() {
+    var live = 0;
+    __resizeObservers.slice().forEach(function (obs) {
+        var entries = [];
+        obs._targets.forEach(function (t) {
+            live++;
+            var b = __zippBox(t.el);
+            if (!b) return;
+            var key = t.box === "border-box" ? b[0] + "," + b[1] : b[4] + "," + b[5];
+            if (key === t.last) return;
+            t.last = key;
+            entries.push(__zippResizeEntry(t.el, b));
+        });
+        if (entries.length) {
+            try { obs._cb.call(obs, entries, obs); }
+            catch (e) { console.error("Uncaught (in ResizeObserver callback) " + ((e && (e.stack || e.message)) || e)); }
+        }
+    });
+    if (!live && __resizeTimer) { clearTimeout(__resizeTimer); __resizeTimer = 0; }
+}
+var ResizeObserver = class ResizeObserver {
+    constructor(callback) {
+        if (typeof callback !== "function") throw new TypeError("Failed to construct 'ResizeObserver': parameter 1 is not of type 'Function'.");
+        this._cb = callback; this._targets = [];
+    }
+    observe(el, opts) {
+        if (!el || el.nodeType !== 1) throw new TypeError("Failed to execute 'observe' on 'ResizeObserver': parameter 1 is not of type 'Element'.");
+        if (this._targets.some(function (t) { return t.el === el; })) return;
+        this._targets.push({ el: el, box: (opts && opts.box) || "content-box", last: null });
+        if (__resizeObservers.indexOf(this) < 0) __resizeObservers.push(this);
+        if (!__resizeTimer) __resizeTimer = __zippSetTimer(__zippDeliverResizeObservations, 100, [], true);
+    }
+    unobserve(el) { this._targets = this._targets.filter(function (t) { return t.el !== el; }); }
+    disconnect() {
+        this._targets = [];
+        var i = __resizeObservers.indexOf(this);
+        if (i >= 0) __resizeObservers.splice(i, 1);
+    }
+};
 
 // Scrolling. Where a scroll container is scrolled to and how big it is come
 // from the layout (`__zippScrollMetrics`, and again as it scrolls); setting
@@ -1530,13 +1677,54 @@ if (!_rootDiv) {
     doc.body.appendChild(_rootDiv);
 }
 
-// Performance.now: return a slowly incrementing counter so React's scheduler
-// thinks minimal time is passing (prevents immediate yielding in sync mode).
-// React yields after 5ms; incrementing by 0.1ms per call means ~50 calls before yield.
-var _perfCounter = 0;
-var performance = { now: function(){return _perfCounter+=0.01;}, mark:function(){}, measure:function(){}, getEntriesByName:function(){return [];}, getEntriesByType:function(){return [];} };
+// `performance`: a real clock, in milliseconds since the page started. It
+// was a counter creeping 0.01 ms a call, so that React's scheduler -- when the
+// page's tasks ran in one batch -- never thought it time to yield. Tasks run
+// one at a time now (`__zippRunTask`), and an animation timed by that counter
+// (GSAP, a motion library) barely moved. `timing` is the old Navigation
+// Timing API, which analytics scripts read on load.
+var __perfOrigin = Date.now();
+var __perfEntries = [];
+var performance = {
+    timeOrigin: __perfOrigin,
+    now: function () { return Date.now() - __perfOrigin; },
+    timing: (function () {
+        var t = {};
+        ["navigationStart", "unloadEventStart", "unloadEventEnd", "redirectStart", "redirectEnd", "fetchStart",
+         "domainLookupStart", "domainLookupEnd", "connectStart", "connectEnd", "secureConnectionStart", "requestStart",
+         "responseStart", "responseEnd", "domLoading", "domInteractive", "domContentLoadedEventStart",
+         "domContentLoadedEventEnd", "domComplete", "loadEventStart", "loadEventEnd"].forEach(function (k) { t[k] = __perfOrigin; });
+        return t;
+    })(),
+    navigation: { type: 0, redirectCount: 0 },
+    mark: function (name, opts) {
+        var e = { name: String(name), entryType: "mark", startTime: opts && opts.startTime !== undefined ? opts.startTime : performance.now(), duration: 0, detail: opts && opts.detail };
+        __perfEntries.push(e);
+        return e;
+    },
+    measure: function (name, start, end) {
+        function at(m, dflt) { if (typeof m === "number") return m; for (var i = __perfEntries.length - 1; i >= 0; i--) if (__perfEntries[i].name === m) return __perfEntries[i].startTime; return dflt; }
+        var s0 = start && typeof start === "object" ? at(start.start, 0) : at(start, 0);
+        var s1 = start && typeof start === "object" ? at(start.end, performance.now()) : at(end, performance.now());
+        var e = { name: String(name), entryType: "measure", startTime: s0, duration: s1 - s0 };
+        __perfEntries.push(e);
+        return e;
+    },
+    getEntries: function () { return __perfEntries.slice(); },
+    getEntriesByName: function (n, type) { return __perfEntries.filter(function (e) { return e.name === n && (!type || e.entryType === type); }); },
+    getEntriesByType: function (type) { return __perfEntries.filter(function (e) { return e.entryType === type; }); },
+    clearMarks: function (n) { __perfEntries = __perfEntries.filter(function (e) { return e.entryType !== "mark" || (n !== undefined && e.name !== n); }); },
+    clearMeasures: function (n) { __perfEntries = __perfEntries.filter(function (e) { return e.entryType !== "measure" || (n !== undefined && e.name !== n); }); },
+    setResourceTimingBufferSize: function () {},
+    clearResourceTimings: function () {},
+    toJSON: function () { return { timeOrigin: __perfOrigin }; },
+    addEventListener: function () {}, removeEventListener: function () {},
+};
 var navigator = {
-    userAgent:"ZippBrowser/0.2", language:"en-US", languages:["en-US","en"],
+    // The one the browser's requests carry (main.rs `USER_AGENT`): a page
+    // sniffing it in script should come to the same answer as its server.
+    userAgent:"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Zipp/1.0",
+    language:"en-US", languages:["en-US","en"],
     platform:"Win32", vendor:"", onLine:true,
     cookieEnabled:true, hardwareConcurrency:4, maxTouchPoints:0,
     clipboard:{ writeText:function(){return Promise.resolve();}, readText:function(){return Promise.resolve("");} },
@@ -2327,7 +2515,7 @@ var window = {
     history:{state:null,pushState:function(s,t,u){this.state=s;__historyMove(u);},replaceState:function(s,t,u){this.state=s;__historyMove(u);},back:function(){},forward:function(){},go:function(n){},length:1},
     self:null, top:null, parent:null,
     getSelection:function(){return {removeAllRanges:function(){},addRange:function(){},getRangeAt:function(){return doc.createRange();}};},
-    ResizeObserver:function(){this.observe=function(){};this.unobserve=function(){};this.disconnect=function(){};},
+    ResizeObserver:ResizeObserver,
     // A real IntersectionObserver delivers an initial observation for every
     // observed element once layout is known. Stubbing `observe` as a no-op means
     // the callback never runs — and the extremely common
@@ -2533,7 +2721,6 @@ var blur = window.blur;
 var print = window.print;
 var requestIdleCallback = window.requestIdleCallback;
 var cancelIdleCallback = window.cancelIdleCallback;
-var ResizeObserver = window.ResizeObserver;
 var IntersectionObserver = window.IntersectionObserver;
 // NOTE: Do NOT define setImmediate - it causes infinite recursion in React's scheduler.
 // React will fall through to MessageChannel which has proper queue-draining.

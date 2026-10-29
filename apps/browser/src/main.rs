@@ -320,7 +320,7 @@ fn run_js_suite(tag: &str, tests: &str, max_failures: usize) -> bool {
         eprintln!("[{tag}] Uncaught: {e}");
     }
     // Asynchronous tests (`A`) finish in the page's event loop.
-    event_bridge::run_page_tasks(&mut state, 100, 0);
+    event_bridge::run_page_tasks(&mut state, 100, 0, std::time::Duration::from_secs(10));
 
     let passed = state.eval_in_context("_p").ok();
     let failed = state.eval_in_context("_f").ok();
@@ -681,16 +681,24 @@ function __zippDrainQueues(rounds, frames) {
     return did;
 }
 
-// One task of the page's event loop: the next due timer, else the next posted
-// message (MessageChannel, an IntersectionObserver report), else -- when
-// `allowFrame` -- an animation frame. The host (`run_page_tasks`) runs the VM's
-// microtasks after each one, as a browser does after every task, so an `await`
-// continuation or a `.then` reaction runs before the next timer rather than
-// after the whole batch. Returns 0 when nothing was due, 1 after a task, 2
+// One task of the page's event loop: a due timer or a posted message
+// (MessageChannel, an IntersectionObserver report) -- the two taking turns --
+// else, when `allowFrame`, an animation frame. The host (`run_page_tasks`) runs
+// the VM's microtasks after each one, as a browser does after every task, so an
+// `await` continuation or a `.then` reaction runs before the next timer rather
+// than after the whole batch. Returns 0 when nothing was due, 1 after a task, 2
 // after a frame.
+//
+// Turns, because timers always went first: an app animating on a timer chain
+// whose every step outlasts its delay always has one due, and React, which
+// renders from a posted message, never rendered (softn.com's apps stayed
+// hidden behind their "loading" state).
+var __zippTimerTurn = true;
 function __zippRunTask(allowFrame) {
     __zippDueTimers();
-    var q = __timerQueue.length > 0 ? __timerQueue : __mcQueue.length > 0 ? __mcQueue : null;
+    var q = __timerQueue.length > 0 && (__zippTimerTurn || __mcQueue.length === 0) ? __timerQueue
+        : __mcQueue.length > 0 ? __mcQueue : null;
+    if (q) __zippTimerTurn = q !== __timerQueue;
     if (q) {
         __zippDrainStats.rounds++;
         try { q.shift()(); }
@@ -1108,6 +1116,8 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
         // Copy the pending bytes into `__zippHostBytes`.
         // An element's box in the viewport (`getBoundingClientRect`).
         "rect" => Ok(event_bridge::layout_rect(args.first().map(String::as_str).unwrap_or_default())),
+        // `offsetWidth`, `clientWidth`, a ResizeObserver's boxes.
+        "box" => Ok(event_bridge::layout_box(args.first().map(String::as_str).unwrap_or_default())),
         // `getComputedStyle(el)[name]`, from the last layout.
         "computed_style" => Ok(event_bridge::layout_style(
             args.first().map(String::as_str).unwrap_or_default(),
@@ -1553,7 +1563,7 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
                 Ok(v) => eprintln!("[CLICK] dispatched -> {v:?}"),
                 Err(e) => eprintln!("[CLICK] dispatch failed: {e}"),
             }
-            event_bridge::run_page_tasks(state, 400, 2);
+            event_bridge::run_page_tasks(state, 400, 2, std::time::Duration::from_secs(1));
             if let Ok(JsValue::String(updated)) = state.call_global("__getRenderedHTML", &[]) {
                 if !updated.is_empty() {
                     eprintln!(
@@ -2168,7 +2178,7 @@ var __zippEsmDebug=true;
     // continuation that sets `isInitialized` ever ran.
     let init_ms = t_init.elapsed().as_millis();
     let t_settle = std::time::Instant::now();
-    event_bridge::run_page_tasks(&mut state, 600, 2);
+    event_bridge::run_page_tasks(&mut state, 600, 2, std::time::Duration::from_secs(3));
     // Settled: from here on the page's timers keep real time.
     let _ = state.call_global("__zippEndSettle", &[]);
     // A page drawing with WebGL shows its first frame from the start: present

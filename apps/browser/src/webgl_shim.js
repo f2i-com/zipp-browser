@@ -865,13 +865,6 @@ var __zippWebGL = (function () {
     if (this.tagName !== "CANVAS") return undefined;
     type = String(type);
     var gl = type === "webgl" || type === "experimental-webgl" ? 1 : type === "webgl2" ? 2 : 0;
-    // A page animating a canvas times its frames with performance.now(); the
-    // shim's own is a slow counter that keeps React's scheduler from yielding.
-    // Make it the real clock once there is something to animate.
-    if ((gl || type === "webgpu" || type === "2d") && __zippCanvasContexts.length === 0) {
-      var t0 = Date.now();
-      performance.now = function () { return Date.now() - t0; };
-    }
     if (type === "2d") {
       var current = this._zippCanvasContext;
       if (current) return current instanceof CanvasRenderingContext2D ? current : null;
