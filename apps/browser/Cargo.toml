@@ -54,10 +54,11 @@ winit = { workspace = true }
 
 # Zipp JS engine — ZIPP's register VM + x86-64/ARM64 JIT, consumed through
 # its `embed` module (persistent VM: compile once, keep alive, eval + dispatch
-# event handlers into the same global context). Pinned to a ZIPP release tag;
-# to build against a local zipp.org checkout instead, see the README.
-# The `web-assembly` branch: the WebAssembly JS API (vm/webassembly).
-zipp-vm = { git = "https://github.com/f2i-com/zipp.org", branch = "web-assembly" }
+# event handlers into the same global context). ZIPP's `dev` branch, which has
+# the WebAssembly JS API (vm/webassembly); Cargo.lock pins the commit, and
+# `cargo update -p zipp-vm` moves to the newest. To build against a local
+# zipp.org checkout instead, see the README.
+zipp-vm = { git = "https://github.com/f2i-com/zipp.org", branch = "dev" }
 
 # Linebender
 linebender_resource_handle = { workspace = true }

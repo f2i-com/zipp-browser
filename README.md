@@ -42,8 +42,14 @@ cd zipp-browser
 cargo build --release
 ```
 
-Cargo fetches ZIPP itself. To move to a newer engine, change the `tag` on
-`zipp-vm` in `apps/browser/Cargo.toml`.
+Cargo fetches ZIPP itself, from its `dev` branch at the commit `Cargo.lock`
+pins; `cargo update -p zipp-vm` moves to the newest.
+
+zipp-vm's WebAssembly interpreter dispatches by tail calls, which needs the
+release profile's fat LTO and single codegen unit. An optimised build without
+them -- a fast incremental one for working on the browser -- needs
+`--features zipp-vm/wasm-portable-dispatch`, or a long-running module (the
+zipp.org playground's engine) overflows its thread's stack.
 
 To build against a local `zipp.org` checkout instead (working on the engine and
 the browser together), keep the two checkouts side by side and put a patch in a
@@ -115,8 +121,7 @@ with `controls`, the bar along the bottom also seeks and mutes. A muted
 
 ## WebAssembly, workers, Canvas 2D, WebGL and WebGPU
 
-`WebAssembly` is zipp-vm's own (on its `dev` branch; this branch builds against
-`web-assembly`, which is `dev` with the latest WebAssembly fixes): the whole JS
+`WebAssembly` is zipp-vm's own (on its `dev` branch, which this builds against): the whole JS
 API, with modules run by the [wasmi](https://github.com/wasmi-labs/wasmi)
 interpreter, so a page's `instantiateStreaming(fetch("x.wasm"))` works as
 written, and wasm-bindgen's output -- `externref` values and tables included --
@@ -217,9 +222,10 @@ Honest list, not an exhaustive one:
   hand-written menu toggle): the shim re-serialises SVG lossily, so showing its
   tree for every page would cost them their icons.
 - **WebAssembly is interpreted.** wasmi runs modules without a JIT: the
-  zipp.org playground's engine takes about 2.4 s to start in a release build
-  (where Chrome takes well under one), and the page, which waits 2 s for it,
-  starts a second engine meanwhile. Programs then run at full frame rate.
+  zipp.org playground's engine takes about 1.5 s to start in a release build
+  (where Chrome takes well under one), and Python heavy at start-up runs some
+  ten times slower than in Chrome -- the Game of Life sample sets up in 2.7 s
+  and draws about 2 frames a second. Simple programs run at full frame rate.
 - **A worker cannot be stopped mid-task.** zipp-vm cannot interrupt running
   script, so `terminate()` takes effect between tasks; a worker stuck in a loop
   keeps its thread busy until the browser exits, though the page no longer
