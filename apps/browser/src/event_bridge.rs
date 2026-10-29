@@ -81,6 +81,9 @@ pub struct JsEventBridge {
     page_url: String,
     /// When the page started, for its animation frames' timestamps.
     started: std::time::Instant,
+    /// Which page this is (`worker::new_page`), so its going stops its own
+    /// workers and not the next page's.
+    page: u64,
     /// Whether the page shows the script's tree, so its listeners are wired
     /// to it. A page showing its own markup keeps its script for timers and
     /// the console, but hears no events: its listeners were never wired, and
@@ -131,6 +134,7 @@ impl JsEventBridge {
             pending_rerender: None,
             page_url: page_url.to_string(),
             started: std::time::Instant::now(),
+            page: crate::worker::current_page(),
             live_dom: !event_map_json.is_empty(),
             next_timer: None,
             rendered_mutations: 0.0,
@@ -344,7 +348,7 @@ impl JsEventBridge {
 impl Drop for JsEventBridge {
     /// The page is going, and its workers with it.
     fn drop(&mut self) {
-        crate::worker::terminate_all();
+        crate::worker::terminate_page(self.page);
     }
 }
 

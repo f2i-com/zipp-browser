@@ -230,6 +230,7 @@ fn main() {
     // respond to nothing.
     app.set_document_builder(Box::new(|url, html, config, viewport| {
         console::clear();
+        worker::new_page();
         let (final_html, event_map_json, js_state) = render_page(&url, &html, viewport, None);
         let mut doc = build_document(&final_html, config);
         attach_event_bridge(&mut doc, event_map_json, js_state, &url);

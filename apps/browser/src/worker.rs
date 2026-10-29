@@ -40,12 +40,18 @@ pub(crate) enum FromWorker {
 struct Handle {
     to: Sender<ToWorker>,
     from: Receiver<FromWorker>,
+    /// The page that started it (`new_page`).
+    page: u64,
 }
 
 thread_local! {
     /// The workers this thread's page started, by id.
     static WORKERS: RefCell<HashMap<u32, Handle>> = RefCell::new(HashMap::new());
     static NEXT_ID: Cell<u32> = const { Cell::new(1) };
+    /// Which page this thread is running: a navigation builds the next page,
+    /// its workers starting, before the last page's document is dropped, so a
+    /// page's going must stop its own workers only.
+    static PAGE: Cell<u64> = const { Cell::new(0) };
     /// Whether this thread's page may start workers: the window's may, not a
     /// page prerendered in the background, which would start them for nothing.
     static ALLOWED: Cell<bool> = const { Cell::new(false) };
@@ -71,6 +77,16 @@ fn wake() {
     if let Some(wake) = WAKER.get() {
         wake();
     }
+}
+
+/// A new page on this thread: the workers it starts are its own.
+pub(crate) fn new_page() {
+    PAGE.set(PAGE.get() + 1);
+}
+
+/// The page this thread is running, for its event bridge to remember.
+pub(crate) fn current_page() -> u64 {
+    PAGE.get()
 }
 
 /// Let this thread's page start workers (the window's thread).
@@ -100,7 +116,7 @@ pub(crate) fn start(url: &str, module: bool) -> Result<u32, String> {
         .stack_size(64 * 1024 * 1024)
         .spawn(move || run(&url, module, to_rx, from_tx))
         .map_err(|e| format!("Error: cannot start a worker: {e}"))?;
-    WORKERS.with(|w| w.borrow_mut().insert(id, Handle { to: to_tx, from: from_rx }));
+    WORKERS.with(|w| w.borrow_mut().insert(id, Handle { to: to_tx, from: from_rx, page: PAGE.get() }));
     Ok(id)
 }
 
@@ -120,10 +136,14 @@ pub(crate) fn terminate(id: u32) {
     }
 }
 
-/// The page is going: so are its workers.
-pub(crate) fn terminate_all() {
-    let all: Vec<Handle> = WORKERS.with(|w| w.borrow_mut().drain().map(|(_, h)| h).collect());
-    for handle in all {
+/// Page `page` is going: so are its workers.
+pub(crate) fn terminate_page(page: u64) {
+    let gone: Vec<Handle> = WORKERS.with(|w| {
+        let mut w = w.borrow_mut();
+        let ids: Vec<u32> = w.iter().filter(|(_, h)| h.page == page).map(|(&id, _)| id).collect();
+        ids.into_iter().filter_map(|id| w.remove(&id)).collect()
+    });
+    for handle in gone {
         let _ = handle.to.send(ToWorker::Terminate);
     }
 }
