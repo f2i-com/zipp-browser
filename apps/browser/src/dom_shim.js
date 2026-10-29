@@ -1,4 +1,12 @@
 // Zipp Browser DOM Shim - Class-based (ES6)
+
+// Queue a microtask with the VM's own promises, taken now: a page may replace
+// the global `Promise` (Dexie does, inside its transactions), and the
+// browser's microtasks -- `queueMicrotask`, IndexedDB's -- must not run
+// through the page's.
+var __zippMicrotask = (function (resolved, then) {
+    return function (fn) { then.call(resolved, fn); };
+})(Promise.resolve(), Promise.prototype.then);
 // Polyfill Object methods that Zipp doesn't have natively
 if (typeof Object.defineProperty === "undefined") {
     Object.defineProperty = function(obj, prop, desc) {
@@ -73,26 +81,13 @@ if (typeof Object.getOwnPropertyDescriptors === "undefined") {
     };
 }
 
-// Symbol polyfill using numeric values. React's typeof checks for
-// Symbol use 'function', which our polyfill satisfies. The .for()
-// method returns unique numeric IDs matching React's fallback constants.
-var __symCounter = 0;
-var __symRegistry = {};
-var Symbol = function(desc) {
-    return 0xfff0 + __symCounter++;
-};
-Symbol._counter = 0;
-Symbol._registry = __symRegistry;
-Symbol.for = function(key) {
-    if (__symRegistry[key] !== undefined) return __symRegistry[key];
-    var id = 0xfff0 + __symCounter++;
-    __symRegistry[key] = id;
-    return id;
-};
-Symbol.iterator = Symbol("Symbol.iterator");
-Symbol.hasInstance = Symbol("Symbol.hasInstance");
-Symbol.toPrimitive = Symbol("Symbol.toPrimitive");
-Symbol.toStringTag = Symbol("Symbol.toStringTag");
+// The VM's own `Symbol`, error types, `Proxy`, `Reflect`, `WeakRef` and
+// `FinalizationRegistry` are used. Stand-ins for an older engine used to
+// replace them: `Symbol()` returned numbers, so a class's `[Symbol.iterator]`
+// was never found by `for...of` and `Symbol.asyncIterator` did not exist; a
+// TypeError the engine threw was not `instanceof TypeError`; `Proxy` copied
+// its target's own properties once and never called a trap, so a library
+// wrapping an object (idb wraps IndexedDB's) found its methods undefined.
 
 // `console` and `__zippInspect` are in console_shim.js, which comes first.
 
@@ -852,17 +847,6 @@ class MessageChannel {
 // around an app's `async` functions) ran its steps out of order. Reactions
 // now run as microtasks, after each task of the event loop (`__zippRunTask`).
 
-// --- Error type polyfills ---
-var TypeError = function(msg) { this.message = msg || ''; this.name = 'TypeError'; this.stack = ''; };
-TypeError.prototype = Object.create(Error.prototype);
-var ReferenceError = function(msg) { this.message = msg || ''; this.name = 'ReferenceError'; this.stack = ''; };
-ReferenceError.prototype = Object.create(Error.prototype);
-var SyntaxError = function(msg) { this.message = msg || ''; this.name = 'SyntaxError'; this.stack = ''; };
-SyntaxError.prototype = Object.create(Error.prototype);
-var RangeError = function(msg) { this.message = msg || ''; this.name = 'RangeError'; this.stack = ''; };
-RangeError.prototype = Object.create(Error.prototype);
-var URIError = function(msg) { this.message = msg || ''; this.name = 'URIError'; this.stack = ''; };
-URIError.prototype = Object.create(Error.prototype);
 
 // --- Number static methods ---
 if (typeof Number.isFinite === 'undefined') Number.isFinite = function(v) { return typeof v === 'number' && isFinite(v); };
@@ -1069,51 +1053,6 @@ XMLHttpRequest.prototype.addEventListener = function(t, fn) { this["on" + t] = f
 XMLHttpRequest.prototype.removeEventListener = function() {};
 XMLHttpRequest.UNSENT = 0; XMLHttpRequest.OPENED = 1; XMLHttpRequest.HEADERS_RECEIVED = 2;
 XMLHttpRequest.LOADING = 3; XMLHttpRequest.DONE = 4;
-
-// --- WeakRef polyfill (basic - stores value, deref returns it) ---
-var WeakRef = function(target) { this._target = target; };
-WeakRef.prototype.deref = function() { return this._target; };
-
-// --- FinalizationRegistry polyfill (no-op) ---
-var FinalizationRegistry = function(callback) { this._callback = callback; };
-FinalizationRegistry.prototype.register = function() {};
-FinalizationRegistry.prototype.unregister = function() {};
-
-// --- Proxy polyfill (basic - wraps target, forwards gets/sets) ---
-var Proxy = function(target, handler) {
-    // Basic proxy: copy target properties, apply handler traps
-    var p = {};
-    for (var k in target) {
-        if (handler && handler.get) {
-            Object.defineProperty(p, k, {
-                get: (function(key) { return function() { return handler.get(target, key, p); }; })(k),
-                set: (function(key) { return function(v) { if (handler.set) handler.set(target, key, v, p); else target[key] = v; }; })(k),
-                enumerable: true, configurable: true
-            });
-        } else {
-            p[k] = target[k];
-        }
-    }
-    return p;
-};
-Proxy.revocable = function(target, handler) { var p = new Proxy(target, handler); return { proxy: p, revoke: function() {} }; };
-
-// --- Reflect polyfill ---
-var Reflect = {
-    apply: function(target, thisArg, args) { return target.apply(thisArg, args); },
-    construct: function(target, args) { return new (Function.prototype.bind.apply(target, [null].concat(args))); },
-    defineProperty: function(obj, prop, desc) { Object.defineProperty(obj, prop, desc); return true; },
-    deleteProperty: function(obj, prop) { delete obj[prop]; return true; },
-    get: function(obj, prop) { return obj[prop]; },
-    getOwnPropertyDescriptor: function(obj, prop) { return Object.getOwnPropertyDescriptor(obj, prop); },
-    getPrototypeOf: function(obj) { return Object.getPrototypeOf(obj); },
-    has: function(obj, prop) { return prop in obj; },
-    isExtensible: function(obj) { return true; },
-    ownKeys: function(obj) { return Object.keys(obj); },
-    preventExtensions: function(obj) { return true; },
-    set: function(obj, prop, value) { obj[prop] = value; return true; },
-    setPrototypeOf: function(obj, proto) { return true; }
-};
 
 // --- String.matchAll polyfill ---
 if (!String.prototype.matchAll) {
@@ -1335,7 +1274,7 @@ var window = {
     // that were due, and after other tasks.
     queueMicrotask:function(fn){
         if(typeof fn!=="function") throw new TypeError("Failed to execute 'queueMicrotask': parameter 1 is not of type 'Function'.");
-        Promise.resolve().then(function(){ try{ fn(); }catch(e){ console.error("Uncaught (in queueMicrotask) "+((e&&(e.stack||e.message))||e)); } });
+        __zippMicrotask(function(){ try{ fn(); }catch(e){ console.error("Uncaught (in queueMicrotask) "+((e&&(e.stack||e.message))||e)); } });
     },
     btoa:__btoa, atob:__atob,
     // Was `function(){return null;}` -- a page whose call to action is "opens
@@ -1438,6 +1377,27 @@ if (typeof URL === "undefined" || !URL.prototype) {
     URL.revokeObjectURL = function() {};
 }
 window.URL = URL;
+
+// `window` is the global object, as in a browser, so that `window.$ = jQuery`
+// -- or `globalThis.X`, `self.X`, how every UMD bundle registers itself --
+// defines a global the next script can name. It was a separate object, and a
+// library loaded by one `<script>` was "not defined" in the next. The shim's
+// window API moves onto the global object, and the names below that pointed
+// at the old object (`self`, `globalThis`) point at it too.
+(function () {
+    var g = (function () { return this; })();
+    if (!g || g === window) return;
+    var keys = Object.getOwnPropertyNames(window);
+    for (var i = 0; i < keys.length; i++) {
+        var d = Object.getOwnPropertyDescriptor(window, keys[i]);
+        try {
+            if (d.get || d.set) Object.defineProperty(g, keys[i], d);
+            else g[keys[i]] = d.value;
+        } catch (e) {}
+    }
+    window = g;
+})();
+window.window = window; window.self = window; window.top = window; window.parent = window; window.frames = window;
 doc.defaultView=window;
 
 var document = doc;
