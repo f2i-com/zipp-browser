@@ -1686,6 +1686,9 @@ if (!_rootDiv) {
     _rootDiv.id = "root";
     doc.body.appendChild(_rootDiv);
 }
+// The DOM as the page's HTML made it: what the page's script changes after
+// this is the script's (`__getRenderedHTML`).
+var __zippSeedMutations = __domMutations;
 
 // `performance`: a real clock, in milliseconds since the page started. It
 // was a counter creeping 0.01 ms a call, so that React's scheduler -- when the
@@ -2833,6 +2836,11 @@ function __serializeNode(node) {
 function __getRenderedHTML() {
     var root = doc.getElementById("root");
     if(root && root.childNodes.length > 0) return __serializeNode(doc.body);
+    // An app on this machine (a file: page) that changes the page its HTML
+    // made -- a status line's text, a list it fills -- is drawn from the
+    // script's tree from then on. A web page keeps the HTML it came with
+    // until its script fills #root or draws on a canvas.
+    if(__locUrl.protocol === "file:" && __domMutations !== __zippSeedMutations) return __serializeNode(doc.body);
     // A canvas drawing in the page -- not one kept off it to measure text or
     // test emoji, which many pages make and never show.
     if(typeof __zippCanvasContexts !== "undefined" && __zippCanvasContexts.some(function(c){return c.canvas && c.canvas.isConnected;})) return __serializeNode(doc.body);
