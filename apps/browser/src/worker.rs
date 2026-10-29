@@ -122,6 +122,9 @@ pub(crate) fn start(url: &str, module: bool) -> Result<u32, String> {
 
 /// `worker.postMessage(data)`, `data` already encoded.
 pub(crate) fn post(id: u32, data: String) {
+    if debug() {
+        eprintln!("[WORKER] {id} posted {}", data.chars().take(60).collect::<String>());
+    }
     WORKERS.with(|w| {
         if let Some(handle) = w.borrow().get(&id) {
             let _ = handle.to.send(ToWorker::Message(data));
@@ -196,8 +199,10 @@ fn run(url: &str, module: bool, inbox: Receiver<ToWorker>, outbox: Sender<FromWo
             Ok(JsValue::Number(ms)) if ms >= 0.0 => Duration::from_millis(ms as u64),
             _ => Duration::from_secs(3600),
         };
+        let mut received = None;
         match inbox.recv_timeout(wait) {
             Ok(ToWorker::Message(data)) => {
+                received = Some(std::time::Instant::now());
                 if debug() {
                     eprintln!("[WORKER] {url} <- {}", data.chars().take(200).collect::<String>());
                 }
@@ -209,6 +214,11 @@ fn run(url: &str, module: bool, inbox: Receiver<ToWorker>, outbox: Sender<FromWo
             Err(RecvTimeoutError::Timeout) => {}
         }
         settle(&mut state);
+        // How long the message kept the worker: its handler, and the promises
+        // and timers it set going.
+        if let Some(received) = received.filter(|_| debug()) {
+            eprintln!("[WORKER] {url}: busy {}ms", received.elapsed().as_millis());
+        }
     }
 }
 
