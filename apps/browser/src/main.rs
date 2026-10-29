@@ -237,7 +237,14 @@ fn main() {
         Box::new(doc)
     }));
     let renderer = TinySkiaWindowRenderer::new();
-    let window = WindowConfig::with_size(Box::new(doc) as _, renderer, INITIAL_WINDOW_SIZE);
+    let attributes = winit::window::WindowAttributes::default()
+        .with_surface_size(winit::dpi::LogicalSize::new(INITIAL_WINDOW_SIZE.0, INITIAL_WINDOW_SIZE.1))
+        .with_window_icon(app_icon(false));
+    #[cfg(windows)]
+    let attributes = attributes.with_platform_attributes(Box::new(
+        winit::platform::windows::WindowAttributesWindows::default().with_taskbar_icon(app_icon(true)),
+    ));
+    let window = WindowConfig::with_attributes(Box::new(doc) as _, renderer, attributes);
     app.add_window(window);
 
     eprintln!("[BROWSER] Window opened");
@@ -446,6 +453,30 @@ fn prerender_linked_pages(html: &str, base_url: &str) {
 // ---------------------------------------------------------------------------
 // Font loading
 // ---------------------------------------------------------------------------
+
+/// The paper airplane (`assets/zipp.ico`, drawn by `assets/make_icon.py`).
+///
+/// On Windows it comes from the .exe's own resources, where `build.rs` puts
+/// it, at the size Windows asks for: small for the title bar, big for the
+/// taskbar and Alt+Tab. Elsewhere, from the PNG.
+fn app_icon(big: bool) -> Option<winit::icon::Icon> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXICON, SM_CXSMICON};
+        // SAFETY: reads a system metric; no pointers involved.
+        let px = unsafe { GetSystemMetrics(if big { SM_CXICON } else { SM_CXSMICON }) }.max(16) as u32;
+        winit::platform::windows::WinIcon::from_resource(1, Some(winit::dpi::PhysicalSize::new(px, px)))
+            .ok()
+            .map(Into::into)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = big;
+        let rgba = image::load_from_memory(include_bytes!("../assets/zipp.png")).ok()?.into_rgba8();
+        let (width, height) = rgba.dimensions();
+        winit::icon::RgbaIcon::new(rgba.into_raw(), width, height).ok().map(Into::into)
+    }
+}
 
 fn load_fonts() -> FontContext {
     let mut font_ctx = FontContext::default();

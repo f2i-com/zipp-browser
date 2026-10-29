@@ -49,6 +49,8 @@ html5ever = { workspace = true }
 zipp-dom = { workspace = true, features = ["default", "woff-rust", "parallel-construct"] }
 zipp-renderer = { workspace = true, features = ["default"] }
 zipp-shell = { workspace = true, features = ["default", "http2"] }
+# The window's icon (`app_icon`). Already in the tree through zipp-shell.
+winit = { workspace = true }
 
 # Zipp JS engine — ZIPP's register VM + x86-64/ARM64 JIT, consumed through
 # its `embed` module (persistent VM: compile once, keep alive, eval + dispatch
@@ -77,6 +79,10 @@ urlencoding = "2"
 
 # Tracing (optional)
 tracing-subscriber = { workspace = true, optional = true }
+
+# The icon (`assets/zipp.ico`) compiled into the Windows .exe (`build.rs`).
+[build-dependencies]
+embed-resource = "3.0.12"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread"], optional = true }
