@@ -1007,9 +1007,16 @@ URLSearchParams.prototype.entries = function() { return this._params; };
 URLSearchParams.prototype.keys = function() { return this._params.map(function(p) { return p[0]; }); };
 URLSearchParams.prototype.values = function() { return this._params.map(function(p) { return p[1]; }); };
 
-// --- TextEncoder/TextDecoder polyfill ---
-var TextEncoder = function() {};
-TextEncoder.prototype.encode = function(str) {
+// --- TextEncoder/TextDecoder ---
+// The engine's own where it has them, as a worker does: native, and the whole
+// API -- a `Uint8Array` from `encode`, `encodeInto`, characters past the BMP.
+// This stand-in returned a plain array and dropped those characters, and as a
+// loop in script it was slow for wasm-bindgen glue, which decodes every string
+// coming out of WebAssembly.
+var __zippNativeText = typeof globalThis.TextEncoder === "function" && typeof globalThis.TextDecoder === "function"
+    ? { encoder: globalThis.TextEncoder, decoder: globalThis.TextDecoder } : null;
+var TextEncoder = __zippNativeText ? __zippNativeText.encoder : function() {};
+if (!__zippNativeText) TextEncoder.prototype.encode = function(str) {
     var arr = [];
     for (var i = 0; i < str.length; i++) {
         var c = str.charCodeAt(i);
@@ -1019,8 +1026,8 @@ TextEncoder.prototype.encode = function(str) {
     }
     return arr;
 };
-var TextDecoder = function() {};
-TextDecoder.prototype.decode = function(arr) {
+var TextDecoder = __zippNativeText ? __zippNativeText.decoder : function() {};
+if (!__zippNativeText) TextDecoder.prototype.decode = function(arr) {
     var str = '', i = 0;
     while (i < arr.length) {
         var c = arr[i];
