@@ -67,6 +67,12 @@ pub(crate) fn set_waker(wake: Box<dyn Fn() + Send + Sync>) {
     let _ = WAKER.set(wake);
 }
 
+thread_local! {
+    /// With `ZIPP_DEBUG_WORKERS`: the host calls this worker made since it
+    /// last reported, by kind -- how many, and how long they took.
+    static HOST_TIME: RefCell<Vec<(String, u32, Duration)>> = const { RefCell::new(Vec::new()) };
+}
+
 /// `ZIPP_DEBUG_WORKERS=1` logs the messages that cross.
 fn debug() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -217,7 +223,10 @@ fn run(url: &str, module: bool, inbox: Receiver<ToWorker>, outbox: Sender<FromWo
         // How long the message kept the worker: its handler, and the promises
         // and timers it set going.
         if let Some(received) = received.filter(|_| debug()) {
-            eprintln!("[WORKER] {url}: busy {}ms", received.elapsed().as_millis());
+            let host: Vec<String> = HOST_TIME.with(|h| {
+                h.borrow_mut().drain(..).map(|(k, n, t)| format!("{k} x{n} {}ms", t.as_millis())).collect()
+            });
+            eprintln!("[WORKER] {url}: busy {}ms (host: {})", received.elapsed().as_millis(), host.join(", "));
         }
     }
 }
@@ -295,6 +304,22 @@ fn host_call(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> Result<Strin
         "worker_error" => send(FromWorker::Error(args.first().cloned().unwrap_or_default())),
         "worker_close" => CLOSED.set(true),
         "worker_start" => return Err("Error: a worker cannot start workers yet".into()),
+        _ if debug() => {
+            let t = std::time::Instant::now();
+            let r = crate::browser_host_call_ctx(ctx, kind, args);
+            HOST_TIME.with(|h| {
+                let mut h = h.borrow_mut();
+                let e = t.elapsed();
+                match h.iter_mut().find(|(k, _, _)| k == kind) {
+                    Some(entry) => {
+                        entry.1 += 1;
+                        entry.2 += e;
+                    }
+                    None => h.push((kind.to_string(), 1, e)),
+                }
+            });
+            return r;
+        }
         _ => return crate::browser_host_call_ctx(ctx, kind, args),
     }
     Ok(String::new())
