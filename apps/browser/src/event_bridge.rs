@@ -95,6 +95,11 @@ pub struct JsEventBridge {
     /// The page's DOM mutation count when its tree was last rendered, so
     /// background work re-renders only what changed it.
     rendered_mutations: f64,
+    /// The scroll containers among the script's nodes; `None` until found
+    /// for the tree as it is now.
+    scrollers: Option<Vec<usize>>,
+    /// What the script was last told of each one (`Node::scroll_metrics`).
+    scroll_metrics: HashMap<u32, [f64; 6]>,
     /// A hash of the tree as last rendered: background work (timers, worker
     /// messages) compares against it, which sees every kind of change.
     rendered_hash: Option<u64>,
@@ -138,6 +143,8 @@ impl JsEventBridge {
             live_dom: !event_map_json.is_empty(),
             next_timer: None,
             rendered_mutations: 0.0,
+            scrollers: None,
+            scroll_metrics: HashMap::new(),
             rendered_hash: None,
             console_shown: 0,
             console_refreshed: Instant::now(),
@@ -251,6 +258,81 @@ impl JsEventBridge {
         state.run_microtasks();
         // The page reads the files and shows them: settle as after a click.
         self.settle_after_click();
+    }
+
+    /// Bring scrolling into line both ways. Where the script scrolled an
+    /// element (`scrollTop = ...`), scroll it -- to where it asked: the layout
+    /// clamps it to the element's range. And tell the script where its scroll
+    /// containers are and how big, so that `scrollHeight` and `clientHeight`
+    /// mean something and a console can keep its newest line in view.
+    fn sync_scrolls(&mut self, doc: &mut BaseDocument) {
+        let Some(state) = self.js_state.as_mut() else {
+            return;
+        };
+        if let Ok(JsValue::String(json)) = state.call_global("__zippTakeScrolls", &[])
+            && let Ok(serde_json::Value::Object(asked)) = serde_json::from_str(&json)
+        {
+            for (nid, to) in asked {
+                let Ok(flid) = nid.parse::<u32>() else { continue };
+                let Some((&node, _)) = self.reverse_flid.iter().find(|&(_, &f)| f == flid) else {
+                    continue;
+                };
+                let Some(node) = doc.get_node_mut(node) else { continue };
+                if let Some(top) = to.get(0).and_then(serde_json::Value::as_f64) {
+                    node.scroll_offset.y = top;
+                }
+                if let Some(left) = to.get(1).and_then(serde_json::Value::as_f64) {
+                    node.scroll_offset.x = left;
+                }
+            }
+            doc.shell_provider.request_redraw();
+        }
+        // Nothing more until the tree has been styled and laid out: just after
+        // a re-render its nodes are new, and every overflow would read as the
+        // default and every size as zero -- a console told its height is 0
+        // would scroll back to its top.
+        let laid_out = self
+            .reverse_flid
+            .keys()
+            .any(|&id| doc.get_node(id).is_some_and(|n| n.primary_styles().is_some()));
+        if !laid_out {
+            return;
+        }
+        if self.scrollers.is_none() {
+            let found = self
+                .reverse_flid
+                .keys()
+                .copied()
+                .filter(|&id| doc.get_node(id).is_some_and(|n| n.is_scroll_container()))
+                .collect();
+            self.scrollers = Some(found);
+        }
+        let scrollers = self.scrollers.clone().unwrap_or_default();
+        self.tell_scroll_metrics(doc, &scrollers);
+    }
+
+    /// Tell the script how these nodes are scrolled, where that has changed.
+    fn tell_scroll_metrics(&mut self, doc: &BaseDocument, nodes: &[usize]) {
+        let mut changed = serde_json::Map::new();
+        for &id in nodes {
+            let (Some(node), Some(&flid)) = (doc.get_node(id), self.reverse_flid.get(&id)) else {
+                continue;
+            };
+            let metrics = node.scroll_metrics();
+            if self.scroll_metrics.get(&flid) != Some(&metrics) {
+                self.scroll_metrics.insert(flid, metrics);
+                changed.insert(flid.to_string(), serde_json::json!(metrics));
+            }
+        }
+        if changed.is_empty() {
+            return;
+        }
+        if let Some(state) = self.js_state.as_mut() {
+            let json = serde_json::Value::Object(changed).to_string();
+            if let Err(e) = state.call_global("__zippScrollMetrics", &[JsValue::String(json)]) {
+                eprintln!("[EVENT] telling the page its scroll positions failed: {e}");
+            }
+        }
     }
 
     /// Give focus where the page's `focus()` last asked for it, if it did.
@@ -482,6 +564,24 @@ impl EventHandler for JsEventBridge {
             }
             return;
         }
+        // An element scrolled: its script reads where to before its `scroll`
+        // listeners run -- a code editor moving its highlighting with it.
+        let scrolled = matches!(event.data, DomEventData::Scroll(_));
+        if scrolled {
+            self.tell_scroll_metrics(&_doc.inner(), &[event.target]);
+        }
+        // Typing in a text field: the script's node has the text before its
+        // listeners run, as a browser's `input` event finds it. Before, a code
+        // editor reading `value` back saw nothing typed at all.
+        if let DomEventData::Input(input) = &event.data
+            && is_text_field(_doc, event.target)
+            && let (Some(&flid), Some(state)) = (self.reverse_flid.get(&event.target), self.js_state.as_mut())
+        {
+            let args = [JsValue::Number(f64::from(flid)), JsValue::String(input.value.clone())];
+            if let Err(e) = state.call_global("__zippSetValue", &args) {
+                eprintln!("[EVENT] passing on what was typed failed: {e}");
+            }
+        }
         let details = event_details(&event.data);
         let mut ran_listener = false;
 
@@ -508,7 +608,9 @@ impl EventHandler for JsEventBridge {
             .copied()
             .unwrap_or(0);
 
-        // Walk the bubble chain (target first, then ancestors).
+        // Walk the bubble chain (target first, then ancestors). A scroll is
+        // the scrolled element's own: it does not bubble.
+        let chain = if scrolled { &chain[..chain.len().min(1)] } else { chain };
         for &node_id in chain {
             if let Some(types) = self.handler_map.get(&node_id) {
                 if types.iter().any(|t| t == event_name) {
@@ -586,7 +688,7 @@ impl EventHandler for JsEventBridge {
         // keeps on the document): drag handlers that follow the pointer off
         // their element listen there, as do a game's keys. Not for the toolbar,
         // which is the browser's, not the page's.
-        if self.live_dom && !event_state.propagation_is_stopped() && !in_chrome(_doc, chain) {
+        if self.live_dom && !scrolled && !event_state.propagation_is_stopped() && !in_chrome(_doc, chain) {
             if let Some(state) = self.js_state.as_mut() {
                 let result = state.call_global(
                     "__zippDispatchToDocument",
@@ -620,7 +722,9 @@ impl EventHandler for JsEventBridge {
             self.refresh_next_timer();
         }
         if ran_listener {
-            self.apply_focus_request(&mut _doc.inner_mut());
+            let mut doc = _doc.inner_mut();
+            self.apply_focus_request(&mut doc);
+            self.sync_scrolls(&mut doc);
         }
     }
 
@@ -667,6 +771,7 @@ impl EventHandler for JsEventBridge {
             }
         }
         self.apply_focus_request(doc);
+        self.sync_scrolls(doc);
         let console_due = self.refresh_console(doc, now, false);
         [self.next_timer, console_due].into_iter().flatten().min()
     }
@@ -710,6 +815,8 @@ impl EventHandler for JsEventBridge {
     fn document_rerendered(&mut self, doc: &mut BaseDocument) {
         // The script's tree is showing now, whatever it was before.
         self.live_dom = true;
+        // Its scroll containers are new nodes: find them again.
+        self.scrollers = None;
         // The canvases are new nodes now: give them back the frames they showed.
         crate::reapply_canvas_frames(doc);
         let flid_map = build_flid_map(doc);
@@ -728,6 +835,14 @@ impl EventHandler for JsEventBridge {
             .map(|(&flid, &blitz_id)| (blitz_id, flid))
             .collect();
     }
+}
+
+/// Whether `node` is a field text is typed into: an `<input>` or `<textarea>`.
+fn is_text_field(doc: &dyn Document, node: usize) -> bool {
+    doc.inner()
+        .get_node(node)
+        .and_then(|n| n.element_data())
+        .is_some_and(|el| el.text_input_data().is_some())
 }
 
 /// Whether `node` is an `<input type=file>`.

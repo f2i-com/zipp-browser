@@ -125,8 +125,10 @@ pub(crate) fn handle_keypress<F: FnMut(DomEvent)>(
                     GeneratedEvent::Submit => {
                         // TODO: Generate submit event that can be handled by script
                         implicit_form_submission(doc, target);
+                        return;
                     }
                 }
+                doc.scroll_caret_into_view(node_id, &mut dispatch_event);
             }
         }
     }

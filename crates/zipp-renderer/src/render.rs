@@ -431,10 +431,10 @@ impl<'dom> DocumentPainter<'dom> {
                             x: cx.pos.x - node.scroll_offset.x,
                             y: cx.pos.y - node.scroll_offset.y,
                         };
-                        cx.transform = cx.transform.then_translate(Vec2 {
-                            x: -node.scroll_offset.x,
-                            y: -node.scroll_offset.y,
-                        });
+                        // Not the transform as well: the element's own content
+                        // (its text, a text field's) is drawn at a position
+                        // already scrolled, and scrolled twice, a <pre>'s lines
+                        // moved at double the speed of the text area under it.
                         cx.draw_image(scene);
                         cx.draw_media_controls(scene);
                         #[cfg(feature = "svg")]

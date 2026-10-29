@@ -645,7 +645,31 @@ fn collect_complex_layout_children(
     }
 }
 
+impl BaseDocument {
+    /// The text a text field starts with: a `<textarea>`'s content, an
+    /// `<input>`'s value attribute.
+    pub(crate) fn text_field_initial_text(&self, id: usize) -> String {
+        let node = &self.nodes[id];
+        let Some(el) = node.element_data() else {
+            return String::new();
+        };
+        if el.name.local == local_name!("textarea") {
+            node.children
+                .iter()
+                .filter_map(|&child| self.nodes[child].text_data())
+                .map(|text| text.content.as_str())
+                .collect()
+        } else {
+            el.attr(local_name!("value")).unwrap_or(" ").to_string()
+        }
+    }
+}
+
 fn create_text_editor(doc: &mut BaseDocument, input_element_id: usize, is_multiline: bool) {
+    // A <textarea> starts with its content, as in any browser. Only a value
+    // attribute was read, which a textarea never has: every one started empty,
+    // a code editor's included.
+    let initial_text = doc.text_field_initial_text(input_element_id);
     let node = &mut doc.nodes[input_element_id];
     let parley_style = node
         .primary_styles()
@@ -657,7 +681,7 @@ fn create_text_editor(doc: &mut BaseDocument, input_element_id: usize, is_multil
     if !matches!(element.special_data, SpecialElementData::TextInput(_)) {
         let mut text_input_data = TextInputData::new(is_multiline);
         let editor = &mut text_input_data.editor;
-        editor.set_text(element.attr(local_name!("value")).unwrap_or(" "));
+        editor.set_text(&initial_text);
         element.special_data = SpecialElementData::TextInput(text_input_data);
     }
 
@@ -674,6 +698,14 @@ fn create_text_editor(doc: &mut BaseDocument, input_element_id: usize, is_multil
     styles.insert(StyleProperty::FontSize(parley_style.font_size));
     styles.insert(StyleProperty::LineHeight(parley_style.line_height));
     styles.insert(StyleProperty::Brush(parley_style.brush));
+    // The field's own font, not the default face: a monospace code editor
+    // typed in a proportional one, its caret drifting off the text a page
+    // draws over it, and clicks landing on the wrong letters.
+    styles.insert(StyleProperty::FontFamily(parley_style.font_family.clone()));
+    styles.insert(StyleProperty::FontWidth(parley_style.font_width));
+    styles.insert(StyleProperty::FontStyle(parley_style.font_style));
+    styles.insert(StyleProperty::FontWeight(parley_style.font_weight));
+    styles.insert(StyleProperty::LetterSpacing(parley_style.letter_spacing));
 
     editor.refresh_layout(&mut doc.font_ctx.lock().unwrap(), &mut doc.layout_ctx);
 }

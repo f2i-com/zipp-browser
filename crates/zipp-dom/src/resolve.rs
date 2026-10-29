@@ -55,6 +55,7 @@ impl BaseDocument {
     /// 8. Runs taffy layout.
     /// 9. Recursively resolves sub-documents (iframes).
     pub fn resolve(&mut self, current_time_for_animations: f64) {
+        self.animation_time = current_time_for_animations;
         if TDocument::as_node(&&self.nodes[0])
             .first_element_child()
             .is_none()
@@ -386,8 +387,10 @@ impl BaseDocument {
             if node.scroll_offset.x == 0.0 && node.scroll_offset.y == 0.0 {
                 continue;
             }
-            let max_x = node.final_layout.scroll_width() as f64;
-            let max_y = node.final_layout.scroll_height() as f64;
+            let (max_x, max_y) = node.text_input_scroll_range().unwrap_or((
+                node.final_layout.scroll_width() as f64,
+                node.final_layout.scroll_height() as f64,
+            ));
             node.scroll_offset.x = node.scroll_offset.x.clamp(0.0, max_x.max(0.0));
             node.scroll_offset.y = node.scroll_offset.y.clamp(0.0, max_y.max(0.0));
         }

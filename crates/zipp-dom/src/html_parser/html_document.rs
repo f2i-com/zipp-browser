@@ -17,6 +17,9 @@ pub struct HtmlDocument {
     /// document element, so one the page later drops can be removed without
     /// touching attributes that came from the original markup (`lang`).
     js_root_attrs: Vec<String>,
+    /// The body was replaced since the last layout. Until the next frame lays
+    /// it out, its new nodes have no boxes, and a click there hit nothing.
+    layout_stale: bool,
 }
 
 impl Deref for HtmlDocument {
@@ -45,6 +48,20 @@ impl Document for HtmlDocument {
     }
 
     fn handle_ui_event(&mut self, event: UiEvent) {
+        // Lay out a body the page just replaced before finding what the
+        // pointer is over. A page that redraws every frame (a game) replaces
+        // it between frames, and a button released in that gap was missed:
+        // the click went to the page itself, which closed the menu it opened.
+        // And find again what the pointer is over: the re-render forgot it,
+        // and the next notches of a wheel turned over a scrolling box went to
+        // the page instead.
+        if std::mem::take(&mut self.layout_stale) {
+            let now = self.inner.animation_time;
+            self.inner.resolve(now);
+            if let Some((x, y)) = self.inner.last_pointer {
+                self.inner.set_hover_to(x, y);
+            }
+        }
         if let Some(ref mut handler) = self.event_handler {
             let handler_ref: &mut dyn EventHandler = &mut **handler;
             let mut driver = EventDriver::new(&mut self.inner, handler_ref);
@@ -151,9 +168,40 @@ impl HtmlDocument {
                                 .map(|flid| format!("[data-flid=\"{flid}\"]"))
                                 .or_else(|| attr("id").map(|id| format!("#{id}")))
                         });
+                    // And how far each scrolled element was scrolled -- a
+                    // console following its output, an editor -- or every
+                    // re-render sent them all back to the top.
+                    // A focused text field keeps its editor -- the caret, the
+                    // selection -- when the re-render gives it the same text:
+                    // typing re-renders the page, and the caret went back to
+                    // the start with every key.
+                    let focused_editor = self.inner.focus_node_id.and_then(|id| {
+                        let el = self.inner.nodes.get_mut(id)?.element_data_mut()?;
+                        el.text_input_data()?;
+                        match std::mem::take(&mut el.special_data) {
+                            crate::node::SpecialElementData::TextInput(editor) => Some(editor),
+                            other => {
+                                el.special_data = other;
+                                None
+                            }
+                        }
+                    });
+                    let flid_attr = markup5ever::LocalName::from("data-flid");
+                    let scrolled: Vec<(String, crate::Point<f64>)> = self
+                        .inner
+                        .nodes
+                        .iter()
+                        .filter(|(_, n)| n.scroll_offset.x != 0.0 || n.scroll_offset.y != 0.0)
+                        .filter_map(|(_, n)| Some((n.attr(flid_attr.clone())?.to_string(), n.scroll_offset)))
+                        .collect();
                     let mut mutator = crate::DocumentMutator::new(&mut self.inner);
                     mutator.set_inner_html(body_id, &html);
                     drop(mutator);
+                    for (flid, offset) in scrolled {
+                        if let Ok(Some(node)) = self.inner.query_selector(&format!("[data-flid=\"{flid}\"]")) {
+                            self.inner.nodes[node].scroll_offset = offset;
+                        }
+                    }
                     // Animation state is keyed by node id and those ids are
                     // recycled by the re-parse, so stale entries would attach
                     // to whichever new element inherits the id.
@@ -165,6 +213,13 @@ impl HtmlDocument {
                         && let Ok(Some(node)) = self.inner.query_selector(&selector)
                     {
                         self.inner.set_focus_to(node);
+                        // (Its own editor is made at layout, from its text.)
+                        if let Some(editor) = focused_editor
+                            && self.inner.text_field_initial_text(node) == editor.editor.raw_text()
+                            && let Some(el) = self.inner.nodes[node].element_data_mut()
+                        {
+                            el.special_data = crate::node::SpecialElementData::TextInput(editor);
+                        }
                     }
                     // Every node id the handler cached is stale now — the body's
                     // whole subtree was dropped and re-parsed. Let it rebuild
@@ -172,6 +227,7 @@ impl HtmlDocument {
                     // interaction on a page ever works.
                     handler.document_rerendered(&mut self.inner);
                     self.inner.shell_provider.request_redraw();
+                    self.layout_stale = true;
                 }
             }
         }
@@ -195,6 +251,7 @@ impl HtmlDocument {
             inner: doc,
             event_handler: None,
             js_root_attrs: Vec::new(),
+            layout_stale: false,
         }
     }
 

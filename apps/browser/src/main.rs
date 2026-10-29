@@ -813,6 +813,38 @@ function __zippRunListeners(handlers, type, target, currentTarget, phase, detail
     return (defaultPrevented ? 1 : 0) | (propagationStopped ? 2 : 0);
 }
 
+// What the user typed into a text field, its node's value before its `input`
+// listeners run.
+function __zippSetValue(nid, value) {
+    var el = __nodesById[nid];
+    if (el) el.value = value;
+}
+
+// Where script scrolled elements since the host last asked: JSON
+// `{"nid": [top or null, left or null]}`, or "" for nowhere.
+function __zippTakeScrolls() {
+    var asked = __zippScrollRequests;
+    for (var nid in asked) {
+        __zippScrollRequests = {};
+        return JSON.stringify(asked);
+    }
+    return "";
+}
+
+// Where scroll containers are scrolled to and how big, from the layout: JSON
+// `{"nid": [scrollTop, scrollLeft, scrollWidth, scrollHeight, clientWidth,
+// clientHeight]}`.
+function __zippScrollMetrics(json) {
+    var metrics = JSON.parse(json);
+    for (var nid in metrics) {
+        var el = __nodesById[nid], m = metrics[nid];
+        if (!el) continue;
+        el._scrollTop = m[0]; el._scrollLeft = m[1];
+        el._scrollWidth = m[2]; el._scrollHeight = m[3];
+        el._clientWidth = m[4]; el._clientHeight = m[5];
+    }
+}
+
 // The element `focus()` was last called on, since the host last asked, by its
 // number; -1 when nothing asked for focus.
 function __zippTakeFocus() {
@@ -2401,7 +2433,7 @@ fn toolbar_markup(current_url: &str) -> String {
     <a href="zipp-nav:back" title="Back (Alt+Left)" style="display:flex;align-items:center;padding:3px;border-radius:4px;text-decoration:none;color:#495057"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg></a>
     <a href="zipp-nav:forward" title="Forward (Alt+Right)" style="display:flex;align-items:center;padding:3px;border-radius:4px;text-decoration:none;color:#495057"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg></a>
     <a href="zipp-nav:reload" title="Reload (F5)" style="display:flex;align-items:center;padding:3px;border-radius:4px;text-decoration:none;color:#495057"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg></a>
-    <input type="text" name="__nav_url" value="{current_url}" style="flex:1;min-width:0;height:32px;padding:0 12px;border:1px solid #ced4da;border-radius:8px;font-size:14px;background:white;color:#212529;outline:none;box-sizing:border-box" />
+    <input type="text" name="__nav_url" value="{current_url}" style="flex:1;min-width:0;height:32px;padding:0 12px;border:1px solid #ced4da;border-radius:8px;font-family:Arial,sans-serif;font-size:14px;font-weight:normal;font-style:normal;letter-spacing:normal;background:white;color:#212529;outline:none;box-sizing:border-box" />
     <a id="__zipp_console_button" href="zipp-console:toggle" title="Console (F12)" style="display:flex;align-items:center;gap:4px;padding:4px 6px;border-radius:4px;text-decoration:none;color:#495057">{button}</a>
   </form>
   <div id="__zipp_console" style="position:absolute;left:0;right:0;z-index:2147483646;flex-direction:column;background:white;border-bottom:2px solid #ced4da;font-family:Consolas,'Liberation Mono',monospace;font-size:12px;line-height:16px;color:#212529;text-align:left;box-sizing:border-box;margin:0">

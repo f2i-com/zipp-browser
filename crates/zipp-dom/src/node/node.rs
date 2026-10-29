@@ -455,6 +455,54 @@ impl Node {
         self.element_data_mut().and_then(|el| el.sub_doc_data_mut())
     }
 
+    /// Whether this element scrolls its content -- its overflow is anything
+    /// but visible, or it is a `<textarea>` -- and so may be scrolled by script.
+    pub fn is_scroll_container(&self) -> bool {
+        self.style.overflow.x != taffy::Overflow::Visible
+            || self.style.overflow.y != taffy::Overflow::Visible
+            || self.text_input_scroll_range().is_some()
+    }
+
+    /// Where this element is scrolled to and how big it is, as script reads
+    /// them: `[scrollTop, scrollLeft, scrollWidth, scrollHeight, clientWidth,
+    /// clientHeight]`.
+    pub fn scroll_metrics(&self) -> [f64; 6] {
+        let layout = &self.final_layout;
+        let client_width = f64::from(
+            (layout.size.width - layout.border.left - layout.border.right - layout.scrollbar_size.width).max(0.0),
+        );
+        let client_height = f64::from(
+            (layout.size.height - layout.border.top - layout.border.bottom - layout.scrollbar_size.height).max(0.0),
+        );
+        let (range_x, range_y) = self
+            .text_input_scroll_range()
+            .unwrap_or((f64::from(layout.scroll_width()), f64::from(layout.scroll_height())));
+        [
+            self.scroll_offset.y,
+            self.scroll_offset.x,
+            range_x + client_width,
+            range_y + client_height,
+            client_width,
+            client_height,
+        ]
+    }
+
+    /// How far a `<textarea>`'s text reaches past its content box, (x, y) in
+    /// CSS px: the range it scrolls through. Its layout box knows nothing of
+    /// its text, so without this one holding more lines than it shows could
+    /// not be scrolled at all. None for anything but a textarea.
+    pub fn text_input_scroll_range(&self) -> Option<(f64, f64)> {
+        let input = self.data.downcast_element()?.text_input_data()?;
+        if !input.is_multiline {
+            return None;
+        }
+        let layout = input.editor.try_layout()?;
+        let scale = layout.scale();
+        let x = layout.full_width() / scale - self.final_layout.content_box_width();
+        let y = layout.height() / scale - self.final_layout.content_box_height();
+        Some((f64::from(x.max(0.0)), f64::from(y.max(0.0))))
+    }
+
     pub fn text_input_v_centering_offset(&self, scale: f64) -> f64 {
         // For single-line inputs, add an offset to vertically center the text input layout
         // within the content box of it's node.

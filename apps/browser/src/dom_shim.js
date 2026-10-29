@@ -293,7 +293,6 @@ class Element extends DOMNode {
         this.dataset = _makeDataset(this);
         this.classList = new ClassList(this);
         this.offsetTop = 0; this.offsetLeft = 0;
-        this.scrollWidth = 0; this.scrollHeight = 0; this.scrollTop = 0; this.scrollLeft = 0;
         this.clientTop = 0; this.clientLeft = 0;
         // Form-control state. React reads `value`/`checked` back off the node
         // when it commits a controlled input, and reconciles `<select>` through
@@ -423,7 +422,13 @@ class SVGElement extends Element {}
 // reading `value` back -- a highlighter over a textarea -- doubled every line.
 Object.defineProperty(Element.prototype, "value", {
     configurable: true,
-    get: function () { return this._value === undefined ? "" : this._value; },
+    get: function () {
+        if (this._value !== undefined) return this._value;
+        // Until script or the user sets one, the markup's.
+        if (this.tagName === "TEXTAREA") return (this.textContent || "").replace(/\r\n?/g, "\n");
+        if (this.tagName === "INPUT" || this.tagName === "OPTION") return this.getAttribute("value") || "";
+        return "";
+    },
     set: function (v) {
         v = v === null || v === undefined ? "" : String(v);
         if (this.tagName === "TEXTAREA") v = v.replace(/\r\n?/g, "\n");
@@ -600,6 +605,46 @@ doc.title = '__PAGE_TITLE__';
         set: function (v) { this[store] = v; },
     });
 });
+
+// Scrolling. Where a scroll container is scrolled to and how big it is come
+// from the layout (`__zippScrollMetrics`, and again as it scrolls); setting
+// `scrollTop` or `scrollLeft` scrolls it there (`__zippTakeScrolls`).
+var __zippScrollRequests = {};
+["scrollTop", "scrollLeft"].forEach(function (p) {
+    var store = "_" + p, index = p === "scrollTop" ? 0 : 1;
+    Object.defineProperty(Element.prototype, p, {
+        configurable: true,
+        get: function () { return this[store] || 0; },
+        set: function (v) {
+            v = Math.max(0, Number(v) || 0);
+            this[store] = v;
+            var asked = __zippScrollRequests[this._id] || (__zippScrollRequests[this._id] = [null, null]);
+            asked[index] = v;
+        },
+    });
+});
+["scrollWidth", "scrollHeight"].forEach(function (p) {
+    var store = "_" + p, client = p === "scrollWidth" ? "clientWidth" : "clientHeight";
+    Object.defineProperty(Element.prototype, p, {
+        configurable: true,
+        get: function () { return this[store] !== undefined ? this[store] : this[client]; },
+        set: function (v) { this[store] = v; },
+    });
+});
+Element.prototype.scrollTo = function (x, y) {
+    if (x && typeof x === "object") {
+        if (x.top !== undefined) this.scrollTop = x.top;
+        if (x.left !== undefined) this.scrollLeft = x.left;
+    } else {
+        this.scrollLeft = x;
+        this.scrollTop = y;
+    }
+};
+Element.prototype.scroll = Element.prototype.scrollTo;
+Element.prototype.scrollBy = function (x, y) {
+    if (x && typeof x === "object") { this.scrollTop += x.top || 0; this.scrollLeft += x.left || 0; }
+    else { this.scrollLeft += x || 0; this.scrollTop += y || 0; }
+};
 
 // The page's own body (seed.rs): `[attributes, children]`, an element being
 // `[tag, [name, value, ...], [children], ns?]` and text a string. Its scripts
@@ -1578,7 +1623,12 @@ function __serializeNode(node) {
     var r="<"+tag;
     if(node.id) r+=" id=\""+__ea(node.id)+"\"";
     if(node.className) r+=" class=\""+__ea(node.className)+"\"";
-    for(var k in node.attributes){if(k==="id"||k==="class"||k==="style") continue; r+=" "+k+"=\""+__ea(node.attributes[k])+"\"";}
+    // A field's value as script or the user left it, not the markup's: it is
+    // what the rendered field shows. Before, a textarea filled by script (a
+    // code editor's) rendered empty, and lost what was typed into it.
+    var fieldValue=(tag==="input"||tag==="textarea")&&node._value!==undefined&&!/^file$/i.test(node.attributes.type||"");
+    for(var k in node.attributes){if(k==="id"||k==="class"||k==="style") continue; if(k==="value"&&fieldValue&&tag==="input") continue; r+=" "+k+"=\""+__ea(node.attributes[k])+"\"";}
+    if(fieldValue&&tag==="input") r+=" value=\""+__ea(node._value)+"\"";
     // One style attribute: the author's text, then the object's declarations,
     // which come later so a value JS changed wins.
     var st=(node.attributes&&node.attributes.style?String(node.attributes.style).replace(/;?\s*$/,";"):"")+(node.style?__styleText(node.style):"");
@@ -1612,6 +1662,8 @@ function __serializeNode(node) {
     if(svg_skip.indexOf(tag)>=0) return "";
     var v=["area","base","br","col","embed","hr","img","input","link","meta","param","source","track","wbr"];
     if(v.indexOf(tag)>=0) return r;
+    // The parser drops one newline straight after <textarea>: keep a leading one.
+    if(fieldValue&&tag==="textarea") return r+(node._value.charAt(0)==="\n"?"\n":"")+__eh(node._value)+"</textarea>";
     for(var i=0;i<node.childNodes.length;i++) r+=__serializeNode(node.childNodes[i]);
     r+="</"+tag+">";
     return r;

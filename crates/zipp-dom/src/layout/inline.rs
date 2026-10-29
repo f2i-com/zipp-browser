@@ -784,6 +784,15 @@ impl BaseDocument {
             width: width / scale,
             height: height / scale,
         });
+        // What the text takes, which can be more than a box sized for it:
+        // what an overflow:hidden or scrolling box scrolls through. Reported
+        // as the box's own size, a <pre> showing ten of sixty lines could be
+        // scrolled no further than its padding -- a code editor's highlighting
+        // stayed put while its text area scrolled.
+        let text_size = taffy::Size {
+            width: final_size.width.max(inline_layout.layout.full_width() / scale),
+            height: final_size.height.max(height / scale),
+        };
 
         // Store sizes and positions of inline boxes (a real layout only, for the
         // same reason the lines are kept: a measurement must not move them).
@@ -908,7 +917,7 @@ impl BaseDocument {
 
         LayoutOutput {
             size,
-            content_size: measured_size + padding.sum_axes(),
+            content_size: text_size + padding.sum_axes(),
             first_baselines: Point::NONE,
             top_margin: CollapsibleMarginSet::ZERO,
             bottom_margin: CollapsibleMarginSet::ZERO,

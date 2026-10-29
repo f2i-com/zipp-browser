@@ -297,6 +297,12 @@ pub struct BaseDocument {
     pub(crate) focus_node_id: Option<usize>,
     /// The node which is currently active (mousedown, if any).
     pub(crate) active_node_id: Option<usize>,
+    /// The animation time of the last style and layout pass (`resolve`), for
+    /// a pass that has to run between frames.
+    pub(crate) animation_time: f64,
+    /// Where the pointer last was, in page coordinates: what it is over is
+    /// found again there when the page's body is replaced under it.
+    pub(crate) last_pointer: Option<(f32, f32)>,
     /// The node which received a mousedown event (if any).
     pub(crate) mousedown_node_id: Option<usize>,
     /// The last time a mousedown was made (for double-click detection).
@@ -507,6 +513,8 @@ impl BaseDocument {
             hover_node_is_text: false,
             focus_node_id: None,
             active_node_id: None,
+            animation_time: 0.0,
+            last_pointer: None,
             mousedown_node_id: None,
             has_active_animations: false,
             subdoc_is_animating: false,
@@ -1460,6 +1468,7 @@ impl BaseDocument {
 
     /// Update the hover state to the node at (x, y). Returns `true` if the hovered node changed.
     pub fn set_hover_to(&mut self, x: f32, y: f32) -> bool {
+        self.last_pointer = Some((x, y));
         let hit = self.hit(x, y);
         let hover_node_id = hit.map(|hit| hit.node_id);
         let new_is_text = hit.map(|hit| hit.is_text).unwrap_or(false);
@@ -1682,6 +1691,58 @@ impl BaseDocument {
     /// Scroll a node by the given (x, y) delta, bubbling overflow to ancestors.
     ///
     /// Returns `true` if the scroll offset of any node actually changed.
+    /// Scroll a `<textarea>` so that its caret shows -- typing or moving the
+    /// caret past the last line in view brings the next one into it -- and
+    /// say so with a `scroll` event, as a page that draws its own text over
+    /// the field (a code editor's highlighting) follows it by that.
+    pub fn scroll_caret_into_view<F: FnMut(DomEvent)>(&mut self, node_id: usize, mut dispatch_event: F) {
+        let Some(node) = self.nodes.get_mut(node_id) else {
+            return;
+        };
+        let Some(input) = node.data.downcast_element().and_then(|el| el.text_input_data()) else {
+            return;
+        };
+        if !input.is_multiline {
+            return;
+        }
+        let (Some(layout), Some(caret)) = (input.editor.try_layout(), input.editor.cursor_geometry(1.0)) else {
+            return;
+        };
+        let scale = f64::from(layout.scale());
+        let view = (
+            f64::from(node.final_layout.content_box_width()),
+            f64::from(node.final_layout.content_box_height()),
+        );
+        let initial = node.scroll_offset;
+        let (left, right, top, bottom) = (caret.x0 / scale, caret.x1 / scale, caret.y0 / scale, caret.y1 / scale);
+        if top < node.scroll_offset.y {
+            node.scroll_offset.y = top;
+        } else if bottom > node.scroll_offset.y + view.1 {
+            node.scroll_offset.y = bottom - view.1;
+        }
+        if left < node.scroll_offset.x {
+            node.scroll_offset.x = left;
+        } else if right > node.scroll_offset.x + view.0 {
+            node.scroll_offset.x = right - view.0;
+        }
+        if node.scroll_offset != initial {
+            let (range_x, range_y) = node.text_input_scroll_range().unwrap_or_default();
+            let layout = node.final_layout;
+            dispatch_event(DomEvent::new(
+                node_id,
+                DomEventData::Scroll(ScrollEvent {
+                    scroll_top: node.scroll_offset.y,
+                    scroll_left: node.scroll_offset.x,
+                    scroll_width: range_x as i32,
+                    scroll_height: range_y as i32,
+                    client_width: layout.size.width as i32,
+                    client_height: layout.size.height as i32,
+                }),
+            ));
+            self.shell_provider.request_redraw();
+        }
+    }
+
     pub fn scroll_node_by_has_changed<F: FnMut(DomEvent)>(
         &mut self,
         node_id: usize,
@@ -1706,14 +1767,20 @@ impl BaseDocument {
             .downcast_element()
             .is_some_and(|e| e.name.local == *"html");
 
+        // A <textarea> scrolls through its text unless it is told not to.
+        let text_range = node.text_input_scroll_range();
         let (can_x_scroll, can_y_scroll) = node
             .primary_styles()
-            .map(|styles| {
-                (
+            .map(|styles| match text_range {
+                Some(_) => (
+                    !matches!(styles.clone_overflow_x(), Overflow::Hidden | Overflow::Clip),
+                    !matches!(styles.clone_overflow_y(), Overflow::Hidden | Overflow::Clip),
+                ),
+                None => (
                     matches!(styles.clone_overflow_x(), Overflow::Scroll | Overflow::Auto),
                     matches!(styles.clone_overflow_y(), Overflow::Scroll | Overflow::Auto)
                         || (styles.clone_overflow_y() == Overflow::Visible && is_root_scroller),
-                )
+                ),
             })
             .unwrap_or((false, false));
 
@@ -1724,8 +1791,10 @@ impl BaseDocument {
         let mut bubble_x = 0.0;
         let mut bubble_y = 0.0;
 
-        let scroll_width = node.final_layout.scroll_width() as f64;
-        let scroll_height = node.final_layout.scroll_height() as f64;
+        let (scroll_width, scroll_height) = text_range.unwrap_or((
+            node.final_layout.scroll_width() as f64,
+            node.final_layout.scroll_height() as f64,
+        ));
 
         // Handle sub document case
         if let Some(mut sub_doc) = node.subdoc_mut().map(|doc| doc.inner_mut()) {
