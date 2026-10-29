@@ -835,12 +835,57 @@ impl BaseDocument {
             if let Some(after) = node.after {
                 self.drop_node_ignoring_parent(after);
             }
+            // And the anonymous blocks its layout wrapped its children in,
+            // which live only in its `layout_children`. Left behind, each kept
+            // a `layout_parent` that no longer existed, and the next web font
+            // to load -- which marks every inline context's parent for layout
+            // -- indexed it and panicked ("invalid key"): softn.com, whose
+            // script replaces parts of the page as its fonts arrive, hung.
+            let layout_children = node.layout_children.borrow_mut().take();
+            if let Some(layout_children) = layout_children {
+                self.free_anonymous_wrappers(layout_children);
+            }
+            // Nor does it wait for an image any more. Its id goes back to the
+            // slab, and the image arriving later went to whatever node took the
+            // id next -- an element shown the wrong picture, or a text node,
+            // which panicked.
+            if !self.pending_images.is_empty() {
+                for waiting in self.pending_images.values_mut() {
+                    waiting.retain(|(id, _)| *id != node_id);
+                }
+            }
 
             for &child in &node.children {
                 self.drop_node_ignoring_parent(child);
             }
         }
         node
+    }
+
+    /// Remove the anonymous block wrappers among `children` (and any nested
+    /// in them) from the slab. Pseudo-elements are anonymous blocks too, but
+    /// their owner keeps them across collections, so they stay.
+    pub(crate) fn free_anonymous_wrappers(&mut self, children: Vec<usize>) {
+        for child_id in children {
+            let Some(child) = self.nodes.get(child_id) else {
+                continue;
+            };
+            if !matches!(child.data, NodeData::AnonymousBlock(_)) {
+                continue;
+            }
+            let is_pseudo = child.parent.and_then(|p| self.nodes.get(p)).is_some_and(|owner| {
+                owner.before == Some(child_id) || owner.after == Some(child_id)
+            });
+            if is_pseudo {
+                continue;
+            }
+            let nested = self.nodes[child_id].layout_children.borrow_mut().take();
+            if let Some(nested) = nested {
+                self.free_anonymous_wrappers(nested);
+            }
+            self.nodes.remove(child_id);
+            self.changed_nodes.remove(&child_id);
+        }
     }
 
     /// Whether the document has been mutated (has changed nodes).
@@ -1164,8 +1209,10 @@ impl BaseDocument {
 
                     match image_type {
                         ImageType::Image => {
-                            node.element_data_mut().unwrap().special_data =
-                                SpecialElementData::Image(Box::new(image.clone()));
+                            let Some(element) = node.element_data_mut() else {
+                                continue;
+                            };
+                            element.special_data = SpecialElementData::Image(Box::new(image.clone()));
 
                             // Clear layout cache
                             node.cache.clear();
@@ -1223,8 +1270,10 @@ impl BaseDocument {
 
                     match image_type {
                         ImageType::Image => {
-                            node.element_data_mut().unwrap().special_data =
-                                SpecialElementData::Image(Box::new(image.clone()));
+                            let Some(element) = node.element_data_mut() else {
+                                continue;
+                            };
+                            element.special_data = SpecialElementData::Image(Box::new(image.clone()));
 
                             // Clear layout cache
                             node.cache.clear();

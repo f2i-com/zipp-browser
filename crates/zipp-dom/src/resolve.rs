@@ -29,7 +29,7 @@ use style::properties::generated::longhands::position::computed_value::T as Posi
 use taffy::AvailableSpace;
 
 use crate::{
-    BaseDocument, NON_INCREMENTAL, NodeData,
+    BaseDocument, NON_INCREMENTAL,
     events::ScrollAnimationState,
     layout::{
         construct::{
@@ -296,30 +296,8 @@ impl BaseDocument {
             doc.nodes[node_id].set_damage(damage);
         }
 
-        /// Remove the anonymous block wrappers among `children` (and any nested
-        /// in them) from the slab. Pseudo-elements are anonymous blocks too, but
-        /// their owner keeps them across collections, so they stay.
         fn free_anonymous_wrappers(doc: &mut BaseDocument, children: Vec<usize>) {
-            for child_id in children {
-                let Some(child) = doc.nodes.get(child_id) else {
-                    continue;
-                };
-                if !matches!(child.data, NodeData::AnonymousBlock(_)) {
-                    continue;
-                }
-                let is_pseudo = child.parent.and_then(|p| doc.nodes.get(p)).is_some_and(|owner| {
-                    owner.before == Some(child_id) || owner.after == Some(child_id)
-                });
-                if is_pseudo {
-                    continue;
-                }
-                let nested = doc.nodes[child_id].layout_children.borrow_mut().take();
-                if let Some(nested) = nested {
-                    free_anonymous_wrappers(doc, nested);
-                }
-                doc.nodes.remove(child_id);
-                doc.changed_nodes.remove(&child_id);
-            }
+            doc.free_anonymous_wrappers(children);
         }
     }
 
