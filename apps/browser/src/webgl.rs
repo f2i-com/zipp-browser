@@ -1,10 +1,13 @@
-//! WebGL 1 and 2 for `<canvas>`, on desktop OpenGL through WGL (Windows).
+//! WebGL 1 and 2 for `<canvas>`, on desktop OpenGL: through WGL on Windows,
+//! and through EGL on Linux, where Mesa provides it -- on the GPU where it
+//! has a driver for one, and on the CPU (llvmpipe) anywhere else.
 //!
 //! The page side is `webgl_shim.js`: a `WebGLRenderingContext` (or
 //! `WebGL2RenderingContext`) that records its calls into a batch of
 //! `[op, ...args]` and sends it here with the `gl` host call, bytes beside it
 //! in `__zippHostBytes`. A GL thread replays batches: one OpenGL context per
-//! canvas, on a hidden window, each drawing into an offscreen framebuffer that
+//! canvas (made current on a hidden window with WGL, on no surface at all
+//! with EGL), each drawing into an offscreen framebuffer that
 //! stands in for the canvas's default one (`bindFramebuffer(null)` binds it;
 //! multisampled when the context is antialiased, as WebGL's are by default).
 //! A `present` at the end of a frame reads that framebuffer back; the frame
@@ -28,24 +31,16 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::{CString, c_void};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use glow::HasContext;
 use serde_json::Value as Json;
-use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::Graphics::Gdi::{GetDC, HDC};
-use windows::Win32::Graphics::OpenGL::{
-    ChoosePixelFormat, HGLRC, PFD_DOUBLEBUFFER, PFD_DRAW_TO_WINDOW, PFD_MAIN_PLANE, PFD_SUPPORT_OPENGL,
-    PFD_TYPE_RGBA, PIXELFORMATDESCRIPTOR, SetPixelFormat, wglCreateContext, wglDeleteContext, wglGetProcAddress,
-    wglMakeCurrent,
-};
-use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryA};
-use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, RegisterClassW, WINDOW_EX_STYLE, WNDCLASSW, WS_OVERLAPPEDWINDOW,
-};
-use windows::core::{PCSTR, s, w};
 use zipp_vm::embed::HostCtx;
+
+#[cfg(target_os = "linux")]
+use egl::{Platform, RawContext};
+#[cfg(windows)]
+use wgl::{Platform, RawContext};
 
 use crate::canvas::Frame;
 
@@ -120,8 +115,8 @@ pub(crate) fn host_call(ctx: &mut dyn HostCtx, args: &[String]) -> Result<String
 }
 
 fn gl_thread(batches: Receiver<Batch>) {
-    let mut host = match Wgl::new() {
-        Ok(host) => Some(host),
+    let mut host = match Platform::new() {
+        Ok(platform) => Some(Host { platform, current: None, contexts: HashMap::new() }),
         Err(e) => {
             eprintln!("[WEBGL] no OpenGL: {e}");
             None
@@ -136,22 +131,16 @@ fn gl_thread(batches: Receiver<Batch>) {
     }
 }
 
-/// The hidden window's procedure: it handles nothing itself.
-unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
-}
-
-/// The hidden window every context draws through, and the contexts.
-struct Wgl {
-    dc: HDC,
-    opengl32: HMODULE,
+/// The platform's way of making GL contexts, and the contexts.
+struct Host {
+    platform: Platform,
     current: Option<u32>,
     contexts: HashMap<u32, Context>,
 }
 
 /// One canvas's GL context and the WebGL objects in it, by the page's numbers.
 struct Context {
-    hglrc: HGLRC,
+    raw: RawContext,
     gl: glow::Context,
     flid: u32,
     width: i32,
@@ -225,69 +214,7 @@ impl PageState {
     }
 }
 
-impl Wgl {
-    fn new() -> Result<Self, String> {
-        unsafe {
-            let instance = GetModuleHandleW(None).map_err(|e| e.to_string())?;
-            let class = WNDCLASSW {
-                lpfnWndProc: Some(window_proc),
-                hInstance: instance.into(),
-                lpszClassName: w!("ZippWebGL"),
-                ..Default::default()
-            };
-            RegisterClassW(&class);
-            let hwnd: HWND = CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                w!("ZippWebGL"),
-                w!("Zipp WebGL"),
-                WS_OVERLAPPEDWINDOW,
-                0,
-                0,
-                16,
-                16,
-                None,
-                None,
-                Some(instance.into()),
-                None,
-            )
-            .map_err(|e| e.to_string())?;
-            let dc = GetDC(Some(hwnd));
-            let pfd = PIXELFORMATDESCRIPTOR {
-                nSize: std::mem::size_of::<PIXELFORMATDESCRIPTOR>() as u16,
-                nVersion: 1,
-                dwFlags: PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER,
-                iPixelType: PFD_TYPE_RGBA,
-                cColorBits: 32,
-                cDepthBits: 24,
-                cStencilBits: 8,
-                iLayerType: PFD_MAIN_PLANE.0 as u8,
-                ..Default::default()
-            };
-            let format = ChoosePixelFormat(dc, &pfd);
-            if format == 0 {
-                return Err("no pixel format".into());
-            }
-            SetPixelFormat(dc, format, &pfd).map_err(|e| e.to_string())?;
-            let opengl32 = LoadLibraryA(s!("opengl32.dll")).map_err(|e| e.to_string())?;
-            Ok(Wgl { dc, opengl32, current: None, contexts: HashMap::new() })
-        }
-    }
-
-    fn proc_address(opengl32: HMODULE, name: &str) -> *const c_void {
-        let Ok(c) = CString::new(name) else {
-            return std::ptr::null();
-        };
-        unsafe {
-            let p = wglGetProcAddress(PCSTR(c.as_ptr() as *const u8)).map(|f| f as usize).unwrap_or(0);
-            // wglGetProcAddress answers 1, 2, 3 or -1 for "not mine": the
-            // OpenGL 1.1 entry points live in opengl32.dll itself.
-            if p > 3 && p != usize::MAX {
-                return p as *const c_void;
-            }
-            GetProcAddress(opengl32, PCSTR(c.as_ptr() as *const u8)).map(|f| f as usize).unwrap_or(0) as *const c_void
-        }
-    }
-
+impl Host {
     fn make_current(&mut self, context: u32) -> bool {
         if self.current == Some(context) {
             return true;
@@ -295,7 +222,7 @@ impl Wgl {
         let Some(ctx) = self.contexts.get(&context) else {
             return false;
         };
-        let ok = unsafe { wglMakeCurrent(self.dc, ctx.hglrc) }.is_ok();
+        let ok = unsafe { self.platform.make_current(Some(ctx.raw)) };
         self.current = ok.then_some(context);
         ok
     }
@@ -305,10 +232,10 @@ impl Wgl {
         if let Some(ctx) = self.contexts.remove(&context) {
             unsafe {
                 if self.current == Some(context) {
-                    let _ = wglMakeCurrent(self.dc, HGLRC::default());
+                    self.platform.make_current(None);
                     self.current = None;
                 }
-                let _ = wglDeleteContext(ctx.hglrc);
+                self.platform.destroy(ctx.raw);
             }
         }
     }
@@ -322,11 +249,18 @@ impl Wgl {
         // a number still in use replaces it.
         self.delete(context);
         unsafe {
-            let hglrc = wglCreateContext(self.dc).map_err(|e| e.to_string())?;
-            wglMakeCurrent(self.dc, hglrc).map_err(|e| e.to_string())?;
+            let raw = self.platform.create()?;
             self.current = Some(context);
-            let opengl32 = self.opengl32;
-            let gl = glow::Context::from_loader_function(|name| Self::proc_address(opengl32, name));
+            let platform = &self.platform;
+            let gl = glow::Context::from_loader_function(|name| platform.proc_address(name));
+            static FIRST: std::sync::Once = std::sync::Once::new();
+            FIRST.call_once(|| {
+                eprintln!(
+                    "[WEBGL] {} / OpenGL {}",
+                    gl.get_parameter_string(glow::RENDERER),
+                    gl.get_parameter_string(glow::VERSION)
+                )
+            });
             let fbo = gl.create_framebuffer()?;
             let color = gl.create_renderbuffer()?;
             let depth = gl.create_renderbuffer()?;
@@ -338,7 +272,7 @@ impl Wgl {
                 gl.enable(glow::PRIMITIVE_RESTART_FIXED_INDEX);
             }
             let mut ctx = Context {
-                hglrc,
+                raw,
                 gl,
                 flid,
                 width: 0,
@@ -1293,5 +1227,253 @@ mod tests {
         assert!(out.contains("#define mediump\n"), "{out}");
         assert!(!out.contains("GL_OES_standard_derivatives"), "{out}");
         assert!(!out.contains("precision mediump float;"), "{out}");
+    }
+}
+
+/// Contexts through WGL, all drawing through one hidden window.
+#[cfg(windows)]
+mod wgl {
+    use std::ffi::{CString, c_void};
+
+    use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::Graphics::Gdi::{GetDC, HDC};
+    use windows::Win32::Graphics::OpenGL::{
+        ChoosePixelFormat, HGLRC, PFD_DOUBLEBUFFER, PFD_DRAW_TO_WINDOW, PFD_MAIN_PLANE, PFD_SUPPORT_OPENGL,
+        PFD_TYPE_RGBA, PIXELFORMATDESCRIPTOR, SetPixelFormat, wglCreateContext, wglDeleteContext, wglGetProcAddress,
+        wglMakeCurrent,
+    };
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryA};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, RegisterClassW, WINDOW_EX_STYLE, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    };
+    use windows::core::{PCSTR, s, w};
+
+    pub(super) type RawContext = HGLRC;
+
+    /// The hidden window's procedure: it handles nothing itself.
+    unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+
+    /// The hidden window every context draws through.
+    pub(super) struct Platform {
+        dc: HDC,
+        opengl32: HMODULE,
+    }
+
+    impl Platform {
+        pub(super) fn new() -> Result<Self, String> {
+            unsafe {
+                let instance = GetModuleHandleW(None).map_err(|e| e.to_string())?;
+                let class = WNDCLASSW {
+                    lpfnWndProc: Some(window_proc),
+                    hInstance: instance.into(),
+                    lpszClassName: w!("ZippWebGL"),
+                    ..Default::default()
+                };
+                RegisterClassW(&class);
+                let hwnd: HWND = CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("ZippWebGL"),
+                    w!("Zipp WebGL"),
+                    WS_OVERLAPPEDWINDOW,
+                    0,
+                    0,
+                    16,
+                    16,
+                    None,
+                    None,
+                    Some(instance.into()),
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+                let dc = GetDC(Some(hwnd));
+                let pfd = PIXELFORMATDESCRIPTOR {
+                    nSize: std::mem::size_of::<PIXELFORMATDESCRIPTOR>() as u16,
+                    nVersion: 1,
+                    dwFlags: PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER,
+                    iPixelType: PFD_TYPE_RGBA,
+                    cColorBits: 32,
+                    cDepthBits: 24,
+                    cStencilBits: 8,
+                    iLayerType: PFD_MAIN_PLANE.0 as u8,
+                    ..Default::default()
+                };
+                let format = ChoosePixelFormat(dc, &pfd);
+                if format == 0 {
+                    return Err("no pixel format".into());
+                }
+                SetPixelFormat(dc, format, &pfd).map_err(|e| e.to_string())?;
+                let opengl32 = LoadLibraryA(s!("opengl32.dll")).map_err(|e| e.to_string())?;
+                Ok(Platform { dc, opengl32 })
+            }
+        }
+
+        pub(super) fn proc_address(&self, name: &str) -> *const c_void {
+            let opengl32 = self.opengl32;
+            let Ok(c) = CString::new(name) else {
+                return std::ptr::null();
+            };
+            unsafe {
+                let p = wglGetProcAddress(PCSTR(c.as_ptr() as *const u8)).map(|f| f as usize).unwrap_or(0);
+                // wglGetProcAddress answers 1, 2, 3 or -1 for "not mine": the
+                // OpenGL 1.1 entry points live in opengl32.dll itself.
+                if p > 3 && p != usize::MAX {
+                    return p as *const c_void;
+                }
+                GetProcAddress(opengl32, PCSTR(c.as_ptr() as *const u8)).map(|f| f as usize).unwrap_or(0) as *const c_void
+            }
+        }
+
+        /// A new context, current.
+        pub(super) unsafe fn create(&self) -> Result<RawContext, String> {
+            unsafe {
+                let hglrc = wglCreateContext(self.dc).map_err(|e| e.to_string())?;
+                wglMakeCurrent(self.dc, hglrc).map_err(|e| e.to_string())?;
+                Ok(hglrc)
+            }
+        }
+
+        /// Make `raw` current, or none.
+        pub(super) unsafe fn make_current(&self, raw: Option<RawContext>) -> bool {
+            unsafe { wglMakeCurrent(self.dc, raw.unwrap_or_default()) }.is_ok()
+        }
+
+        pub(super) unsafe fn destroy(&self, raw: RawContext) {
+            let _ = unsafe { wglDeleteContext(raw) };
+        }
+    }
+}
+
+/// Contexts through EGL on no surface at all (`EGL_MESA_platform_surfaceless`):
+/// every canvas draws into framebuffers of its own, so none needs a window or
+/// a display server. libEGL is opened when the first context is asked for, so
+/// a machine without it still shows every page that does not use WebGL.
+#[cfg(target_os = "linux")]
+mod egl {
+    use std::ffi::{CStr, CString, c_char, c_void};
+
+    pub(super) type RawContext = *mut c_void;
+    type Display = *mut c_void;
+    type Config = *mut c_void;
+
+    const EGL_NONE: i32 = 0x3038;
+    const EGL_PLATFORM_SURFACELESS_MESA: u32 = 0x31DD;
+    const EGL_OPENGL_API: u32 = 0x30A2;
+    const EGL_SURFACE_TYPE: i32 = 0x3033;
+    const EGL_PBUFFER_BIT: i32 = 0x0001;
+    const EGL_RENDERABLE_TYPE: i32 = 0x3040;
+    const EGL_OPENGL_BIT: i32 = 0x0008;
+    const EGL_RED_SIZE: i32 = 0x3024;
+    const EGL_GREEN_SIZE: i32 = 0x3023;
+    const EGL_BLUE_SIZE: i32 = 0x3022;
+    const EGL_ALPHA_SIZE: i32 = 0x3021;
+    const EGL_DEPTH_SIZE: i32 = 0x3025;
+    const EGL_STENCIL_SIZE: i32 = 0x3026;
+    const EGL_VENDOR: i32 = 0x3053;
+
+    /// libEGL's display, and the entry points used after it is set up.
+    pub(super) struct Platform {
+        _lib: libloading::Library,
+        display: Display,
+        config: Config,
+        get_proc_address: unsafe extern "C" fn(*const c_char) -> *const c_void,
+        create_context: unsafe extern "C" fn(Display, Config, RawContext, *const i32) -> RawContext,
+        make_current: unsafe extern "C" fn(Display, *mut c_void, *mut c_void, RawContext) -> u32,
+        destroy_context: unsafe extern "C" fn(Display, RawContext) -> u32,
+        get_error: unsafe extern "C" fn() -> i32,
+    }
+
+    impl Platform {
+        pub(super) fn new() -> Result<Self, String> {
+            unsafe {
+                let lib = libloading::Library::new("libEGL.so.1").map_err(|e| e.to_string())?;
+                macro_rules! sym {
+                    ($name:literal) => {
+                        *lib.get(concat!($name, "\0").as_bytes()).map_err(|e| format!("{}: {e}", $name))?
+                    };
+                }
+                let get_platform_display: unsafe extern "C" fn(u32, *mut c_void, *const isize) -> Display =
+                    sym!("eglGetPlatformDisplay");
+                let initialize: unsafe extern "C" fn(Display, *mut i32, *mut i32) -> u32 = sym!("eglInitialize");
+                let bind_api: unsafe extern "C" fn(u32) -> u32 = sym!("eglBindAPI");
+                let choose_config: unsafe extern "C" fn(Display, *const i32, *mut Config, i32, *mut i32) -> u32 =
+                    sym!("eglChooseConfig");
+                let query_string: unsafe extern "C" fn(Display, i32) -> *const c_char = sym!("eglQueryString");
+                let get_error: unsafe extern "C" fn() -> i32 = sym!("eglGetError");
+
+                let display = get_platform_display(EGL_PLATFORM_SURFACELESS_MESA, std::ptr::null_mut(), [EGL_NONE as isize].as_ptr());
+                if display.is_null() {
+                    return Err(format!("no surfaceless EGL display (0x{:x})", get_error()));
+                }
+                let (mut major, mut minor) = (0, 0);
+                if initialize(display, &mut major, &mut minor) == 0 {
+                    return Err(format!("eglInitialize: 0x{:x}", get_error()));
+                }
+                if bind_api(EGL_OPENGL_API) == 0 {
+                    return Err("this EGL has no desktop OpenGL".into());
+                }
+                let attributes = [
+                    EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+                    EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+                    EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+                    EGL_DEPTH_SIZE, 24, EGL_STENCIL_SIZE, 8,
+                    EGL_NONE,
+                ];
+                let (mut config, mut count) = (std::ptr::null_mut(), 0);
+                if choose_config(display, attributes.as_ptr(), &mut config, 1, &mut count) == 0 || count < 1 {
+                    // Mesa takes a context with no config (EGL_KHR_no_config_context);
+                    // the canvases never draw to a surface that would need one.
+                    config = std::ptr::null_mut();
+                }
+                let vendor = query_string(display, EGL_VENDOR);
+                let vendor = if vendor.is_null() { "?".into() } else { CStr::from_ptr(vendor).to_string_lossy() };
+                eprintln!("[WEBGL] EGL {major}.{minor} ({vendor}), surfaceless");
+                Ok(Platform {
+                    get_proc_address: sym!("eglGetProcAddress"),
+                    create_context: sym!("eglCreateContext"),
+                    make_current: sym!("eglMakeCurrent"),
+                    destroy_context: sym!("eglDestroyContext"),
+                    get_error,
+                    display,
+                    config,
+                    _lib: lib,
+                })
+            }
+        }
+
+        pub(super) fn proc_address(&self, name: &str) -> *const c_void {
+            let Ok(c) = CString::new(name) else {
+                return std::ptr::null();
+            };
+            unsafe { (self.get_proc_address)(c.as_ptr()) }
+        }
+
+        /// A new context, current. With no version asked for, Mesa gives the
+        /// newest compatibility profile it has, as WGL's legacy contexts do.
+        pub(super) unsafe fn create(&self) -> Result<RawContext, String> {
+            unsafe {
+                let raw = (self.create_context)(self.display, self.config, std::ptr::null_mut(), [EGL_NONE].as_ptr());
+                if raw.is_null() {
+                    return Err(format!("eglCreateContext: 0x{:x}", (self.get_error)()));
+                }
+                if !self.make_current(Some(raw)) {
+                    let error = (self.get_error)();
+                    self.destroy(raw);
+                    return Err(format!("eglMakeCurrent: 0x{error:x}"));
+                }
+                Ok(raw)
+            }
+        }
+
+        /// Make `raw` current, or none; there is never a surface.
+        pub(super) unsafe fn make_current(&self, raw: Option<RawContext>) -> bool {
+            let none = std::ptr::null_mut();
+            unsafe { (self.make_current)(self.display, none, none, raw.unwrap_or(none)) != 0 }
+        }
+
+        pub(super) unsafe fn destroy(&self, raw: RawContext) {
+            unsafe { (self.destroy_context)(self.display, raw) };
+        }
     }
 }

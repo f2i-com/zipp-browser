@@ -110,6 +110,10 @@ tokio = { workspace = true, features = ["rt-multi-thread"], optional = true }
 # server (zipp-linux).
 [target.'cfg(target_os = "linux")'.dependencies]
 zipp-kms = { path = "../../crates/zipp-kms" }
+# WebGPU (`webgpu.rs`) on Vulkan; WebGL's contexts (`webgl.rs`) through EGL,
+# whose library is opened at run time.
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "wgsl", "vulkan"] }
+libloading = "0.8"
 
 # Reading the OS colour scheme before the window exists (`system_prefers_dark`).
 # Already in the tree through winit; this only adds the registry bindings.
@@ -131,10 +135,15 @@ windows = { version = "0.62", features = [
     "Win32_System_LibraryLoader",
     "Win32_UI_WindowsAndMessaging",
 ] }
-# WebGL (`webgl.rs`): OpenGL calls, and the batches page script sends.
-glow = "0.18"
 windows-core = "0.62"
-# WebGPU (`webgpu.rs`): wgpu implements it; pollster waits on its futures.
+# WebGPU (`webgpu.rs`) on Vulkan or Direct3D 12.
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "wgsl", "vulkan", "dx12"] }
+
+# WebGL on desktop OpenGL (`webgl.rs`) and WebGPU on wgpu (`webgpu.rs`), on
+# Windows and Linux.
+[target.'cfg(any(windows, target_os = "linux"))'.dependencies]
+# OpenGL calls, and the batches page script sends.
+glow = "0.18"
+# pollster waits on wgpu's futures.
 pollster = "1"
 

@@ -48,9 +48,9 @@ mod canvas;
 mod canvas2d;
 mod console;
 mod worker;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 mod webgl;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 mod webgpu;
 mod viewers;
 
@@ -1204,16 +1204,16 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
             })
         }
         // A WebGL context's batch of calls (webgl.rs).
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         "gl" => webgl::host_call(ctx, args),
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         "gl" => Err("Error: WebGL is not available on this platform".into()),
         // A Canvas 2D batch (canvas2d.rs).
         "c2d" => canvas2d::host_call(ctx, args),
         // A WebGPU batch (webgpu.rs).
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         "gpu" => webgpu::host_call(ctx, args),
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         "gpu" => Err("Error: WebGPU is not available on this platform".into()),
         // An image's size, for `naturalWidth` and `load`.
         "image_info" => viewers::image_info(&resolve_page_url(args.first().map(String::as_str).unwrap_or_default())),

@@ -240,9 +240,9 @@ fn program(url: &str, module: bool) -> Result<String, String> {
     // The zipp.org playground's engine computes in its worker, and without it
     // fell back to JavaScript on the CPU: its Game of Life drew 2 frames a
     // second where Chrome, on the GPU, draws 27.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     let gpu = include_str!("webgpu_shim.js");
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     let gpu = "";
     let prelude = format!(
         "{}\n{}\n{scope}\n{gpu}\n",
