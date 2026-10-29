@@ -72,6 +72,14 @@ impl BaseDocument {
 
         let root_node_id = self.root_element().id;
 
+        // Style and layout, and again while a size container's size changed:
+        // `@container` queries and `cq*` lengths in its subtree were resolved
+        // against the size it had before (none, on the first pass), so they
+        // are restyled and laid out once more. Content can still change a
+        // container's size here, as Taffy has no size containment, so it
+        // stops after three passes rather than chase a cycle.
+        let mut pass = 0;
+        loop {
         // Resolve stylist first since it drives layout
         self.resolve_stylist(current_time_for_animations);
 
@@ -98,6 +106,12 @@ impl BaseDocument {
         if needs_layout {
             // Resolve layout
             self.resolve_layout();
+        }
+
+        pass += 1;
+        if pass >= 3 || !(needs_layout && self.update_container_sizes()) {
+            break;
+        }
         }
 
         // Clear all damage and dirty flags
@@ -135,6 +149,41 @@ impl BaseDocument {
             }
         }
         self.subdoc_is_animating = subdoc_is_animating;
+    }
+
+    /// Record each size container's content box from the layout just done,
+    /// for `query_container_size`, and mark for restyle the subtree of every
+    /// one whose size changed (or that became or stopped being a container).
+    /// Returns whether any did. An unchanged page costs only this walk.
+    fn update_container_sizes(&mut self) -> bool {
+        use style::invalidation::element::restyle_hints::RestyleHint;
+        use style::values::computed::ContainerType;
+        let mut changed = Vec::new();
+        for (id, node) in self.nodes.iter() {
+            let kind = node
+                .primary_styles()
+                .map(|s| s.get_box().clone_container_type())
+                .unwrap_or(ContainerType::NORMAL);
+            let l = &node.unrounded_layout;
+            let width = l.size.width - l.padding.left - l.padding.right - l.border.left - l.border.right;
+            let height = l.size.height - l.padding.top - l.padding.bottom - l.border.top - l.border.bottom;
+            let size = if kind.contains(ContainerType::SIZE) {
+                (Some(width.max(0.0)), Some(height.max(0.0)))
+            } else if kind.contains(ContainerType::INLINE_SIZE) {
+                (Some(width.max(0.0)), None)
+            } else {
+                (None, None)
+            };
+            if size != node.query_container_size {
+                changed.push((id, size));
+            }
+        }
+        for &(id, size) in &changed {
+            let node = &mut self.nodes[id];
+            node.query_container_size = size;
+            node.set_restyle_hint(RestyleHint::restyle_subtree());
+        }
+        !changed.is_empty()
     }
 
     /// Advance the scroll fling animation (if any) by one frame.

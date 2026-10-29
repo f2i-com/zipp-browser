@@ -32,6 +32,22 @@ use servo_arc::Arc;
 use std::fmt::{self, Write};
 use style_traits::{CssStringWriter, CssWriter, ParseError, StyleParseErrorKind, ToCss};
 
+/// Whether `@container` rules and the container-relative lengths (`cqw`, ...)
+/// parse. Gecko always has them; a servo build has them behind the pref that
+/// also gates `container-type` and `container-name`, so that the three come
+/// and go together. (zipp-browser patch: upstream 0.14 parsed neither outside
+/// Gecko, so a servo embedder could set `container-type` and use nothing.)
+#[cfg(feature = "gecko")]
+pub fn container_queries_enabled() -> bool {
+    true
+}
+
+/// Whether `@container` rules and the container-relative lengths parse.
+#[cfg(not(feature = "gecko"))]
+pub fn container_queries_enabled() -> bool {
+    static_prefs::pref!("layout.container-queries.enabled")
+}
+
 /// A container rule.
 #[derive(Debug, ToShmem)]
 pub struct ContainerRule {

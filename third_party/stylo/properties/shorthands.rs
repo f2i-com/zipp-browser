@@ -509,7 +509,7 @@ pub mod border {
     }
 }
 
-#[cfg(feature = "gecko")]
+// Not Gecko-only: servo builds have it behind the container-queries pref.
 pub mod container {
     use super::*;
     pub use crate::properties::generated::shorthands::container::*;

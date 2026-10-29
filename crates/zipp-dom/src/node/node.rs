@@ -136,6 +136,13 @@ pub struct Node {
     pub scroll_offset: crate::Point<f64>,
 
     pub transform: Option<Affine>,
+
+    /// For a size container (`container-type: size | inline-size`), its
+    /// content box from the last layout, in CSS px -- what `@container`
+    /// queries and `cq*` lengths in its subtree resolve against. Only the
+    /// width for an inline-size container; `None` for any other element, and
+    /// before the first layout (they then fall back to the viewport).
+    pub(crate) query_container_size: (Option<f32>, Option<f32>),
 }
 
 unsafe impl Send for Node {}
@@ -198,6 +205,8 @@ impl Node {
             scroll_offset: crate::Point::ZERO,
 
             transform: None,
+
+            query_container_size: (None, None),
         }
     }
 

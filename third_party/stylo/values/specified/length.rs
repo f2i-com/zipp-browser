@@ -13,6 +13,7 @@ use crate::font_metrics::{FontMetrics, FontMetricsOrientation};
 #[cfg(feature = "gecko")]
 use crate::gecko_bindings::structs::GeckoFontMetrics;
 use crate::parser::{Parse, ParserContext};
+use crate::stylesheets::container_rule::container_queries_enabled;
 use crate::values::computed::{self, CSSPixelLength, Context, FontSize};
 use crate::values::generics::length as generics;
 use crate::values::generics::length::{
@@ -1275,22 +1276,23 @@ impl NoCalcLength {
             },
             // Container query lengths. Inherit the limitation from viewport units since
             // we may fall back to them.
-            "cqw" if !in_page_rule && cfg!(feature = "gecko") => {
+            // (zipp-browser: available outside Gecko too; see container_rule.rs.)
+            "cqw" if !in_page_rule && container_queries_enabled() => {
                 Self::ContainerRelative(ContainerRelativeLength::Cqw(value))
             },
-            "cqh" if !in_page_rule && cfg!(feature = "gecko") => {
+            "cqh" if !in_page_rule && container_queries_enabled() => {
                 Self::ContainerRelative(ContainerRelativeLength::Cqh(value))
             },
-            "cqi" if !in_page_rule && cfg!(feature = "gecko") => {
+            "cqi" if !in_page_rule && container_queries_enabled() => {
                 Self::ContainerRelative(ContainerRelativeLength::Cqi(value))
             },
-            "cqb" if !in_page_rule && cfg!(feature = "gecko") => {
+            "cqb" if !in_page_rule && container_queries_enabled() => {
                 Self::ContainerRelative(ContainerRelativeLength::Cqb(value))
             },
-            "cqmin" if !in_page_rule && cfg!(feature = "gecko") => {
+            "cqmin" if !in_page_rule && container_queries_enabled() => {
                 Self::ContainerRelative(ContainerRelativeLength::Cqmin(value))
             },
-            "cqmax" if !in_page_rule && cfg!(feature = "gecko") => {
+            "cqmax" if !in_page_rule && container_queries_enabled() => {
                 Self::ContainerRelative(ContainerRelativeLength::Cqmax(value))
             },
             _ => return Err(()),

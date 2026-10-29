@@ -710,7 +710,7 @@ impl<'a, 'i> AtRuleParser<'i> for NestedRuleParser<'a, 'i> {
             "font-face" => {
                 AtRulePrelude::FontFace
             },
-            "container" if cfg!(feature = "gecko") => {
+            "container" if crate::stylesheets::container_rule::container_queries_enabled() => {
                 let condition = Arc::new(ContainerCondition::parse(&self.context, input)?);
                 AtRulePrelude::Container(condition)
             },

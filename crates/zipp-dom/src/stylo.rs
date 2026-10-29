@@ -1080,10 +1080,19 @@ impl<'a> TElement for DomNode<'a> {
 #[inline]
     fn query_container_size(
         &self,
-        _display: &style::values::specified::Display,
+        display: &style::values::specified::Display,
     ) -> euclid::default::Size2D<Option<app_units::Au>> {
-        // FIXME: Implement container queries. For now this effectively disables them without panicking.
-        Default::default()
+        // Size containment does not apply to an inline box, nor to one that
+        // generates no box: such an element is no size container.
+        if display.is_none() || display.is_contents() || display.outside() == style::values::specified::box_::DisplayOutside::Inline {
+            return Default::default();
+        }
+        // Recorded after each layout (`update_container_sizes`).
+        let (width, height) = self.query_container_size;
+        euclid::default::Size2D::new(
+            width.map(app_units::Au::from_f32_px),
+            height.map(app_units::Au::from_f32_px),
+        )
     }
 
 #[inline]

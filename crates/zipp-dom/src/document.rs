@@ -443,6 +443,9 @@ impl BaseDocument {
         style_config::set_pref!("layout.grid.enabled", true);
         style_config::set_pref!("layout.unimplemented", true);
         style_config::set_pref!("layout.columns.enabled", true);
+        // Container queries: `container-type`, `@container` and the `cq*`
+        // lengths (third_party/stylo/ZIPP_PATCHES.md); sizes from layout.
+        style_config::set_pref!("layout.container-queries.enabled", true);
         style_config::set_pref!("layout.threads", -1);
         // Variable fonts. Google Fonts serves most modern faces as variable
         // (Bricolage Grotesque ships an `opsz` axis, for one), so leaving these
