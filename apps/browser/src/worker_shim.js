@@ -59,6 +59,14 @@ var navigator = {
   userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Zipp",
   language: "en-US", languages: ["en-US"], hardwareConcurrency: 8, onLine: true, platform: "Win32",
 };
+// As its page is: WebGPU and the like are offered only to secure contexts.
+var isSecureContext = true;
+// A URL from script, resolved against the worker's (WebGPU copies an image by it).
+function __zippAbsoluteUrl(u) {
+  u = String(u);
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(u)) return u;
+  try { return new URL(u, location.href).href; } catch (e) { return u; }
+}
 
 // ---- Odds and ends ---------------------------------------------------------
 var performance = globalThis.performance || (function () { var t0 = Date.now(); return { now: function () { return Date.now() - t0; } }; })();

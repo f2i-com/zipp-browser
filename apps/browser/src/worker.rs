@@ -226,7 +226,20 @@ fn run(url: &str, module: bool, inbox: Receiver<ToWorker>, outbox: Sender<FromWo
 /// as fetched, a module with its graph linked.
 fn program(url: &str, module: bool) -> Result<String, String> {
     let scope = include_str!("worker_shim.js").replace("__WORKER_URL__", &crate::js_quoted(url));
-    let prelude = format!("{}\n{}\n{scope}\n", include_str!("console_shim.js"), include_str!("clone.js"));
+    // WebGPU, as a worker has it in a browser: `navigator.gpu`, with its own
+    // device on its own GPU thread (webgpu.rs keeps one per calling thread).
+    // The zipp.org playground's engine computes in its worker, and without it
+    // fell back to JavaScript on the CPU: its Game of Life drew 2 frames a
+    // second where Chrome, on the GPU, draws 27.
+    #[cfg(windows)]
+    let gpu = include_str!("webgpu_shim.js");
+    #[cfg(not(windows))]
+    let gpu = "";
+    let prelude = format!(
+        "{}\n{}\n{scope}\n{gpu}\n",
+        include_str!("console_shim.js"),
+        include_str!("clone.js")
+    );
     if !module {
         let source = crate::fetch(url).map_err(|e| format!("worker script {url} failed to load: {e}"))?;
         return Ok(format!("{prelude}\n;\n{source}"));
