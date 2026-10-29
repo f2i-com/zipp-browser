@@ -734,6 +734,17 @@ var loc = {
     toString: function() { return this.href; }
 };
 
+// `pushState`/`replaceState`: the URL moves, resolved against the current one
+// -- `href`, path, query and fragment. Only `pathname` used to, set to the
+// argument as given, so `?page=2` became a path and `location.href`, which
+// cookies and routers read, stayed on the page as loaded.
+function __historyMove(u) {
+    if (u == null || u === "") return;
+    var p;
+    try { p = JSON.parse(__zippHostCall("url", String(u), String(loc.href))); } catch (e) { return; }
+    loc.href = p.href; loc.pathname = p.pathname; loc.search = p.search; loc.hash = p.hash;
+}
+
 var _rafId=0, _tid=1000;
 // Animation-frame callbacks, `[id, fn]`, waiting for the next frame. A frame
 // runs them all (`__zippRunAnimationFrame`); a callback that asks for another
@@ -1361,7 +1372,7 @@ var window = {
     dispatchEvent:function(ev){return doc.dispatchEvent(ev);},
     matchMedia:function(q){return {matches:__zippMediaMatches(String(q)),media:q,onchange:null,addEventListener:function(){},removeEventListener:function(){},addListener:function(){},removeListener:function(){}};},
     scrollTo:function(){}, scroll:function(){}, scrollBy:function(){},
-    history:{state:null,pushState:function(s,t,u){this.state=s;if(u)loc.pathname=u;},replaceState:function(s,t,u){this.state=s;if(u)loc.pathname=u;},back:function(){},forward:function(){},go:function(n){},length:1},
+    history:{state:null,pushState:function(s,t,u){this.state=s;__historyMove(u);},replaceState:function(s,t,u){this.state=s;__historyMove(u);},back:function(){},forward:function(){},go:function(n){},length:1},
     self:null, top:null, parent:null,
     getSelection:function(){return {removeAllRanges:function(){},addRange:function(){},getRangeAt:function(){return doc.createRange();}};},
     ResizeObserver:function(){this.observe=function(){};this.unobserve=function(){};this.disconnect=function(){};},

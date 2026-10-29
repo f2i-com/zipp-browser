@@ -938,6 +938,21 @@ thread_local! {
     static PENDING_BYTES: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     /// The page's body for the shim to start from (`seed.rs`), until it asks.
     static SEED: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// The document whose script runs on this thread. It decides whose cookies
+    /// a host call reaches, never an argument from the page: a page could
+    /// otherwise read and set another site's.
+    static DOC_URL: std::cell::RefCell<Option<url::Url>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The document a host call comes from: the URL its script started on, or the
+/// page's own `location.href` (which `pushState` moves) when it is on that
+/// same origin. `None` off a page's thread -- a worker has no cookies to read.
+fn host_doc_url(claimed: Option<&str>) -> Option<url::Url> {
+    let doc = DOC_URL.with(|d| d.borrow().clone())?;
+    match claimed.and_then(|c| url::Url::parse(c).ok()) {
+        Some(c) if c.origin() == doc.origin() => Some(c),
+        _ => Some(doc),
+    }
 }
 
 /// A URL from page script, resolved against the page as the browser would.
@@ -1071,12 +1086,13 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
 
 fn browser_host_call(kind: &str, args: &[String]) -> Result<String, String> {
     match kind {
-        // `document.cookie`, read and written: the browser's jar.
-        "cookie_get" => Ok(url::Url::parse(args.first().map(String::as_str).unwrap_or_default())
+        // `document.cookie`, read and written: the browser's jar, for this
+        // document only.
+        "cookie_get" => Ok(host_doc_url(args.first().map(String::as_str))
             .map(|u| zipp_shell::cookies::jar().document_cookie(&u))
             .unwrap_or_default()),
         "cookie_set" => {
-            if let (Some(url), Some(value)) = (args.first().and_then(|u| url::Url::parse(u).ok()), args.get(1)) {
+            if let (Some(url), Some(value)) = (host_doc_url(args.first().map(String::as_str)), args.get(1)) {
                 zipp_shell::cookies::jar().set_document_cookie(&url, value);
             }
             Ok(String::new())
@@ -1836,6 +1852,7 @@ fn run_zipp_js_inner(
     page_url: &str,
     viewport: (u32, u32),
 ) -> Option<(String, String, ScriptState)> {
+    DOC_URL.with(|d| *d.borrow_mut() = url::Url::parse(page_url).ok());
     let mut external_scripts = Vec::new();
     // `<script type="module">` entries are linked separately: their source is ES
     // module syntax, which is a syntax error in the classic program the rest of
