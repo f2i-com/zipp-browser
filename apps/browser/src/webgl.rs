@@ -28,6 +28,11 @@
 //! switched on: point sprites and shader-set point sizes, seamless cube maps,
 //! sRGB encoding when drawing into sRGB textures, and (WebGL 2) primitive
 //! restart at the largest index.
+//!
+//! Where desktop OpenGL is older than 3.3 (a Raspberry Pi 4's GPU has 3.1)
+//! the contexts are OpenGL ES 3 ones instead, which is what WebGL is made
+//! from: shaders go to them as the page wrote them, and none of the switches
+//! above is needed. `ZIPP_WEBGL_API=es` (or `gl`) chooses either way.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -142,6 +147,8 @@ struct Host {
 struct Context {
     raw: RawContext,
     gl: glow::Context,
+    /// OpenGL ES rather than desktop OpenGL.
+    es: bool,
     flid: u32,
     width: i32,
     height: i32,
@@ -265,15 +272,19 @@ impl Host {
             let color = gl.create_renderbuffer()?;
             let depth = gl.create_renderbuffer()?;
             let resolve = if antialias { Some((gl.create_framebuffer()?, gl.create_renderbuffer()?)) } else { None };
-            for cap in [0x8861 /* POINT_SPRITE */, glow::PROGRAM_POINT_SIZE, glow::TEXTURE_CUBE_MAP_SEAMLESS, glow::FRAMEBUFFER_SRGB] {
-                gl.enable(cap);
-            }
-            if version >= 2 {
-                gl.enable(glow::PRIMITIVE_RESTART_FIXED_INDEX);
+            let es = platform.es();
+            if !es {
+                for cap in [0x8861 /* POINT_SPRITE */, glow::PROGRAM_POINT_SIZE, glow::TEXTURE_CUBE_MAP_SEAMLESS, glow::FRAMEBUFFER_SRGB] {
+                    gl.enable(cap);
+                }
+                if version >= 2 {
+                    gl.enable(glow::PRIMITIVE_RESTART_FIXED_INDEX);
+                }
             }
             let mut ctx = Context {
                 raw,
                 gl,
+                es,
                 flid,
                 width: 0,
                 height: 0,
@@ -685,7 +696,8 @@ impl Context {
                 "deleteShader" => { if let Some(s) = self.shaders.remove(&u(1)) { self.gl.delete_shader(s); } }
                 "shaderSource" => {
                     if let Some(&s) = self.shaders.get(&u(1)) {
-                        self.gl.shader_source(s, &translate_shader(&text(2)));
+                        let source = text(2);
+                        self.gl.shader_source(s, &if self.es { source } else { translate_shader(&source) });
                     }
                 }
                 "compileShader" => { if let Some(&s) = self.shaders.get(&u(1)) { self.gl.compile_shader(s); } }
@@ -1262,6 +1274,11 @@ mod wgl {
     }
 
     impl Platform {
+        /// Always desktop OpenGL.
+        pub(super) fn es(&self) -> bool {
+            false
+        }
+
         pub(super) fn new() -> Result<Self, String> {
             unsafe {
                 let instance = GetModuleHandleW(None).map_err(|e| e.to_string())?;
@@ -1360,6 +1377,9 @@ mod egl {
     const EGL_NONE: i32 = 0x3038;
     const EGL_PLATFORM_SURFACELESS_MESA: u32 = 0x31DD;
     const EGL_OPENGL_API: u32 = 0x30A2;
+    const EGL_OPENGL_ES_API: u32 = 0x30A0;
+    const EGL_OPENGL_ES3_BIT: i32 = 0x0040;
+    const EGL_CONTEXT_MAJOR_VERSION: i32 = 0x3098;
     const EGL_SURFACE_TYPE: i32 = 0x3033;
     const EGL_PBUFFER_BIT: i32 = 0x0001;
     const EGL_RENDERABLE_TYPE: i32 = 0x3040;
@@ -1382,6 +1402,8 @@ mod egl {
         make_current: unsafe extern "C" fn(Display, *mut c_void, *mut c_void, RawContext) -> u32,
         destroy_context: unsafe extern "C" fn(Display, RawContext) -> u32,
         get_error: unsafe extern "C" fn() -> i32,
+        /// OpenGL ES 3 contexts, not desktop OpenGL ones.
+        es: bool,
     }
 
     impl Platform {
@@ -1410,35 +1432,82 @@ mod egl {
                 if initialize(display, &mut major, &mut minor) == 0 {
                     return Err(format!("eglInitialize: 0x{:x}", get_error()));
                 }
-                if bind_api(EGL_OPENGL_API) == 0 {
-                    return Err("this EGL has no desktop OpenGL".into());
-                }
-                let attributes = [
-                    EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
-                    EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
-                    EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
-                    EGL_DEPTH_SIZE, 24, EGL_STENCIL_SIZE, 8,
-                    EGL_NONE,
-                ];
-                let (mut config, mut count) = (std::ptr::null_mut(), 0);
-                if choose_config(display, attributes.as_ptr(), &mut config, 1, &mut count) == 0 || count < 1 {
-                    // Mesa takes a context with no config (EGL_KHR_no_config_context);
-                    // the canvases never draw to a surface that would need one.
-                    config = std::ptr::null_mut();
-                }
-                let vendor = query_string(display, EGL_VENDOR);
-                let vendor = if vendor.is_null() { "?".into() } else { CStr::from_ptr(vendor).to_string_lossy() };
-                eprintln!("[WEBGL] EGL {major}.{minor} ({vendor}), surfaceless");
-                Ok(Platform {
+                let choose = |renderable: i32| {
+                    let attributes = [
+                        EGL_RENDERABLE_TYPE, renderable,
+                        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+                        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+                        EGL_DEPTH_SIZE, 24, EGL_STENCIL_SIZE, 8,
+                        EGL_NONE,
+                    ];
+                    let (mut config, mut count) = (std::ptr::null_mut(), 0);
+                    if choose_config(display, attributes.as_ptr(), &mut config, 1, &mut count) == 0 || count < 1 {
+                        // Mesa takes a context with no config (EGL_KHR_no_config_context);
+                        // the canvases never draw to a surface that would need one.
+                        config = std::ptr::null_mut();
+                    }
+                    config
+                };
+                let mut platform = Platform {
                     get_proc_address: sym!("eglGetProcAddress"),
                     create_context: sym!("eglCreateContext"),
                     make_current: sym!("eglMakeCurrent"),
                     destroy_context: sym!("eglDestroyContext"),
                     get_error,
                     display,
-                    config,
+                    config: std::ptr::null_mut(),
+                    es: false,
                     _lib: lib,
-                })
+                };
+                let wanted = std::env::var("ZIPP_WEBGL_API").unwrap_or_default();
+                if wanted != "es" && bind_api(EGL_OPENGL_API) != 0 {
+                    platform.config = choose(EGL_OPENGL_BIT);
+                    // Desktop OpenGL older than 3.3 cannot compile WebGL 2's
+                    // shaders as GLSL 3.30: OpenGL ES, then, unless asked not to.
+                    let version = platform.probe_version();
+                    match version {
+                        Some((major, minor)) if (major, minor) < (3, 3) && wanted != "gl" => {
+                            eprintln!("[WEBGL] desktop OpenGL is {major}.{minor}, older than 3.3: OpenGL ES instead");
+                            platform.es = true;
+                        }
+                        _ => {}
+                    }
+                } else if wanted == "gl" {
+                    return Err("this EGL has no desktop OpenGL".into());
+                } else {
+                    platform.es = true;
+                }
+                if platform.es {
+                    if bind_api(EGL_OPENGL_ES_API) == 0 {
+                        return Err("this EGL has neither desktop OpenGL 3.3 nor OpenGL ES".into());
+                    }
+                    platform.config = choose(EGL_OPENGL_ES3_BIT);
+                }
+                let vendor = query_string(display, EGL_VENDOR);
+                let vendor = if vendor.is_null() { "?".into() } else { CStr::from_ptr(vendor).to_string_lossy() };
+                let api = if platform.es { "OpenGL ES" } else { "OpenGL" };
+                eprintln!("[WEBGL] EGL {major}.{minor} ({vendor}), surfaceless, {api}");
+                Ok(platform)
+            }
+        }
+
+        pub(super) fn es(&self) -> bool {
+            self.es
+        }
+
+        /// The desktop OpenGL version a context would have, from one made
+        /// and thrown away.
+        unsafe fn probe_version(&self) -> Option<(u32, u32)> {
+            use glow::HasContext as _;
+            unsafe {
+                let raw = self.create().ok()?;
+                let gl = glow::Context::from_loader_function(|name| self.proc_address(name));
+                let version = gl.version();
+                let found = (version.major, version.minor);
+                drop(gl);
+                self.make_current(None);
+                self.destroy(raw);
+                Some(found)
             }
         }
 
@@ -1450,10 +1519,12 @@ mod egl {
         }
 
         /// A new context, current. With no version asked for, Mesa gives the
-        /// newest compatibility profile it has, as WGL's legacy contexts do.
+        /// newest compatibility profile it has, as WGL's legacy contexts do;
+        /// OpenGL ES is asked for as 3, and comes as the newest it has.
         pub(super) unsafe fn create(&self) -> Result<RawContext, String> {
             unsafe {
-                let raw = (self.create_context)(self.display, self.config, std::ptr::null_mut(), [EGL_NONE].as_ptr());
+                let attributes: &[i32] = if self.es { &[EGL_CONTEXT_MAJOR_VERSION, 3, EGL_NONE] } else { &[EGL_NONE] };
+                let raw = (self.create_context)(self.display, self.config, std::ptr::null_mut(), attributes.as_ptr());
                 if raw.is_null() {
                     return Err(format!("eglCreateContext: 0x{:x}", (self.get_error)()));
                 }
