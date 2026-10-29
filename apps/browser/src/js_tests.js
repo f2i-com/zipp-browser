@@ -96,6 +96,62 @@ T("innerHTML round-trips markup", function() { var d = document.createElement("d
 T("textContent is escaped", function() { var d = document.createElement("div"); d.textContent = "a < b & c"; return d.innerHTML === "a &lt; b &amp; c"; });
 T("render keeps innerHTML markup", function() { var d = document.createElement("div"); d.innerHTML = "<i>hi</i>"; var t = document.createElement("p"); t.textContent = "1 < 2"; d.appendChild(t); var h = __serializeNode(d); return h.indexOf("<i>hi</i>") >= 0 && h.indexOf("1 &lt; 2") >= 0; });
 
+// Selectors, custom elements, URLs: what GitHub's scripts run on.
+T("selectors: attributes, combinators, pseudo-classes", function() {
+    var d = document.createElement("div");
+    d.innerHTML = "";
+    var a = document.createElement("section"); a.className = "a b"; a.setAttribute("data-t", "x-app.data other");
+    var s = document.createElement("script"); s.setAttribute("type", "application/json"); a.appendChild(s);
+    var p = document.createElement("p"); a.appendChild(p); d.appendChild(a);
+    return d.querySelector('[data-t~="x-app.data"] > script[type="application/json"]') === s
+        && d.querySelector(".a.b > p:last-child") === p && d.querySelector("section:has(p):not(.c)") === a
+        && d.querySelectorAll(":scope section *").length === 2 && a.matches("div > .b") && p.closest("[data-t^=x-app]") === a;
+});
+T("selectors: an invalid one throws SyntaxError", function() { try { document.querySelector("a[") ; return false; } catch (e) { return e.name === "SyntaxError"; } });
+T("elements are instances of their interfaces", function() {
+    return document.createElement("button") instanceof HTMLButtonElement && document.createElement("div") instanceof HTMLElement
+        && document.body instanceof EventTarget && document instanceof Document && typeof window.HTMLDialogElement === "function";
+});
+T("custom elements upgrade, connect and observe", function() {
+    var log = [];
+    var host = document.createElement("t-up"); host.setAttribute("n", "1"); document.body.appendChild(host);
+    class TUp extends HTMLElement {
+        static get observedAttributes() { return ["n"]; }
+        constructor() { super(); log.push("ctor"); }
+        connectedCallback() { log.push("connected"); }
+        attributeChangedCallback(name, old, v) { log.push(name + ":" + old + ">" + v); }
+    }
+    customElements.define("t-up", TUp);
+    host.setAttribute("n", "2");
+    var made = document.createElement("t-up");
+    document.body.removeChild(host);
+    return host instanceof TUp && made instanceof TUp && log.join() === "ctor,n:null>1,connected,n:1>2,ctor" && customElements.get("t-up") === TUp;
+});
+T("a page may replace window.HTMLElement", function() {
+    var orig = window.HTMLElement;
+    window.HTMLElement = function () { return Reflect.construct(orig, [], this.constructor); };
+    HTMLElement.prototype = orig.prototype; Object.setPrototypeOf(HTMLElement, orig);
+    class TAd extends HTMLElement { constructor() { super(); this.ok = 1; } }
+    customElements.define("t-ad", TAd);
+    var el = document.createElement("t-ad"), div = document.createElement("div");
+    window.HTMLElement = orig;
+    return el.ok === 1 && el instanceof TAd && div instanceof orig;
+});
+T("URL resolves and serialises as the standard does", function() {
+    var u = new URL("./c.js?b=2#h", "https://h.com/a/./b/x.js");
+    u.searchParams.append("c", "x y");
+    return u.href === "https://h.com/a/b/c.js?b=2&c=x+y#h" && new URLSearchParams("a=1&b=%20x+y").get("b") === " x y" && !URL.canParse("nope");
+});
+T("attributes are iterable, and a link's href absolute", function() {
+    var a = document.createElement("a"); a.setAttribute("href", "/x?y=1"); a.setAttribute("data-k", "v");
+    var names = []; for (var at of a.attributes) names.push(at.name + "=" + at.value);
+    return names.join() === "href=/x?y=1,data-k=v" && a.attributes.length === 2 && a.href === "http://localhost/x?y=1" && a.pathname === "/x";
+});
+T("getComputedStyle reads values, and a style knows every property", function() {
+    var d = document.createElement("div");
+    return getComputedStyle(d).transform === "none" && getComputedStyle(d).display === "block" && "transform" in d.style && d.style.transform === "";
+});
+
 // IndexedDB (indexeddb_shim.js). No document here, so nothing is kept on disk.
 function idbReq(r) { return new Promise(function(res, rej) { r.onsuccess = function() { res(r.result); }; r.onerror = function() { rej(r.error); }; }); }
 function idbDone(tx) { return new Promise(function(res, rej) { tx.oncomplete = function() { res(); }; tx.onabort = function() { rej(tx.error || new Error("aborted")); }; }); }

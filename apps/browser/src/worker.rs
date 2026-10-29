@@ -325,7 +325,9 @@ fn host_call(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> Result<Strin
     Ok(String::new())
 }
 
-/// `new URL(input, base)`, for a worker's scope: its parts, as JSON.
+/// `new URL(input, base)`, for a page's or a worker's `URL`: its parts, as
+/// JSON, as the URL standard's getters give them (an empty query is no
+/// `search`, as in a browser).
 pub(crate) fn url_parts(input: &str, base: &str) -> Result<String, String> {
     let parsed = if base.is_empty() {
         url::Url::parse(input)
@@ -333,21 +335,44 @@ pub(crate) fn url_parts(input: &str, base: &str) -> Result<String, String> {
         url::Url::parse(base).and_then(|b| b.join(input))
     }
     .map_err(|e| format!("TypeError: Invalid URL: {e}"))?;
-    let port = parsed.port().map(|p| p.to_string()).unwrap_or_default();
-    let hostname = parsed.host_str().unwrap_or("").to_string();
-    let host = if port.is_empty() { hostname.clone() } else { format!("{hostname}:{port}") };
-    Ok(serde_json::json!({
-        "href": parsed.as_str(),
-        "origin": parsed.origin().ascii_serialization(),
-        "protocol": format!("{}:", parsed.scheme()),
-        "username": parsed.username(),
-        "password": parsed.password().unwrap_or(""),
-        "host": host,
-        "hostname": hostname,
-        "port": port,
-        "pathname": parsed.path(),
-        "search": parsed.query().map(|q| format!("?{q}")).unwrap_or_default(),
-        "hash": parsed.fragment().map(|f| format!("#{f}")).unwrap_or_default(),
+    Ok(parts_json(&parsed))
+}
+
+fn parts_json(u: &url::Url) -> String {
+    use url::quirks as q;
+    serde_json::json!({
+        "href": q::href(u),
+        "origin": q::origin(u),
+        "protocol": q::protocol(u),
+        "username": q::username(u),
+        "password": q::password(u),
+        "host": q::host(u),
+        "hostname": q::hostname(u),
+        "port": q::port(u),
+        "pathname": q::pathname(u),
+        "search": q::search(u),
+        "hash": q::hash(u),
     })
-    .to_string())
+    .to_string()
+}
+
+/// `url.<part> = value`: the URL with that part set as the URL standard's
+/// setter sets it, as `url_parts` gives it. A value the setter refuses (a
+/// port that is not one) leaves the URL as it was, as in a browser.
+pub(crate) fn url_set(href: &str, part: &str, value: &str) -> Result<String, String> {
+    use url::quirks as q;
+    let mut u = url::Url::parse(href).map_err(|e| format!("TypeError: Invalid URL: {e}"))?;
+    let _ = match part {
+        "protocol" => q::set_protocol(&mut u, value),
+        "username" => q::set_username(&mut u, value),
+        "password" => q::set_password(&mut u, value),
+        "host" => q::set_host(&mut u, value),
+        "hostname" => q::set_hostname(&mut u, value),
+        "port" => q::set_port(&mut u, value),
+        "pathname" => Ok(q::set_pathname(&mut u, value)),
+        "search" => Ok(q::set_search(&mut u, value)),
+        "hash" => Ok(q::set_hash(&mut u, value)),
+        _ => return Err(format!("unknown URL part {part:?}")),
+    };
+    Ok(parts_json(&u))
 }

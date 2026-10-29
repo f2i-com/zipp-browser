@@ -51,7 +51,7 @@ pub struct Linked {
 /// longest key ending in `/` that prefixes the specifier. A key or specifier
 /// that looks like a URL (`/`, `./`, `../`, a scheme) is resolved first, as
 /// the spec says, so a map can also redirect URLs.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ImportMap {
     /// Keys and the absolute URLs they map to, in order: the first map to
     /// name a key keeps it.
@@ -493,8 +493,22 @@ pub fn link_graph(
     fetch: &dyn Fn(&str) -> Result<String, String>,
     resolve: &dyn Fn(&str, &str) -> String,
 ) -> Linked {
-    let mut queue: Vec<String> = entries.to_vec();
-    let mut seen: HashSet<String> = entries.iter().cloned().collect();
+    link_more(entries, &HashSet::new(), true, fetch, resolve)
+}
+
+/// [`link_graph`], leaving out the modules in `linked` (the page has them),
+/// and running the entries only if `run`. A page links more this way when it
+/// imports a module whose URL it computes as it runs -- a code-split chunk --
+/// which no reading of the source could have found up front.
+pub fn link_more(
+    entries: &[String],
+    linked: &HashSet<String>,
+    run: bool,
+    fetch: &dyn Fn(&str) -> Result<String, String>,
+    resolve: &dyn Fn(&str, &str) -> String,
+) -> Linked {
+    let mut queue: Vec<String> = entries.iter().filter(|e| !linked.contains(*e)).cloned().collect();
+    let mut seen: HashSet<String> = entries.iter().chain(linked.iter()).cloned().collect();
     let mut modules: Vec<(String, Rewritten)> = Vec::new();
     let mut failures: Vec<(String, String)> = Vec::new();
 
@@ -547,8 +561,10 @@ pub fn link_graph(
         out.push_str(&rw.body);
         out.push_str("\n});\n");
     }
-    for e in entries {
-        out.push_str(&format!("__zippRunModule({});\n", js_string(e)));
+    if run {
+        for e in entries {
+            out.push_str(&format!("__zippRunModule({});\n", js_string(e)));
+        }
     }
     out.push_str("})();\n");
 
@@ -578,6 +594,24 @@ function __zippResolveModuleUrl(base, spec) {
     }
     if (best) return map[best] + key.slice(best.length);
     try { return String(new URL(spec, base)); } catch (e) { return spec; }
+}
+// A module for `import()`: linked up front, or -- a chunk whose URL the page
+// computes as it runs, which no reading of the source can find -- fetched and
+// linked now, with whatever it imports that is not here yet. Before, such an
+// import resolved to an empty namespace, and a bundler's loader reported the
+// chunk as failed.
+function __zippImportModule(u) {
+    if (!Object.prototype.hasOwnProperty.call(__zippModuleDefs, u)) {
+        var src = '';
+        try { src = __zippHostCall('esm_link', u, JSON.stringify(Object.keys(__zippModuleDefs))); } catch (e) {}
+        if (src) {
+            try { (0, eval)(src); } catch (e) { env.log('error', 'module ' + u + ' could not be linked: ' + e); }
+        }
+        if (!Object.prototype.hasOwnProperty.call(__zippModuleDefs, u)) {
+            return Promise.reject(new TypeError('Failed to fetch dynamically imported module: ' + u));
+        }
+    }
+    return Promise.resolve(__zippRunModule(u));
 }
 function __zippRunModule(url) {
     if (Object.prototype.hasOwnProperty.call(__zippModuleNs, url)) {
@@ -610,13 +644,14 @@ function __zippRunModule(url) {
     };
     var dbg = typeof __zippEsmDebug !== 'undefined' && __zippEsmDebug;
     var dyn = function (u) {
+        u = __zippResolveModuleUrl(url, u);
         if (dbg) env.log('info', 'esm dynamic ' + u);
-        return Promise.resolve(__zippRunModule(u));
+        return __zippImportModule(u);
     };
     var dynRel = function (base, spec) {
         var u = __zippResolveModuleUrl(base, spec);
         if (dbg) env.log('info', 'esm dynamic(rel) ' + spec + ' -> ' + u);
-        return Promise.resolve(__zippRunModule(u));
+        return __zippImportModule(u);
     };
     var meta = { url: url, env: { MODE: 'production', PROD: true, DEV: false, BASE_URL: '/' } };
     if (typeof __zippEsmDebug !== 'undefined' && __zippEsmDebug) {

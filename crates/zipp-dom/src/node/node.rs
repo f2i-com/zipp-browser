@@ -889,6 +889,17 @@ impl Node {
         self.stylo_element_data.primary_styles()
     }
 
+    /// The computed value of CSS property `name` -- a longhand, or a
+    /// `--custom` one -- on this element, serialised as `getComputedStyle`
+    /// gives it. `None` for a shorthand, a name that is no property, or an
+    /// element not styled.
+    pub fn computed_style_value(&self, name: &str) -> Option<String> {
+        let styles = self.primary_styles()?;
+        let id = style::properties::PropertyId::parse_enabled_for_all_content(name).ok()?;
+        let declaration = id.as_shorthand().err()?;
+        Some(styles.computed_value_to_string(declaration))
+    }
+
     #[inline]
     pub fn text_content(&self) -> String {
         let mut out = String::new();

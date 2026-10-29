@@ -979,6 +979,8 @@ thread_local! {
     /// a host call reaches, never an argument from the page: a page could
     /// otherwise read and set another site's.
     static DOC_URL: std::cell::RefCell<Option<url::Url>> = const { std::cell::RefCell::new(None) };
+    /// The page's import map, for modules it links as it runs (`esm_link`).
+    static IMPORT_MAP: std::cell::RefCell<esm::ImportMap> = std::cell::RefCell::new(esm::ImportMap::default());
 }
 
 /// The document a host call comes from: the URL its script started on, or the
@@ -1053,7 +1055,27 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
             worker::terminate(args.first().and_then(|a| a.parse().ok()).unwrap_or(0));
             Ok(String::new())
         }
-        // `new URL(input, base)` in a worker's scope.
+        // `url.<part> = value` (`URL`'s setters).
+        "url_set" => worker::url_set(
+            args.first().map(String::as_str).unwrap_or_default(),
+            args.get(1).map(String::as_str).unwrap_or_default(),
+            args.get(2).map(String::as_str).unwrap_or_default(),
+        ),
+        // A module the page imports as it runs that was not linked up front:
+        // it, and what it imports that the page lacks, as script to evaluate.
+        "esm_link" => {
+            let url = args.first().cloned().unwrap_or_default();
+            let linked: std::collections::HashSet<String> =
+                serde_json::from_str(args.get(1).map(String::as_str).unwrap_or("[]")).unwrap_or_default();
+            let map = IMPORT_MAP.with(|m| m.borrow().clone());
+            let resolve_module = |base: &str, spec: &str| map.resolve(base, spec, &resolve).unwrap_or_else(|| resolve(base, spec));
+            let out = esm::link_more(&[url], &linked, false, &fetch, &resolve_module);
+            for (url, err) in &out.failures {
+                console::push(console::Level::Error, format!("module {url} failed to load: {err}"));
+            }
+            Ok(out.source)
+        }
+        // `new URL(input, base)`, for a page or a worker.
         "url" => worker::url_parts(
             args.first().map(String::as_str).unwrap_or_default(),
             args.get(1).map(String::as_str).unwrap_or_default(),
@@ -1086,6 +1108,11 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
         // Copy the pending bytes into `__zippHostBytes`.
         // An element's box in the viewport (`getBoundingClientRect`).
         "rect" => Ok(event_bridge::layout_rect(args.first().map(String::as_str).unwrap_or_default())),
+        // `getComputedStyle(el)[name]`, from the last layout.
+        "computed_style" => Ok(event_bridge::layout_style(
+            args.first().map(String::as_str).unwrap_or_default(),
+            args.get(1).map(String::as_str).unwrap_or_default(),
+        )),
         "take_bytes" => {
             let (addr, count, kind) = ctx.typed_array_region("__zippHostBytes")?;
             if kind != 1 {
@@ -2044,6 +2071,7 @@ fn run_zipp_js_inner(
         let resolve_module =
             |base: &str, spec: &str| import_map.resolve(base, spec, &resolve).unwrap_or_else(|| resolve(base, spec));
         let linked = esm::link_graph(&module_entries, &fetch_module, &resolve_module);
+        IMPORT_MAP.with(|m| *m.borrow_mut() = import_map.clone());
         eprintln!(
             "[ESM] Linked {} modules from {} entr{} in {}ms",
             linked.module_count,
@@ -2077,6 +2105,13 @@ var __zippEsmDebug=true;
     // program and before the program's own microtasks, so every timer saw the
     // promises the scripts had settled as still pending.
 
+    // `ZIPP_DUMP_PROGRAM=<path>` writes the whole program out -- shim, page
+    // scripts, linked modules -- so that a stack frame's `<anonymous>:line:col`
+    // can be read off it directly.
+    if let Ok(path) = std::env::var("ZIPP_DUMP_PROGRAM") {
+        let _ = std::fs::write(&path, &full);
+        eprintln!("[JS] wrote the program to {path}");
+    }
     eprintln!("[JS] Compiling {} bytes...", full.len());
     let t_compile = std::time::Instant::now();
     let mut state = match compile_script(&full) {

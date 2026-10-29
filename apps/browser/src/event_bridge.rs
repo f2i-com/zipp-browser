@@ -905,6 +905,27 @@ pub(crate) fn layout_rect(nid: &str) -> String {
     })
 }
 
+/// The computed value of CSS property `name` on the script's node `nid`, from
+/// the last layout, as `getComputedStyle` reads it; "" when there is no
+/// layout to read or no such longhand.
+pub(crate) fn layout_style(nid: &str, name: &str) -> String {
+    let Ok(nid) = nid.parse::<u32>() else {
+        return String::new();
+    };
+    LAYOUT_DOC.with(|d| {
+        let ptr = d.get();
+        if ptr.is_null() {
+            return String::new();
+        }
+        // SAFETY: as in `layout_rect`.
+        let doc = unsafe { &*ptr };
+        let Ok(Some(id)) = doc.query_selector(&format!("[data-flid=\"{nid}\"]")) else {
+            return String::new();
+        };
+        doc.get_node(id).and_then(|node| node.computed_style_value(name)).unwrap_or_default()
+    })
+}
+
 /// Whether `node` is a field text is typed into: an `<input>` or `<textarea>`.
 fn is_text_field(doc: &dyn Document, node: usize) -> bool {
     doc.inner()

@@ -4,9 +4,11 @@
 //! so a server-rendered page's scripts found none of its elements, and a
 //! `<canvas>` written in the HTML could not be drawn on. This parses the page
 //! with html5ever and gives the shim its body as JSON (`__zippHostCall("seed")`),
-//! `[bodyAttributes, children]`, where an element is
+//! `[bodyAttributes, children, headChildren, htmlAttributes]`, where an element is
 //! `[tag, [name, value, ...], [children], ns?]` (`ns` "s" for SVG, "m" for
-//! MathML) and text is a string.
+//! MathML) and text is a string. The head is there for scripts that read it
+//! -- its `<meta>`s, a JSON `<script>` of settings (GitHub's `#client-env`) --
+//! and is never rendered from the shim.
 //!
 //! Left out: comments; `<noscript>`, since scripts run; and what is inside
 //! `#root`, which a client-rendered app fills itself, starting from empty as it
@@ -225,6 +227,15 @@ pub(crate) fn body_json(html: &str) -> Option<String> {
     }
     out.push(',');
     write_children(&mut out, &nodes, body);
+    out.push(',');
+    match nodes[html_el].children.iter().find(|&&c| is(c, &local_name!("head"))) {
+        Some(&head) => write_children(&mut out, &nodes, head),
+        None => out.push_str("[]"),
+    }
+    out.push(',');
+    if let Kind::Element { attrs, .. } = &nodes[html_el].kind {
+        write_attrs(&mut out, attrs);
+    }
     out.push(']');
     Some(out)
 }
@@ -323,7 +334,7 @@ mod tests {
     #[test]
     fn seeds_the_body() {
         let json = body_json(
-            "<!doctype html><html><body class=\"x\"><h1 id=a>Hi &amp; \"you\"</h1><!-- c -->\
+            "<!doctype html><html lang=en><head><meta name=release content=1></head><body class=\"x\"><h1 id=a>Hi &amp; \"you\"</h1><!-- c -->\
              <canvas width=640></canvas><noscript>no</noscript><div id=root><p>ssr</p></div>\
              <svg viewBox=\"0 0 1 1\"><path d=\"M0\"/></svg></body></html>",
         )
@@ -332,12 +343,13 @@ mod tests {
             json,
             "[[\"class\",\"x\"],[[\"h1\",[\"id\",\"a\"],[\"Hi & \\\"you\\\"\"]],\
              [\"canvas\",[\"width\",\"640\"],[]],[\"div\",[\"id\",\"root\"],[]],\
-             [\"svg\",[\"viewBox\",\"0 0 1 1\"],[[\"path\",[\"d\",\"M0\"],[],\"s\"]],\"s\"]]]"
+             [\"svg\",[\"viewBox\",\"0 0 1 1\"],[[\"path\",[\"d\",\"M0\"],[],\"s\"]],\"s\"]],\
+             [[\"meta\",[\"name\",\"release\",\"content\",\"1\"],[]]],[\"lang\",\"en\"]]"
         );
     }
 
     #[test]
     fn a_page_without_markup_still_has_a_body() {
-        assert_eq!(body_json("").as_deref(), Some("[[],[]]"));
+        assert_eq!(body_json("").as_deref(), Some("[[],[],[],[]]"));
     }
 }
