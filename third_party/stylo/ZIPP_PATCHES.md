@@ -31,3 +31,19 @@ All of them now follow that one pref (`container_queries_enabled()` in
 `stylesheets/container_rule.rs`); Gecko builds are unchanged. Evaluating them
 was already engine-neutral: it asks the embedder for a container's size
 through `TElement::query_container_size`, which zipp-dom answers from layout.
+
+## `servo/media_features.rs`: the rest of the media features
+
+Upstream 0.14's servo build knew five media features -- `width`, `scan`,
+`resolution`, the device pixel ratio and `prefers-color-scheme` -- so a query
+naming any other (`height`, `orientation`, `aspect-ratio`, `hover`, `pointer`,
+`prefers-reduced-motion`, `forced-colors`...) failed to parse and its rules
+were dropped. GitHub hides its card labels inside `@media (hover:hover)`, and
+they showed.
+
+The rest of Media Queries 4 and 5 are there now, answered as a desktop
+browser with a mouse answers them: viewport size and shape, fine pointer
+that hovers, sRGB, no preference for reduced motion, contrast or data, no
+forced or inverted colours, scripting enabled. Most of the names are not
+among servo's static atoms, so `MEDIA_FEATURES` is built on first use (a
+`LazyLock`), and `queries/feature_expression.rs` takes it as a slice.
