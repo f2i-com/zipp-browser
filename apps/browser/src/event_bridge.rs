@@ -496,6 +496,7 @@ impl EventHandler for JsEventBridge {
     /// without one are not driven: their animation frames run while they
     /// settle and after events, as before.
     fn animation_frame(&mut self, doc: &mut BaseDocument) -> bool {
+        let _layout = LayoutScope::enter(doc);
         let Some(state) = self.js_state.as_mut() else {
             return false;
         };
@@ -538,6 +539,7 @@ impl EventHandler for JsEventBridge {
         event_state: &mut EventState,
     ) {
         let event_name = event.data.name();
+        let _layout = LayoutScope::enter(&_doc.inner());
         // The console's button and links, and F12, are the browser's.
         let console_key = matches!(&event.data, DomEventData::KeyDown(k) if k.code == keyboard_types::Code::F12);
         let console_link = matches!(event.data, DomEventData::Click(_))
@@ -729,6 +731,7 @@ impl EventHandler for JsEventBridge {
     }
 
     fn run_tasks(&mut self, doc: &mut BaseDocument) -> Option<Instant> {
+        let _layout = LayoutScope::enter(doc);
         let now = Instant::now();
         // What the page's workers sent: each message is a task of its own.
         let messages = crate::worker::take_messages();
@@ -835,6 +838,64 @@ impl EventHandler for JsEventBridge {
             .map(|(&flid, &blitz_id)| (blitz_id, flid))
             .collect();
     }
+}
+
+thread_local! {
+    /// The document, laid out, while the page's script runs on its behalf --
+    /// an event, a timer, a frame: what `getBoundingClientRect` reads.
+    static LAYOUT_DOC: std::cell::Cell<*const BaseDocument> = const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+/// While alive, the page's script can read the document's layout.
+struct LayoutScope(*const BaseDocument);
+
+impl LayoutScope {
+    fn enter(doc: &BaseDocument) -> Self {
+        LayoutScope(LAYOUT_DOC.with(|d| d.replace(doc)))
+    }
+}
+
+impl Drop for LayoutScope {
+    fn drop(&mut self) {
+        LAYOUT_DOC.with(|d| d.set(self.0));
+    }
+}
+
+/// The border box of the script's node `nid` in the viewport, as JSON
+/// `[x, y, width, height]`; "" when there is no layout to read. Before, every
+/// box was all zeros, and a page mapping a click onto its canvas divided by a
+/// width of 0: a game's buttons, drawn on the canvas, could not be pressed.
+pub(crate) fn layout_rect(nid: &str) -> String {
+    let Ok(nid) = nid.parse::<u32>() else {
+        return String::new();
+    };
+    LAYOUT_DOC.with(|d| {
+        let ptr = d.get();
+        if ptr.is_null() {
+            return String::new();
+        }
+        // SAFETY: set only while a bridge method that has the document runs
+        // the page's script, which reads the layout and cannot change it.
+        let doc = unsafe { &*ptr };
+        let Ok(Some(id)) = doc.query_selector(&format!("[data-flid=\"{nid}\"]")) else {
+            return String::new();
+        };
+        let Some(node) = doc.get_node(id) else {
+            return String::new();
+        };
+        // `absolute_position` takes off the node's own scroll too, which moves
+        // its content, not the box.
+        let at = node.absolute_position(0.0, 0.0);
+        let scroll = doc.viewport_scroll();
+        let size = node.final_layout.size;
+        format!(
+            "[{},{},{},{}]",
+            f64::from(at.x) + node.scroll_offset.x - scroll.x,
+            f64::from(at.y) + node.scroll_offset.y - scroll.y,
+            size.width,
+            size.height
+        )
+    })
 }
 
 /// Whether `node` is a field text is typed into: an `<input>` or `<textarea>`.

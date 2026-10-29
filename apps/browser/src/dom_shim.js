@@ -338,7 +338,14 @@ class Element extends DOMNode {
     getElementsByClassName(cls) { var r=[]; function w(n){for(var i=0;i<n.childNodes.length;i++){var c=n.childNodes[i];if(c.nodeType===1&&c.classList&&c.classList.contains(cls))r.push(c);if(c.nodeType===1)w(c);}} w(this); return r; }
     querySelector(sel) { return _qs(this,sel,false); }
     querySelectorAll(sel) { return _qs(this,sel,true); }
-    getBoundingClientRect() { return {top:0,left:0,right:0,bottom:0,width:0,height:0,x:0,y:0}; }
+    // Its box in the viewport, from the last layout (zeros before there is one).
+    getBoundingClientRect() {
+        var r = null;
+        try { var s = __zippHostCall("rect", String(this._id)); if (s) r = JSON.parse(s); } catch (e) {}
+        if (!r) r = [0, 0, 0, 0];
+        return { x: r[0], y: r[1], left: r[0], top: r[1], width: r[2], height: r[3], right: r[0] + r[2], bottom: r[1] + r[3],
+                 toJSON: function () { return { x: this.x, y: this.y, width: this.width, height: this.height, top: this.top, left: this.left, right: this.right, bottom: this.bottom }; } };
+    }
     matches(sel) { return _sm(this,sel); }
     closest(sel) { var el=this; while(el){if(el.nodeType===1&&el.matches(sel))return el; el=el.parentNode;} return null; }
     cloneNode(deep) { var c=new Element(this.localName); c.className=this.className; c.id=this.id; for(var k in this.attributes) c.attributes[k]=this.attributes[k]; if(deep) for(var i=0;i<this.childNodes.length;i++) c.appendChild(this.childNodes[i].cloneNode(true)); return c; }

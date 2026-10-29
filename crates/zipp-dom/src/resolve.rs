@@ -376,6 +376,40 @@ impl BaseDocument {
         // it back; the pre-existing clamps all run BEFORE the relayout their own
         // change triggers, so they measure the previous frame.
         self.clamp_scroll_offsets();
+        self.place_hoisted_boxes();
+    }
+
+    /// Place each box painted from its stacking context (one with a z-index)
+    /// by this layout. Its offset from the stacking context is the sum of its
+    /// ancestors' positions between them, gathered when the stacking contexts
+    /// are built -- before layout, from the last one. A box that had only just
+    /// appeared (a menu opening) was painted for a frame at its stacking
+    /// context's corner, and jumped into place on the next.
+    fn place_hoisted_boxes(&mut self) {
+        let roots: Vec<usize> = self
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.stacking_context.is_some())
+            .map(|(id, _)| id)
+            .collect();
+        for root in roots {
+            let Some(mut context) = self.nodes[root].stacking_context.take() else {
+                continue;
+            };
+            for hoisted in context.children.iter_mut() {
+                let mut position = taffy::Point::ZERO;
+                let mut ancestor = self.nodes.get(hoisted.node_id).and_then(|n| n.layout_parent.get());
+                while let Some(id) = ancestor.filter(|&id| id != root) {
+                    let node = &self.nodes[id];
+                    position.x += node.final_layout.location.x - node.scroll_offset.x as f32;
+                    position.y += node.final_layout.location.y - node.scroll_offset.y as f32;
+                    ancestor = node.layout_parent.get();
+                }
+                hoisted.position = position;
+            }
+            context.compute_content_size(self);
+            self.nodes[root].stacking_context = Some(context);
+        }
     }
 
     /// Clamp every scroll offset to its element's current scrollable range.

@@ -1017,6 +1017,8 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
             ))
         }
         // Copy the pending bytes into `__zippHostBytes`.
+        // An element's box in the viewport (`getBoundingClientRect`).
+        "rect" => Ok(event_bridge::layout_rect(args.first().map(String::as_str).unwrap_or_default())),
         "take_bytes" => {
             let (addr, count, kind) = ctx.typed_array_region("__zippHostBytes")?;
             if kind != 1 {
