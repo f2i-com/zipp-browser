@@ -156,3 +156,7 @@ opt-level = "z"
 # See third_party/stylo/ZIPP_PATCHES.md.
 [patch.crates-io]
 stylo = { path = "third_party/stylo" }
+
+# Taffy at the same rev, with the fixes in third_party/taffy/ZIPP_PATCHES.md.
+[patch."https://github.com/DioxusLabs/taffy"]
+taffy = { path = "third_party/taffy" }

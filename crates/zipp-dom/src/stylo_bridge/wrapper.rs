@@ -173,6 +173,16 @@ impl<T: Deref<Target = ComputedValues>> taffy::BlockItemStyle for TaffyStyloStyl
     fn is_table(&self) -> bool {
         convert::is_table(self.0.clone_display())
     }
+
+    #[inline]
+    fn intrinsic_width(&self) -> Option<taffy::IntrinsicWidth> {
+        match self.0.get_position().width {
+            stylo::Size::MinContent => Some(taffy::IntrinsicWidth::MinContent),
+            stylo::Size::MaxContent => Some(taffy::IntrinsicWidth::MaxContent),
+            stylo::Size::FitContent => Some(taffy::IntrinsicWidth::FitContent),
+            _ => None,
+        }
+    }
 }
 
 // FlexboxContainerStyle impl

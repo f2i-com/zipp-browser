@@ -598,6 +598,12 @@ pub fn to_taffy_style(style: &stylo::ComputedValues) -> taffy::Style<Atom> {
         display: self::display(display),
         box_sizing: self::box_sizing(style.clone_box_sizing()),
         item_is_table: display.inside() == stylo::DisplayInside::Table,
+        item_intrinsic_width: match pos.width {
+            stylo::Size::MinContent => Some(taffy::IntrinsicWidth::MinContent),
+            stylo::Size::MaxContent => Some(taffy::IntrinsicWidth::MaxContent),
+            stylo::Size::FitContent => Some(taffy::IntrinsicWidth::FitContent),
+            _ => None,
+        },
         item_is_replaced: false,
         position: self::position(style.clone_position()),
         overflow: taffy::Point {
