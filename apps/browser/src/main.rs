@@ -141,6 +141,16 @@ fn main() {
         let ok = screenshot(&normalize_url(&url), &out, width, height);
         std::process::exit(if ok { 0 } else { 1 });
     }
+    // WPT reftests, many in one process: `tools/wpt_reftest.py` drives it.
+    //   zipp-browser --reftest pairs.tsv results.tsv
+    if arg == "--reftest" {
+        let mut rest = std::env::args().skip(2);
+        let (Some(pairs), Some(results)) = (rest.next(), rest.next()) else {
+            eprintln!("usage: zipp-browser --reftest pairs.tsv results.tsv");
+            std::process::exit(2);
+        };
+        std::process::exit(if reftest_batch(&pairs, &results) { 0 } else { 1 });
+    }
 
     let url = if arg.is_empty() { "https://lance.name".to_string() } else { arg };
     eprintln!("[BROWSER] Loading {url}");
@@ -1270,6 +1280,133 @@ fn attach_event_bridge(
 ///
 /// No window, no event loop — just the same document pipeline the window uses,
 /// pointed at a software framebuffer. Returns whether it succeeded.
+/// The viewport WPT reftests are written for.
+const REFTEST_SIZE: (u32, u32) = (800, 600);
+
+/// Pages are rendered without the browser's toolbar (`--reftest`).
+static NO_CHROME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `--reftest pairs.tsv results.tsv`: run Web Platform Tests reftests. Each
+/// line of `pairs` is `test URL \t reference URL \t largest channel difference
+/// allowed \t differing pixels allowed \t match|mismatch` (WPT's `fuzzy`
+/// annotation gives the allowances); both pages are rendered at 800x600, and
+/// one line is appended to `results` per test:
+/// `test URL \t pass|fail|error|crash \t differing pixels \t largest difference`.
+///
+/// Tests already in `results` are skipped, so the driver can restart a run that
+/// a crash ended where it stopped. A panic is caught and reported as `crash`;
+/// an abort (a stack overflow) ends the process, and the driver records it.
+fn reftest_batch(pairs: &str, results: &str) -> bool {
+    use std::io::Write;
+    let done: std::collections::HashSet<String> = std::fs::read_to_string(results)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split('\t').next().map(str::to_string))
+        .collect();
+    let Ok(list) = std::fs::read_to_string(pairs) else {
+        eprintln!("[REFTEST] cannot read {pairs}");
+        return false;
+    };
+    let Ok(mut out) = std::fs::OpenOptions::new().create(true).append(true).open(results) else {
+        eprintln!("[REFTEST] cannot write {results}");
+        return false;
+    };
+    NO_CHROME.store(true, std::sync::atomic::Ordering::Relaxed);
+    // Stylesheets, fonts and images land asynchronously: a runtime for the run.
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
+    // One network client for the run, as a window has one for its pages: a
+    // client per page opened thousands of connections a minute, and the ones
+    // closing still held their ports, so new ones failed now and then.
+    let net = Arc::new(zipp_shell::net::Provider::new(None));
+    for line in list.lines() {
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() < 2 || done.contains(f[0]) {
+            continue;
+        }
+        let max_diff: u8 = f.get(2).and_then(|v| v.parse().ok()).unwrap_or(0);
+        let max_pixels: usize = f.get(3).and_then(|v| v.parse().ok()).unwrap_or(0);
+        let mismatch = f.get(4) == Some(&"mismatch");
+        let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (render_rgba(f[0], &rt, &net), render_rgba(f[1], &rt, &net))
+        }));
+        let (status, differing, largest) = match rendered {
+            Err(_) => ("crash", 0, 0),
+            Ok((Some(test), Some(reference))) => {
+                let (mut differing, mut largest) = (0usize, 0u8);
+                for (a, b) in test.data().chunks_exact(4).zip(reference.data().chunks_exact(4)) {
+                    let d = a.iter().zip(b).map(|(x, y)| x.abs_diff(*y)).max().unwrap_or(0);
+                    if d > max_diff {
+                        differing += 1;
+                    }
+                    largest = largest.max(d);
+                }
+                let same = differing <= max_pixels;
+                let status = if same != mismatch { "pass" } else { "fail" };
+                // `ZIPP_REFTEST_DUMP=<dir>`: both renders of each failure, to look at.
+                if status == "fail"
+                    && let Some(dir) = std::env::var_os("ZIPP_REFTEST_DUMP")
+                {
+                    let name: String = f[0].rsplit('/').take(2).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("_");
+                    let base = std::path::Path::new(&dir).join(name);
+                    let _ = test.save_png(base.with_extension("test.png"));
+                    let _ = reference.save_png(base.with_extension("ref.png"));
+                }
+                (status, differing, largest)
+            }
+            Ok(_) => ("error", 0, 0),
+        };
+        let _ = writeln!(out, "{}\t{status}\t{differing}\t{largest}", f[0]);
+        let _ = out.flush();
+        eprintln!("[REFTEST] {status} {}", f[0]);
+    }
+    true
+}
+
+/// A page rendered at the reftest size, with fonts of its own: a clone of a
+/// font context shares its collection, so the web fonts one test registered
+/// were there for every test after it in the process, and results depended
+/// on the order tests ran in.
+fn render_rgba(url: &str, rt: &tokio::runtime::Runtime, net_provider: &Arc<zipp_shell::net::Provider>) -> Option<tiny_skia::Pixmap> {
+    use zipp_dom::traits_src::shell::{ColorScheme, Viewport};
+    let (width, height) = REFTEST_SIZE;
+    // The page itself comes through the blocking client, which must not run
+    // inside the runtime: in it, fetches failed now and then ("error sending
+    // request"), and a page that did not load failed its test.
+    let (final_html, _, _js_state) = prepare_page(url, (width, height));
+    let _guard = rt.enter();
+    let config = DocumentConfig {
+        font_ctx: Some(load_fonts()),
+        base_url: Some(url.to_string()),
+        net_provider: Some(net_provider.clone() as _),
+        html_parser_provider: Some(Arc::new(HtmlProvider) as _),
+        navigation_provider: Some(Arc::new(RecordingNavProvider) as _),
+        // Light, whatever the machine prefers: the same pixels every run.
+        viewport: Some(Viewport::new(width, height, 1.0, ColorScheme::Light)),
+        ..Default::default()
+    };
+    let mut doc = build_document(&final_html, config);
+    // Stylesheets, webfonts (Ahem, mostly) and images first, as `screenshot`.
+    let t = std::time::Instant::now();
+    loop {
+        while (!net_provider.is_empty() || doc.as_ref().has_pending_critical_resources()) && t.elapsed().as_secs() < 10 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            doc.as_mut().resolve(0.0);
+        }
+        doc.as_mut().handle_messages();
+        doc.as_mut().resolve(0.0);
+        if t.elapsed().as_secs() >= 10 || (net_provider.is_empty() && !doc.as_ref().has_pending_critical_resources()) {
+            break;
+        }
+    }
+    doc.as_mut().resolve(0.0);
+    doc.as_mut().resolve(ANIMATION_SETTLE_SECS);
+    let mut painter = zipp_renderer::tinyskia::TinySkiaPainter::new(width, height);
+    // The canvas a browser shows under a page with no background of its own.
+    painter.pixmap.fill(tiny_skia::Color::WHITE);
+    zipp_renderer::paint_scene(&mut painter, doc.as_ref(), 1.0, width, height, 0, 0);
+    Some(painter.pixmap)
+}
+
 fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
     use zipp_dom::traits_src::shell::{ColorScheme, Viewport};
 
@@ -2280,6 +2417,11 @@ pub(crate) fn chrome_css(console_open: bool) -> String {
 /// `body > header` -- and the page's body attributes were dropped, taking
 /// `body.home .hero`-style selectors with them.
 fn wrap_with_toolbar(html: &str, current_url: &str) -> String {
+    // A reftest's page as written: no toolbar (whose address differs between a
+    // test and its reference), no band above it, no doctype it did not have.
+    if NO_CHROME.load(std::sync::atomic::Ordering::Relaxed) {
+        return html.to_string();
+    }
     let toolbar = toolbar_markup(current_url);
     // Lowercasing only ASCII keeps every byte offset valid in `html`.
     let lower = html.to_ascii_lowercase();
