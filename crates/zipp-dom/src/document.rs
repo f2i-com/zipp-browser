@@ -1242,15 +1242,19 @@ impl BaseDocument {
                     }
                 }
             }
-            Resource::Font(bytes) => {
+            Resource::Font(bytes, family) => {
                 let font = Blob::new(Arc::new(bytes));
+                // Under the family name its `@font-face` rule gives it, as a
+                // browser does: the name inside the file is often another
+                // (GitHub's "Mona Sans" is "Mona Sans VF"), and a page asking
+                // for the rule's name got a fallback font.
+                let info = parley::fontique::FontInfoOverride { family_name: family.as_deref(), ..Default::default() };
 
-                // TODO: Implement FontInfoOverride
                 // TODO: Investigate eliminating double-box
                 let mut global_font_ctx = self.font_ctx.lock().unwrap();
                 global_font_ctx
                     .collection
-                    .register_fonts(font.clone(), None);
+                    .register_fonts(font.clone(), Some(info));
 
                 #[cfg(feature = "parallel-construct")]
                 {
@@ -1259,7 +1263,7 @@ impl BaseDocument {
                             .thread_font_contexts
                             .get_or(|| RefCell::new(Box::new(global_font_ctx.clone())))
                             .borrow_mut();
-                        font_ctx.collection.register_fonts(font.clone(), None);
+                        font_ctx.collection.register_fonts(font.clone(), Some(info));
                     });
                 }
                 drop(global_font_ctx);

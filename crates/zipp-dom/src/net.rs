@@ -51,8 +51,9 @@ pub enum Resource {
     Svg(ImageType, Arc<usvg::Tree>),
     /// A parsed CSS stylesheet.
     Css(DocumentStyleSheet),
-    /// Raw font bytes (possibly decompressed from WOFF/WOFF2).
-    Font(Bytes),
+    /// Raw font bytes (possibly decompressed from WOFF/WOFF2), and the family
+    /// name its `@font-face` rule gives it.
+    Font(Bytes, Option<String>),
     /// Placeholder for requests that complete but produce no usable resource
     /// (e.g. nested `@import` rules whose result is applied in-place).
     None,
@@ -315,7 +316,8 @@ impl NetHandler for ResourceHandler<NestedStylesheetHandler> {
 ///
 /// Stores the font format hint (if known) so the handler can attempt WOFF
 /// decompression when appropriate.
-struct FontFaceHandler(FontFaceSourceFormatKeyword);
+/// A font for an `@font-face` rule: its format, and the rule's family name.
+struct FontFaceHandler(FontFaceSourceFormatKeyword, Option<String>);
 
 impl NetHandler for ResourceHandler<FontFaceHandler> {
     fn bytes(mut self: Box<Self>, resolved_url: String, bytes: Bytes) {
@@ -399,7 +401,7 @@ impl FontFaceHandler {
             _ => {}
         }
 
-        Ok(Resource::Font(bytes))
+        Ok(Resource::Font(bytes, self.1.clone()))
     }
 }
 
@@ -425,10 +427,14 @@ pub(crate) fn fetch_font_face(
         .rules(read_guard)
         .iter()
         .filter_map(|rule| match rule {
-            CssRule::FontFace(font_face) => font_face.read_with(read_guard).sources.as_ref(),
+            CssRule::FontFace(font_face) => {
+                let rule = font_face.read_with(read_guard);
+                let family = rule.family.as_ref().map(|f| f.name.to_string());
+                rule.sources.as_ref().map(|sources| (sources, family))
+            }
             _ => None,
         })
-        .for_each(|source_list| {
+        .for_each(|(source_list, family)| {
             // Find the first font source in the source list that specifies a font of a type
             // that we support.
             let preferred_source = source_list
@@ -496,7 +502,7 @@ pub(crate) fn fetch_font_face(
                         doc_id,
                         node_id,
                         shell_provider.clone(),
-                        FontFaceHandler(format),
+                        FontFaceHandler(format, family.clone()),
                     ),
                 );
             }
