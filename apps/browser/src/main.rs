@@ -107,7 +107,28 @@ const INITIAL_WINDOW_SIZE: (u32, u32) = (1280, 800);
 const ANIMATION_SETTLE_SECS: f64 = 5.0;
 
 /// Customisable User-Agent string. Change this to mimic different browsers.
+/// It names the platform the browser runs on, as Chrome's does.
+#[cfg(not(target_os = "linux"))]
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Zipp/1.0";
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Zipp/1.0";
+#[cfg(all(target_os = "linux", not(target_arch = "aarch64")))]
+const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Zipp/1.0";
+
+/// A shim with the platform it is told about made this one's: the shims say
+/// Windows (`navigator.userAgent`, `navigator.platform`), as `USER_AGENT` does
+/// there.
+pub(crate) fn platform_shim(js: &str) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let platform = if cfg!(target_arch = "aarch64") { "Linux aarch64" } else { "Linux x86_64" };
+        js.replace("Windows NT 10.0; Win64; x64", &format!("X11; {platform}"))
+            .replace("platform:\"Win32\"", &format!("platform:\"{platform}\""))
+            .replace("platform: \"Win32\"", &format!("platform: \"{platform}\""))
+    }
+    #[cfg(not(target_os = "linux"))]
+    js.to_string()
+}
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -359,7 +380,7 @@ fn save_profile() {
 /// `--test-js` exercises the DOM surface, `--test-compat` the language surface;
 /// only the source file and how many failures to print differ.
 fn run_js_suite(tag: &str, tests: &str, max_failures: usize) -> bool {
-    let dom_shim = &format!("{}\n{}", include_str!("console_shim.js"), include_str!("dom_shim.js"));
+    let dom_shim = &platform_shim(&format!("{}\n{}", include_str!("console_shim.js"), include_str!("dom_shim.js")));
     let shim = dom_shim
         .replace("__PAGE_URL__", "http://localhost/test")
         .replace("__PAGE_TITLE__", "")
@@ -459,7 +480,7 @@ var t4 = "huge_extra: len=" + b4.extra_items.length + " indexOf=" + b4.extra_ite
 var result = t1 + " | " + t2 + " | " + t3 + " | " + t4;
 "#;
     // Load with DOM shim to test in the same environment as real pages
-    let dom_shim = &format!("{}\n{}", include_str!("console_shim.js"), include_str!("dom_shim.js"));
+    let dom_shim = &platform_shim(&format!("{}\n{}", include_str!("console_shim.js"), include_str!("dom_shim.js")));
     let shim = dom_shim
         .replace("__PAGE_URL__", "http://localhost/test")
         .replace("__PAGE_TITLE__", "")
@@ -2064,7 +2085,7 @@ fn run_zipp_js_inner(
     let seed = seed::body_json(html).unwrap_or_default();
     SEED.with(|s| *s.borrow_mut() = seed);
 
-    let dom_shim = &format!("{}\n{}", include_str!("console_shim.js"), include_str!("dom_shim.js"));
+    let dom_shim = &platform_shim(&format!("{}\n{}", include_str!("console_shim.js"), include_str!("dom_shim.js")));
     let router_helpers = include_str!("router_helpers.js");
     let webgl_shim = include_str!("webgl_shim.js");
     let webgpu_shim = include_str!("webgpu_shim.js");

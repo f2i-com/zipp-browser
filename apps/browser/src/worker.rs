@@ -234,7 +234,7 @@ fn run(url: &str, module: bool, inbox: Receiver<ToWorker>, outbox: Sender<FromWo
 /// The worker's whole program: its scope, then its script -- a classic one
 /// as fetched, a module with its graph linked.
 fn program(url: &str, module: bool) -> Result<String, String> {
-    let scope = include_str!("worker_shim.js").replace("__WORKER_URL__", &crate::js_quoted(url));
+    let scope = crate::platform_shim(include_str!("worker_shim.js")).replace("__WORKER_URL__", &crate::js_quoted(url));
     // WebGPU, as a worker has it in a browser: `navigator.gpu`, with its own
     // device on its own GPU thread (webgpu.rs keeps one per calling thread).
     // The zipp.org playground's engine computes in its worker, and without it
