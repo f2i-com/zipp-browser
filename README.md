@@ -217,9 +217,9 @@ Honest list, not an exhaustive one:
   hand-written menu toggle): the shim re-serialises SVG lossily, so showing its
   tree for every page would cost them their icons.
 - **WebAssembly is interpreted.** wasmi runs modules without a JIT: the
-  zipp.org playground's engine takes about 7 s to start in an unoptimised build
-  where Chrome takes well under one, and the page, waiting 2 s, starts a second
-  engine meanwhile.
+  zipp.org playground's engine takes about 2.4 s to start in a release build
+  (where Chrome takes well under one), and the page, which waits 2 s for it,
+  starts a second engine meanwhile. Programs then run at full frame rate.
 - **A worker cannot be stopped mid-task.** zipp-vm cannot interrupt running
   script, so `terminate()` takes effect between tasks; a worker stuck in a loop
   keeps its thread busy until the browser exits, though the page no longer
