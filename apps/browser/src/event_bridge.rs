@@ -876,6 +876,15 @@ impl Drop for LayoutScope {
 /// `[x, y, width, height]`; "" when there is no layout to read. Before, every
 /// box was all zeros, and a page mapping a click onto its canvas divided by a
 /// width of 0: a game's buttons, drawn on the canvas, could not be pressed.
+/// Whether `node` has been through a layout. A re-render builds the body's
+/// nodes afresh, and until the next one styles and lays them out their boxes
+/// read as 0 by 0: a page's script running in between saw its elements
+/// shrink to nothing and grow back, and a WebGL app sizing its canvas to them
+/// reallocated it at 1 by 1 and back, frame after frame.
+fn laid_out(node: &zipp_dom::Node) -> bool {
+    node.primary_styles().is_some()
+}
+
 pub(crate) fn layout_rect(nid: &str) -> String {
     let Ok(nid) = nid.parse::<u32>() else {
         return String::new();
@@ -891,7 +900,7 @@ pub(crate) fn layout_rect(nid: &str) -> String {
         let Ok(Some(id)) = doc.query_selector(&format!("[data-flid=\"{nid}\"]")) else {
             return String::new();
         };
-        let Some(node) = doc.get_node(id) else {
+        let Some(node) = doc.get_node(id).filter(|n| laid_out(n)) else {
             return String::new();
         };
         // `absolute_position` takes off the node's own scroll too, which moves
@@ -927,7 +936,7 @@ pub(crate) fn layout_box(nid: &str) -> String {
         let Ok(Some(id)) = doc.query_selector(&format!("[data-flid=\"{nid}\"]")) else {
             return String::new();
         };
-        let Some(node) = doc.get_node(id) else {
+        let Some(node) = doc.get_node(id).filter(|n| laid_out(n)) else {
             return String::new();
         };
         let l = &node.final_layout;

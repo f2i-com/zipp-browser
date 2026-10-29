@@ -462,7 +462,8 @@ var Element = class Element extends DOMNode {
     getBoundingClientRect() {
         var r = null;
         try { var s = __zippHostCall("rect", String(this._id)); if (s) r = JSON.parse(s); } catch (e) {}
-        if (!r) r = [0, 0, 0, 0];
+        if (r) __lastRects.set(this, r);
+        else r = (this.isConnected && __lastRects.get(this)) || [0, 0, 0, 0];
         return { x: r[0], y: r[1], left: r[0], top: r[1], width: r[2], height: r[3], right: r[0] + r[2], bottom: r[1] + r[3],
                  toJSON: function () { return { x: this.x, y: this.y, width: this.width, height: this.height, top: this.top, left: this.left, right: this.right, bottom: this.bottom }; } };
     }
@@ -1528,9 +1529,18 @@ doc.title = '__PAGE_TITLE__';
 // Layout sizes: the element's boxes as the page was last laid out (the
 // host's `box`). Before the first layout there are none, and they are 0 --
 // except a canvas's, which is its drawing buffer's, as it is when no CSS sizes
-// it: pages size a canvas from its `clientWidth`, and 0 left it empty.
+// it: pages size a canvas from its `clientWidth`, and 0 left it empty. Between
+// a re-render and the layout after it the element's new node has no boxes
+// yet, and it keeps the ones it had -- while it is in the page: one taken
+// out has none, as in Chrome.
+var __lastBoxes = new WeakMap();
+var __lastRects = new WeakMap();
 function __zippBox(el) {
-    try { var s = __zippHostCall("box", String(el._id)); return s ? JSON.parse(s) : null; } catch (e) { return null; }
+    var b = null;
+    try { var s = __zippHostCall("box", String(el._id)); if (s) b = JSON.parse(s); } catch (e) {}
+    if (b) __lastBoxes.set(el, b);
+    else if (el.isConnected) b = __lastBoxes.get(el) || null;
+    return b;
 }
 [["offsetWidth", 0], ["offsetHeight", 1], ["clientWidth", 2], ["clientHeight", 3]].forEach(function (pi) {
     var p = pi[0], dim = p.indexOf("Width") > 0 ? "width" : "height", store = "_" + p;
