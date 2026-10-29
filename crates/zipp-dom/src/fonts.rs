@@ -17,7 +17,7 @@
 //! Licensed under the SIL Open Font License 1.1; the license and authors files
 //! sit next to the fonts in `assets/fonts/`.
 
-use parley::fontique::{Blob, Collection, GenericFamily};
+use parley::fontique::{Blob, Collection, FallbackKey, FamilyId, GenericFamily, Script};
 use std::sync::Arc;
 
 /// Which CSS generic a face should back.
@@ -126,5 +126,47 @@ pub fn register_embedded_fonts(collection: &mut Collection) {
         } else {
             collection.append_generic_families(generic, families.iter().copied());
         }
+    }
+
+    register_symbol_fallbacks(collection);
+}
+
+/// Installed fonts that have the symbols text fonts leave out -- ▾ ✓ ✕ ★ ☰ ⌘
+/// -- by platform: Windows, macOS, then the usual Linux ones.
+const SYMBOL_FAMILIES: &[&str] = &[
+    "Segoe UI Symbol",
+    "Apple Symbols",
+    "Noto Sans Symbols 2",
+    "Noto Sans Symbols",
+    "DejaVu Sans",
+];
+
+/// The scripts a symbol is looked up under: one in running text takes the
+/// script of the text around it, so "Samples ▾" asks Latin's fallback.
+const SYMBOL_SCRIPTS: &[&str] = &["Latn", "Zyyy", "Zinh", "Grek", "Cyrl", "Arab", "Hebr"];
+
+/// Put the symbol fonts behind each script's own fallback.
+///
+/// The platform's fallback for Latin is a text font (Segoe UI on Windows),
+/// which has no ▾, so the menu arrow on a "Samples ▾" button was a box where
+/// Chrome, falling back per character, finds Segoe UI Symbol. Emoji were
+/// unaffected: those fall back to the emoji font on their own.
+pub fn register_symbol_fallbacks(collection: &mut Collection) {
+    let symbols: Vec<FamilyId> = SYMBOL_FAMILIES
+        .iter()
+        .filter_map(|name| collection.family_id(name))
+        .collect();
+    if symbols.is_empty() {
+        return;
+    }
+    for script in SYMBOL_SCRIPTS {
+        let key = FallbackKey::new(Script::from_str_unchecked(script), None);
+        let mut families: Vec<FamilyId> = collection.fallback_families(key).collect();
+        for &id in &symbols {
+            if !families.contains(&id) {
+                families.push(id);
+            }
+        }
+        collection.set_fallbacks(key, families.into_iter());
     }
 }
