@@ -79,7 +79,9 @@ fn debug() -> bool {
     *ON.get_or_init(|| std::env::var_os("ZIPP_DEBUG_WORKERS").is_some())
 }
 
-fn wake() {
+/// Wake the window's thread: a worker sent something, or a USB transfer
+/// finished (usb.rs).
+pub(crate) fn wake() {
     if let Some(wake) = WAKER.get() {
         wake();
     }

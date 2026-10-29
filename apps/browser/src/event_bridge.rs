@@ -762,6 +762,23 @@ impl EventHandler for JsEventBridge {
             }
             self.run_due_work();
         }
+        // USB transfers that finished (usb.rs): each settles its promise.
+        #[cfg(target_os = "linux")]
+        {
+            let done = crate::usb::take_completions();
+            if !done.is_empty() {
+                if let Some(state) = self.js_state.as_mut() {
+                    for (id, result) in done {
+                        let args = [JsValue::Number(id as f64), JsValue::String(result)];
+                        if let Err(e) = state.call_global("__zippUsbComplete", &args) {
+                            eprintln!("[USB] delivering a transfer failed: {e}");
+                        }
+                        state.run_microtasks();
+                    }
+                }
+                self.run_due_work();
+            }
+        }
         if console::has_submitted() {
             self.run_console_input();
             // An empty line again, still focused, for the next.

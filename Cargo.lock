@@ -6994,6 +6994,7 @@ dependencies = [
  "image",
  "keyboard-types 0.7.0",
  "lazy_static",
+ "libc",
  "libloading",
  "linebender_resource_handle",
  "mimalloc",

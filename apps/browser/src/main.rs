@@ -45,6 +45,8 @@ mod site_storage;
 #[cfg(windows)]
 mod media;
 mod canvas;
+#[cfg(target_os = "linux")]
+mod usb;
 mod canvas2d;
 mod console;
 mod worker;
@@ -1234,6 +1236,11 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
         // A WebGPU batch (webgpu.rs).
         #[cfg(any(windows, target_os = "linux"))]
         "gpu" => webgpu::host_call(ctx, args),
+        // WebUSB (usb.rs).
+        #[cfg(target_os = "linux")]
+        "usb" => usb::host_call(args),
+        #[cfg(not(target_os = "linux"))]
+        "usb" => Err("NotSupportedError: WebUSB is not available on this platform".into()),
         #[cfg(not(any(windows, target_os = "linux")))]
         "gpu" => Err("Error: WebGPU is not available on this platform".into()),
         // An image's size, for `naturalWidth` and `load`.
@@ -2089,8 +2096,9 @@ fn run_zipp_js_inner(
     let router_helpers = include_str!("router_helpers.js");
     let webgl_shim = include_str!("webgl_shim.js");
     let webgpu_shim = include_str!("webgpu_shim.js");
+    let webusb_shim = include_str!("webusb_shim.js");
     let dom_shim = &format!(
-        "{HOST_PRELUDE_JS}\n{dom_shim}\n{}\n{}\n{}\n{webgl_shim}\n{}\n{webgpu_shim}",
+        "{HOST_PRELUDE_JS}\n{dom_shim}\n{}\n{}\n{}\n{webgl_shim}\n{}\n{webgpu_shim}\n{webusb_shim}",
         include_str!("clone.js"),
         include_str!("indexeddb_shim.js"),
         include_str!("worker_page.js"),
