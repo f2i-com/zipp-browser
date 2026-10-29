@@ -18,6 +18,87 @@ use super::resolve_calc_value;
 use crate::BaseDocument;
 
 impl BaseDocument {
+    /// Lay out an absolutely positioned box among inline content, in `area`:
+    /// its containing block, as far as this layout knows it.
+    ///
+    /// Its size comes first, as CSS has it and taffy's block layout does: the
+    /// size its styles and insets give it, else its content's within the
+    /// area, clamped by its min and max. Only then is its content laid out,
+    /// at that size. Done in one pass, a column flexbox measured its items at
+    /// the area's width -- a menu's, under a button a few words wide -- and
+    /// its `min-width` widened the box only afterwards, so every item kept
+    /// the height of one word per line.
+    fn layout_inline_absolute_child(&mut self, child: usize, area: Size<f32>) -> LayoutOutput {
+        let (known, min_size, max_size) = {
+            let style = &self.nodes[child].style;
+            let aspect_ratio = style.aspect_ratio;
+            let margin = style.margin.map(|m| m.resolve_to_option(area.width, resolve_calc_value));
+            let padding = style.padding.resolve_or_zero(Some(area.width), resolve_calc_value);
+            let border = style.border.resolve_or_zero(Some(area.width), resolve_calc_value);
+            let padding_border = (padding + border).sum_axes();
+            let box_sizing_adjustment = if style.box_sizing == BoxSizing::ContentBox {
+                padding_border
+            } else {
+                Size::ZERO
+            };
+            let left = style.inset.left.maybe_resolve(area.width, resolve_calc_value);
+            let right = style.inset.right.maybe_resolve(area.width, resolve_calc_value);
+            let top = style.inset.top.maybe_resolve(area.height, resolve_calc_value);
+            let bottom = style.inset.bottom.maybe_resolve(area.height, resolve_calc_value);
+            let style_size = style
+                .size
+                .maybe_resolve(area, resolve_calc_value)
+                .maybe_apply_aspect_ratio(aspect_ratio)
+                .maybe_add(box_sizing_adjustment);
+            let min_size = style
+                .min_size
+                .maybe_resolve(area, resolve_calc_value)
+                .maybe_apply_aspect_ratio(aspect_ratio)
+                .maybe_add(box_sizing_adjustment)
+                .or(padding_border.map(Some))
+                .maybe_max(padding_border);
+            let max_size = style
+                .max_size
+                .maybe_resolve(area, resolve_calc_value)
+                .maybe_apply_aspect_ratio(aspect_ratio)
+                .maybe_add(box_sizing_adjustment);
+            let mut known = style_size.maybe_clamp(min_size, max_size);
+            if let (None, Some(left), Some(right)) = (known.width, left, right) {
+                let width = area.width.maybe_sub(margin.left).maybe_sub(margin.right) - left - right;
+                known.width = Some(width.max(0.0));
+                known = known.maybe_apply_aspect_ratio(aspect_ratio).maybe_clamp(min_size, max_size);
+            }
+            if let (None, Some(top), Some(bottom)) = (known.height, top, bottom) {
+                let height = area.height.maybe_sub(margin.top).maybe_sub(margin.bottom) - top - bottom;
+                known.height = Some(height.max(0.0));
+                known = known.maybe_apply_aspect_ratio(aspect_ratio).maybe_clamp(min_size, max_size);
+            }
+            (known, min_size, max_size)
+        };
+        let sizing = LayoutInput {
+            known_dimensions: known,
+            parent_size: area.map(Some),
+            available_space: Size {
+                width: AvailableSpace::Definite(area.width.maybe_clamp(min_size.width, max_size.width)),
+                height: AvailableSpace::Definite(area.height.maybe_clamp(min_size.height, max_size.height)),
+            },
+            sizing_mode: SizingMode::ContentSize,
+            run_mode: RunMode::ComputeSize,
+            axis: taffy::RequestedAxis::Both,
+            vertical_margins_are_collapsible: taffy::Line::FALSE,
+        };
+        let measured = self.compute_child_layout(NodeId::from(child), sizing).size;
+        let size = known.unwrap_or(measured).maybe_clamp(min_size, max_size);
+        self.compute_child_layout(
+            NodeId::from(child),
+            LayoutInput {
+                known_dimensions: size.map(Some),
+                run_mode: RunMode::PerformLayout,
+                ..sizing
+            },
+        )
+    }
+
     pub(crate) fn compute_inline_layout(
         &mut self,
         node_id: usize,
@@ -751,7 +832,8 @@ impl BaseDocument {
                     let is_floated = false;
 
                     if node.style.position == Position::Absolute {
-                        let output = self.compute_child_layout(NodeId::from(ibox.id), child_inputs);
+                        let output =
+                            self.layout_inline_absolute_child(ibox.id as usize, final_size);
 
                         let layout = &mut self.nodes[ibox.id as usize].unrounded_layout;
                         layout.size = output.size;
