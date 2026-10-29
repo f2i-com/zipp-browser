@@ -196,13 +196,32 @@ script settles, the shim serializes its tree to HTML, which is parsed into the
 real DOM for styling and layout. The VM stays alive, so a click re-enters the
 page's handlers and the updated tree is re-rendered.
 
+## Cookies and site storage
+
+The browser keeps a profile, `%LOCALAPPDATA%\Zipp` (`$XDG_DATA_HOME/zipp`
+elsewhere, or `ZIPP_PROFILE_DIR`):
+
+- **Cookies** -- one jar (RFC 6265) for every request and `document.cookie`,
+  in `cookies.json`. HttpOnly cookies go out with requests but scripts can
+  neither read nor set them; persistent cookies survive a restart, session
+  cookies do not.
+- **IndexedDB and `localStorage`** -- per origin, under `storage/`.
+  IndexedDB is the whole API (`indexeddb_shim.js`): object stores, indexes
+  (unique, multi-entry), cursors in every direction, key ranges, version
+  upgrades, and transactions that auto-commit and roll back on abort. idb,
+  Dexie and localforage run against it.
+
+Which site's cookies and storage a page reaches is decided by the browser,
+from the document the script belongs to, never by an argument from the page.
+
 ## Patched stylo
 
-`third_party/stylo` is stylo 0.14.0 from crates.io with one fix, wired in by
+`third_party/stylo` is stylo 0.14.0 from crates.io with two fixes, wired in by
 `[patch.crates-io]`: its servo build never reported a dark colour scheme, so
-`light-dark()` and dark system colours were unusable. See
-`third_party/stylo/ZIPP_PATCHES.md`; drop the copy when moving to a stylo that
-carries the fix.
+`light-dark()` and dark system colours were unusable; and it parsed container
+queries (`@container`, `cqw` and the other container lengths) only for Gecko.
+See `third_party/stylo/ZIPP_PATCHES.md`; drop the copy when moving to a stylo
+that carries the fixes.
 
 ## Known gaps
 
@@ -231,7 +250,7 @@ Honest list, not an exhaustive one:
   script, so `terminate()` takes effect between tasks; a worker stuck in a loop
   keeps its thread busy until the browser exits, though the page no longer
   hears from it. Workers cannot start workers, and nothing is transferred:
-  `postMessage` always copies.
+  `postMessage` always copies. Workers have no IndexedDB yet.
 - **Canvas 2D draws no shadows or filters**, text is laid out without shaping
   or kerning in the embedded faces only, a conic gradient is its first colour,
   and a video or WebGL canvas cannot be drawn into one.

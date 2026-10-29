@@ -96,6 +96,51 @@ T("innerHTML round-trips markup", function() { var d = document.createElement("d
 T("textContent is escaped", function() { var d = document.createElement("div"); d.textContent = "a < b & c"; return d.innerHTML === "a &lt; b &amp; c"; });
 T("render keeps innerHTML markup", function() { var d = document.createElement("div"); d.innerHTML = "<i>hi</i>"; var t = document.createElement("p"); t.textContent = "1 < 2"; d.appendChild(t); var h = __serializeNode(d); return h.indexOf("<i>hi</i>") >= 0 && h.indexOf("1 &lt; 2") >= 0; });
 
+// IndexedDB (indexeddb_shim.js). No document here, so nothing is kept on disk.
+function idbReq(r) { return new Promise(function(res, rej) { r.onsuccess = function() { res(r.result); }; r.onerror = function() { rej(r.error); }; }); }
+function idbDone(tx) { return new Promise(function(res, rej) { tx.oncomplete = function() { res(); }; tx.onabort = function() { rej(tx.error || new Error("aborted")); }; }); }
+function idbOpen(name, upgrade) { var r = indexedDB.open(name, 1); r.onupgradeneeded = function() { upgrade(r.result); }; return idbReq(r); }
+A("IndexedDB: put, get, index, key order", async function() {
+    var db = await idbOpen("t-basic", function(d) { d.createObjectStore("s", { keyPath: "id", autoIncrement: true }).createIndex("byN", "n"); });
+    var tx = db.transaction("s", "readwrite"), s = tx.objectStore("s");
+    var a = await idbReq(s.add({ n: "b" })), b = await idbReq(s.add({ n: "a", when: new Date(5) }));
+    await idbDone(tx);
+    s = db.transaction("s").objectStore("s");
+    var byN = await idbReq(s.index("byN").getAll());
+    var got = await idbReq(s.get(2));
+    return a === 1 && b === 2 && byN.map(function(x) { return x.n; }).join() === "a,b" && got.when.getTime() === 5 && indexedDB.cmp(1, "1") < 0 && indexedDB.cmp([1], "z") > 0;
+});
+A("IndexedDB: cursors in each direction", async function() {
+    var db = await idbOpen("t-cursor", function(d) { d.createObjectStore("s").createIndex("v", "v"); });
+    var tx = db.transaction("s", "readwrite"), s = tx.objectStore("s");
+    [["a", 1], ["b", 2], ["c", 1]].forEach(function(e) { s.put({ v: e[1] }, e[0]); });
+    await idbDone(tx);
+    function walk(src, dir) { return new Promise(function(res) { var seen = [], r = src.openCursor(null, dir); r.onsuccess = function() { var c = r.result; if (!c) return res(seen.join()); seen.push(c.primaryKey); c.continue(); }; }); }
+    s = db.transaction("s").objectStore("s");
+    return (await walk(s, "prev")) === "c,b,a" && (await walk(s.index("v"), "next")) === "a,c,b" && (await walk(s.index("v"), "nextunique")) === "a,b" && (await walk(s.index("v"), "prevunique")) === "b,a";
+});
+A("IndexedDB: an abort rolls back, a handled error does not", async function() {
+    var db = await idbOpen("t-abort", function(d) { d.createObjectStore("s").createIndex("u", "u", { unique: true }); });
+    var tx = db.transaction("s", "readwrite"), s = tx.objectStore("s");
+    s.put({ u: 1 }, "x");
+    var clash = s.put({ u: 1 }, "y");
+    clash.onerror = function(e) { e.preventDefault(); };
+    await idbDone(tx);
+    tx = db.transaction("s", "readwrite");
+    tx.objectStore("s").clear();
+    tx.abort();
+    try { await idbDone(tx); } catch (e) {}
+    return (await idbReq(db.transaction("s").objectStore("s").getAllKeys())).join() === "x" && clash.error.name === "ConstraintError";
+});
+A("IndexedDB: a transaction ends when nothing more is asked of it", async function() {
+    var db = await idbOpen("t-commit", function(d) { d.createObjectStore("s"); });
+    var tx = db.transaction("s", "readwrite"), s = tx.objectStore("s");
+    await idbReq(s.put(1, "a"));
+    await idbReq(s.put(2, "b"));
+    await new Promise(function(r) { setTimeout(r, 0); });
+    try { s.put(3, "c"); return false; } catch (e) { return e.name === "TransactionInactiveError"; }
+});
+
 env.log("info", "");
 env.log("info", "=== JS TEST RESULTS: " + _p + "/" + (_p + _f) + " passed ===");
 if (_f > 0) { env.log("warn", _f + " failures:"); for (var i = 0; i < _e.length; i++) env.log("warn", "  " + _e[i]); }

@@ -41,6 +41,7 @@ use zipp_shell::{create_default_event_loop, ZippApp, ShellProxy, WindowConfig};
 mod esm;
 mod event_bridge;
 mod seed;
+mod site_storage;
 #[cfg(windows)]
 mod media;
 mod canvas;
@@ -140,7 +141,7 @@ fn main() {
         let width: u32 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(1280);
         let height: u32 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(2000);
         let ok = screenshot(&normalize_url(&url), &out, width, height);
-        zipp_shell::cookies::flush();
+        save_profile();
         std::process::exit(if ok { 0 } else { 1 });
     }
     // WPT reftests, many in one process: `tools/wpt_reftest.py` drives it.
@@ -152,7 +153,7 @@ fn main() {
             std::process::exit(2);
         };
         let ok = reftest_batch(&pairs, &results);
-        zipp_shell::cookies::flush();
+        save_profile();
         std::process::exit(if ok { 0 } else { 1 });
     }
 
@@ -271,7 +272,14 @@ fn main() {
     stacker::maybe_grow(64 * 1024 * 1024, 256 * 1024 * 1024, || {
         event_loop.run_app(app).unwrap();
     });
+    save_profile();
+}
+
+/// Before the browser exits: write out what is waiting to be saved to the
+/// profile -- cookies, and what sites keep.
+fn save_profile() {
     zipp_shell::cookies::flush();
+    site_storage::flush();
 }
 
 // ---------------------------------------------------------------------------
@@ -293,7 +301,11 @@ fn run_js_suite(tag: &str, tests: &str, max_failures: usize) -> bool {
         .replace("__VIEWPORT_H__", "800")
         .replace("__BODY_HTML__", "<div id=\\'root\\'></div>");
 
-    let full = format!("{HOST_PRELUDE_JS}\n{shim}{tests}");
+    let full = format!(
+        "{HOST_PRELUDE_JS}\n{shim}\n{}\n{}\n{tests}",
+        include_str!("clone.js"),
+        include_str!("indexeddb_shim.js")
+    );
     eprintln!("[{tag}] Compiling {} bytes...", full.len());
     let mut state = match compile_script(&full) {
         Ok(s) => s,
@@ -1111,6 +1123,18 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
 
 fn browser_host_call(kind: &str, args: &[String]) -> Result<String, String> {
     match kind {
+        // What the site keeps -- IndexedDB, `localStorage` -- in its own
+        // folder: which site's is decided here, from the document.
+        "site_read" | "site_write" | "site_delete" | "site_names" => {
+            let doc = host_doc_url(None).ok_or("SecurityError: no document")?;
+            let arg = |i: usize| args.get(i).map(String::as_str).unwrap_or_default();
+            match kind {
+                "site_read" => site_storage::read(&doc, arg(0), arg(1)).map(Option::unwrap_or_default),
+                "site_write" => site_storage::write(&doc, arg(0), arg(1), Some(arg(2).to_string())).map(|_| String::new()),
+                "site_delete" => site_storage::write(&doc, arg(0), arg(1), None).map(|_| String::new()),
+                _ => site_storage::names(&doc, arg(0)),
+            }
+        }
         // `document.cookie`, read and written: the browser's jar, for this
         // document only.
         "cookie_get" => Ok(host_doc_url(args.first().map(String::as_str))
@@ -1945,8 +1969,9 @@ fn run_zipp_js_inner(
     let webgl_shim = include_str!("webgl_shim.js");
     let webgpu_shim = include_str!("webgpu_shim.js");
     let dom_shim = &format!(
-        "{HOST_PRELUDE_JS}\n{dom_shim}\n{}\n{}\n{webgl_shim}\n{}\n{webgpu_shim}",
+        "{HOST_PRELUDE_JS}\n{dom_shim}\n{}\n{}\n{}\n{webgl_shim}\n{}\n{webgpu_shim}",
         include_str!("clone.js"),
+        include_str!("indexeddb_shim.js"),
         include_str!("worker_page.js"),
         include_str!("canvas2d_shim.js")
     );

@@ -89,5 +89,8 @@ var __zippClone = (function () {
   return {
     encode: function (v) { return JSON.stringify(out(v, [])); },
     decode: function (s) { return back(JSON.parse(s)); },
+    // The tree `encode` serialises, and back: IndexedDB keeps values as these.
+    out: function (v) { return out(v, []); },
+    back: back,
   };
 })();

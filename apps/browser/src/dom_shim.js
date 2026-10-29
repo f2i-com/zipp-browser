@@ -957,16 +957,38 @@ if (!Array.prototype.keys) Array.prototype.keys = function() { var i = 0, self =
 // restoring saved state on startup just found nothing. `getItem` also used
 // `|| null`, which turned a stored "" or "0" into null.
 //
-// Still in-memory only: nothing is persisted across a page load, so this is a
-// working Storage API, not a working store.
-function __Storage() { this._data = {}; }
+// `localStorage` is kept in the browser's profile, per site (site_storage.rs),
+// and saved on every change; `sessionStorage` lasts as long as the page.
+function __Storage(kept) {
+    this._data = {};
+    this._kept = !!kept;
+    if (kept) {
+        try {
+            var saved = JSON.parse(__zippHostCall("site_read", "local", "") || "{}");
+            if (saved && typeof saved === "object") this._data = saved;
+        } catch (e) {}
+    }
+}
+__Storage.prototype._save = function() {
+    if (this._kept) { try { __zippHostCall("site_write", "local", "", JSON.stringify(this._data)); } catch (e) {} }
+};
 __Storage.prototype.getItem = function(k) {
     k = String(k);
     return Object.prototype.hasOwnProperty.call(this._data, k) ? this._data[k] : null;
 };
-__Storage.prototype.setItem = function(k, v) { this._data[String(k)] = String(v); };
-__Storage.prototype.removeItem = function(k) { delete this._data[String(k)]; };
-__Storage.prototype.clear = function() { this._data = {}; };
+__Storage.prototype.setItem = function(k, v) {
+    k = String(k); v = String(v);
+    if (this._data[k] === v && Object.prototype.hasOwnProperty.call(this._data, k)) return;
+    this._data[k] = v;
+    this._save();
+};
+__Storage.prototype.removeItem = function(k) {
+    k = String(k);
+    if (!Object.prototype.hasOwnProperty.call(this._data, k)) return;
+    delete this._data[k];
+    this._save();
+};
+__Storage.prototype.clear = function() { this._data = {}; this._save(); };
 __Storage.prototype.key = function(i) {
     var keys = Object.keys(this._data);
     return i >= 0 && i < keys.length ? keys[i] : null;
@@ -976,7 +998,7 @@ Object.defineProperty(__Storage.prototype, "length", {
 });
 
 var sessionStorage = new __Storage();
-var localStorage = new __Storage();
+var localStorage = new __Storage(true);
 
 var __b64chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 function __btoa(s) {
