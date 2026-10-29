@@ -22,11 +22,16 @@ const MAX_PDF_PAGES: usize = 200;
 /// the size it is shown, so it is sharp at the default zoom.
 const PDF_SCALE: f32 = 96.0 / 72.0;
 
+/// What Chrome accepts when it navigates to a page.
+const NAVIGATION_ACCEPT: &str =
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8";
+
 /// Load `url` as a top-level document: the page's own HTML, or a viewer page
 /// for anything else.
 ///
 /// With `allow_download` false (prerendering), content that would be saved to
 /// disk is an error instead -- a background prefetch must never write files.
+
 pub(crate) fn fetch_document(url: &str, allow_download: bool) -> Result<String, String> {
     if let Some(path) = url.strip_prefix("file://") {
         let path = local_path(path);
@@ -35,7 +40,21 @@ pub(crate) fn fetch_document(url: &str, allow_download: bool) -> Result<String, 
         return classify(url, bytes, mime.map(str::to_string), None, allow_download);
     }
 
-    let response = crate::HTTP_CLIENT.get(url).send().map_err(|e| e.to_string())?;
+    // Asked for as a browser navigates, not as a script fetches: a server may
+    // answer the two differently. softn.com sends an app's page
+    // (`/play/<name>`) only to a request that accepts HTML, and the rest of
+    // its site's "there is no page here" to anything else -- which is what
+    // every app opened in this browser showed.
+    let response = crate::HTTP_CLIENT
+        .get(url)
+        .header(reqwest::header::ACCEPT, NAVIGATION_ACCEPT)
+        .header("Sec-Fetch-Dest", "document")
+        .header("Sec-Fetch-Mode", "navigate")
+        .header("Sec-Fetch-Site", "none")
+        .header("Sec-Fetch-User", "?1")
+        .header("Upgrade-Insecure-Requests", "1")
+        .send()
+        .map_err(|e| e.to_string())?;
     let header = |name: reqwest::header::HeaderName| {
         response.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string)
     };
