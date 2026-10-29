@@ -17,6 +17,10 @@
 (function () {
   "use strict";
   var C = __zippClone;
+  // The shim's own timers, taken now: a page may replace the globals (zone.js
+  // and fake-timer libraries do), and a transaction's commit must not wait on
+  // theirs.
+  var setTask = setTimeout, clearTask = clearTimeout;
   var MAX_GEN = 9007199254740992; // 2^53: the key generator's limit
 
   function err(name, message) { return new DOMException(message, name); }
@@ -388,7 +392,7 @@
     }
   }
   function armCommit(t) {
-    t._timer = setTimeout(function () {
+    t._timer = setTask(function () {
       t._timer = 0;
       if (!t._done && !t._reqs.length && queue[0] === t) commitTx(t);
       kick();
@@ -418,7 +422,7 @@
   }
   function commitTx(t) {
     t._done = true;
-    if (t._timer) { clearTimeout(t._timer); t._timer = 0; }
+    if (t._timer) { clearTask(t._timer); t._timer = 0; }
     if (t.mode !== "readonly") saveDb(t.db._db, t._changed);
     fire(t, new Event("complete", {}), []);
     if (t._open) t._open.finish(true);
@@ -427,7 +431,7 @@
   function abortTx(t, error) {
     if (t._done) return;
     t._done = true;
-    if (t._timer) { clearTimeout(t._timer); t._timer = 0; }
+    if (t._timer) { clearTask(t._timer); t._timer = 0; }
     if (t.mode !== "readonly") restoreDb(t.db._db, t._changed, t.mode === "versionchange");
     var left = t._reqs;
     t._reqs = [];
@@ -436,7 +440,7 @@
     // returns first, so a handler set on the next line still hears of it.
     // The transactions after it wait for them.
     t._aborting = true;
-    setTimeout(function () {
+    setTask(function () {
       t._aborting = false;
       for (var i = 0; i < left.length; i++) {
         var q = left[i].req;
