@@ -235,6 +235,13 @@ var __zippWebGL = (function () {
     if (offset || length) a = a.subarray(offset || 0, length ? (offset || 0) + length : a.length);
     return Array.prototype.slice.call(a);
   }
+  // The same values as a new typed array: a copy, since the page may change
+  // its own array before the batch goes (three.js reuses one per matrix).
+  function copied(v, Kind, offset, length) {
+    var a = v instanceof Kind ? v : new Kind(v);
+    if (offset || length) a = a.subarray(offset || 0, length ? (offset || 0) + length : a.length);
+    return new Kind(a);
+  }
   // Bytes per pixel of `format`/`type`, for `readPixels`.
   function pixelBytes(format, type) {
     switch (type) {
@@ -495,20 +502,24 @@ var __zippWebGL = (function () {
   P.getVertexAttribOffset = function () { return 0; };
 
   // Uniforms: a location is its program and name; the host resolves it.
-  // WebGL 2's array forms take a source offset and length, in elements.
+  // WebGL 2's array forms take a source offset and length, in elements. The
+  // values go as bytes beside the batch: as numbers in its JSON, a frame of a
+  // three.js scene's matrices was hundreds of kilobytes of decimals to write
+  // out and parse back.
   function uniform(ctx, loc, kind, values, transpose) {
     if (!loc) return;
-    ctx._cmd(transpose ? ["uniform", loc._program, loc._name, kind, values, true] : ["uniform", loc._program, loc._name, kind, values]);
+    var u8 = new Uint8Array(values.buffer, values.byteOffset, values.byteLength);
+    ctx._cmd(["uniform", loc._program, loc._name, kind, ctx._bytes(u8), u8.length, !!transpose]);
   }
   ["1", "2", "3", "4"].forEach(function (n) {
-    P["uniform" + n + "f"] = function (loc) { uniform(this, loc, n + "f", numbers(Array.prototype.slice.call(arguments, 1), Float32Array)); };
-    P["uniform" + n + "i"] = function (loc) { uniform(this, loc, n + "i", numbers(Array.prototype.slice.call(arguments, 1), Int32Array)); };
-    P["uniform" + n + "fv"] = function (loc, v, off, len) { uniform(this, loc, n + "f", numbers(v, Float32Array, off, len)); };
-    P["uniform" + n + "iv"] = function (loc, v, off, len) { uniform(this, loc, n + "i", numbers(v, Int32Array, off, len)); };
+    P["uniform" + n + "f"] = function (loc) { uniform(this, loc, n + "f", copied(Array.prototype.slice.call(arguments, 1), Float32Array)); };
+    P["uniform" + n + "i"] = function (loc) { uniform(this, loc, n + "i", copied(Array.prototype.slice.call(arguments, 1), Int32Array)); };
+    P["uniform" + n + "fv"] = function (loc, v, off, len) { uniform(this, loc, n + "f", copied(v, Float32Array, off, len)); };
+    P["uniform" + n + "iv"] = function (loc, v, off, len) { uniform(this, loc, n + "i", copied(v, Int32Array, off, len)); };
   });
   ["2", "3", "4"].forEach(function (n) {
     P["uniformMatrix" + n + "fv"] = function (loc, transpose, v, off, len) {
-      uniform(this, loc, "m" + n, numbers(v, Float32Array, off, len), !!transpose);
+      uniform(this, loc, "m" + n, copied(v, Float32Array, off, len), !!transpose);
     };
   });
 
@@ -708,12 +719,12 @@ var __zippWebGL = (function () {
 
   // Uniforms
   ["1", "2", "3", "4"].forEach(function (n) {
-    P2["uniform" + n + "ui"] = function (loc) { uniform(this, loc, n + "u", numbers(Array.prototype.slice.call(arguments, 1), Uint32Array)); };
-    P2["uniform" + n + "uiv"] = function (loc, v, off, len) { uniform(this, loc, n + "u", numbers(v, Uint32Array, off, len)); };
+    P2["uniform" + n + "ui"] = function (loc) { uniform(this, loc, n + "u", copied(Array.prototype.slice.call(arguments, 1), Uint32Array)); };
+    P2["uniform" + n + "uiv"] = function (loc, v, off, len) { uniform(this, loc, n + "u", copied(v, Uint32Array, off, len)); };
   });
   ["2x3", "2x4", "3x2", "3x4", "4x2", "4x3"].forEach(function (n) {
     P2["uniformMatrix" + n + "fv"] = function (loc, transpose, v, off, len) {
-      uniform(this, loc, "m" + n.replace("x", ""), numbers(v, Float32Array, off, len), !!transpose);
+      uniform(this, loc, "m" + n.replace("x", ""), copied(v, Float32Array, off, len), !!transpose);
     };
   });
   P2.getUniformBlockIndex = function (p, name) { return this._ask(["getUniformBlockIndex", p._id, String(name)]); };

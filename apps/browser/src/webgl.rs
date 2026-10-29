@@ -907,12 +907,15 @@ impl Context {
                 }
                 "vertexAttribDivisor" => self.gl.vertex_attrib_divisor(u(1), u(2)),
                 "uniform" => {
-                    let (program, name, kind, transpose) = (u(1), text(2), text(3), flag(5));
-                    let values = nums(4);
+                    // The values are bytes beside the batch, of the kind's type.
+                    let (program, name, kind, transpose) = (u(1), text(2), text(3), flag(6));
+                    let raw = bytes(u(4) as usize, u(5) as usize)?;
                     if let Some(loc) = self.uniform_location(program, &name) {
-                        let fs: Vec<f32> = values.iter().map(|&v| v as f32).collect();
-                        let is: Vec<i32> = values.iter().map(|&v| v as i32).collect();
-                        let us: Vec<u32> = values.iter().map(|&v| v as u32).collect();
+                        let words = || raw.chunks_exact(4).map(|w| [w[0], w[1], w[2], w[3]]);
+                        let (int, uint) = (kind.ends_with('i'), kind.ends_with('u'));
+                        let fs: Vec<f32> = if int || uint { Vec::new() } else { words().map(f32::from_le_bytes).collect() };
+                        let is: Vec<i32> = if int { words().map(i32::from_le_bytes).collect() } else { Vec::new() };
+                        let us: Vec<u32> = if uint { words().map(u32::from_le_bytes).collect() } else { Vec::new() };
                         let (gl, loc) = (&self.gl, Some(&loc));
                         match kind.as_str() {
                             "1f" => gl.uniform_1_f32_slice(loc, &fs),
