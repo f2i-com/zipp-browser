@@ -235,27 +235,40 @@ pub(crate) fn collect_layout_children(
             doc.nodes[container_node_id].children = children;
         }
         DisplayInside::Flow | DisplayInside::FlowRoot | DisplayInside::TableCell => {
-            // TODO: make "all_inline" detection work in the presence of display:contents nodes
             let mut all_block = true;
             let mut all_inline = true;
             let mut all_out_of_flow = true;
             let mut has_contents = false;
-            for child in doc.nodes[container_node_id]
-                .children
-                .iter()
-                .copied()
-                .map(|child_id| &doc.nodes[child_id])
-            {
+            // The children as boxes: a `display:contents` child stands for its
+            // own children, recursively. It used to count as nothing, so a
+            // block whose only child was `contents` around block children took
+            // them all to be inline and laid them out as an inline formatting
+            // context: a `height:100%` among them resolved to nothing, and an
+            // app root positioned absolutely inside it collapsed (every
+            // softn.com app is wrapped so).
+            fn box_children(doc: &BaseDocument, node_id: usize, out: &mut Vec<usize>, has_contents: &mut bool) {
+                for &child_id in &doc.nodes[node_id].children {
+                    let is_contents = doc.nodes[child_id]
+                        .primary_styles()
+                        .is_some_and(|s| matches!(s.clone_display().inside(), DisplayInside::Contents));
+                    if is_contents {
+                        *has_contents = true;
+                        box_children(doc, child_id, out, has_contents);
+                    } else {
+                        out.push(child_id);
+                    }
+                }
+            }
+            let mut boxes = Vec::new();
+            box_children(doc, container_node_id, &mut boxes, &mut has_contents);
+            for child in boxes.iter().copied().map(|child_id| &doc.nodes[child_id]) {
                 // Unwraps on Text and SVG nodes
                 let style = child.primary_styles();
                 let style = style.as_ref();
                 let display = style
                     .map(|s| s.clone_display())
                     .unwrap_or(Display::inline());
-                if matches!(display.inside(), DisplayInside::Contents) {
-                    has_contents = true;
-                    all_out_of_flow = false;
-                } else {
+                {
                     let position = style
                         .map(|s| s.clone_position())
                         .unwrap_or(PositionProperty::Static);
@@ -295,7 +308,9 @@ pub(crate) fn collect_layout_children(
                 }
             }
 
-            if all_out_of_flow {
+            // (Not with a `contents` child: these push the children as they are,
+            // and a `contents` node is no box.)
+            if all_out_of_flow && !has_contents {
                 return push_non_whitespace_children_and_pseudos(
                     layout_children,
                     &doc.nodes[container_node_id],
