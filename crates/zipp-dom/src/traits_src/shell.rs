@@ -48,6 +48,10 @@ pub trait ShellProvider: Send + Sync + 'static {
         let _ = filter;
         vec![]
     }
+    /// A folder the user picks (`<input type=file webkitdirectory>`).
+    fn open_folder_dialog(&self) -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
 pub struct DummyShellProvider;

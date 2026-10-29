@@ -677,9 +677,9 @@ function __getHtmlClass() {
 
 function __zippDispatchEvent(handlerNid, targetNid, type, details) {
     var byType = __eventHandlers[handlerNid];
-    if (!byType) return false;
+    if (!byType) return 0;
     var handlers = byType[type];
-    if (!handlers || handlers.length === 0) return false;
+    if (!handlers || handlers.length === 0) return 0;
     var target = __nodesById[targetNid] || __nodesById[handlerNid] || null;
     return __zippRunListeners(handlers, type, target, __nodesById[handlerNid] || null, 2, details);
 }
@@ -691,10 +691,11 @@ function __zippDispatchToDocument(targetNid, type, details) {
     var handlers = byType && byType[type];
     if (!handlers || handlers.length === 0) return 0;
     var target = __nodesById[targetNid] || document.body || document;
-    return __zippRunListeners(handlers, type, target, document, 3, details) ? 3 : 1;
+    return (__zippRunListeners(handlers, type, target, document, 3, details) & 1) ? 3 : 1;
 }
 
-// Call `handlers` with one event; true when one called preventDefault().
+// Call `handlers` with one event, and say what they asked for: 1 when one
+// called preventDefault(), 2 when one stopped propagation (both: 3).
 // `details` is the JSON the bridge sends (`event_details`): coordinates,
 // buttons, modifier keys, wheel deltas, the key.
 function __zippRunListeners(handlers, type, target, currentTarget, phase, details) {
@@ -773,7 +774,74 @@ function __zippRunListeners(handlers, type, target, currentTarget, phase, detail
     // default action — for an <a>, a real navigation. React Router cancels the
     // click and routes in-page; without this the navigation ALSO ran, throwing
     // away the live JS state and leaving every control on the next page dead.
-    return defaultPrevented;
+    //
+    // And whether one stopped propagation, so that the event goes no further:
+    // a menu button that stops its click, so the document's "click anywhere
+    // closes the menu" listener never hears it, opened its menu and had it
+    // shut again in the same click.
+    return (defaultPrevented ? 1 : 0) | (propagationStopped ? 2 : 0);
+}
+
+// The element `focus()` was last called on, since the host last asked, by its
+// number; -1 when nothing asked for focus.
+function __zippTakeFocus() {
+    var node = document._focusRequest;
+    document._focusRequest = null;
+    return node && typeof node._id === "number" ? node._id : -1;
+}
+
+// An event on `target` and up through its ancestors to the document (which
+// holds the window's listeners too), as the page's own code would see it.
+function __zippFire(target, type) {
+    for (var n = target; n; n = n.parentNode) {
+        var byType = __eventHandlers[n._id];
+        var handlers = byType && byType[type];
+        if (handlers && handlers.length &&
+            (__zippRunListeners(handlers, type, target, n, n === target ? 2 : 3, null) & 2)) break;
+    }
+}
+
+// What was picked in an <input type=file>'s dialog, as JSON
+// `[[path, relativePath, size, modifiedMs], ...]`: the input's `files` now,
+// and its `input` and `change` events, as a browser fires them.
+function __zippFilesChosen(nid, json) {
+    var input = __nodesById[nid];
+    if (!input) return 0;
+    var files = JSON.parse(json).map(function (f) { return __zippChosenFile(f[0], f[1], f[2], f[3]); });
+    files.item = function (i) { return this[i] || null; };
+    input._files = files;
+    __zippFire(input, "input");
+    __zippFire(input, "change");
+    return files.length;
+}
+
+// A `File` picked in a dialog: its bytes are read from disk when asked for.
+function __zippChosenFile(path, relative, size, modified) {
+    var file = Object.create(File.prototype);
+    file._path = path;
+    file._parts = [];
+    file.name = path.split(/[\\/]/).pop();
+    file.size = size;
+    file.lastModified = modified;
+    file.webkitRelativePath = relative || "";
+    var ext = (file.name.match(/\.([^.]+)$/) || ["", ""])[1].toLowerCase();
+    file.type = ({
+        py: "text/x-python", js: "text/javascript", mjs: "text/javascript", json: "application/json",
+        txt: "text/plain", md: "text/markdown", csv: "text/csv", html: "text/html", htm: "text/html",
+        css: "text/css", svg: "image/svg+xml", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+        gif: "image/gif", webp: "image/webp", wasm: "application/wasm", pdf: "application/pdf"
+    })[ext] || "";
+    return file;
+}
+
+// A picked file's bytes. The host reads only what the user picked.
+function __zippChosenBytes(path) {
+    var len = Number(__zippHostCall("chosen_bytes", path));
+    if (__zippHostBytes.length < len) {
+        __zippHostBytes = new Uint8Array(Math.max(len, __zippHostBytes.length * 2));
+    }
+    __zippHostCall("take_bytes");
+    return __zippHostBytes.slice(0, len).buffer;
 }
 "#;
 
@@ -821,6 +889,17 @@ fn fetch_bytes_for_page(url: &str) -> Result<(u16, Vec<u8>), String> {
     Ok((status, bytes.to_vec()))
 }
 
+thread_local! {
+    /// The files picked in this window's file dialogs: the only ones a page
+    /// may read (`chosen_bytes`).
+    static CHOSEN_FILES: std::cell::RefCell<std::collections::HashSet<std::path::PathBuf>> = std::cell::RefCell::default();
+}
+
+/// Let the page read these files: the user picked them in a file dialog.
+pub(crate) fn allow_chosen_files<'a>(paths: impl IntoIterator<Item = &'a std::path::Path>) {
+    CHOSEN_FILES.with(|c| c.borrow_mut().extend(paths.into_iter().map(std::path::Path::to_path_buf)));
+}
+
 /// The host channel with the VM at hand, for the calls that move bytes: a
 /// binary body goes into the shim's `__zippHostBytes` scratch array through
 /// the engine's typed-array region, not through a string. Every other call is
@@ -849,6 +928,18 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
             args.first().map(String::as_str).unwrap_or_default(),
             args.get(1).map(String::as_str).unwrap_or_default(),
         ),
+        // A file picked in a file dialog, as bytes for `take_bytes`; its length.
+        // Only those: a page reads no other file of yours this way.
+        "chosen_bytes" => {
+            let path = std::path::PathBuf::from(args.first().map(String::as_str).unwrap_or_default());
+            if !CHOSEN_FILES.with(|c| c.borrow().contains(&path)) {
+                return Err("NotAllowedError: only a file picked in a file dialog can be read".into());
+            }
+            let bytes = std::fs::read(&path).map_err(|e| format!("NotReadableError: {}: {e}", path.display()))?;
+            let len = bytes.len();
+            PENDING_BYTES.with(|p| *p.borrow_mut() = bytes);
+            Ok(len.to_string())
+        }
         // `fetch(url).arrayBuffer()`: fetch the body as bytes and keep it for
         // `take_bytes`; report its status and length, so the shim can make the
         // scratch array big enough first.

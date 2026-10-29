@@ -136,6 +136,21 @@ impl HtmlDocument {
                     self.js_root_attrs = attrs.into_iter().map(|(name, _)| name).collect();
                 }
                 if let Some(body_id) = body_id {
+                    // What has focus, by the script's number for it (or its
+                    // id, for the browser's own console line), to give focus
+                    // back once its node is rebuilt: a page that re-renders
+                    // every frame would otherwise lose it at once (a game's
+                    // canvas, reading the arrow keys).
+                    let focused = self
+                        .inner
+                        .focus_node_id
+                        .and_then(|id| self.inner.get_node(id))
+                        .and_then(|n| {
+                            let attr = |name: &str| n.attr(markup5ever::LocalName::from(name)).map(str::to_string);
+                            attr("data-flid")
+                                .map(|flid| format!("[data-flid=\"{flid}\"]"))
+                                .or_else(|| attr("id").map(|id| format!("#{id}")))
+                        });
                     let mut mutator = crate::DocumentMutator::new(&mut self.inner);
                     mutator.set_inner_html(body_id, &html);
                     drop(mutator);
@@ -146,6 +161,11 @@ impl HtmlDocument {
                     // Hover/focus/mousedown ids point into the subtree that was
                     // just freed; the next mouse move would index a dead id.
                     self.inner.clear_interaction_state();
+                    if let Some(selector) = focused
+                        && let Ok(Some(node)) = self.inner.query_selector(&selector)
+                    {
+                        self.inner.set_focus_to(node);
+                    }
                     // Every node id the handler cached is stale now — the body's
                     // whole subtree was dropped and re-parsed. Let it rebuild
                     // before the next event arrives, or only the FIRST

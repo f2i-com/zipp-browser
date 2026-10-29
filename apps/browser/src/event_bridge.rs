@@ -221,6 +221,62 @@ impl JsEventBridge {
         self.refresh_next_timer();
     }
 
+    /// Hand the page what was picked in a file dialog -- `value` is zipp-dom's
+    /// `[[path, relativePath], ...]` -- with each file's size and time, and let
+    /// it read them. Its `change` listener then runs, and the page settles.
+    fn files_chosen(&mut self, flid: u32, value: &str) {
+        let Ok(picked) = serde_json::from_str::<Vec<(String, String)>>(value) else {
+            return;
+        };
+        let files: Vec<serde_json::Value> = picked
+            .iter()
+            .map(|(path, relative)| {
+                let meta = std::fs::metadata(path).ok();
+                let modified = meta
+                    .as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_millis() as u64);
+                serde_json::json!([path, relative, meta.map_or(0, |m| m.len()), modified])
+            })
+            .collect();
+        crate::allow_chosen_files(picked.iter().map(|(path, _)| std::path::Path::new(path)));
+        let Some(state) = self.js_state.as_mut() else {
+            return;
+        };
+        let json = serde_json::Value::Array(files).to_string();
+        if let Err(e) = state.call_global("__zippFilesChosen", &[JsValue::Number(f64::from(flid)), JsValue::String(json)]) {
+            eprintln!("[EVENT] handing over the chosen files failed: {e}");
+        }
+        state.run_microtasks();
+        // The page reads the files and shows them: settle as after a click.
+        self.settle_after_click();
+    }
+
+    /// Give focus where the page's `focus()` last asked for it, if it did.
+    fn apply_focus_request(&mut self, doc: &mut BaseDocument) {
+        let Some(state) = self.js_state.as_mut() else {
+            return;
+        };
+        let Ok(JsValue::Number(n)) = state.call_global("__zippTakeFocus", &[]) else {
+            return;
+        };
+        if n < 0.0 {
+            return;
+        }
+        let flid = n as u32;
+        if let Some((&node, _)) = self.reverse_flid.iter().find(|&(_, &f)| f == flid) {
+            doc.set_focus_to(node);
+        }
+    }
+
+    /// Whether the page changed its tree since it was last shown.
+    fn dom_changed(&mut self) -> bool {
+        self.js_state.as_mut().is_some_and(|state| {
+            matches!(state.call_global("__zippDomMutationCount", &[]), Ok(JsValue::Number(n)) if n != self.rendered_mutations)
+        })
+    }
+
     /// The tree as it is now is the one shown.
     fn note_rendered(&mut self) {
         if let Some(state) = self.js_state.as_mut()
@@ -416,6 +472,16 @@ impl EventHandler for JsEventBridge {
             self.show_console(&mut inner);
             return;
         }
+        // A file dialog closed on a choice: the page gets the files.
+        if let DomEventData::Input(input) = &event.data
+            && is_file_input(_doc, event.target)
+        {
+            if let Some(&flid) = self.reverse_flid.get(&event.target) {
+                self.files_chosen(flid, &input.value);
+                self.apply_focus_request(&mut _doc.inner_mut());
+            }
+            return;
+        }
         let details = event_details(&event.data);
         let mut ran_listener = false;
 
@@ -476,11 +542,21 @@ impl EventHandler for JsEventBridge {
                             Err(e) => {
                                 eprintln!("[EVENT] handler for \"{event_name}\" failed: {e}")
                             }
-                            // The page called preventDefault(). Blitz checks its
-                            // own event state before running an element's default
-                            // action, so this is what stops an <a> the page
-                            // handled itself from also navigating for real.
-                            Ok(JsValue::Bool(true)) => event_state.prevent_default(),
+                            // The page called preventDefault() (1). Blitz checks
+                            // its own event state before running an element's
+                            // default action, so this is what stops an <a> the
+                            // page handled itself from also navigating for real.
+                            // Or stopPropagation() (2): the event goes no
+                            // further up, nor to the document.
+                            Ok(JsValue::Number(n)) => {
+                                let asked = *n as u32;
+                                if asked & 1 != 0 {
+                                    event_state.prevent_default();
+                                }
+                                if asked & 2 != 0 {
+                                    event_state.stop_propagation();
+                                }
+                            }
                             Ok(_) => {}
                         }
                         // Flush what the handler scheduled. `call_global` returns
@@ -536,8 +612,15 @@ impl EventHandler for JsEventBridge {
         }
         if ran_listener && event_name == "click" {
             self.settle_after_click();
+        } else if ran_listener && self.dom_changed() {
+            // A key or move listener that changed the page -- a score, a log
+            // line -- is shown now, not whenever a timer next comes due.
+            self.run_due_work();
         } else if ran_listener {
             self.refresh_next_timer();
+        }
+        if ran_listener {
+            self.apply_focus_request(&mut _doc.inner_mut());
         }
     }
 
@@ -583,6 +666,7 @@ impl EventHandler for JsEventBridge {
                 doc.shell_provider.request_paint();
             }
         }
+        self.apply_focus_request(doc);
         let console_due = self.refresh_console(doc, now, false);
         [self.next_timer, console_due].into_iter().flatten().min()
     }
@@ -644,6 +728,16 @@ impl EventHandler for JsEventBridge {
             .map(|(&flid, &blitz_id)| (blitz_id, flid))
             .collect();
     }
+}
+
+/// Whether `node` is an `<input type=file>`.
+fn is_file_input(doc: &dyn Document, node: usize) -> bool {
+    doc.inner()
+        .get_node(node)
+        .and_then(|n| n.element_data())
+        .is_some_and(|el| {
+            &*el.name.local == "input" && el.attr(LocalName::from("type")) == Some("file")
+        })
 }
 
 /// Whether an event happened in the browser's toolbar rather than the page.

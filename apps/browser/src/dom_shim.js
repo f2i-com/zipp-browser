@@ -345,8 +345,13 @@ class Element extends DOMNode {
     cloneNode(deep) { var c=new Element(this.localName); c.className=this.className; c.id=this.id; for(var k in this.attributes) c.attributes[k]=this.attributes[k]; if(deep) for(var i=0;i<this.childNodes.length;i++) c.appendChild(this.childNodes[i].cloneNode(true)); return c; }
     _ps(s) { var p=s.split(";"); for(var i=0;i<p.length;i++){var kv=p[i].split(":"); if(kv.length===2) this.style[kv[0].trim()]=kv[1].trim();} }
     get isConnected() { var n=this; while(n){if(n.nodeType===9)return true; n=n.parentNode;} return false; }
-    focus() {}
-    blur() {}
+    // Remembered, for the host to give the element focus (`__zippTakeFocus`):
+    // a game's canvas, focused on mousedown, then reads the keys.
+    focus() { doc._focusRequest = this; doc._activeElement = this; }
+    blur() { if (doc._activeElement === this) doc._activeElement = null; }
+    // What an <input type=file> holds: set when its dialog closes on a choice.
+    get files() { return this._files || (this.localName === "input" && this.getAttribute("type") === "file" ? [] : undefined); }
+    set files(list) { this._files = list; }
     remove() { if(this.parentNode) this.parentNode.removeChild(this); }
     replaceWith(node) { if(this.parentNode) { this.parentNode.insertBefore(node,this); this.parentNode.removeChild(this); } }
     replaceChildren() { while(this.childNodes.length) this.removeChild(this.childNodes[this.childNodes.length-1]); for(var i=0;i<arguments.length;i++){ var n=arguments[i]; this.appendChild(typeof n==="string"?doc.createTextNode(n):n); } }
@@ -574,7 +579,7 @@ doc.forms = [];
 doc.images = [];
 doc.links = [];
 doc.styleSheets = [];
-Object.defineProperty(doc, 'activeElement', { get: function() { return doc.body; } });
+Object.defineProperty(doc, 'activeElement', { get: function() { return doc._activeElement || doc.body; } });
 doc.hasFocus = function() { return true; };
 doc.createNodeIterator = function(root) { return { nextNode:function(){return null;}, previousNode:function(){return null;} }; };
 doc.adoptNode = function(node) { node.ownerDocument=doc; return node; };
@@ -1182,6 +1187,31 @@ var Blob = function(parts, options) { this._parts = parts || []; this.type = (op
 Blob.prototype.text = function() { return Promise.resolve(this._parts.join("")); };
 Blob.prototype.arrayBuffer = function() { return Promise.resolve(this._parts.join("")); };
 
+// --- File: a Blob with a name. One picked in a file dialog (`_path`) reads
+// its bytes from disk when asked: see `__zippChosenFile`.
+var File = function(parts, name, options) {
+    Blob.call(this, parts, options);
+    this.name = String(name);
+    this.lastModified = (options && options.lastModified) || Date.now();
+    this.webkitRelativePath = "";
+};
+File.prototype = Object.create(Blob.prototype);
+File.prototype.constructor = File;
+File.prototype.arrayBuffer = function() {
+    if (!this._path) return Blob.prototype.arrayBuffer.call(this);
+    var path = this._path;
+    return new Promise(function(resolve, reject) {
+        try { resolve(__zippChosenBytes(path)); } catch (e) { reject(e); }
+    });
+};
+File.prototype.bytes = function() {
+    return this.arrayBuffer().then(function(buffer) { return new Uint8Array(buffer); });
+};
+File.prototype.text = function() {
+    if (!this._path) return Blob.prototype.text.call(this);
+    return this.bytes().then(function(bytes) { return new TextDecoder().decode(bytes); });
+};
+
 // --- matchMedia ---
 // Evaluates a media query list against the real viewport. It used to answer
 // `false` to everything, so an app branching in JS on `(max-width: 760px)`
@@ -1392,7 +1422,7 @@ var window = {
     XMLHttpRequest:XMLHttpRequest,
     WeakRef:WeakRef, FinalizationRegistry:FinalizationRegistry,
     Proxy:Proxy, Reflect:Reflect,
-    Headers:Headers, FormData:FormData, Blob:Blob
+    Headers:Headers, FormData:FormData, Blob:Blob, File:File
 };
 window.self=window; window.top=window; window.parent=window;
 // URL polyfill (improved - supports relative URL resolution)

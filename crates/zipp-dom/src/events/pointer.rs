@@ -454,6 +454,8 @@ pub(crate) fn handle_click(
     let double_click_event = event.clone();
 
     let mut maybe_node_id = Some(target);
+    // Whether the click gave focus to something on the way up.
+    let mut focused = false;
     let matched = 'matched: {
         while let Some(node_id) = maybe_node_id {
             let maybe_element = {
@@ -557,10 +559,24 @@ pub(crate) fn handle_click(
                 #[cfg(feature = "file_input")]
                 local_name!("input") if el.attr(local_name!("type")) == Some("file") => {
                     use crate::qual_name;
-                    //TODO: Handle accept attribute https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Attributes/accept by passing an appropriate filter
                     let multiple = el.attr(local_name!("multiple")).is_some();
-                    let files = doc.shell_provider.open_file_dialog(multiple, None);
+                    // `webkitdirectory`: a folder, and every file in it.
+                    let folder = el.attr(markup5ever::LocalName::from("webkitdirectory")).is_some();
+                    let filter = el.attr(local_name!("accept")).and_then(accept_filter);
+                    // Each chosen file, and its path from the chosen folder
+                    // (`webkitRelativePath`; empty for a file chosen alone).
+                    let chosen: Vec<(std::path::PathBuf, String)> = if folder {
+                        doc.shell_provider.open_folder_dialog().map(folder_files).unwrap_or_default()
+                    } else {
+                        doc.shell_provider
+                            .open_file_dialog(multiple, filter)
+                            .into_iter()
+                            .map(|p| (p, String::new()))
+                            .collect()
+                    };
+                    let files: Vec<std::path::PathBuf> = chosen.iter().map(|(p, _)| p.clone()).collect();
 
+                    let el = doc.nodes[node_id].data.downcast_element_mut().unwrap();
                     if let Some(file) = files.first() {
                         el.attrs
                             .set(qual_name!("value", html), &file.to_string_lossy());
@@ -582,12 +598,51 @@ pub(crate) fn handle_click(
                     } else {
                         el.special_data = SpecialElementData::FileInput(files.into())
                     }
-                    let child_label_id = doc.nodes[node_id].children[1];
-                    let child_text_id = doc.nodes[child_label_id].children[0];
-                    let text_data = doc.nodes[child_text_id]
-                        .text_data_mut()
-                        .expect("Text data not found");
-                    text_data.content = text_content;
+                    // The control's own label, where it has one (a hidden
+                    // input, as pages put inside a styled <label>, may not).
+                    let label_text = doc.nodes[node_id]
+                        .children
+                        .get(1)
+                        .and_then(|&label| doc.nodes[label].children.first().copied());
+                    if let Some(text) = label_text.and_then(|id| doc.nodes[id].text_data_mut()) {
+                        text.content = text_content;
+                    }
+                    // The page hears what was chosen: an input event carrying
+                    // the files as JSON `[[path, relativePath], ...]`, which
+                    // its event bridge turns into `files` and `change`.
+                    if !chosen.is_empty() {
+                        let mut json = String::from("[");
+                        for (i, (path, relative)) in chosen.iter().enumerate() {
+                            if i > 0 {
+                                json.push(',');
+                            }
+                            json.push('[');
+                            json_string(&mut json, &path.to_string_lossy());
+                            json.push(',');
+                            json_string(&mut json, relative);
+                            json.push(']');
+                        }
+                        json.push(']');
+                        dispatch_event(DomEvent::new(node_id, DomEventData::Input(InputEvent { value: json })));
+                    }
+                    // Done: walking on up would reach the <label> the input
+                    // sits in, whose click opens the dialog again -- over and
+                    // over, Cancel or not.
+                    break 'matched true;
+                }
+                // Anything else that takes focus -- a button, an element with
+                // a `tabindex` (a canvas a game reads keys on) -- gets it, as a
+                // click gives it in any browser. Before, only text fields did.
+                // The walk goes on: a button inside a link still follows it.
+                _ if el.is_focussable && !focused => {
+                    generate_focus_events(
+                        doc,
+                        &mut |doc| {
+                            doc.set_focus_to(node_id);
+                        },
+                        dispatch_event,
+                    );
+                    focused = true;
                 }
                 _ => {}
             }
@@ -600,8 +655,8 @@ pub(crate) fn handle_click(
         false
     };
 
-    // If nothing is matched then clear focus
-    if !matched {
+    // If nothing is matched (or focused) then clear focus
+    if !matched && !focused {
         generate_focus_events(doc, &mut |doc| doc.clear_focus(), dispatch_event);
     }
 
@@ -613,6 +668,64 @@ pub(crate) fn handle_click(
             DomEventData::DoubleClick(double_click_event),
         ));
     }
+}
+
+/// A file dialog filter from an `accept` attribute's extensions (`.py,.js`);
+/// none when it names only types (`image/*`).
+#[cfg(feature = "file_input")]
+fn accept_filter(accept: &str) -> Option<crate::traits_src::shell::FileDialogFilter> {
+    let extensions: Vec<String> = accept
+        .split(',')
+        .filter_map(|a| a.trim().strip_prefix('.').map(|e| e.to_ascii_lowercase()))
+        .filter(|e| !e.is_empty())
+        .collect();
+    if extensions.is_empty() {
+        return None;
+    }
+    Some(crate::traits_src::shell::FileDialogFilter { name: "Accepted files".into(), extensions })
+}
+
+/// Every file under `root`, with its path from `root`'s parent
+/// (`folder/sub/file.py`), as `webkitRelativePath` has it. At most 10,000.
+#[cfg(feature = "file_input")]
+fn folder_files(root: std::path::PathBuf) -> Vec<(std::path::PathBuf, String)> {
+    let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut out = Vec::new();
+    let mut stack = vec![(root, name)];
+    while let Some((dir, relative)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let child = format!("{relative}/{}", entry.file_name().to_string_lossy());
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => stack.push((path, child)),
+                Ok(t) if t.is_file() => {
+                    out.push((path, child));
+                    if out.len() >= 10_000 {
+                        return out;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+#[cfg(feature = "file_input")]
+fn json_string(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }
 
 pub(crate) fn handle_wheel<F: FnMut(DomEvent)>(
@@ -634,5 +747,32 @@ pub(crate) fn handle_wheel<F: FnMut(DomEvent)>(
     );
     if has_changed {
         doc.shell_provider.request_redraw();
+    }
+}
+
+#[cfg(all(test, feature = "file_input"))]
+mod tests {
+    use super::{accept_filter, folder_files};
+
+    #[test]
+    fn a_picked_folder_lists_every_file_with_its_path_from_the_folder() {
+        let root = std::env::temp_dir().join(format!("zipp-folder-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let proj = root.join("proj");
+        std::fs::create_dir_all(proj.join("sub")).unwrap();
+        std::fs::write(proj.join("main.py"), "print(1)").unwrap();
+        std::fs::write(proj.join("sub").join("util.py"), "x = 1").unwrap();
+
+        let mut relative: Vec<String> = folder_files(proj.clone()).into_iter().map(|(_, r)| r).collect();
+        relative.sort();
+        assert_eq!(relative, ["proj/main.py", "proj/sub/util.py"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn accept_gives_a_filter_of_its_extensions_only() {
+        let filter = accept_filter(".py, .JS,.mjs").unwrap();
+        assert_eq!(filter.extensions, ["py", "js", "mjs"]);
+        assert!(accept_filter("image/*").is_none());
     }
 }
