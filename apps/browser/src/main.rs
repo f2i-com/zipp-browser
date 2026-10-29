@@ -44,7 +44,9 @@ mod seed;
 #[cfg(windows)]
 mod media;
 mod canvas;
+mod canvas2d;
 mod console;
+mod worker;
 #[cfg(windows)]
 mod webgl;
 #[cfg(windows)]
@@ -142,8 +144,10 @@ fn main() {
 
     let url = if arg.is_empty() { "https://lance.name".to_string() } else { arg };
     eprintln!("[BROWSER] Loading {url}");
-    // The window's page runs on this thread: its console is the one shown.
+    // The window's page runs on this thread: its console is the one shown,
+    // and it may start workers.
     console::record_this_thread();
+    worker::allow_on_this_thread();
 
     // 1-3. Fetch, run the page's JS, post-process. The ScriptState is !Send, so
     //      this stays on the main thread to keep it alive for event dispatch.
@@ -173,6 +177,14 @@ fn main() {
     // 6. Create window and net provider
     let event_loop = create_default_event_loop();
     let (proxy, receiver) = ShellProxy::new(event_loop.create_proxy());
+    // A worker that has sent its page something wakes the window, whose event
+    // bridge hands it over (`JsEventBridge::run_tasks`).
+    let wake_proxy = std::sync::Mutex::new(proxy.clone());
+    worker::set_waker(Box::new(move || {
+        if let Ok(proxy) = wake_proxy.lock() {
+            proxy.send_event(zipp_shell::ShellEvent::Embedder(Arc::new(())));
+        }
+    }));
     let net_provider = Arc::new(zipp_shell::net::Provider::new(Some(Arc::new(
         proxy.clone(),
     ))));
@@ -250,7 +262,7 @@ fn main() {
 /// `--test-js` exercises the DOM surface, `--test-compat` the language surface;
 /// only the source file and how many failures to print differ.
 fn run_js_suite(tag: &str, tests: &str, max_failures: usize) -> bool {
-    let dom_shim = include_str!("dom_shim.js");
+    let dom_shim = &format!("{}\n{}", include_str!("console_shim.js"), include_str!("dom_shim.js"));
     let shim = dom_shim
         .replace("__PAGE_URL__", "http://localhost/test")
         .replace("__PAGE_TITLE__", "")
@@ -344,7 +356,7 @@ var t4 = "huge_extra: len=" + b4.extra_items.length + " indexOf=" + b4.extra_ite
 var result = t1 + " | " + t2 + " | " + t3 + " | " + t4;
 "#;
     // Load with DOM shim to test in the same environment as real pages
-    let dom_shim = include_str!("dom_shim.js");
+    let dom_shim = &format!("{}\n{}", include_str!("console_shim.js"), include_str!("dom_shim.js"));
     let shim = dom_shim
         .replace("__PAGE_URL__", "http://localhost/test")
         .replace("__PAGE_TITLE__", "")
@@ -816,6 +828,26 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
     match kind {
         // The page's body, once, as the shim's document starts.
         "seed" => Ok(SEED.with(|s| std::mem::take(&mut *s.borrow_mut()))),
+        // Web Workers (worker.rs): start one, post to one, stop one.
+        "worker_start" => {
+            let url = args.first().map(String::as_str).unwrap_or_default();
+            let module = args.get(1).is_some_and(|t| t == "module");
+            worker::start(url, module).map(|id| id.to_string())
+        }
+        "worker_post" => {
+            let id = args.first().and_then(|a| a.parse().ok()).unwrap_or(0);
+            worker::post(id, args.get(1).cloned().unwrap_or_default());
+            Ok(String::new())
+        }
+        "worker_terminate" => {
+            worker::terminate(args.first().and_then(|a| a.parse().ok()).unwrap_or(0));
+            Ok(String::new())
+        }
+        // `new URL(input, base)` in a worker's scope.
+        "url" => worker::url_parts(
+            args.first().map(String::as_str).unwrap_or_default(),
+            args.get(1).map(String::as_str).unwrap_or_default(),
+        ),
         // `fetch(url).arrayBuffer()`: fetch the body as bytes and keep it for
         // `take_bytes`; report its status and length, so the shim can make the
         // scratch array big enough first.
@@ -851,6 +883,8 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
         "gl" => webgl::host_call(ctx, args),
         #[cfg(not(windows))]
         "gl" => Err("Error: WebGL is not available on this platform".into()),
+        // A Canvas 2D batch (canvas2d.rs).
+        "c2d" => canvas2d::host_call(ctx, args),
         // A WebGPU batch (webgpu.rs).
         #[cfg(windows)]
         "gpu" => webgpu::host_call(ctx, args),
@@ -1558,11 +1592,16 @@ fn run_zipp_js_inner(
     let seed = seed::body_json(html).unwrap_or_default();
     SEED.with(|s| *s.borrow_mut() = seed);
 
-    let dom_shim = include_str!("dom_shim.js");
+    let dom_shim = &format!("{}\n{}", include_str!("console_shim.js"), include_str!("dom_shim.js"));
     let router_helpers = include_str!("router_helpers.js");
     let webgl_shim = include_str!("webgl_shim.js");
     let webgpu_shim = include_str!("webgpu_shim.js");
-    let dom_shim = &format!("{HOST_PRELUDE_JS}\n{dom_shim}\n{webgl_shim}\n{webgpu_shim}");
+    let dom_shim = &format!(
+        "{HOST_PRELUDE_JS}\n{dom_shim}\n{}\n{}\n{webgl_shim}\n{}\n{webgpu_shim}",
+        include_str!("clone.js"),
+        include_str!("worker_page.js"),
+        include_str!("canvas2d_shim.js")
+    );
     let shim = dom_shim.replace(
         "__PAGE_URL__",
         &page_url.replace('\\', "\\\\").replace('\'', "\\'"),
@@ -1675,13 +1714,38 @@ var __zippEsmDebug=true;
         Ok(s) => s,
         Err(e) => {
             eprintln!("[JS] Compile error: {e}");
-            console::push(console::Level::Error, format!("SyntaxError: {e}"));
+            // The offending line of the program, from the error's position:
+            // the program is the shim and every script run together, so the
+            // number alone says little.
+            let line = e
+                .to_string()
+                .split("<anonymous>:")
+                .nth(1)
+                .and_then(|at| at.split(':').next()?.trim().parse::<usize>().ok())
+                .and_then(|n| full.lines().nth(n.saturating_sub(1)))
+                .map(|l| l.chars().take(240).collect::<String>());
+            if let Some(line) = &line {
+                eprintln!("[JS]   at: {line}");
+            }
+            console::push(
+                console::Level::Error,
+                match line {
+                    Some(line) => format!("SyntaxError: {e}\n  at: {line}"),
+                    None => format!("SyntaxError: {e}"),
+                },
+            );
             return None;
         }
     };
     let compile_ms = t_compile.elapsed().as_millis();
     let t_init = std::time::Instant::now();
     state.set_host_call_ctx(Box::new(browser_host_call_ctx));
+    // A rejection nothing handled is an error the page should hear of, as a
+    // browser's console reports one.
+    state.set_unhandled_rejection_sink(Box::new(|reason| {
+        eprintln!("[JS] Uncaught (in promise) {reason}");
+        console::push(console::Level::Error, format!("Uncaught (in promise) {reason}"));
+    }));
     if let Err(e) = state.run_init() {
         // An uncaught throw is not fatal: the shim may still have built enough
         // of a tree to render, so fall through and check. This matches how a

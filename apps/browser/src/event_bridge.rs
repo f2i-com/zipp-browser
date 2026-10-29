@@ -92,6 +92,9 @@ pub struct JsEventBridge {
     /// The page's DOM mutation count when its tree was last rendered, so
     /// background work re-renders only what changed it.
     rendered_mutations: f64,
+    /// A hash of the tree as last rendered: background work (timers, worker
+    /// messages) compares against it, which sees every kind of change.
+    rendered_hash: Option<u64>,
     /// The console as the panel last showed it: its generation, when, and
     /// the badge's text.
     console_shown: u64,
@@ -131,6 +134,7 @@ impl JsEventBridge {
             live_dom: !event_map_json.is_empty(),
             next_timer: None,
             rendered_mutations: 0.0,
+            rendered_hash: None,
             console_shown: 0,
             console_refreshed: Instant::now(),
             console_badge: String::new(),
@@ -246,16 +250,23 @@ impl JsEventBridge {
             let _ = state.call_global("__zippDrainQueues", &[JsValue::Number(50.0), JsValue::Number(0.0)]);
         }
         print_console(state);
-        if let Ok(JsValue::Number(n)) = state.call_global("__zippDomMutationCount", &[])
-            && n != self.rendered_mutations
+        if let Ok(JsValue::String(html)) = state.call_global("__getRenderedHTML", &[])
+            && !html.is_empty()
         {
-            self.rendered_mutations = n;
-            if let Ok(JsValue::String(html)) = state.call_global("__getRenderedHTML", &[])
-                && !html.is_empty()
-            {
-                self.pending_rerender = Some(crate::rerender_body(&html, &self.page_url));
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            html.hash(&mut hasher);
+            let hash = hasher.finish();
+            if self.rendered_hash != Some(hash) {
+                self.rendered_hash = Some(hash);
+                let rebuilt = crate::rerender_body(&html, &self.page_url);
+                if let Ok(path) = std::env::var("ZIPP_DUMP_RERENDER") {
+                    let _ = std::fs::write(&path, &rebuilt);
+                }
+                self.pending_rerender = Some(rebuilt);
             }
         }
+        self.note_rendered();
         self.refresh_next_timer();
     }
 
@@ -327,6 +338,13 @@ impl JsEventBridge {
             doc.shell_provider.request_redraw();
         }
         None
+    }
+}
+
+impl Drop for JsEventBridge {
+    /// The page is going, and its workers with it.
+    fn drop(&mut self) {
+        crate::worker::terminate_all();
     }
 }
 
@@ -521,6 +539,24 @@ impl EventHandler for JsEventBridge {
 
     fn run_tasks(&mut self, doc: &mut BaseDocument) -> Option<Instant> {
         let now = Instant::now();
+        // What the page's workers sent: each message is a task of its own.
+        let messages = crate::worker::take_messages();
+        if !messages.is_empty() {
+            if let Some(state) = self.js_state.as_mut() {
+                for (id, message) in messages {
+                    let (kind, payload) = match message {
+                        crate::worker::FromWorker::Message(data) => ("message", data),
+                        crate::worker::FromWorker::Error(error) => ("error", error),
+                    };
+                    let args = [JsValue::Number(f64::from(id)), JsValue::String(kind.into()), JsValue::String(payload)];
+                    if let Err(e) = state.call_global("__zippWorkerDeliver", &args) {
+                        eprintln!("[WORKER] delivering a {kind} failed: {e}");
+                    }
+                    state.run_microtasks();
+                }
+            }
+            self.run_due_work();
+        }
         if console::has_submitted() {
             self.run_console_input();
             // An empty line again, still focused, for the next.
@@ -533,6 +569,15 @@ impl EventHandler for JsEventBridge {
         }
         if self.next_timer.is_some_and(|due| due <= now) {
             self.run_due_work();
+        }
+        // What canvases drew in that work, shown now: no frame may come.
+        if let Some(state) = self.js_state.as_mut()
+            && matches!(state.call_global("__zippWebGLContexts", &[]), Ok(JsValue::Number(n)) if n > 0.0)
+        {
+            let _ = state.call_global("__zippPresentCanvases", &[]);
+            if crate::apply_canvas_frames(doc) {
+                doc.shell_provider.request_paint();
+            }
         }
         let console_due = self.refresh_console(doc, now, false);
         [self.next_timer, console_due].into_iter().flatten().min()

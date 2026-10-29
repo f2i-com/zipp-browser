@@ -49,6 +49,30 @@ const FACES: &[(Generic, &[u8])] = &[
     (Generic::Mono, include_bytes!("../assets/fonts/LiberationMono-BoldItalic.ttf")),
 ];
 
+/// An embedded face's bytes, for drawing text outside the page's layout (a
+/// canvas's `fillText`): `family` is a CSS family list, matched to serif,
+/// monospace or (otherwise) sans-serif by name.
+pub fn embedded_face(family: &str, bold: bool, italic: bool) -> &'static [u8] {
+    let generic = family
+        .split(',')
+        .map(|f| f.trim().trim_matches(|c| c == '"' || c == '\'').to_ascii_lowercase())
+        .find_map(|f| {
+            if f.contains("mono") || f.contains("courier") || f.contains("consol") || f.contains("menlo") || f.contains("code") {
+                Some(Generic::Mono)
+            } else if (f.contains("serif") && !f.contains("sans")) || f.contains("times") || f.contains("georgia") || f.contains("garamond") {
+                Some(Generic::Serif)
+            } else if f.contains("sans") || f.contains("arial") || f.contains("helvetica") || f.contains("system-ui") {
+                Some(Generic::Sans)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(Generic::Sans);
+    // Each family's faces are Regular, Bold, Italic, BoldItalic, in that order.
+    let style = usize::from(bold) + 2 * usize::from(italic);
+    FACES.iter().filter(|(g, _)| *g == generic).nth(style).map_or(FACES[0].1, |(_, bytes)| bytes)
+}
+
 /// Register the embedded faces and wire them into the CSS generic families.
 ///
 /// The generics are APPENDED, not replaced: where the platform has real fonts

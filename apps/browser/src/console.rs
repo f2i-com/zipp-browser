@@ -62,6 +62,8 @@ static PENDING: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 thread_local! {
     static RECORDS: Cell<bool> = const { Cell::new(false) };
+    /// What this thread's lines are marked with ("worker", say), if anything.
+    static LABEL: Cell<&'static str> = const { Cell::new("") };
 }
 
 /// Record what this thread's page logs: the window's thread, and its
@@ -70,11 +72,19 @@ pub(crate) fn record_this_thread() {
     RECORDS.set(true);
 }
 
+/// Mark what this thread logs: a worker's lines say they are a worker's.
+pub(crate) fn label_this_thread(label: &'static str) {
+    LABEL.set(label);
+}
+
 pub(crate) fn push(level: Level, text: impl Into<String>) {
     if !RECORDS.get() {
         return;
     }
-    let text = text.into();
+    let text = match LABEL.get() {
+        "" => text.into(),
+        label => format!("[{label}] {}", text.into()),
+    };
     let mut log = LOG.lock().unwrap();
     match level {
         Level::Error => log.errors += 1,

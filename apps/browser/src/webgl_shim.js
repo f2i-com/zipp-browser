@@ -16,7 +16,7 @@
 // Page script, like the host (`ScriptState::call_global`), finds globals by
 // the program's top-level bindings, not by properties set on `globalThis`
 // later: hence the `var`s here, set from what the layer returns.
-var __zippAnimationFrame, __zippWebGLContexts, createImageBitmap;
+var __zippAnimationFrame, __zippWebGLContexts, __zippPresentCanvases, createImageBitmap;
 // Every canvas context that draws frames (WebGL here, WebGPU in
 // webgpu_shim.js): each has a `_present()` the frame calls at its end.
 var __zippCanvasContexts = [];
@@ -532,6 +532,13 @@ var __zippWebGL = (function () {
   P.generateMipmap = function (t) { this._cmd(["generateMipmap", t]); };
   // An image source's pixels, under `op` + "Url", or as ImageData's bytes.
   P._uploadImage = function (op, args, source, format, type) {
+    // A 2D canvas: its picture, as bytes (three.js draws text labels so).
+    var other = source._zippCanvasContext;
+    if (other && typeof other._pixels === "function") {
+      var px = other._pixels();
+      this._cmd([op].concat(args, [px.width, px.height, GL.RGBA, GL.UNSIGNED_BYTE, this._bytes(px.data), px.data.length]));
+      return true;
+    }
     var url = sourceUrl(source);
     if (url) { this._cmd([op + "Url"].concat(args, [format, type, url])); return true; }
     if (source.data && source.width) {
@@ -845,7 +852,11 @@ var __zippWebGL = (function () {
         if (this.tagName === "IMG") { this.setAttribute(dim, String(Math.max(0, Math.floor(Number(v)) || 0))); return; }
         if (this.tagName !== "CANVAS") { this[store] = v; return; }
         this.setAttribute(dim, String(Math.max(0, Math.floor(Number(v)) || 0)));
-        if (this._zippCanvasContext) this._zippCanvasContext._cmd(["resize", this.width, this.height]);
+        var ctx = this._zippCanvasContext;
+        if (ctx) {
+          ctx._cmd(["resize", this.width, this.height]);
+          if (ctx._onResize) ctx._onResize();
+        }
       },
     });
   });
@@ -857,9 +868,16 @@ var __zippWebGL = (function () {
     // A page animating a canvas times its frames with performance.now(); the
     // shim's own is a slow counter that keeps React's scheduler from yielding.
     // Make it the real clock once there is something to animate.
-    if ((gl || type === "webgpu") && __zippCanvasContexts.length === 0) {
+    if ((gl || type === "webgpu" || type === "2d") && __zippCanvasContexts.length === 0) {
       var t0 = Date.now();
       performance.now = function () { return Date.now() - t0; };
+    }
+    if (type === "2d") {
+      var current = this._zippCanvasContext;
+      if (current) return current instanceof CanvasRenderingContext2D ? current : null;
+      if (this._zippGPUContext) return null;
+      this._zippCanvasContext = new CanvasRenderingContext2D(this, attributes);
+      return this._zippCanvasContext;
     }
     if (gl) {
       var existing = this._zippCanvasContext;
@@ -967,6 +985,12 @@ var __zippWebGL = (function () {
     return (__rafQueue.length > 0 && __zippCanvasContexts.length > 0 ? 1 : 0) | (__domMutations !== mutations ? 2 : 0);
   };
   __zippWebGLContexts = function () { return __zippCanvasContexts.length; };
+  // Show what canvases drew outside a frame (a timer, a worker's message).
+  __zippPresentCanvases = function () {
+    for (var i = 0; i < __zippCanvasContexts.length; i++) {
+      try { __zippCanvasContexts[i]._present(); } catch (e) { console.error("canvas: " + e); }
+    }
+  };
 
   var exported = {
     Image: window.Image, ImageBitmap: ImageBitmap, WebGLRenderingContext: WebGLRenderingContext,

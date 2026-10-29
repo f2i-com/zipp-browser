@@ -75,8 +75,9 @@ F12, or the toolbar's console button, opens the console under the toolbar:
 what the page logged (`console.*`, every argument inspected as a browser's
 console shows it) and what went wrong while it ran -- a script that would not
 compile, a module that would not load, a listener, timer or module that threw,
-a WebGL or WebGPU error -- newest first, with the error count on the button.
-Its input line runs JavaScript in the page and shows what that gave.
+a WebGL, WebGPU or Canvas 2D error, a promise rejection nothing handled --
+newest first, with the error count on the button; a worker's lines are marked
+as its. Its input line runs JavaScript in the page and shows what that gave.
 
 Timers keep real time: the window wakes for the next one, and `clearTimeout`
 and `setInterval` work. A page's script stays alive after it loads even when
@@ -112,12 +113,30 @@ with `controls`, the bar along the bottom also seeks and mutes. A muted
 `ZIPP_DEBUG_MEDIA=1` logs the engine's events. Elsewhere -- other platforms,
 `--screenshot` -- a video shows its poster.
 
-## WebAssembly, WebGL and WebGPU
+## WebAssembly, workers, Canvas 2D, WebGL and WebGPU
 
-`WebAssembly` is zipp-vm's own (its `web-assembly` branch, which this branch
-builds against): the whole JS API, with modules run by the
-[wasmi](https://github.com/wasmi-labs/wasmi) interpreter, so a page's
-`instantiateStreaming(fetch("x.wasm"))` works as written.
+`WebAssembly` is zipp-vm's own (on its `dev` branch; this branch builds against
+`web-assembly`, which is `dev` with the latest WebAssembly fixes): the whole JS
+API, with modules run by the [wasmi](https://github.com/wasmi-labs/wasmi)
+interpreter, so a page's `instantiateStreaming(fetch("x.wasm"))` works as
+written, and wasm-bindgen's output -- `externref` values and tables included --
+loads as it does in a browser. The zipp.org playground runs: its ZIPP engine,
+8.6 MB of WebAssembly, starts in a worker and runs Python and JavaScript
+programs that draw on a 2D canvas.
+
+`new Worker(url)`, classic or `{ type: "module" }`, runs on a thread of its own
+in a VM of its own (`worker.rs`, its global scope `worker_shim.js`): its module
+graph is linked there as a page's is, it has `fetch`, `URL`, timers,
+`importScripts` and `WebAssembly`, and messages cross as structured clones
+(typed arrays, `Map`, `Set`, `Date`, BigInt, `undefined` survive). A worker
+wakes the window when it posts.
+
+`getContext("2d")` draws with tiny-skia (`canvas2d.rs`): paths, arcs, curves and
+`Path2D` (SVG path strings too), fills and strokes with dashes, joins and caps,
+transforms, clipping, linear and radial gradients, patterns, compositing modes,
+`drawImage` from images and other canvases, `getImageData`/`putImageData`,
+`toDataURL`, and text from the embedded fonts with `measureText`. A 2D canvas
+can be a WebGL texture.
 
 On Windows a `<canvas>` can draw with WebGL 1, WebGL 2 or WebGPU. The page's
 calls are batched and replayed off the window's thread -- WebGL on desktop
@@ -190,12 +209,25 @@ Honest list, not an exhaustive one:
   full, making clamped cards taller. Fixing it means patching stylo, not this
   repo.
 - **Script changes show only on pages that render into `#root` or draw on a
-  canvas.** The shim's document starts as the page's own body, so scripts find
-  its elements, but its tree replaces the page only once script filled `#root`
-  or a canvas has a context. On other server-rendered pages the scripts' changes
-  and listeners go unseen (example.com's translations, a hand-written menu
-  toggle): the shim re-serialises SVG lossily, so showing its tree for every
-  page would cost them their icons.
+  canvas in the page.** The shim's document starts as the page's own body, so
+  scripts find its elements, but its tree replaces the page only once script
+  filled `#root` or a canvas in the document has a context. On other
+  server-rendered pages the scripts keep running (timers, the console) but
+  their changes and listeners go unseen (example.com's translations, a
+  hand-written menu toggle): the shim re-serialises SVG lossily, so showing its
+  tree for every page would cost them their icons.
+- **WebAssembly is interpreted.** wasmi runs modules without a JIT: the
+  zipp.org playground's engine takes about 7 s to start in an unoptimised build
+  where Chrome takes well under one, and the page, waiting 2 s, starts a second
+  engine meanwhile.
+- **A worker cannot be stopped mid-task.** zipp-vm cannot interrupt running
+  script, so `terminate()` takes effect between tasks; a worker stuck in a loop
+  keeps its thread busy until the browser exits, though the page no longer
+  hears from it. Workers cannot start workers, and nothing is transferred:
+  `postMessage` always copies.
+- **Canvas 2D draws no shadows or filters**, text is laid out without shaping
+  or kerning in the embedded faces only, a conic gradient is its first colour,
+  and a video or WebGL canvas cannot be drawn into one.
 - **`mask-image` is unsupported**; a masked element paints unmasked. That is
   much closer to Chrome than dropping the layer, but a `mask-image` fade (the
   hero dot-grid's, for one) simply does not fade, and an icon drawn as a

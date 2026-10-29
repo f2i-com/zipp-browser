@@ -106,6 +106,12 @@ glow = "0.18"
 serde_json = "1"
 # Modifier keys on the events page script is given.
 keyboard-types = { workspace = true }
+# Canvas 2D (`canvas2d.rs`): drawn with tiny-skia, text from the embedded
+# faces' outlines, CSS colours parsed, `Path2D` strings read as SVG paths.
+tiny-skia = { workspace = true }
+skrifa = { workspace = true }
+color = "0.3"
+svgtypes = "0.16"
 # Image textures, decoded from their bytes.
 image = { workspace = true }
 windows-core = "0.62"

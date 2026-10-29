@@ -94,111 +94,7 @@ Symbol.hasInstance = Symbol("Symbol.hasInstance");
 Symbol.toPrimitive = Symbol("Symbol.toPrimitive");
 Symbol.toStringTag = Symbol("Symbol.toStringTag");
 
-// Set up console using Zipp's env bridge (env.log is the builtin). Every
-// argument is shown, as the browser console shows it: strings as they are,
-// objects and arrays inspected a few levels deep, errors with their stack.
-function __zippInspect(v, depth, seen) {
-    depth = depth || 0;
-    seen = seen || [];
-    if (v === null) return "null";
-    if (v === undefined) return "undefined";
-    var t = typeof v;
-    if (t === "string") return depth > 0 ? JSON.stringify(v) : v;
-    if (t === "bigint") return String(v) + "n";
-    if (t === "number" || t === "boolean" || t === "symbol") return String(v);
-    if (t === "function") return "ƒ " + (v.name || "anonymous") + "()";
-    if (v instanceof Error || (typeof v.message === "string" && typeof v.name === "string" && typeof v.stack === "string")) {
-        return v.stack ? String(v.stack) : v.name + ": " + v.message;
-    }
-    if (seen.indexOf(v) >= 0) return "[Circular]";
-    if (depth > 2) return Array.isArray(v) ? "[…]" : "{…}";
-    seen.push(v);
-    try {
-        var parts = [], i, more = false;
-        if (Array.isArray(v) || ArrayBuffer.isView(v)) {
-            for (i = 0; i < v.length && i < 50; i++) parts.push(__zippInspect(v[i], depth + 1, seen));
-            more = v.length > 50;
-            var kind = Array.isArray(v) ? "" : (v.constructor && v.constructor.name || "") + "(" + v.length + ") ";
-            return kind + "[" + parts.join(", ") + (more ? ", …" : "") + "]";
-        }
-        if (v instanceof ArrayBuffer) return "ArrayBuffer(" + v.byteLength + ")";
-        if (typeof v.nodeType === "number" && v.tagName) {
-            return "<" + String(v.tagName).toLowerCase() + (v.id ? "#" + v.id : "") + (v.className ? "." + String(v.className).split(" ").join(".") : "") + ">";
-        }
-        if (v instanceof Map) {
-            v.forEach(function (val, key) { if (parts.length < 30) parts.push(__zippInspect(key, depth + 1, seen) + " => " + __zippInspect(val, depth + 1, seen)); });
-            return "Map(" + v.size + ") {" + parts.join(", ") + "}";
-        }
-        if (v instanceof Set) {
-            v.forEach(function (val) { if (parts.length < 30) parts.push(__zippInspect(val, depth + 1, seen)); });
-            return "Set(" + v.size + ") {" + parts.join(", ") + "}";
-        }
-        if (typeof v.then === "function") return "Promise {…}";
-        var keys = Object.keys(v);
-        for (i = 0; i < keys.length && i < 30; i++) {
-            var val;
-            try { val = v[keys[i]]; } catch (e) { val = "[getter threw]"; }
-            parts.push(keys[i] + ": " + __zippInspect(val, depth + 1, seen));
-        }
-        var name = v.constructor && v.constructor !== Object && v.constructor.name ? v.constructor.name + " " : "";
-        return name + "{" + parts.join(", ") + (keys.length > 30 ? ", …" : "") + "}";
-    } catch (e) {
-        return String(v);
-    } finally {
-        seen.pop();
-    }
-}
-// A console call's arguments as one line: a leading string's %s/%d/%i/%f/%o/%O/%c
-// take the arguments after it, the rest follow, space-separated.
-function __zippConsoleText(args) {
-    var rest = Array.prototype.slice.call(args), head = "";
-    if (typeof rest[0] === "string" && rest[0].indexOf("%") >= 0) {
-        var format = rest.shift();
-        head = format.replace(/%([sdifoOc%])/g, function (m, c) {
-            if (c === "%") return "%";
-            if (rest.length === 0) return m;
-            var a = rest.shift();
-            if (c === "c") return "";
-            if (c === "d" || c === "i") return String(parseInt(a, 10));
-            if (c === "f") return String(Number(a));
-            return __zippInspect(a, c === "s" ? 0 : 1);
-        });
-        if (rest.length === 0) return head;
-        head += " ";
-    }
-    return head + rest.map(function (a) { return __zippInspect(a); }).join(" ");
-}
-var __zippCounts = {}, __zippTimes = {};
-var console = {
-    log: function () { env.log("info", __zippConsoleText(arguments)); },
-    info: function () { env.log("info", __zippConsoleText(arguments)); },
-    debug: function () { env.log("info", __zippConsoleText(arguments)); },
-    warn: function () { env.log("warn", __zippConsoleText(arguments)); },
-    error: function () { env.log("error", __zippConsoleText(arguments)); },
-    trace: function () { env.log("info", "Trace: " + __zippConsoleText(arguments)); },
-    dir: function (v) { env.log("info", __zippInspect(v, 1)); },
-    dirxml: function (v) { env.log("info", __zippInspect(v, 1)); },
-    table: function (v) { env.log("info", __zippInspect(v, 1)); },
-    group: function () { if (arguments.length) env.log("info", __zippConsoleText(arguments)); },
-    groupCollapsed: function () { if (arguments.length) env.log("info", __zippConsoleText(arguments)); },
-    groupEnd: function () {},
-    count: function (label) { label = label === undefined ? "default" : String(label); __zippCounts[label] = (__zippCounts[label] || 0) + 1; env.log("info", label + ": " + __zippCounts[label]); },
-    countReset: function (label) { __zippCounts[label === undefined ? "default" : String(label)] = 0; },
-    time: function (label) { __zippTimes[label === undefined ? "default" : String(label)] = Date.now(); },
-    timeLog: function (label) { label = label === undefined ? "default" : String(label); if (label in __zippTimes) env.log("info", label + ": " + (Date.now() - __zippTimes[label]) + " ms"); },
-    timeEnd: function (label) { label = label === undefined ? "default" : String(label); if (label in __zippTimes) { env.log("info", label + ": " + (Date.now() - __zippTimes[label]) + " ms"); delete __zippTimes[label]; } },
-    clear: function () {},
-    assert: function (cond) { if (!cond) env.log("error", "Assertion failed" + (arguments.length > 1 ? ": " + __zippConsoleText(Array.prototype.slice.call(arguments, 1)) : "")); }
-};
-// Code typed into the console: what it gave, inspected, or "\u0001" and
-// what it threw.
-function __zippConsoleEval(code) {
-    try {
-        return __zippInspect((0, eval)(code), 1);
-    } catch (e) {
-        return "\u0001" + ((e && e.stack) || ("Uncaught " + __zippInspect(e)));
-    }
-}
+// `console` and `__zippInspect` are in console_shim.js, which comes first.
 
 // All definitions at top level (no IIFE) so they become globals in Zipp
 var __fl_strict = true;
@@ -331,7 +227,7 @@ class DOMNode {
 
         return child;
     }
-    removeChild(child) { for(var i=0;i<this.childNodes.length;i++){if(this.childNodes[i]===child){this.childNodes.splice(i,1);child.parentNode=null;break;}} return child; }
+    removeChild(child) { for(var i=0;i<this.childNodes.length;i++){if(this.childNodes[i]===child){this.childNodes.splice(i,1);child.parentNode=null;__domMutations++;break;}} return child; }
     insertBefore(n,ref) {
         __domMutations++;
 
@@ -342,6 +238,9 @@ class DOMNode {
         var i=this._findChild(ref); if(i>=0) this.childNodes.splice(i,0,n); else this.childNodes.push(n);
         n.parentNode=this; n.ownerDocument=this.ownerDocument||this; return n;
     }
+    // ParentNode's append and prepend: nodes, or strings as text.
+    append() { for(var i=0;i<arguments.length;i++){var n=arguments[i]; this.appendChild(n!==null&&typeof n==="object"?n:doc.createTextNode(String(n)));} }
+    prepend() { var first=this.childNodes[0]||null; for(var i=0;i<arguments.length;i++){var n=arguments[i]; n=n!==null&&typeof n==="object"?n:doc.createTextNode(String(n)); if(first) this.insertBefore(n,first); else this.appendChild(n);} }
     replaceChild(n,old) { var i=this._findChild(old); if(i>=0){if(n.parentNode)n.parentNode.removeChild(n);this.childNodes[i]=n;n.parentNode=this;old.parentNode=null;} return old; }
     contains(o) { if(this===o)return true; for(var i=0;i<this.childNodes.length;i++) if(this.childNodes[i].contains(o))return true; return false; }
     cloneNode(deep) { var c=new DOMNode(this.nodeType,this.nodeName); if(deep) for(var i=0;i<this.childNodes.length;i++) c.appendChild(this.childNodes[i].cloneNode(true)); return c; }
@@ -418,9 +317,9 @@ class Element extends DOMNode {
         return this.getElementsByTagName("option");
     }
     get textContent() { var t=""; for(var i=0;i<this.childNodes.length;i++){var c=this.childNodes[i]; if(c.nodeType===3)t+=c.data; else if(c.nodeType===1)t+=c.textContent;} return t; }
-    set textContent(v) { this.childNodes=[]; if(v) this.appendChild(new Text(String(v))); }
+    set textContent(v) { if(this.childNodes.length) __domMutations++; this.childNodes=[]; if(v) this.appendChild(new Text(String(v))); }
     get innerHTML() { return __sc(this); }
-    set innerHTML(v) { this.childNodes=[]; if(v) this.appendChild(__markupText(String(v))); }
+    set innerHTML(v) { if(this.childNodes.length) __domMutations++; this.childNodes=[]; if(v) this.appendChild(__markupText(String(v))); }
     get outerHTML() { return __sn(this); }
     get children() { return this.childNodes.filter(function(c){return c.nodeType===1;}); }
     // Attribute names are DOMStrings: WebIDL stringifies whatever it is given,
@@ -428,9 +327,9 @@ class Element extends DOMNode {
     // "undefined" rather than throwing. Taking `n` on trust meant a name that
     // was not already a string blew up on `n.indexOf`, which is how this shim
     // turned a harmless call into a dead page.
-    setAttribute(n,v) { n=String(n); v=String(v); this.attributes[n]=v; if(n==="class")this.className=v; if(n==="id")this.id=v; if(n==="style")this._ps(v); }
+    setAttribute(n,v) { n=String(n); v=String(v); if(this.attributes[n]!==v) __domMutations++; this.attributes[n]=v; if(n==="class")this.className=v; if(n==="id")this.id=v; if(n==="style")this._ps(v); }
     getAttribute(n) { n=String(n); if(n==="class")return this.className||null; if(n==="id")return this.id||null; return this.attributes[n]!==undefined?this.attributes[n]:null; }
-    removeAttribute(n) { n=String(n); delete this.attributes[n]; }
+    removeAttribute(n) { n=String(n); if(this.attributes[n]!==undefined) __domMutations++; delete this.attributes[n]; }
     hasAttribute(n) { n=String(n); return n in this.attributes||(n==="class"&&this.className)||(n==="id"&&this.id); }
     setAttributeNS(ns,n,v) { this.setAttribute(n,v); }
     getAttributeNS(ns,n) { return this.getAttribute(n); }
@@ -450,6 +349,11 @@ class Element extends DOMNode {
     blur() {}
     remove() { if(this.parentNode) this.parentNode.removeChild(this); }
     replaceWith(node) { if(this.parentNode) { this.parentNode.insertBefore(node,this); this.parentNode.removeChild(this); } }
+    replaceChildren() { while(this.childNodes.length) this.removeChild(this.childNodes[this.childNodes.length-1]); for(var i=0;i<arguments.length;i++){ var n=arguments[i]; this.appendChild(typeof n==="string"?doc.createTextNode(n):n); } }
+    // Text controls' selection editing (an editor inserting a tab, say).
+    setSelectionRange(s,e) { this.selectionStart=s; this.selectionEnd=e===undefined?s:e; }
+    setRangeText(text,start,end,mode) { var v=String(this.value||""); text=String(text); if(start===undefined){start=this.selectionStart||0;end=this.selectionEnd===undefined?start:this.selectionEnd;} this.value=v.slice(0,start)+text+v.slice(end); var pos=start+text.length; if(mode==="select"){this.selectionStart=start;this.selectionEnd=pos;} else if(mode==="start"){this.selectionStart=this.selectionEnd=start;} else if(mode==="end"){this.selectionStart=this.selectionEnd=pos;} else {this.selectionStart=this.selectionEnd=Math.min(pos,this.value.length);} }
+    select() { this.selectionStart=0; this.selectionEnd=String(this.value||"").length; }
     before() { if(!this.parentNode) return; for(var i=0;i<arguments.length;i++) this.parentNode.insertBefore(arguments[i],this); }
     after() { if(!this.parentNode) return; var ref=this.nextSibling; for(var i=0;i<arguments.length;i++){if(ref)this.parentNode.insertBefore(arguments[i],ref);else this.parentNode.appendChild(arguments[i]);} }
     insertAdjacentElement(pos,el) { if(!el)return null; if(pos==="beforebegin"&&this.parentNode) this.parentNode.insertBefore(el,this); else if(pos==="afterbegin") this.insertBefore(el,this.firstChild); else if(pos==="beforeend") this.appendChild(el); else if(pos==="afterend"&&this.parentNode){var ns=this.nextSibling;if(ns)this.parentNode.insertBefore(el,ns);else this.parentNode.appendChild(el);} return el; }
@@ -507,6 +411,30 @@ class HTMLAnchorElement extends Element {}
 class HTMLImageElement extends Element {}
 class HTMLCanvasElement extends Element {}
 class SVGElement extends Element {}
+
+// A form control's value, as the HTML spec has it set: a <textarea>'s line
+// breaks normalised to LF (a file with CRLF endings put in an editor), a
+// single-line <input>'s stripped. A data property kept the CRs, and code
+// reading `value` back -- a highlighter over a textarea -- doubled every line.
+Object.defineProperty(Element.prototype, "value", {
+    configurable: true,
+    get: function () { return this._value === undefined ? "" : this._value; },
+    set: function (v) {
+        v = v === null || v === undefined ? "" : String(v);
+        if (this.tagName === "TEXTAREA") v = v.replace(/\r\n?/g, "\n");
+        else if (this.tagName === "INPUT" && !/^(checkbox|radio|file|hidden|range|color)$/i.test(this.getAttribute && this.getAttribute("type") || "")) v = v.replace(/[\r\n]/g, "");
+        this._value = v;
+    }
+});
+// Boolean attributes their properties reflect: `el.hidden = true` must hide
+// it (a menu, a placeholder), and `button.disabled` must reach `:disabled`.
+["hidden", "disabled"].forEach(function (name) {
+    Object.defineProperty(Element.prototype, name, {
+        configurable: true,
+        get: function () { return this.attributes[name] !== undefined; },
+        set: function (v) { if (v) this.setAttribute(name, ""); else this.removeAttribute(name); }
+    });
+});
 
 // Thrown by DOM APIs; the router checks `err instanceof DOMException` in its
 // history.pushState fallback path.
@@ -1665,7 +1593,9 @@ function __serializeNode(node) {
 function __getRenderedHTML() {
     var root = doc.getElementById("root");
     if(root && root.childNodes.length > 0) return __serializeNode(doc.body);
-    if(typeof __zippCanvasContexts !== "undefined" && __zippCanvasContexts.length > 0) return __serializeNode(doc.body);
+    // A canvas drawing in the page -- not one kept off it to measure text or
+    // test emoji, which many pages make and never show.
+    if(typeof __zippCanvasContexts !== "undefined" && __zippCanvasContexts.some(function(c){return c.canvas && c.canvas.isConnected;})) return __serializeNode(doc.body);
     return null;
 }
 

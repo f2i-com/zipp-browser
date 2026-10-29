@@ -172,7 +172,7 @@ struct Rewritten {
     /// Export bindings are hoisted in real ESM, and the getters here are lazy
     /// (`() => local`), so hoisting them keeps cycles working: a module that
     /// re-enters a partially-initialised dependency still sees the binding, and
-    /// only throws if it actually reads one still in its TDZ — which is exactly
+    /// only throws if it actually reads one still in its TDZ â€” which is exactly
     /// what a real engine does.
     export_calls: Vec<String>,
     /// The body awaits at top level, so it runs as an async function.
@@ -246,7 +246,7 @@ fn rewrite_module(
                     }
                 }
                 if named.is_empty() {
-                    // `import "./side-effect.js"` — still has to run.
+                    // `import "./side-effect.js"` â€” still has to run.
                     out.push_str(&format!("__imp({});", js_string(&abs)));
                 } else {
                     out.push_str(&format!(
@@ -260,9 +260,9 @@ fn rewrite_module(
             }
             ox::Statement::ExportNamedDeclaration(d) => {
                 let span = d.span();
-                let mut out = String::new();
+                let out = String::new();
                 if let Some(src) = &d.source {
-                    // `export {a as b} from "./m"` — no local binding is made.
+                    // `export {a as b} from "./m"` â€” no local binding is made.
                     let abs = add_dep(&src.value, &mut deps);
                     for s in &d.specifiers {
                         let local = match &s.local {
@@ -283,14 +283,17 @@ fn rewrite_module(
                         ));
                     }
                 } else if let Some(decl) = &d.declaration {
-                    // `export const x = 1` / `export function f(){}` — keep the
-                    // declaration, drop the `export` keyword, record the names.
+                    // `export const x = 1` / `export function f(){}` â€” keep the
+                    // declaration where it is, drop the `export` keyword, record
+                    // the names. Only the keyword is edited: the declaration
+                    // may hold edits of its own (`import.meta`, `import()`).
                     let dspan = decl.span();
-                    out.push_str(&source[dspan.start as usize..dspan.end as usize]);
+                    wrap(&mut edits, span.start, dspan.start, dspan.end, span.end, "", "");
                     for name in declared_names(decl) {
                         export_calls
                             .push(format!("__exp({},()=>{});", js_string(&name), name));
                     }
+                    continue;
                 } else {
                     for s in &d.specifiers {
                         let local = match &s.local {
@@ -313,48 +316,32 @@ fn rewrite_module(
                 edits.push(Edit { start: span.start, end: span.end, text: out });
             }
             ox::Statement::ExportDefaultDeclaration(d) => {
+                // As above, the declaration or expression stays where it is and
+                // only what surrounds it is edited.
                 let span = d.span();
-                let out = match &d.declaration {
-                    ox::ExportDefaultDeclarationKind::FunctionDeclaration(f) => {
-                        let fspan = f.span();
-                        let text = &source[fspan.start as usize..fspan.end as usize];
-                        match &f.id {
-                            Some(id) => {
-                                export_calls
-                                    .push(format!("__exp(\"default\",()=>{});", id.name));
-                                text.to_string()
-                            }
-                            None => {
-                                export_calls
-                                    .push("__exp(\"default\",()=>__zippDefault);".into());
-                                format!("const __zippDefault={text};")
-                            }
-                        }
+                let named = |id: Option<&str>, export_calls: &mut Vec<String>| match id {
+                    Some(name) => {
+                        export_calls.push(format!("__exp(\"default\",()=>{name});"));
+                        ("", "")
                     }
-                    ox::ExportDefaultDeclarationKind::ClassDeclaration(c) => {
-                        let cspan = c.span();
-                        let text = &source[cspan.start as usize..cspan.end as usize];
-                        match &c.id {
-                            Some(id) => {
-                                export_calls
-                                    .push(format!("__exp(\"default\",()=>{});", id.name));
-                                text.to_string()
-                            }
-                            None => {
-                                export_calls
-                                    .push("__exp(\"default\",()=>__zippDefault);".into());
-                                format!("const __zippDefault={text};")
-                            }
-                        }
-                    }
-                    other => {
-                        let ospan = other.span();
-                        let text = &source[ospan.start as usize..ospan.end as usize];
+                    None => {
                         export_calls.push("__exp(\"default\",()=>__zippDefault);".into());
-                        format!("const __zippDefault=({text});")
+                        ("const __zippDefault=", ";")
                     }
                 };
-                edits.push(Edit { start: span.start, end: span.end, text: out });
+                let (inner, (before, after)) = match &d.declaration {
+                    ox::ExportDefaultDeclarationKind::FunctionDeclaration(f) => {
+                        (f.span(), named(f.id.as_ref().map(|i| i.name.as_str()), &mut export_calls))
+                    }
+                    ox::ExportDefaultDeclarationKind::ClassDeclaration(c) => {
+                        (c.span(), named(c.id.as_ref().map(|i| i.name.as_str()), &mut export_calls))
+                    }
+                    other => {
+                        export_calls.push("__exp(\"default\",()=>__zippDefault);".into());
+                        (other.span(), ("const __zippDefault=(", ");"))
+                    }
+                };
+                wrap(&mut edits, span.start, inner.start, inner.end, span.end, before, after);
             }
             ox::Statement::ExportAllDeclaration(d) => {
                 let span = d.span();
@@ -412,6 +399,16 @@ fn rewrite_module(
     }
 
     Ok(Rewritten { body, deps, export_calls, top_level_await })
+}
+
+/// Replace `outer_start..inner_start` with `before` and `inner_end..outer_end`
+/// with `after`, leaving `inner_start..inner_end` -- and any edits inside it --
+/// alone.
+fn wrap(edits: &mut Vec<Edit>, outer_start: u32, inner_start: u32, inner_end: u32, outer_end: u32, before: &str, after: &str) {
+    edits.push(Edit { start: outer_start, end: inner_start, text: before.into() });
+    if inner_end < outer_end || !after.is_empty() {
+        edits.push(Edit { start: inner_end, end: outer_end, text: after.into() });
+    }
 }
 
 /// A quoted string literal's value, when the text is exactly that.
@@ -563,7 +560,7 @@ pub const MODULE_RUNTIME_JS: &str = r#"
 // ES module registry. `__zippDefine` records a module; `__zippRunModule`
 // instantiates one. Namespaces are created BEFORE a module body runs and
 // exports are defined as getters at the top of it, so an import cycle sees the
-// binding rather than an empty object — the same shape real ESM has.
+// binding rather than an empty object â€” the same shape real ESM has.
 var __zippModuleDefs = {};
 var __zippModuleNs = {};
 function __zippDefine(url, fn) { __zippModuleDefs[url] = fn; }
@@ -746,6 +743,20 @@ mod tests {
         assert!(r.body.contains(r#"__dynRel("http://x/a.js",name)"#), "{}", r.body);
     }
 
+    /// An export's own edit used to copy the declaration's text over the whole
+    /// statement, overlapping these: the module came out wrong, or the linker
+    /// panicked slicing mid-character.
+    #[test]
+    fn edits_inside_exported_declarations_survive() {
+        let r = rw("export class A { static f(u = new URL('k.wasm', import.meta.url)) { return 'â€”' + u; } }");
+        assert!(r.body.contains("class A { static f(u = new URL('k.wasm', __meta.url))"), "{}", r.body);
+        assert!(!r.body.contains("export"), "{}", r.body);
+        let r = rw("export default function () { return import('./lazy.js'); }");
+        assert!(r.body.contains(r#"const __zippDefault=function () { return __dyn("http://x/lazy.js"); };"#), "{}", r.body);
+        let r = rw("export default { u: import.meta.url };");
+        assert!(r.body.contains("const __zippDefault=({ u: __meta.url });"), "{}", r.body);
+    }
+
     #[test]
     fn import_meta_is_replaced() {
         let r = rw("const u = import.meta.url;");
@@ -764,3 +775,4 @@ mod tests {
         assert!(r.export_calls.is_empty());
     }
 }
+

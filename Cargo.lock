@@ -6379,6 +6379,7 @@ name = "zipp-browser"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "color",
  "glow",
  "hayro",
  "html5ever",
@@ -6395,7 +6396,10 @@ dependencies = [
  "pollster 1.0.1",
  "reqwest",
  "serde_json",
+ "skrifa 0.40.0",
  "stacker",
+ "svgtypes",
+ "tiny-skia",
  "tokio",
  "tracing-subscriber",
  "url",
@@ -6460,7 +6464,7 @@ dependencies = [
 [[package]]
 name = "zipp-numparse"
 version = "0.0.30"
-source = "git+https://github.com/f2i-com/zipp.org?branch=web-assembly#67c770a42858d02133783ee84522ec1cd8e38aad"
+source = "git+https://github.com/f2i-com/zipp.org?branch=web-assembly#5db928540225e5293ef58915c4e521b5cd2592cd"
 dependencies = [
  "num-bigint 0.5.1",
  "num-traits",
@@ -6469,7 +6473,7 @@ dependencies = [
 [[package]]
 name = "zipp-regress"
 version = "0.11.1"
-source = "git+https://github.com/f2i-com/zipp.org?branch=web-assembly#67c770a42858d02133783ee84522ec1cd8e38aad"
+source = "git+https://github.com/f2i-com/zipp.org?branch=web-assembly#5db928540225e5293ef58915c4e521b5cd2592cd"
 dependencies = [
  "dynasm",
  "dynasmrt",
@@ -6528,7 +6532,7 @@ dependencies = [
 [[package]]
 name = "zipp-vm"
 version = "0.0.30"
-source = "git+https://github.com/f2i-com/zipp.org?branch=web-assembly#67c770a42858d02133783ee84522ec1cd8e38aad"
+source = "git+https://github.com/f2i-com/zipp.org?branch=web-assembly#5db928540225e5293ef58915c4e521b5cd2592cd"
 dependencies = [
  "dynasm",
  "dynasmrt",
