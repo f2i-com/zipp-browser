@@ -179,6 +179,10 @@ mod alsa_out {
         for card in alsa::card::Iter::new().flatten() {
             let Ok(ctl) = alsa::Ctl::from_card(&card, false) else { continue };
             let card_name = card.get_name().unwrap_or_default();
+            // ALSA's virtual cards, which lead nowhere.
+            if card_name == "Loopback" || card_name == "Dummy" {
+                continue;
+            }
             cards.push((format!("sysdefault:{}", card.get_index()), card_name.clone()));
             for device in alsa::ctl::DeviceIter::new(&ctl) {
                 let Ok(info) = ctl.pcm_info(device as u32, 0, Direction::Playback) else { continue };
@@ -198,6 +202,9 @@ mod alsa_out {
         for (name, label) in candidates {
             match open_device(&name) {
                 Ok((pcm, rate)) => {
+                    for failure in &failures {
+                        eprintln!("[AUDIO] passed over {failure}");
+                    }
                     eprintln!("[AUDIO] {name} ({label})");
                     unmute(&name);
                     return Ok((pcm, rate));
