@@ -17,7 +17,7 @@ file_dialog = ["dep:rfd"]
 data-uri = []
 # Net features (from blitz-net)
 http2 = ["reqwest/http2"]
-cookies = ["reqwest/cookies"]
+cookies = ["reqwest/cookies", "dep:cookie_store"]
 multipart = ["reqwest/multipart", "reqwest/stream"]
 cache = ["dep:reqwest-middleware", "dep:http-cache-reqwest", "dep:directories"]
 
@@ -42,6 +42,8 @@ data-url = { workspace = true }
 reqwest-middleware = { workspace = true, optional = true }
 http-cache-reqwest = { workspace = true, optional = true, features = ["manager-cacache"] }
 directories = { version = "6.0.0", optional = true }
+# One cookie jar, saved in the profile (`cookies`); reqwest already uses it.
+cookie_store = { version = "0.22", optional = true }
 
 # Other dependencies
 url = { workspace = true }

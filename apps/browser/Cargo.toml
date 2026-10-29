@@ -48,7 +48,8 @@ html5ever = { workspace = true }
 # In-repo workspace crates
 zipp-dom = { workspace = true, features = ["default", "woff-rust", "parallel-construct"] }
 zipp-renderer = { workspace = true, features = ["default"] }
-zipp-shell = { workspace = true, features = ["default", "http2"] }
+# `cookies`: the page loader and `document.cookie` use the shell's jar.
+zipp-shell = { workspace = true, features = ["default", "http2", "cookies"] }
 # The window's icon (`app_icon`). Already in the tree through zipp-shell.
 winit = { workspace = true }
 

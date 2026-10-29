@@ -158,8 +158,10 @@ def run_shard(exe, pairs_path, results_path, total, hang_seconds, log):
         pending = [t for t in order if t not in done]
         if not pending:
             return
+        # Its own profile, so cookies the tests set stay out of the user's.
+        env = dict(os.environ, ZIPP_PROFILE_DIR=os.path.join(os.path.dirname(results_path), "profile"))
         proc = subprocess.Popen([exe, "--reftest", pairs_path, results_path],
-                                stdout=subprocess.DEVNULL, stderr=log)
+                                stdout=subprocess.DEVNULL, stderr=log, env=env)
         size = os.path.getsize(results_path) if os.path.exists(results_path) else 0
         last_change = time.time()
         status = None

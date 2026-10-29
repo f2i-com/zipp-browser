@@ -70,8 +70,9 @@ impl Provider {
         let builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::limited(10))
             .danger_accept_invalid_certs(true); // Fix TLS on RDP/corporate environments
+        // The browser's one jar, which pages and their scripts share.
         #[cfg(feature = "cookies")]
-        let builder = builder.cookie_store(true);
+        let builder = builder.cookie_provider(crate::cookies::jar());
         let client = builder.build().unwrap();
 
         #[cfg(feature = "cache")]

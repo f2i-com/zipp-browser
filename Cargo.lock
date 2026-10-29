@@ -7132,6 +7132,7 @@ dependencies = [
  "android-activity",
  "anyrender",
  "arboard",
+ "cookie_store",
  "data-url",
  "directories",
  "futures-util",

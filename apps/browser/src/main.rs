@@ -83,8 +83,9 @@ lazy_static::lazy_static! {
         // immediately -- the next request went out unauthenticated and the app
         // decided the user was not logged in. Nothing about that looks like a
         // network failure from inside the page, which is why it surfaced as a
-        // dashboard 404 rather than an error.
-        .cookie_store(true)
+        // dashboard 404 rather than an error. It is the browser's one jar,
+        // which the page's images and styles, and `document.cookie`, share.
+        .cookie_provider(zipp_shell::cookies::jar())
         .build()
         .expect("failed to build HTTP client");
 }
@@ -139,6 +140,7 @@ fn main() {
         let width: u32 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(1280);
         let height: u32 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(2000);
         let ok = screenshot(&normalize_url(&url), &out, width, height);
+        zipp_shell::cookies::flush();
         std::process::exit(if ok { 0 } else { 1 });
     }
     // WPT reftests, many in one process: `tools/wpt_reftest.py` drives it.
@@ -149,7 +151,9 @@ fn main() {
             eprintln!("usage: zipp-browser --reftest pairs.tsv results.tsv");
             std::process::exit(2);
         };
-        std::process::exit(if reftest_batch(&pairs, &results) { 0 } else { 1 });
+        let ok = reftest_batch(&pairs, &results);
+        zipp_shell::cookies::flush();
+        std::process::exit(if ok { 0 } else { 1 });
     }
 
     let url = if arg.is_empty() { "https://lance.name".to_string() } else { arg };
@@ -267,6 +271,7 @@ fn main() {
     stacker::maybe_grow(64 * 1024 * 1024, 256 * 1024 * 1024, || {
         event_loop.run_app(app).unwrap();
     });
+    zipp_shell::cookies::flush();
 }
 
 // ---------------------------------------------------------------------------
@@ -1066,6 +1071,16 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
 
 fn browser_host_call(kind: &str, args: &[String]) -> Result<String, String> {
     match kind {
+        // `document.cookie`, read and written: the browser's jar.
+        "cookie_get" => Ok(url::Url::parse(args.first().map(String::as_str).unwrap_or_default())
+            .map(|u| zipp_shell::cookies::jar().document_cookie(&u))
+            .unwrap_or_default()),
+        "cookie_set" => {
+            if let (Some(url), Some(value)) = (args.first().and_then(|u| url::Url::parse(u).ok()), args.get(1)) {
+                zipp_shell::cookies::jar().set_document_cookie(&url, value);
+            }
+            Ok(String::new())
+        }
         // Page `console.*`, via the shim's `env.log`.
         "log" => {
             let level = args.first().map(String::as_str).unwrap_or("info");

@@ -536,32 +536,20 @@ doc.contentType = "text/html";
 
 // --- document.cookie ---
 //
-// Was entirely absent, so `document.cookie` read as undefined and any script
-// doing `document.cookie.split(';')` threw on the first line. Plenty of apps
-// read a CSRF token or a theme preference straight out of it during startup and
-// died there.
-//
-// This is a per-document jar with no persistence and no server round trip: the
-// network layer keeps its own store (the `cookies` feature), and nothing joins
-// the two yet. Expiry is honoured well enough that a script deleting a cookie by
-// setting a past `expires` sees it disappear, which is the common idiom.
-// This is a STUB, deliberately: a plain string property, not a real jar.
-// Reading gives back whatever was last written, verbatim, including any
-// `; path=/; expires=...` attributes, and writing a second cookie discards the
-// first. That is wrong, but it is inert-wrong — the property existing at all
-// stops `document.cookie.split(';')` throwing on line one of a startup script,
-// which is what actually broke pages.
-//
-// A correct jar needs a get/set accessor, and one cannot be made to work here
-// yet: the VM bypasses an accessor's setter when the assignment is compiled in a
-// different unit from the `defineProperty` (a page script assigning to a
-// property the shim defined), replacing it with an own data property. The same
-// fault shows up for any accessor defined on a PROTOTYPE. Both are reproducible
-// standalone; once the VM honours those, the parsing jar can replace this.
-//
-// Note also that nothing joins this to the network cookie store, so cookies
-// still do not survive a navigation or reach a server.
-doc.cookie = "";
+// The browser's own jar (zipp-shell's `cookies`): what servers set, what the
+// page's requests carry, kept in the profile between runs. Reading gives the
+// page's cookies as `name=value; ...`; writing sets one, attributes and all. An
+// HttpOnly cookie is neither shown nor settable, as in any browser.
+Object.defineProperty(doc, "cookie", {
+    configurable: true,
+    enumerable: true,
+    get: function () {
+        try { return __zippHostCall("cookie_get", String(location.href)); } catch (e) { return ""; }
+    },
+    set: function (v) {
+        try { __zippHostCall("cookie_set", String(location.href), String(v)); } catch (e) {}
+    }
+});
 
 var __createElement_count = 0;
 var __domMutations = 0;
@@ -578,11 +566,6 @@ doc.querySelector = function(s) { return _qs(doc,s,false); };
 doc.querySelectorAll = function(s) { return _qs(doc,s,true); };
 
 // Document missing methods/properties
-var __cookieStore = "";
-Object.defineProperty(doc, 'cookie', {
-    get: function() { return __cookieStore; },
-    set: function(v) { __cookieStore = String(v); }
-});
 doc.readyState = "complete";
 doc.createTreeWalker = function(root,what,filter) { return { currentNode:root, nextNode:function(){return null;}, previousNode:function(){return null;}, firstChild:function(){return null;}, lastChild:function(){return null;}, nextSibling:function(){return null;}, previousSibling:function(){return null;}, parentNode:function(){return null;} }; };
 doc.createRange = function() { return { setStart:function(){}, setEnd:function(){}, collapse:function(){}, cloneRange:function(){return doc.createRange();}, selectNode:function(){}, selectNodeContents:function(){}, getBoundingClientRect:function(){return{top:0,left:0,right:0,bottom:0,width:0,height:0};}, createContextualFragment:function(html){var f=doc.createDocumentFragment();f.appendChild(doc.createTextNode(html));return f;} }; };

@@ -12,6 +12,9 @@ mod application;
 mod convert_events;
 mod event;
 pub mod net;
+pub mod profile;
+#[cfg(feature = "cookies")]
+pub mod cookies;
 mod window;
 
 #[cfg(feature = "accessibility")]
