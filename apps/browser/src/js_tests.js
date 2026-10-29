@@ -1,5 +1,8 @@
 var _p = 0, _f = 0, _e = [];
 function T(n, fn) { try { if (fn() === true) _p++; else { _f++; _e.push("FAIL: " + n); } } catch(e) { _f++; _e.push("ERR: " + n + " - " + (e && e.message ? e.message : String(e))); } }
+// An asynchronous test: a failure until its promise settles to true. The
+// suite's counters are read after the microtasks have run.
+function A(n, fn) { _f++; _e.push("PENDING: " + n); var i = _e.length - 1; try { Promise.resolve(fn()).then(function(r) { if (r === true) { _f--; _p++; _e[i] = ""; } else _e[i] = "FAIL: " + n; }, function(e) { _e[i] = "ERR: " + n + " - " + (e && e.message ? e.message : String(e)); }); } catch (e) { _e[i] = "ERR: " + n + " - " + (e && e.message ? e.message : String(e)); } }
 
 // Core language
 T("let/const", function() { let a = 1; const b = 2; return a + b === 3; });
@@ -54,8 +57,11 @@ T("Number.isFinite", function() { return Number.isFinite(42) && !Number.isFinite
 T("Number.isNaN", function() { return Number.isNaN(NaN) && !Number.isNaN(42); });
 
 // Promise
-T("Promise.resolve", function() { var v; Promise.resolve(42).then(function(x){v=x;}); return v === 42; });
-T("Promise.all", function() { var p = Promise.all([Promise.resolve(1),Promise.resolve(2)]); return p._state === 'fulfilled' && p._value.length === 2 && p._value[0] === 1 && p._value[1] === 2; });
+A("Promise.resolve", function() { return Promise.resolve(42).then(function(x) { return x === 42; }); });
+A("Promise.all", function() { return Promise.all([Promise.resolve(1),Promise.resolve(2)]).then(function(v) { return v.length === 2 && v[0] === 1 && v[1] === 2; }); });
+A("then runs after the current script", function() { var order = []; var p = Promise.resolve().then(function() { order.push("then"); }); order.push("sync"); return p.then(function() { return order.join() === "sync,then"; }); });
+A("await resumes", function() { return (async function() { var a = await 1; var b = await Promise.resolve(2); return a + b === 3; })(); });
+A("queueMicrotask before a timer", function() { return new Promise(function(done) { var order = []; setTimeout(function() { order.push("timer"); done(order.join() === "micro,timer"); }, 0); queueMicrotask(function() { order.push("micro"); }); }); });
 
 // Error types
 T("TypeError", function() { return new TypeError("t").name === "TypeError"; });

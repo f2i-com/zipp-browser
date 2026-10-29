@@ -1,6 +1,9 @@
 // Comprehensive JS compatibility tests for modern web frameworks
 var _p = 0, _f = 0, _e = [];
 function T(n, fn) { try { if (fn() === true) _p++; else { _f++; _e.push("FAIL: " + n); } } catch(e) { _f++; _e.push("ERR: " + n + " - " + (e && e.message ? e.message : String(e))); } }
+// An asynchronous test: a failure until its promise settles to true. The
+// suite's counters are read after the microtasks have run.
+function A(n, fn) { _f++; _e.push("PENDING: " + n); var i = _e.length - 1; try { Promise.resolve(fn()).then(function(r) { if (r === true) { _f--; _p++; _e[i] = ""; } else _e[i] = "FAIL: " + n; }, function(e) { _e[i] = "ERR: " + n + " - " + (e && e.message ? e.message : String(e)); }); } catch (e) { _e[i] = "ERR: " + n + " - " + (e && e.message ? e.message : String(e)); } }
 
 // === ES6+ Language Features ===
 T("template literals", function() { var x = 42; return ("v=" + x) === "v=42"; });
@@ -51,8 +54,8 @@ T("Set delete", function() { var s = new Set(); s.add(1); s.delete(1); return s.
 T("Map entries", function() { var m = new Map(); m.set("a",1); var it = m.entries(); var f = it.next(); return Array.isArray(f.value) && f.value[0] === "a" && f.value[1] === 1 && it.next().done === true; });
 
 // === Promise Advanced ===
-T("Promise constructor", function() { var p = new Promise(function(r){r(42);}); return p._state === "fulfilled" && p._value === 42; });
-T("Promise.race", function() { var v; Promise.race([Promise.resolve(1),Promise.resolve(2)]).then(function(x){v=x;}); return v === 1; });
+A("Promise constructor", function() { return new Promise(function(r){r(42);}).then(function(v) { return v === 42; }); });
+A("Promise.race", function() { return Promise.race([Promise.resolve(1),Promise.resolve(2)]).then(function(x) { return x === 1; }); });
 
 // === Error Handling ===
 T("Error stack", function() { var e = new Error("test"); return typeof e.stack === "string"; });

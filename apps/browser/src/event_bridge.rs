@@ -28,6 +28,30 @@ use zipp_dom::{BaseDocument, Document, EventHandler, LocalName};
 // flid map construction
 // ---------------------------------------------------------------------------
 
+/// Run the page's event loop until it is quiet, as a browser does: one task
+/// at a time -- a due timer, a posted message, and up to `frames` animation
+/// frames once nothing else is due -- with the VM's microtasks run after each
+/// (`__zippRunTask`). Stops after `max_tasks`, as a page may reschedule
+/// forever. Returns how many tasks ran, frames not counted.
+///
+/// The page's timers used to run in batches, the VM's microtasks only between
+/// batches, so an `await` continuation ran after every timer that was due
+/// rather than before the next one -- out of order, and late enough that an
+/// IndexedDB transaction would commit under it.
+pub(crate) fn run_page_tasks(state: &mut ScriptState, max_tasks: usize, mut frames: u32) -> usize {
+    state.run_microtasks();
+    let mut ran = 0;
+    while ran < max_tasks {
+        match state.call_global("__zippRunTask", &[JsValue::Bool(frames > 0)]) {
+            Ok(JsValue::Number(n)) if n == 1.0 => ran += 1,
+            Ok(JsValue::Number(n)) if n == 2.0 => frames = frames.saturating_sub(1),
+            _ => break,
+        }
+        state.run_microtasks();
+    }
+    ran
+}
+
 /// Walk every node in the parsed blitz-dom document and collect the
 /// `data-flid` attribute values.  Returns a map from JS node ID (the flid
 /// integer) to the blitz-dom slab node ID.
@@ -185,20 +209,7 @@ impl JsEventBridge {
         };
         // React's setState is async — the handler has only
         // queued the re-render at this point.
-        let _ = state.call_global(
-            "__zippDrainQueues",
-            &[JsValue::Number(50.0)],
-        );
-        // The shim's own queues and the VM's are separate,
-        // and draining one can feed the other, so alternate
-        // until both settle.
-        for _ in 0..8 {
-            state.run_microtasks();
-            let _ = state.call_global(
-                "__zippDrainQueues",
-                &[JsValue::Number(50.0), JsValue::Number(2.0)],
-            );
-        }
+        run_page_tasks(state, 400, 2);
         print_console(state);
         if let Ok(JsValue::String(new_html)) =
             state.call_global("__getRenderedHTML", &[])
@@ -386,11 +397,7 @@ impl JsEventBridge {
         let Some(state) = self.js_state.as_mut() else {
             return;
         };
-        let _ = state.call_global("__zippDrainQueues", &[JsValue::Number(50.0), JsValue::Number(0.0)]);
-        for _ in 0..4 {
-            state.run_microtasks();
-            let _ = state.call_global("__zippDrainQueues", &[JsValue::Number(50.0), JsValue::Number(0.0)]);
-        }
+        run_page_tasks(state, 250, 0);
         print_console(state);
         if let Ok(JsValue::String(html)) = state.call_global("__getRenderedHTML", &[])
             && !html.is_empty()

@@ -843,92 +843,14 @@ class MessageChannel {
     }
 }
 
-// --- Promise polyfill ---
-var Promise = function(executor) {
-    this._state = 'pending';
-    this._value = undefined;
-    this._callbacks = [];
-    var self = this;
-    function resolve(value) {
-        if (self._state !== 'pending') return;
-        self._state = 'fulfilled';
-        self._value = value;
-        self._callbacks.forEach(function(cb) { if (cb.onFulfilled) cb.onFulfilled(value); });
-    }
-    function reject(reason) {
-        if (self._state !== 'pending') return;
-        self._state = 'rejected';
-        self._value = reason;
-        self._callbacks.forEach(function(cb) { if (cb.onRejected) cb.onRejected(reason); });
-    }
-    try { executor(resolve, reject); } catch(e) { reject(e); }
-};
-Promise.prototype.then = function(onFulfilled, onRejected) {
-    var self = this;
-    return new Promise(function(resolve, reject) {
-        function handle(cb, fallback) {
-            return function(value) {
-                try {
-                    if (typeof cb === 'function') {
-                        var result = cb(value);
-                        if (result && typeof result.then === 'function') {
-                            result.then(resolve, reject);
-                        } else {
-                            resolve(result);
-                        }
-                    } else {
-                        fallback(value);
-                    }
-                } catch(e) { reject(e); }
-            };
-        }
-        if (self._state === 'fulfilled') { handle(onFulfilled, resolve)(self._value); }
-        else if (self._state === 'rejected') { handle(onRejected, reject)(self._value); }
-        else { self._callbacks.push({ onFulfilled: handle(onFulfilled, resolve), onRejected: handle(onRejected, reject) }); }
-    });
-};
-Promise.prototype.catch = function(onRejected) { return this.then(null, onRejected); };
-Promise.prototype.finally = function(fn) { return this.then(function(v) { fn(); return v; }, function(e) { fn(); throw e; }); };
-Promise.resolve = function(v) { return new Promise(function(r) { r(v); }); };
-Promise.reject = function(e) { return new Promise(function(_, r) { r(e); }); };
-Promise.all = function(arr) {
-    // Synchronous implementation: resolve all immediately since our Promises are sync
-    var results = [];
-    var len = arr.length;
-    if (len === 0) return Promise.resolve(results);
-    for (var i = 0; i < len; i++) {
-        var p = arr[i];
-        if (p && p._state === 'fulfilled') {
-            results.push(p._value);
-        } else if (p && typeof p.then === 'function') {
-            // Thenable: resolve synchronously
-            var resolved = false;
-            p.then(function(v) { results.push(v); resolved = true; });
-            if (!resolved) results.push(undefined);
-        } else {
-            results.push(p);
-        }
-    }
-    return Promise.resolve(results);
-};
-Promise.race = function(arr) {
-    // Synchronous: return the first resolved/rejected promise's value
-    for (var i = 0; i < arr.length; i++) {
-        var p = arr[i];
-        if (p && p._state === 'fulfilled') return Promise.resolve(p._value);
-        if (p && p._state === 'rejected') return Promise.reject(p._value);
-    }
-    // If none settled, resolve with first value
-    return arr.length > 0 ? Promise.resolve(arr[0]) : Promise.resolve(undefined);
-};
-Promise.allSettled = function(arr) {
-    return Promise.all(arr.map(function(p) {
-        return Promise.resolve(p).then(
-            function(v) { return {status:'fulfilled',value:v}; },
-            function(e) { return {status:'rejected',reason:e}; }
-        );
-    }));
-};
+// --- Promise ---
+//
+// The VM's own. A polyfill used to replace it here that settled promises
+// synchronously -- `Promise.resolve().then(f)` ran `f` before the next line --
+// while `await` went through the VM's promises regardless, so the two orders
+// disagreed and code mixing them (most code: a library's `.then` chains
+// around an app's `async` functions) ran its steps out of order. Reactions
+// now run as microtasks, after each task of the event loop (`__zippRunTask`).
 
 // --- Error type polyfills ---
 var TypeError = function(msg) { this.message = msg || ''; this.name = 'TypeError'; this.stack = ''; };
@@ -1408,7 +1330,13 @@ var window = {
         this.disconnect=function(){};
         this.takeRecords=function(){return [];};
     },
-    queueMicrotask:function(fn){if(typeof fn==="function")__mcQueue.push(fn);},
+    // A microtask, as in a browser: after the current task, before the next.
+    // It used to be queued with the posted messages, so it ran after timers
+    // that were due, and after other tasks.
+    queueMicrotask:function(fn){
+        if(typeof fn!=="function") throw new TypeError("Failed to execute 'queueMicrotask': parameter 1 is not of type 'Function'.");
+        Promise.resolve().then(function(){ try{ fn(); }catch(e){ console.error("Uncaught (in queueMicrotask) "+((e&&(e.stack||e.message))||e)); } });
+    },
     btoa:__btoa, atob:__atob,
     // Was `function(){return null;}` -- a page whose call to action is "opens
     // in a new tab" had a button that did nothing at all. There are no tabs

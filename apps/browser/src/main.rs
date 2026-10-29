@@ -307,6 +307,8 @@ fn run_js_suite(tag: &str, tests: &str, max_failures: usize) -> bool {
     if let Err(e) = state.run_init() {
         eprintln!("[{tag}] Uncaught: {e}");
     }
+    // Asynchronous tests (`A`) finish in the page's event loop.
+    event_bridge::run_page_tasks(&mut state, 100, 0);
 
     let passed = state.eval_in_context("_p").ok();
     let failed = state.eval_in_context("_f").ok();
@@ -665,6 +667,29 @@ function __zippDrainQueues(rounds, frames) {
         }
     }
     return did;
+}
+
+// One task of the page's event loop: the next due timer, else the next posted
+// message (MessageChannel, an IntersectionObserver report), else -- when
+// `allowFrame` -- an animation frame. The host (`run_page_tasks`) runs the VM's
+// microtasks after each one, as a browser does after every task, so an `await`
+// continuation or a `.then` reaction runs before the next timer rather than
+// after the whole batch. Returns 0 when nothing was due, 1 after a task, 2
+// after a frame.
+function __zippRunTask(allowFrame) {
+    __zippDueTimers();
+    var q = __timerQueue.length > 0 ? __timerQueue : __mcQueue.length > 0 ? __mcQueue : null;
+    if (q) {
+        __zippDrainStats.rounds++;
+        try { q.shift()(); }
+        catch (e) { env.log('error', (q === __timerQueue ? 'timer callback' : 'microtask') + ' threw: ' + ((e && (e.stack || e.message)) || e)); }
+        return 1;
+    }
+    if (allowFrame && __rafQueue.length > 0) {
+        __zippRunAnimationFrame(performance.now());
+        return 2;
+    }
+    return 0;
 }
 
 // Invoke the handlers registered on `handlerNid` for `type`, with the event
@@ -1477,10 +1502,7 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
                 Ok(v) => eprintln!("[CLICK] dispatched -> {v:?}"),
                 Err(e) => eprintln!("[CLICK] dispatch failed: {e}"),
             }
-            for _ in 0..8 {
-                state.run_microtasks();
-                let _ = state.call_global("__zippDrainQueues", &[JsValue::Number(50.0), JsValue::Number(2.0)]);
-            }
+            event_bridge::run_page_tasks(state, 400, 2);
             if let Ok(JsValue::String(updated)) = state.call_global("__getRenderedHTML", &[]) {
                 if !updated.is_empty() {
                     eprintln!(
@@ -2025,14 +2047,10 @@ var __zippEsmDebug=true;
         }
     }
 
-    // Settle the page: run timers and microtasks until nothing is left to do,
-    // so the tree we serialise below is the one the page actually intended.
-    full.push_str("\n__zippDrainQueues(100);\n");
-    full.push_str(
-        "\nif (typeof __zippEsmDebug !== 'undefined' && __zippEsmDebug) { \
-         env.log('info','drain rounds='+__zippDrainStats.rounds+' timers='+__zippDrainStats.timers+\
-         ' micro='+__zippDrainStats.micro); }\n",
-    );
+    // The page settles after this program, in the host's event loop
+    // (`run_page_tasks`). It used to run its timers here, at the end of the
+    // program and before the program's own microtasks, so every timer saw the
+    // promises the scripts had settled as still pending.
 
     eprintln!("[JS] Compiling {} bytes...", full.len());
     let t_compile = std::time::Instant::now();
@@ -2078,40 +2096,19 @@ var __zippEsmDebug=true;
         // real browser treats a script error — the page is what it is.
         eprintln!("[JS] Uncaught: {e}");
     }
-    // Settle the VM's microtasks against the shim's queues.
+    // Settle: run the page's event loop until it is quiet -- each due timer
+    // and posted message as a task, the VM's microtasks after each (an awaited
+    // fetch's continuation, a `.then`), and up to two animation frames once
+    // nothing else is due. A page can reschedule forever (a spinner, a poll),
+    // so it stops after a fixed number of tasks.
     //
-    // These are two SEPARATE queues. `__zippDrainQueues` runs the shim's timers
-    // and MessageChannel callbacks; the continuation of an `await` lives in the
-    // VM's own microtask queue and is only drained from here. Draining one feeds
-    // the other — an awaited fetch resolves in the VM, its continuation sets
-    // state, React schedules a re-render through MessageChannel — so they have
-    // to alternate until both are quiet.
-    //
-    // Without this a client-rendered app is serialised mid-boot: formlogic.local
-    // fetched its session, got its 401, and would have rendered the logged-out
-    // UI, but the tree was read before the continuation that sets
-    // `isInitialized` ever ran, so the page was captured on its loading screen.
-    // Stop as soon as the page is quiet. This used to run all 32 rounds
-    // unconditionally, so a settled app still paid for 32 `run_microtasks` calls
-    // and 32 trips into JS -- the bulk of the settle time on a large page, spent
-    // finding nothing to do. Two consecutive empty rounds rather than one,
-    // because a microtask can enqueue a timer that has not been drained yet.
+    // Without settling, a client-rendered app is serialised mid-boot:
+    // formlogic.local fetched its session, got its 401, and would have
+    // rendered the logged-out UI, but the tree was read before the
+    // continuation that sets `isInitialized` ever ran.
     let init_ms = t_init.elapsed().as_millis();
     let t_settle = std::time::Instant::now();
-    let mut quiet = 0;
-    for round in 0..32 {
-        state.run_microtasks();
-        // The first round may run two animation frames; see __zippDrainQueues.
-        let frames = if round == 0 { 2.0 } else { 0.0 };
-        let ran = match state.call_global("__zippDrainQueues", &[JsValue::Number(50.0), JsValue::Number(frames)]) {
-            Ok(JsValue::Number(n)) => n,
-            _ => 0.0,
-        };
-        quiet = if ran == 0.0 { quiet + 1 } else { 0 };
-        if quiet >= 2 {
-            break;
-        }
-    }
+    event_bridge::run_page_tasks(&mut state, 600, 2);
     // Settled: from here on the page's timers keep real time.
     let _ = state.call_global("__zippEndSettle", &[]);
     // A page drawing with WebGL shows its first frame from the start: present
