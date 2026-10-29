@@ -1273,20 +1273,6 @@ impl Context {
     }
 }
 
-/// `__zippHostCall("image_info", url)`: an image's size, for `naturalWidth`.
-pub(crate) fn image_info(url: &str) -> Result<String, String> {
-    let (status, raw) = crate::fetch_bytes_for_page(url)?;
-    if !(200..300).contains(&status) {
-        return Ok("{\"width\":0,\"height\":0}".into());
-    }
-    let size = image::ImageReader::new(std::io::Cursor::new(raw))
-        .with_guessed_format()
-        .ok()
-        .and_then(|r| r.into_dimensions().ok())
-        .unwrap_or((0, 0));
-    Ok(format!("{{\"width\":{},\"height\":{}}}", size.0, size.1))
-}
-
 #[cfg(test)]
 mod tests {
     use super::translate_shader;

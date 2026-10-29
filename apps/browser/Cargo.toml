@@ -46,7 +46,9 @@ oxc_span = "0.126.0"
 html5ever = { workspace = true }
 
 # In-repo workspace crates
-zipp-dom = { workspace = true, features = ["default", "woff-rust", "parallel-construct"] }
+# zipp-dom's defaults less `system_fonts`, which is this crate's own feature:
+# asking for zipp-dom's `default` turned it on whatever this crate's features said.
+zipp-dom = { workspace = true, features = ["svg", "woff-rust", "block", "flexbox", "grid", "tracing", "file_input", "parallel-construct"] }
 zipp-renderer = { workspace = true, features = ["default"] }
 # `cookies`: the page loader and `document.cookie` use the shell's jar.
 zipp-shell = { workspace = true, features = ["default", "http2", "cookies"] }
@@ -74,6 +76,19 @@ mimalloc = { version = "0.1.52", default-features = false }
 
 # PDF viewer: pure-Rust PDF rasteriser, one PNG per page (src/viewers.rs).
 hayro = "0.8.0"
+
+# Batches page script sends (Canvas 2D, WebGL, WebGPU).
+serde_json = "1"
+# Modifier keys on the events page script is given.
+keyboard-types = { workspace = true }
+# Canvas 2D (`canvas2d.rs`): drawn with tiny-skia, text from the embedded
+# faces' outlines, CSS colours parsed, `Path2D` strings read as SVG paths.
+tiny-skia = { workspace = true }
+skrifa = { workspace = true }
+color = "0.3"
+svgtypes = "0.16"
+# Images decoded from their bytes: `naturalWidth`, and WebGL textures.
+image = { workspace = true }
 
 # Utilities
 base64 = "0.22"
@@ -113,17 +128,6 @@ windows = { version = "0.62", features = [
 ] }
 # WebGL (`webgl.rs`): OpenGL calls, and the batches page script sends.
 glow = "0.18"
-serde_json = "1"
-# Modifier keys on the events page script is given.
-keyboard-types = { workspace = true }
-# Canvas 2D (`canvas2d.rs`): drawn with tiny-skia, text from the embedded
-# faces' outlines, CSS colours parsed, `Path2D` strings read as SVG paths.
-tiny-skia = { workspace = true }
-skrifa = { workspace = true }
-color = "0.3"
-svgtypes = "0.16"
-# Image textures, decoded from their bytes.
-image = { workspace = true }
 windows-core = "0.62"
 # WebGPU (`webgpu.rs`): wgpu implements it; pollster waits on its futures.
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "wgsl", "vulkan", "dx12"] }

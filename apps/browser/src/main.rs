@@ -533,11 +533,9 @@ fn fetch(url: &str) -> Result<String, String> {
     // browser on hand-written test cases is far more precise than only ever
     // loading live sites.
     if let Some(path) = url.strip_prefix("file://") {
-        // Accept file:///C:/x, file://C:/x and file:///c%3A/x alike.
-        let path = path.trim_start_matches('/');
-        let path = urlencoding::decode(path).unwrap_or(std::borrow::Cow::Borrowed(path));
-        return std::fs::read_to_string(path.as_ref())
-            .map_err(|e| format!("cannot read {path}: {e}"));
+        let path = viewers::local_path(path);
+        return std::fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()));
     }
 
     let is_static = url.contains("/static/") || url.ends_with(".js") || url.ends_with(".css");
@@ -1152,8 +1150,7 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
         #[cfg(not(windows))]
         "gpu" => Err("Error: WebGPU is not available on this platform".into()),
         // An image's size, for `naturalWidth` and `load`.
-        #[cfg(windows)]
-        "image_info" => webgl::image_info(&resolve_page_url(args.first().map(String::as_str).unwrap_or_default())),
+        "image_info" => viewers::image_info(&resolve_page_url(args.first().map(String::as_str).unwrap_or_default())),
         _ => browser_host_call(kind, args),
     }
 }

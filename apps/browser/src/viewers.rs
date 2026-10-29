@@ -326,10 +326,29 @@ fn filename_from_url(url: &str) -> String {
     if decoded.is_empty() { "download".to_string() } else { decoded }
 }
 
+/// `__zippHostCall("image_info", url)`: an image's size, for `naturalWidth`.
+pub(crate) fn image_info(url: &str) -> Result<String, String> {
+    let (status, raw) = crate::fetch_bytes_for_page(url)?;
+    if !(200..300).contains(&status) {
+        return Ok("{\"width\":0,\"height\":0}".into());
+    }
+    let size = image::ImageReader::new(std::io::Cursor::new(raw))
+        .with_guessed_format()
+        .ok()
+        .and_then(|r| r.into_dimensions().ok())
+        .unwrap_or((0, 0));
+    Ok(format!("{{\"width\":{},\"height\":{}}}", size.0, size.1))
+}
+
 /// `file:///C:/x`, `file://C:/x` and `file:///c%3A/x` alike.
-fn local_path(path: &str) -> PathBuf {
+pub(crate) fn local_path(path: &str) -> PathBuf {
     let path = path.trim_start_matches('/');
-    PathBuf::from(urlencoding::decode(path).map(|c| c.into_owned()).unwrap_or_else(|_| path.to_string()))
+    let path = urlencoding::decode(path).map(|c| c.into_owned()).unwrap_or_else(|_| path.to_string());
+    // Off Windows a file URL's path is absolute: `file:///app/x` is `/app/x`,
+    // not `app/x` in whatever directory the browser was started from.
+    #[cfg(not(windows))]
+    let path = format!("/{path}");
+    PathBuf::from(path)
 }
 
 // ---------------------------------------------------------------------------
