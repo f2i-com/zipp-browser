@@ -4,6 +4,7 @@
 //   navigator.zipp.fs      readFile, readText, writeFile, appendFile, list,
 //                          stat, exists, mkdir, remove, rename, copy, drives
 //   navigator.zipp.system  run, info, network, reboot, powerOff
+//   navigator.zipp.wifi    status, scan, connect, disconnect
 //
 // Every call returns a promise. Paths are absolute ("/media/sda1/notes.txt").
 // Files cross in pieces through __zippHostBytes. Errors are DOMExceptions
@@ -146,5 +147,32 @@
     powerOff: function () { return call(function () { host("power", "off"); }); },
   };
 
-  navigator.zipp = { fs: fs, system: system };
+  // Wi-Fi, through the system's wpa_supplicant.
+  var wifi = {
+    // { interface, state ("COMPLETED" when joined), ssid, bssid, frequency, address, security }
+    status: function () { return call(function () { return JSON.parse(host("wifi", "status")); }); },
+    // [{ ssid, signal (dBm), frequency, security, bssid }], strongest first,
+    // once a scan has gone over the channels (two seconds at the least,
+    // fifteen at the most).
+    scan: function () {
+      var started = Date.now();
+      function done() {
+        return new Promise(function (resolve) { setTimeout(resolve, 1000); }).then(function () {
+          var state = JSON.parse(host("wifi", "status")).state;
+          var waited = Date.now() - started;
+          if (waited < 15000 && (waited < 2000 || state === "SCANNING")) return done();
+        });
+      }
+      return call(function () { host("wifi", "scan"); }).then(done).then(function () {
+        return call(function () { return JSON.parse(host("wifi", "results")); });
+      });
+    },
+    // Join a network (no passphrase for an open one); status() says when.
+    connect: function (ssid, passphrase) {
+      return call(function () { host("wifi", "connect", ssid, passphrase || ""); });
+    },
+    disconnect: function () { return call(function () { host("wifi", "disconnect"); }); },
+  };
+
+  navigator.zipp = { fs: fs, system: system, wifi: wifi };
 })();

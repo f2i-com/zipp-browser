@@ -172,6 +172,9 @@
     var self = this;
     return attempt(function () {
       self._open();
+      // Already so: as Chrome does, nothing to ask of the device (which a
+      // kernel driver still bound to one of its interfaces would refuse).
+      if (self._active === value) return;
       host("select_configuration", self._id, value);
       self._active = value;
     });

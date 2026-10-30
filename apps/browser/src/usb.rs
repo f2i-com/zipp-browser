@@ -126,6 +126,15 @@ impl Drop for Device {
 static DEVICES: Mutex<Option<HashMap<String, Device>>> = Mutex::new(None);
 static COMPLETIONS: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
 
+/// A new page: the last one's devices are closed -- what they had in flight
+/// cancelled, their interfaces let go -- and its finished transfers dropped,
+/// since the new page numbers its transfers from 1 again.
+pub(crate) fn new_page() {
+    let devices = DEVICES.lock().unwrap_or_else(|e| e.into_inner()).take();
+    drop(devices);
+    COMPLETIONS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
 /// Transfers finished since last asked, as `(id, result JSON)`.
 pub(crate) fn take_completions() -> Vec<(u64, String)> {
     std::mem::take(&mut *COMPLETIONS.lock().unwrap_or_else(|e| e.into_inner()))
@@ -249,16 +258,28 @@ fn claim(device: &Device, iface: u32) -> Result<(), String> {
     if class.is_some_and(|c| SYSTEM_CLASSES.contains(&c)) {
         return Err("SecurityError: the interface is the system's (HID or storage)".into());
     }
+    // A network adapter's or a sound card's, in use by the system: taking it
+    // would take the machine's network or sound away.
+    if let Some(dir) = interface_dir(&device.sysfs, iface)
+        && ["net", "ieee80211", "sound"].iter().any(|d| dir.join(d).exists())
+    {
+        return Err("SecurityError: the interface is the system's (its network or sound)".into());
+    }
     let mut request = DisconnectClaim { interface: iface, flags: 0, driver: [0; 256] };
     ioctl(fd, USBDEVFS_DISCONNECT_CLAIM, &mut request).map_err(|e| format!("NetworkError: {e}"))?;
     Ok(())
 }
 
-/// An interface's class, from its sysfs entry (`<device>:<config>.<interface>`).
-fn interface_class(sysfs: &Path, iface: u32) -> Option<u8> {
+/// An interface's sysfs entry (`<device>:<config>.<interface>`).
+fn interface_dir(sysfs: &Path, iface: u32) -> Option<PathBuf> {
     let name = sysfs.file_name()?.to_str()?.to_string();
     let config = std::fs::read_to_string(sysfs.join("bConfigurationValue")).ok()?;
-    let path = sysfs.join(format!("{name}:{}.{iface}", config.trim())).join("bInterfaceClass");
+    Some(sysfs.join(format!("{name}:{}.{iface}", config.trim())))
+}
+
+/// An interface's class, from its sysfs entry.
+fn interface_class(sysfs: &Path, iface: u32) -> Option<u8> {
+    let path = interface_dir(sysfs, iface)?.join("bInterfaceClass");
     u8::from_str_radix(std::fs::read_to_string(path).ok()?.trim(), 16).ok()
 }
 

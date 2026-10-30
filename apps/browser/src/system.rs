@@ -22,6 +22,15 @@ use zipp_vm::embed::HostCtx;
 pub(crate) static KIOSK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 static COMPLETIONS: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
+/// Which page programs belong to: one the last page started that ends under
+/// the next must not settle that page's promise of the same number.
+static PAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A new page: what the last one ran is no longer anyone's to hear about.
+pub(crate) fn new_page() {
+    PAGE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    COMPLETIONS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
 
 /// Programs finished since last asked, as `(id, result JSON)`.
 pub(crate) fn take_completions() -> Vec<(u64, String)> {
@@ -160,6 +169,7 @@ pub(crate) fn host_call(ctx: &mut dyn HostCtx, args: &[String]) -> Result<String
             let program = arg(2).to_string();
             let argv: Vec<String> = serde_json::from_str(arg(3)).map_err(|e| format!("TypeError: zipp: arguments: {e}"))?;
             let cwd = (!arg(4).is_empty()).then(|| arg(4).to_string());
+            let page = PAGE.load(std::sync::atomic::Ordering::SeqCst);
             let _ = std::thread::Builder::new().name("zipp-run".into()).spawn(move || {
                 let mut command = std::process::Command::new(&program);
                 command.args(&argv).stdin(std::process::Stdio::null());
@@ -174,12 +184,17 @@ pub(crate) fn host_call(ctx: &mut dyn HostCtx, args: &[String]) -> Result<String
                     }),
                     Err(e) => serde_json::json!({ "error": format!("NotFoundError: {program}: {e}") }),
                 };
-                COMPLETIONS.lock().unwrap_or_else(|e| e.into_inner()).push((id, result.to_string()));
-                crate::worker::wake();
+                let mut completions = COMPLETIONS.lock().unwrap_or_else(|e| e.into_inner());
+                if PAGE.load(std::sync::atomic::Ordering::SeqCst) == page {
+                    completions.push((id, result.to_string()));
+                    drop(completions);
+                    crate::worker::wake();
+                }
             });
             Ok(String::new())
         }
         "power" => power(arg(1)),
+        "wifi" => wifi(arg(1), arg(2), arg(3)),
         op => Err(format!("NotSupportedError: navigator.zipp has no operation {op}")),
     }
 }
@@ -509,6 +524,203 @@ fn addresses(name: &str) -> Vec<String> {
     {
         let _ = name;
         Vec::new()
+    }
+}
+
+/// Wi-Fi, through the wpa_supplicant zipp-linux's init runs on the wireless
+/// card: `status`, `scan` (asks for one; `results` some seconds later),
+/// `results`, `connect ssid passphrase` (none for an open network), and
+/// `disconnect`.
+fn wifi(op: &str, ssid: &str, passphrase: &str) -> Result<String, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let iface = wpa::interface().ok_or("NotFoundError: there is no Wi-Fi (no wireless card, or wifi=off)")?;
+        let ask = |command: &str| wpa::request(&iface, command).map_err(|e| format!("OperationError: wpa_supplicant: {e}"));
+        let ok = |command: &str| -> Result<(), String> {
+            let reply = ask(command)?;
+            if reply.trim() == "OK" {
+                Ok(())
+            } else {
+                Err(format!("OperationError: wpa_supplicant: {} ({})", reply.trim(), command.split(' ').next().unwrap_or("")))
+            }
+        };
+        match op {
+            "status" => {
+                let reply = ask("STATUS")?;
+                let field = |key: &str| reply.lines().find_map(|l| l.strip_prefix(key).and_then(|v| v.strip_prefix('='))).unwrap_or("").to_string();
+                Ok(serde_json::json!({
+                    "interface": iface,
+                    "state": field("wpa_state"),
+                    "ssid": wpa::unescape(&field("ssid")),
+                    "bssid": field("bssid"),
+                    "frequency": field("freq").parse::<u32>().unwrap_or(0),
+                    "address": field("ip_address"),
+                    "security": field("key_mgmt"),
+                })
+                .to_string())
+            }
+            "scan" => {
+                let reply = ask("SCAN")?;
+                // Already scanning is as good as starting.
+                if reply.trim() != "OK" && !reply.contains("FAIL-BUSY") {
+                    return Err(format!("OperationError: wpa_supplicant: {}", reply.trim()));
+                }
+                Ok(String::new())
+            }
+            "results" => {
+                let reply = ask("SCAN_RESULTS")?;
+                // bssid, frequency, signal, flags, ssid; one network may have
+                // several access points: the strongest stands for it.
+                let mut best: Vec<serde_json::Value> = Vec::new();
+                for line in reply.lines().skip(1) {
+                    let f: Vec<&str> = line.splitn(5, '\t').collect();
+                    if f.len() < 5 || f[4].is_empty() {
+                        continue;
+                    }
+                    let signal: i64 = f[2].parse().unwrap_or(-100);
+                    let flags = f[3];
+                    let security = if flags.contains("SAE") {
+                        "WPA3"
+                    } else if flags.contains("EAP") {
+                        "enterprise"
+                    } else if flags.contains("WPA2") || flags.contains("RSN") {
+                        "WPA2"
+                    } else if flags.contains("WPA") {
+                        "WPA"
+                    } else if flags.contains("WEP") {
+                        "WEP"
+                    } else {
+                        "open"
+                    };
+                    let entry = serde_json::json!({
+                        "ssid": wpa::unescape(f[4]),
+                        "signal": signal,
+                        "frequency": f[1].parse::<u32>().unwrap_or(0),
+                        "security": security,
+                        "bssid": f[0],
+                    });
+                    match best.iter_mut().find(|e| e["ssid"] == entry["ssid"]) {
+                        Some(e) if e["signal"].as_i64().unwrap_or(-100) < signal => *e = entry,
+                        Some(_) => {}
+                        None => best.push(entry),
+                    }
+                }
+                best.sort_by_key(|e| -e["signal"].as_i64().unwrap_or(-100));
+                Ok(serde_json::Value::Array(best).to_string())
+            }
+            "connect" => {
+                if ssid.is_empty() || ssid.len() > 32 {
+                    return Err("TypeError: a network's name is 1 to 32 bytes".into());
+                }
+                let hex = passphrase.len() == 64 && passphrase.bytes().all(|b| b.is_ascii_hexdigit());
+                if !passphrase.is_empty() && !hex && !(8..=63).contains(&passphrase.len()) {
+                    return Err("TypeError: a passphrase is 8 to 63 characters".into());
+                }
+                ok("REMOVE_NETWORK all")?;
+                let id = ask("ADD_NETWORK")?.trim().to_string();
+                if id.parse::<u32>().is_err() {
+                    return Err(format!("OperationError: wpa_supplicant: {id}"));
+                }
+                let name: String = ssid.bytes().map(|b| format!("{b:02x}")).collect();
+                ok(&format!("SET_NETWORK {id} ssid {name}"))?;
+                ok(&format!("SET_NETWORK {id} scan_ssid 1"))?;
+                if passphrase.is_empty() {
+                    ok(&format!("SET_NETWORK {id} key_mgmt NONE"))?;
+                } else if hex {
+                    ok(&format!("SET_NETWORK {id} key_mgmt WPA-PSK WPA-PSK-SHA256"))?;
+                    ok(&format!("SET_NETWORK {id} psk {passphrase}"))?;
+                } else {
+                    ok(&format!("SET_NETWORK {id} key_mgmt WPA-PSK WPA-PSK-SHA256 SAE"))?;
+                    ok(&format!("SET_NETWORK {id} ieee80211w 1"))?;
+                    ok(&format!("SET_NETWORK {id} psk \"{passphrase}\""))?;
+                }
+                ok(&format!("SELECT_NETWORK {id}"))?;
+                Ok(String::new())
+            }
+            "disconnect" => {
+                ok("DISCONNECT")?;
+                Ok(String::new())
+            }
+            _ => Err(format!("TypeError: zipp: wifi {op}?")),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (op, ssid, passphrase);
+        Err("NotSupportedError: Wi-Fi is for zipp-linux".into())
+    }
+}
+
+/// wpa_supplicant's control interface: a datagram socket per interface in
+/// /run/wpa_supplicant, a request and its reply.
+#[cfg(target_os = "linux")]
+mod wpa {
+    use std::os::unix::net::UnixDatagram;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+
+    const DIR: &str = "/run/wpa_supplicant";
+
+    /// The interface wpa_supplicant runs on (not the Wi-Fi Direct device it
+    /// makes beside it, `p2p-dev-<interface>`).
+    pub(super) fn interface() -> Option<String> {
+        let mut names: Vec<String> = std::fs::read_dir(DIR)
+            .ok()?
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.starts_with("p2p-dev-"))
+            .collect();
+        names.sort();
+        names.into_iter().next()
+    }
+
+    pub(super) fn request(iface: &str, command: &str) -> std::io::Result<String> {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let local = format!("/run/zipp-wpa-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
+        let _ = std::fs::remove_file(&local);
+        let socket = UnixDatagram::bind(&local)?;
+        let result = (|| {
+            socket.connect(format!("{DIR}/{iface}"))?;
+            socket.set_read_timeout(Some(Duration::from_secs(4)))?;
+            socket.send(command.as_bytes())?;
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let n = socket.recv(&mut buf)?;
+                let reply = String::from_utf8_lossy(&buf[..n]).into_owned();
+                // "<3>CTRL-EVENT-..." is an event, not the answer.
+                if !reply.starts_with('<') {
+                    return Ok(reply);
+                }
+            }
+        })();
+        let _ = std::fs::remove_file(&local);
+        result
+    }
+
+    /// A name as wpa_supplicant prints it (\xNN, \\, \") as text.
+    pub(super) fn unescape(text: &str) -> String {
+        let mut bytes = Vec::with_capacity(text.len());
+        let mut it = text.bytes();
+        while let Some(b) = it.next() {
+            if b != b'\\' {
+                bytes.push(b);
+                continue;
+            }
+            match it.next() {
+                Some(b'x') => {
+                    let hex: Vec<u8> = it.by_ref().take(2).collect();
+                    match std::str::from_utf8(&hex).ok().and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                        Some(v) => bytes.push(v),
+                        None => bytes.extend_from_slice(&hex),
+                    }
+                }
+                Some(b'n') => bytes.push(b'\n'),
+                Some(b't') => bytes.push(b'\t'),
+                Some(other) => bytes.push(other),
+                None => bytes.push(b'\\'),
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 }
 

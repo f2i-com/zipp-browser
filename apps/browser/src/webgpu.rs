@@ -366,8 +366,18 @@ impl Gpu {
             })
             .ok_or("no Vulkan or Direct3D 12 adapter")?;
         let info = adapter.get_info();
+        // WebGPU's default limits where the GPU has them; a smaller GPU's own
+        // where it does not (a Raspberry Pi 4's tops out at 4096-pixel
+        // textures and four colour attachments), rather than no device.
+        let limits = if wgpu::Limits::default().check_limits(&adapter.limits()) {
+            wgpu::Limits::default()
+        } else {
+            eprintln!("[WEBGPU] {} is below WebGPU's default limits: using its own", info.name);
+            adapter.limits()
+        };
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("zipp-webgpu"),
+            required_limits: limits,
             ..Default::default()
         }))
         .map_err(|e| e.to_string())?;

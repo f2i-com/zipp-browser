@@ -101,7 +101,12 @@ pub(crate) fn host_call(ctx: &mut dyn HostCtx, args: &[String]) -> Result<String
     sender
         .send(Batch { context, cmds, payload, reply: reply_tx })
         .map_err(|_| "Error: WebGL is unavailable".to_string())?;
-    let reply = reply_rx.recv().map_err(|_| "Error: WebGL stopped".to_string())?;
+    // A draw the GL thread is still on after half a minute (a hung driver, or
+    // a huge one on the CPU) gives the page an error rather than freezing it.
+    let reply = reply_rx.recv_timeout(std::time::Duration::from_secs(30)).map_err(|e| match e {
+        mpsc::RecvTimeoutError::Timeout => "Error: WebGL did not answer in 30 seconds".to_string(),
+        mpsc::RecvTimeoutError::Disconnected => "Error: WebGL stopped".to_string(),
+    })?;
     if let Some(error) = reply.error {
         eprintln!("[WEBGL] {error}");
         crate::console::push(crate::console::Level::Error, format!("WebGL: {error}"));
@@ -444,6 +449,17 @@ fn canvas_buffer(buffer: u32) -> u32 {
 }
 
 impl Context {
+    /// glClearDepth on desktop OpenGL; OpenGL ES has only glClearDepthf.
+    unsafe fn set_clear_depth(&self, depth: f64) {
+        unsafe {
+            if self.es {
+                self.gl.clear_depth_f32(depth as f32);
+            } else {
+                self.gl.clear_depth_f64(depth);
+            }
+        }
+    }
+
     /// Bytes between rows of a `width`-pixel image under the page's
     /// alignment and row length (`pack`: for reading, else for uploading).
     fn row_stride(&self, width: i32, format: u32, ty: u32, pack: bool) -> usize {
@@ -511,7 +527,7 @@ impl Context {
             gl.depth_mask(true);
             gl.stencil_mask(u32::MAX);
             gl.clear_color(0.0, 0.0, 0.0, 0.0);
-            gl.clear_depth_f64(1.0);
+            self.set_clear_depth(1.0);
             gl.clear_stencil(0);
             gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT | glow::STENCIL_BUFFER_BIT);
             self.restore_state();
@@ -540,7 +556,7 @@ impl Context {
             gl.stencil_mask_separate(glow::BACK, s.stencil_mask[1]);
             let [r, g, b, a] = s.clear_color;
             gl.clear_color(r, g, b, a);
-            gl.clear_depth_f64(s.clear_depth);
+            self.set_clear_depth(s.clear_depth);
             gl.clear_stencil(s.clear_stencil);
         }
     }
@@ -689,7 +705,16 @@ impl Context {
                 "copyBufferSubData" => self.gl.copy_buffer_sub_data(u(1), u(2), int(3), int(4), int(5)),
                 "getBufferSubData" => {
                     let mut buf = vec![0u8; u(3) as usize];
-                    self.gl.get_buffer_sub_data(u(1), int(2), &mut buf);
+                    if !self.es {
+                        self.gl.get_buffer_sub_data(u(1), int(2), &mut buf);
+                    } else if !buf.is_empty() {
+                        // OpenGL ES reads a buffer back by mapping it.
+                        let mapped = self.gl.map_buffer_range(u(1), int(2), buf.len() as i32, glow::MAP_READ_BIT);
+                        if !mapped.is_null() {
+                            std::ptr::copy_nonoverlapping(mapped, buf.as_mut_ptr(), buf.len());
+                        }
+                        self.gl.unmap_buffer(u(1));
+                    }
                     reply.bytes = Some(buf);
                 }
                 "createShader" => { let s = self.gl.create_shader(u(2))?; self.shaders.insert(u(1), s); }
@@ -1114,7 +1139,7 @@ impl Context {
                 }
                 "clearDepth" => {
                     self.state.clear_depth = num(1);
-                    self.gl.clear_depth_f64(num(1));
+                    self.set_clear_depth(num(1));
                 }
                 "clearStencil" => {
                     self.state.clear_stencil = int(1);
@@ -1468,6 +1493,10 @@ mod egl {
                     match version {
                         Some((major, minor)) if (major, minor) < (3, 3) && wanted != "gl" => {
                             eprintln!("[WEBGL] desktop OpenGL is {major}.{minor}, older than 3.3: OpenGL ES instead");
+                            platform.es = true;
+                        }
+                        None if wanted != "gl" => {
+                            eprintln!("[WEBGL] no desktop OpenGL context: OpenGL ES instead");
                             platform.es = true;
                         }
                         _ => {}

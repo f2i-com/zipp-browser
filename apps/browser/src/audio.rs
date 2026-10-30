@@ -285,6 +285,7 @@ mod alsa_out {
         };
         let mut buf = vec![0.0f32; PERIOD * 2];
         let mut written: u64 = 0;
+        let mut delay: u64 = 0;
         loop {
             super::next_period(out, &mut buf);
             match io.writei(&buf) {
@@ -298,8 +299,13 @@ mod alsa_out {
                     continue;
                 }
             }
-            let delay = pcm.delay().unwrap_or(0).max(0) as u64;
-            out.played.store(written.saturating_sub(delay), Ordering::Release);
+            // Kept from last time when the device cannot say, so that the
+            // page's time never runs backwards.
+            if let Ok(now) = pcm.delay() {
+                delay = now.max(0) as u64;
+            }
+            let played = written.saturating_sub(delay).max(out.played.load(Ordering::Acquire));
+            out.played.store(played, Ordering::Release);
         }
     }
 }

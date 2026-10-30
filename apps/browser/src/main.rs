@@ -218,7 +218,17 @@ fn main() {
     // 1-3. Fetch, run the page's JS, post-process. The ScriptState is !Send, so
     //      this stays on the main thread to keep it alive for event dispatch.
     let t_fetch = std::time::Instant::now();
-    let html = match viewers::fetch_document(&url, true) {
+    let mut fetched = viewers::fetch_document(&url, true);
+    // A kiosk starts with its network: a page on the web may not be
+    // reachable yet (no address, or no clock for TLS until NTP), so it is
+    // asked again for two minutes before the error is what shows.
+    while kiosk && url.starts_with("http") && t_fetch.elapsed() < std::time::Duration::from_secs(120) {
+        let Err(e) = &fetched else { break };
+        eprintln!("[BROWSER] {url}: {e}; trying again");
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        fetched = viewers::fetch_document(&url, true);
+    }
+    let html = match fetched {
         Ok(html) => {
             PAGE_CACHE.lock().unwrap().insert(url.clone(), html.clone());
             html
@@ -303,6 +313,9 @@ fn main() {
     app.set_document_builder(Box::new(|url, html, config, viewport| {
         console::clear();
         worker::new_page();
+        system::new_page();
+        #[cfg(target_os = "linux")]
+        usb::new_page();
         let (final_html, event_map_json, js_state) = render_page(&url, &html, viewport, None);
         let mut doc = build_document(&final_html, config);
         attach_event_bridge(&mut doc, event_map_json, js_state, &url);

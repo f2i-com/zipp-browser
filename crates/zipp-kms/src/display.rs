@@ -90,7 +90,6 @@ impl Display {
             .flat_map(|&c| card.get_connector(c, true))
             .find(|c| c.state() == connector::State::Connected && !c.modes().is_empty())
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no connected output"))?;
-        let mode = pick_mode(connector.modes());
 
         let crtc = connector
             .current_encoder()
@@ -106,16 +105,48 @@ impl Display {
             })
             .ok_or_else(|| io::Error::other("no CRTC for the output"))?;
 
+        // The first mode that can be set: a buffer for it, and the CRTC
+        // scanning it out. A mode too big for the graphics memory (a 4K
+        // screen on a Raspberry Pi) gives way to the next.
+        let mut chosen = None;
+        let mut last_error = io::Error::other("the output has no modes");
+        for mode in modes_to_try(connector.modes()) {
+            let (w, h) = mode.size();
+            let attempt = (|| -> io::Result<(DumbBuffer, framebuffer::Handle)> {
+                let mut scanout = card.create_dumb_buffer((w as u32, h as u32), DrmFourcc::Xrgb8888, 32)?;
+                if let Ok(mut map) = card.map_dumb_buffer(&mut scanout) {
+                    map.as_mut().fill(0);
+                }
+                let fb = match card.add_framebuffer(&scanout, 24, 32) {
+                    Ok(fb) => fb,
+                    Err(e) => {
+                        let _ = card.destroy_dumb_buffer(scanout);
+                        return Err(e);
+                    }
+                };
+                if let Err(e) = card.set_crtc(crtc, Some(fb), (0, 0), &[connector.handle()], Some(mode)) {
+                    let _ = card.destroy_framebuffer(fb);
+                    let _ = card.destroy_dumb_buffer(scanout);
+                    return Err(e);
+                }
+                Ok((scanout, fb))
+            })();
+            match attempt {
+                Ok((scanout, fb)) => {
+                    chosen = Some((mode, scanout, fb));
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("[kms] {w}x{h}@{}: {e}; trying another mode", mode.vrefresh());
+                    last_error = e;
+                }
+            }
+        }
+        let (mode, scanout, fb) = chosen.ok_or(last_error)?;
         let (mode_w, mode_h) = mode.size();
         let (mode_w, mode_h) = (mode_w as u32, mode_h as u32);
-        let mut scanout = card.create_dumb_buffer((mode_w, mode_h), DrmFourcc::Xrgb8888, 32)?;
         let pitch = drm::buffer::Buffer::pitch(&scanout);
         let width = if pitch % 4 == 0 && pitch / 4 > mode_w { pitch / 4 } else { mode_w };
-        if let Ok(mut map) = card.map_dumb_buffer(&mut scanout) {
-            map.as_mut().fill(0);
-        }
-        let fb = card.add_framebuffer(&scanout, 24, 32)?;
-        card.set_crtc(crtc, Some(fb), (0, 0), &[connector.handle()], Some(mode))?;
 
         // The primary plane: the one now scanning out our framebuffer.
         let planes = card.plane_handles()?;
@@ -182,20 +213,50 @@ impl Display {
     }
 }
 
-fn pick_mode(modes: &[Mode]) -> Mode {
-    if let Ok(wanted) = std::env::var("ZIPP_KMS_MODE") {
-        if let Some((w, h)) = wanted.split_once('x').and_then(|(w, h)| Some((w.parse::<u16>().ok()?, h.parse::<u16>().ok()?))) {
-            if let Some(mode) = modes.iter().find(|m| m.size() == (w, h)) {
-                return *mode;
+/// The most pixels a mode is chosen with unless asked for more: every frame
+/// is drawn on the CPU, and a 4K one is four times the work of this.
+const MOST_PIXELS: u32 = 1920 * 1080;
+
+/// The modes to try, best first. `ZIPP_KMS_MODE=WIDTHxHEIGHT` names one, and
+/// `preferred` the output's own; otherwise the output's preferred mode if it
+/// is no bigger than 1920x1080, or else the biggest mode that is (at the
+/// highest refresh rate). The rest follow, biggest first, should those fail.
+fn modes_to_try(modes: &[Mode]) -> Vec<Mode> {
+    let pixels = |m: &Mode| m.size().0 as u32 * m.size().1 as u32;
+    let preferred = modes.iter().find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED)).copied();
+    let mut by_size: Vec<Mode> = modes.to_vec();
+    by_size.sort_by_key(|m| std::cmp::Reverse((pixels(m), m.vrefresh())));
+    let mut order: Vec<Mode> = Vec::new();
+    match std::env::var("ZIPP_KMS_MODE").as_deref() {
+        Ok("preferred") => order.extend(preferred),
+        Ok(wanted) => {
+            let size = wanted.split_once('x').and_then(|(w, h)| Some((w.parse::<u16>().ok()?, h.parse::<u16>().ok()?)));
+            match size.and_then(|size| by_size.iter().find(|m| m.size() == size)) {
+                Some(mode) => order.push(*mode),
+                None => eprintln!("[kms] no {wanted} mode"),
             }
-            eprintln!("[kms] no {wanted} mode; using the preferred one");
+        }
+        Err(_) => {}
+    }
+    if order.is_empty() {
+        match preferred.filter(|m| pixels(m) <= MOST_PIXELS) {
+            Some(mode) => order.push(mode),
+            None => order.extend(by_size.iter().find(|m| pixels(m) <= MOST_PIXELS).copied()),
         }
     }
-    modes
-        .iter()
-        .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
-        .copied()
-        .unwrap_or(modes[0])
+    order.extend(preferred);
+    order.extend(by_size);
+    let mut seen = Vec::new();
+    order.retain(|m| {
+        let key = (m.size(), m.vrefresh(), m.clock());
+        if seen.contains(&key) {
+            false
+        } else {
+            seen.push(key);
+            true
+        }
+    });
+    order
 }
 
 fn connector_name(info: &connector::Info) -> String {
