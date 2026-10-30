@@ -53,18 +53,25 @@
 
   function stat(path) { return JSON.parse(host("stat", path)); }
 
+  // Read until the file ends: its size is only a guess at that (the
+  // kernel's own files, /proc's, say 0 and are not empty).
   function readFile(path) {
     return call(function () {
-      var size = stat(path).size;
-      var out = new Uint8Array(size);
-      var at = 0;
-      while (at < size) {
-        var want = Math.min(PIECE, size - at);
+      var hint = stat(path).size;
+      var parts = [], total = 0;
+      for (;;) {
+        var want = Math.min(PIECE, Math.max(hint - total, 65536));
         hostBytes(want);
-        var got = +host("read", path, at, want);
-        out.set(__zippHostBytes.subarray(0, got), at);
-        at += got;
-        if (got < want) return out.subarray(0, at);
+        var got = +host("read", path, total, want);
+        parts.push(__zippHostBytes.slice(0, got));
+        total += got;
+        if (got < want) break;
+      }
+      if (parts.length === 1) return parts[0];
+      var out = new Uint8Array(total), at = 0;
+      for (var i = 0; i < parts.length; i++) {
+        out.set(parts[i], at);
+        at += parts[i].length;
       }
       return out;
     });
