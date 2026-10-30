@@ -201,9 +201,30 @@ fn apply_patches(doc: &mut BaseDocument, patches: Vec<crate::DomPatch>) -> bool 
                 };
                 let current: Vec<(String, String)> =
                     current.iter().map(|a| (a.name.local.to_string(), a.value.clone())).collect();
+                // A text field's value that its editor already shows (what
+                // was just typed into it) is only noted: setting it would put
+                // the editor's text again, and the caret at its end.
+                let typed = doc.nodes[node_id]
+                    .element_data()
+                    .and_then(|e| e.text_input_data())
+                    .map(|t| t.editor.raw_text().to_string());
+                let mut noted = false;
+                let attrs: Vec<(String, String)> = attrs
+                    .into_iter()
+                    .filter(|(name, value)| {
+                        if name != "value" || typed.as_deref() != Some(value.as_str()) {
+                            return true;
+                        }
+                        if let Some(el) = doc.nodes[node_id].element_data_mut() {
+                            el.attrs.set(qual(name), value);
+                        }
+                        noted = true;
+                        false
+                    })
+                    .collect();
                 let mut mutator = crate::DocumentMutator::new(doc);
                 for (name, _) in &current {
-                    if !attrs.iter().any(|(n, _)| n == name) {
+                    if !(noted && name == "value") && !attrs.iter().any(|(n, _)| n == name) {
                         mutator.clear_attribute(node_id, qual(name));
                     }
                 }

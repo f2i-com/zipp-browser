@@ -265,7 +265,10 @@ impl JsEventBridge {
         let Some(state) = self.js_state.as_mut() else {
             return;
         };
-        let Ok(JsValue::String(out)) = state.call_global("__zippRenderPatch", &[]) else {
+        // ZIPP_WHOLE_RENDERS: every change drawn as a whole body again, as
+        // before patches, to compare.
+        let whole = std::env::var_os("ZIPP_WHOLE_RENDERS").is_some();
+        let Ok(JsValue::String(out)) = state.call_global(if whole { "__getRenderedHTML" } else { "__zippRenderPatch" }, &[]) else {
             return;
         };
         if out.starts_with('[') {

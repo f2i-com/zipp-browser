@@ -258,9 +258,19 @@ impl EventLoop {
             shared.redraw.store(true, Ordering::Release);
         }
 
+        // ZIPP_KMS_STATS: how many frames are drawn each second, in the log.
+        let stats = std::env::var_os("ZIPP_KMS_STATS").is_some();
+        let (mut frames, mut counted_since) = (0u32, Instant::now());
         loop {
             if let Some(id) = target.window.get() {
                 if flip_due.is_none() && shared.redraw.swap(false, Ordering::AcqRel) {
+                    if stats {
+                        frames += 1;
+                        if counted_since.elapsed() >= Duration::from_secs(1) {
+                            eprintln!("[kms] {frames} frames in {:.2} s", counted_since.elapsed().as_secs_f64());
+                            (frames, counted_since) = (0, Instant::now());
+                        }
+                    }
                     app.window_event(target, id, WindowEvent::RedrawRequested);
                     flip_due = Some(Instant::now() + FLIP_TIMEOUT);
                     // A drawn pointer goes on the new frame at once: the flip
