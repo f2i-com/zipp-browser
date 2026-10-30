@@ -71,8 +71,25 @@ function __zippAbsoluteUrl(u) {
 // ---- Odds and ends ---------------------------------------------------------
 var performance = globalThis.performance || (function () { var t0 = Date.now(); return { now: function () { return Date.now() - t0; } }; })();
 var crypto = globalThis.crypto || {
-  getRandomValues: function (a) { for (var i = 0; i < a.length; i++) a[i] = Math.floor(Math.random() * 256); return a; },
-  randomUUID: function () { return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function (c) { var r = Math.random() * 16 | 0; return (c === "x" ? r : (r & 3 | 8)).toString(16); }); },
+  // The machine's randomness, as the page's crypto has it (dom_shim.js).
+  getRandomValues: function (a) {
+    var n = a && a.byteLength !== undefined ? a.byteLength : (a ? a.length : 0);
+    if (n > 65536) throw new Error("QuotaExceededError: getRandomValues: more than 65536 bytes asked for");
+    var hex = __zippHostCall("random", String(n));
+    var view = ArrayBuffer.isView(a) ? new Uint8Array(a.buffer, a.byteOffset, a.byteLength) : a;
+    for (var i = 0; i < n; i++) view[i] = parseInt(hex.substr(i * 2, 2), 16);
+    return a;
+  },
+  randomUUID: function () {
+    var b = this.getRandomValues(new Uint8Array(16)), s = "";
+    b[6] = (b[6] & 15) | 64;
+    b[8] = (b[8] & 63) | 128;
+    for (var i = 0; i < 16; i++) {
+      s += (b[i] < 16 ? "0" : "") + b[i].toString(16);
+      if (i === 3 || i === 5 || i === 7 || i === 9) s += "-";
+    }
+    return s;
+  },
 };
 var B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
 var btoa = function (s) {

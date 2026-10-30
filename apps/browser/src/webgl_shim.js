@@ -940,8 +940,7 @@ var __zippWebGL = (function () {
       var img = this;
       setTimeout(function () {
         img.complete = true;
-        var handler = img.onload;
-        if (typeof handler === "function") { try { handler.call(img, { type: "load", target: img }); } catch (e) { console.error(e); } }
+        // To its listeners, `onload` among them (a handler property is one).
         if (img.dispatchEvent) { try { img.dispatchEvent({ type: "load", target: img }); } catch (e) {} }
       }, 0);
     },

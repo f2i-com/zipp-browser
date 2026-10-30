@@ -211,6 +211,16 @@ fn main() {
         NO_CHROME.store(true, std::sync::atomic::Ordering::Relaxed);
         system::KIOSK.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    // `--app <url> [file ...]`: the page as an application, in a window of
+    // its own with no toolbar, that may read on disk only its own folder and
+    // the files named after it. ZIPP OS runs a .softn app this way: the page
+    // is SoftN's runtime, the file the app.
+    let app = arg == "--app";
+    let arg = if app { std::env::args().nth(2).unwrap_or_default() } else { arg };
+    if app {
+        NO_CHROME.store(true, std::sync::atomic::Ordering::Relaxed);
+        allow_app_files(&arg, std::env::args().skip(3));
+    }
 
     let url = if arg.is_empty() { "https://lance.name".to_string() } else { arg };
     eprintln!("[BROWSER] Loading {url}");
@@ -649,6 +659,9 @@ fn fetch(url: &str) -> Result<String, String> {
     // loading live sites.
     if let Some(path) = url.strip_prefix("file://") {
         let path = viewers::local_path(path);
+        if !within_app_files(&path) {
+            return Err(format!("{} is not this app's to read", path.display()));
+        }
         return std::fs::read_to_string(&path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()));
     }
@@ -1128,12 +1141,48 @@ fn resolve_page_url(raw: &str) -> String {
         .unwrap_or_else(|_| raw.to_string())
 }
 
+/// What an `--app` page may read on disk: its own folder and the files it
+/// was given, as they are on disk (links followed). Empty when not in `--app`.
+static APP_FILES: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+
+/// `--app <url> [file ...]`: the page's folder, when it is on disk, and the files.
+fn allow_app_files(url: &str, files: impl Iterator<Item = String>) {
+    let mut allowed = APP_FILES.lock().unwrap();
+    if let Some(dir) = url::Url::parse(url).ok().and_then(|u| u.to_file_path().ok()).and_then(|p| p.parent().map(Into::into)) {
+        allowed.extend(std::fs::canonicalize::<std::path::PathBuf>(dir));
+    }
+    allowed.extend(files.filter_map(|f| std::fs::canonicalize(f).ok()));
+    // Nothing that exists: then nothing at all, rather than everything.
+    if allowed.is_empty() {
+        allowed.push(std::path::PathBuf::from("/nonexistent/zipp-app"));
+    }
+}
+
+/// Whether `path` is within what `--app` allowed (anything, outside `--app`).
+fn within_app_files(path: &std::path::Path) -> bool {
+    let allowed = APP_FILES.lock().unwrap();
+    allowed.is_empty() || std::fs::canonicalize(path).is_ok_and(|real| allowed.iter().any(|a| real.starts_with(a)))
+}
+
+/// Whether page script may read the file at `path`. A page from the web may
+/// not read the machine's files at all -- a browser keeps `file:` to `file:`
+/// pages; here any page's `fetch("file:///...")` read anything the browser
+/// could, root's files under zipp-linux -- and an `--app` page only what it
+/// was given.
+fn page_may_read(path: &std::path::Path) -> bool {
+    CURRENT_URL.lock().unwrap().starts_with("file:") && within_app_files(path)
+}
+
 /// GET a URL for page script, as bytes: http(s) through the shared client,
-/// `file:` from disk (a page opened from disk fetches its neighbours).
+/// `file:` from disk (a page opened from disk fetches its neighbours; see
+/// `page_may_read`).
 fn fetch_bytes_for_page(url: &str) -> Result<(u16, Vec<u8>), String> {
     if let Ok(parsed) = url::Url::parse(url) {
         if parsed.scheme() == "file" {
             let path = parsed.to_file_path().map_err(|_| format!("Error: GET {url}: not a file path"))?;
+            if !page_may_read(&path) {
+                return Ok((403, Vec::new()));
+            }
             return match std::fs::read(&path) {
                 Ok(bytes) => Ok((200, bytes)),
                 Err(_) => Ok((404, Vec::new())),
@@ -1165,6 +1214,15 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
     match kind {
         // The page's body, once, as the shim's document starts.
         "seed" => Ok(SEED.with(|s| std::mem::take(&mut *s.borrow_mut()))),
+        // `crypto.getRandomValues` (a page's or a worker's): this many bytes of
+        // the machine's randomness, as hex; WebCrypto's limit, 65536, at most.
+        "random" => {
+            let n = args.first().and_then(|a| a.parse::<usize>().ok()).unwrap_or(0).min(65536);
+            let mut bytes = vec![0u8; n];
+            getrandom::fill(&mut bytes).map_err(|e| format!("OperationError: no randomness: {e}"))?;
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            Ok(bytes.iter().flat_map(|b| [HEX[(b >> 4) as usize] as char, HEX[(b & 15) as usize] as char]).collect())
+        }
         // Web Workers (worker.rs): start one, post to one, stop one.
         "worker_start" => {
             let url = args.first().map(String::as_str).unwrap_or_default();
@@ -1231,6 +1289,16 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
             ))
         }
         // Copy the pending bytes into `__zippHostBytes`.
+        // `document.title = ...`: the window's title.
+        "window_title" => {
+            push_window_request(WindowRequest::Title(args.first().cloned().unwrap_or_default()));
+            Ok(String::new())
+        }
+        // `requestFullscreen()` ("1") and `exitFullscreen()` ("0").
+        "fullscreen" => {
+            push_window_request(WindowRequest::Fullscreen(args.first().is_some_and(|a| a == "1")));
+            Ok(String::new())
+        }
         // An element's box in the viewport (`getBoundingClientRect`).
         "rect" => Ok(event_bridge::layout_rect(args.first().map(String::as_str).unwrap_or_default())),
         // `document.elementFromPoint(x, y)`: the script's node there.
@@ -1530,8 +1598,38 @@ fn attach_event_bridge(
 /// The viewport WPT reftests are written for.
 const REFTEST_SIZE: (u32, u32) = (800, 600);
 
-/// Pages are rendered without the browser's toolbar (`--reftest`).
+/// Pages are rendered without the browser's toolbar (`--reftest`, `--kiosk`,
+/// `--app`).
 static NO_CHROME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether pages are shown with the browser's toolbar (and its console).
+pub(crate) fn chrome_shown() -> bool {
+    !NO_CHROME.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// What page script asks of its window, for the event bridge to carry out
+/// where it has the document (and its shell).
+pub(crate) enum WindowRequest {
+    Title(String),
+    Fullscreen(bool),
+}
+
+static WINDOW_REQUESTS: Mutex<Vec<WindowRequest>> = Mutex::new(Vec::new());
+
+fn push_window_request(request: WindowRequest) {
+    WINDOW_REQUESTS.lock().unwrap_or_else(|e| e.into_inner()).push(request);
+}
+
+/// Carry out what the page asked of its window since last time.
+pub(crate) fn apply_window_requests(doc: &zipp_dom::BaseDocument) {
+    let requests = std::mem::take(&mut *WINDOW_REQUESTS.lock().unwrap_or_else(|e| e.into_inner()));
+    for request in requests {
+        match request {
+            WindowRequest::Title(title) => doc.shell_provider.set_window_title(title),
+            WindowRequest::Fullscreen(on) => doc.shell_provider.set_fullscreen(on),
+        }
+    }
+}
 
 /// `--reftest pairs.tsv results.tsv`: run Web Platform Tests reftests. Each
 /// line of `pairs` is `test URL \t reference URL \t largest channel difference

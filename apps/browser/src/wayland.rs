@@ -73,7 +73,8 @@ const BTN_EXTRA: u32 = 0x114;
 
 // ---- the page's side --------------------------------------------------------------------
 
-/// What the page hears of: ("window" | "size" | "title" | "place" | "gone", window, JSON).
+/// What the page hears of: ("window" | "size" | "title" | "place" | "gone" |
+/// "fullscreen" | "minimize" | "maximize", window, JSON).
 static EVENTS: Mutex<Vec<(&'static str, u32, String)>> = Mutex::new(Vec::new());
 /// Each window's newest frame, until the page shows it.
 static FRAMES: Mutex<Option<HashMap<u32, crate::canvas::Frame>>> = Mutex::new(None);
@@ -128,7 +129,8 @@ pub(crate) fn start(width: i32, height: i32) -> Result<String, String> {
 }
 
 /// What the page does to a window: `bind` (to the canvas with this
-/// `data-flid`; 0 for none), `configure` (width, height, active), `pointer`
+/// `data-flid`; 0 for none), `configure` (width, height, and its states:
+/// "active", "fullscreen", comma-separated -- or "true" for active), `pointer`
 /// (x, y in its frame), `leave`, `button` (DOM button, pressed), `axis`
 /// (dx, dy in pixels), `key` (KeyboardEvent.code, pressed), `focus`, `close`.
 pub(crate) fn call(command: &str, window: u32, a: &str, b: &str, c: &str) -> Result<(), String> {
@@ -148,7 +150,16 @@ pub(crate) fn call(command: &str, window: u32, a: &str, b: &str, c: &str) -> Res
             crate::worker::wake();
             return Ok(());
         }
-        "configure" => Command::Configure { window, width: n(a) as i32, height: n(b) as i32, active: yes(c) },
+        "configure" => {
+            let states: Vec<&str> = c.split(',').collect();
+            Command::Configure {
+                window,
+                width: n(a) as i32,
+                height: n(b) as i32,
+                active: yes(c) || states.contains(&"active"),
+                fullscreen: states.contains(&"fullscreen"),
+            }
+        }
         "pointer" => Command::Pointer { window, x: n(a), y: n(b) },
         "leave" => Command::Pointer { window: 0, x: 0.0, y: 0.0 },
         "button" => {
@@ -319,7 +330,7 @@ fn evdev(code: &str) -> Option<u32> {
 // ---- the server -------------------------------------------------------------------------
 
 enum Command {
-    Configure { window: u32, width: i32, height: i32, active: bool },
+    Configure { window: u32, width: i32, height: i32, active: bool, fullscreen: bool },
     /// Window 0: the pointer left the page's windows.
     Pointer { window: u32, x: f64, y: f64 },
     Button { button: u32, pressed: bool },
@@ -425,6 +436,8 @@ struct Window {
     shown: Option<(u32, u32)>,
     /// The size the page gives it (0: the app's choice), and whether it is the active one.
     want: (i32, i32, bool),
+    /// Whether the page has it over the whole screen (its configure says so).
+    fullscreen: bool,
     /// Where its frame starts in its surface.
     origin: (i32, i32),
 }
@@ -671,9 +684,10 @@ impl State {
 
     fn command(&mut self, command: Command) {
         match command {
-            Command::Configure { window, width, height, active } => {
+            Command::Configure { window, width, height, active, fullscreen } => {
                 if let Some(w) = self.windows.get_mut(&window) {
                     w.want = (width.clamp(0, 16384), height.clamp(0, 16384), active);
+                    w.fullscreen = fullscreen;
                     if w.configured && w.toplevel.is_some() {
                         self.configure(window);
                     }
@@ -787,7 +801,13 @@ impl State {
         w.configured = true;
         if let Some(toplevel) = &w.toplevel {
             let (width, height, active) = w.want;
-            let states = if active { (xdg_toplevel::State::Activated as u32).to_ne_bytes().to_vec() } else { Vec::new() };
+            let mut states = Vec::new();
+            if active {
+                states.extend((xdg_toplevel::State::Activated as u32).to_ne_bytes());
+            }
+            if w.fullscreen {
+                states.extend((xdg_toplevel::State::Fullscreen as u32).to_ne_bytes());
+            }
             toplevel.configure(width, height, states);
         } else if let Some(popup) = &w.popup {
             let (x, y, width, height) = w.place;
@@ -848,6 +868,7 @@ impl State {
                 configured: false,
                 shown: None,
                 want: (0, 0, true),
+                fullscreen: false,
                 origin: (0, 0),
             },
         );
@@ -1430,6 +1451,12 @@ impl Dispatch<XdgToplevel, u32> for State {
         match request {
             xdg_toplevel::Request::SetTitle { title } => state.set_title(*window, Some(title), None),
             xdg_toplevel::Request::SetAppId { app_id } => state.set_title(*window, None, Some(app_id)),
+            // What the app asks of its window, for the page to do.
+            xdg_toplevel::Request::SetFullscreen { .. } => event("fullscreen", *window, serde_json::json!({ "on": true })),
+            xdg_toplevel::Request::UnsetFullscreen => event("fullscreen", *window, serde_json::json!({ "on": false })),
+            xdg_toplevel::Request::SetMinimized => event("minimize", *window, serde_json::json!({})),
+            xdg_toplevel::Request::SetMaximized => event("maximize", *window, serde_json::json!({ "on": true })),
+            xdg_toplevel::Request::UnsetMaximized => event("maximize", *window, serde_json::json!({ "on": false })),
             _ => {}
         }
     }

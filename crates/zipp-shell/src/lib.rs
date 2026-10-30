@@ -126,6 +126,9 @@ impl ShellProvider for WindowShellProvider {
     fn set_window_title(&self, title: String) {
         self.window.set_title(&title);
     }
+    fn set_fullscreen(&self, on: bool) {
+        self.window.set_fullscreen(on.then_some(winit::monitor::Fullscreen::Borderless(None)));
+    }
     fn set_ime_enabled(&self, is_enabled: bool) {
         if is_enabled {
             let _ = self.window.request_ime_update(ImeRequest::Enable(

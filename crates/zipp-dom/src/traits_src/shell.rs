@@ -23,6 +23,10 @@ pub trait ShellProvider: Send + Sync + 'static {
     fn set_window_title(&self, title: String) {
         let _ = title;
     }
+    /// Put the window over the whole screen, or back (the Fullscreen API).
+    fn set_fullscreen(&self, on: bool) {
+        let _ = on;
+    }
     fn set_ime_enabled(&self, is_enabled: bool) {
         let _ = is_enabled;
     }

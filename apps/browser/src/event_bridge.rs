@@ -635,8 +635,11 @@ impl EventHandler for JsEventBridge {
         let event_name = event.data.name();
         let _layout = LayoutScope::enter(&_doc.inner());
         self.refresh_listeners(&_doc.inner());
-        // The console's button and links, and F12, are the browser's.
-        let console_key = matches!(&event.data, DomEventData::KeyDown(k) if k.code == keyboard_types::Code::F12);
+        // The console's button and links, and F12, are the browser's -- when
+        // it shows its toolbar: without one (a kiosk, an app) there is no
+        // console to open, and F12 is the page's, as ZIPP OS's windows need.
+        let console_key = crate::chrome_shown()
+            && matches!(&event.data, DomEventData::KeyDown(k) if k.code == keyboard_types::Code::F12);
         let console_link = matches!(event.data, DomEventData::Click(_))
             .then(|| chain_element_id(_doc, chain, &["__zipp_console_button", "__zipp_console_close", "__zipp_console_clear"]))
             .flatten();
@@ -827,6 +830,8 @@ impl EventHandler for JsEventBridge {
             let mut doc = _doc.inner_mut();
             self.apply_focus_request(&mut doc);
             self.sync_scrolls(&mut doc);
+            // A listener asked for full screen (it takes a click).
+            crate::apply_window_requests(&doc);
         }
     }
 
@@ -970,6 +975,7 @@ impl EventHandler for JsEventBridge {
         }
         self.apply_focus_request(doc);
         self.sync_scrolls(doc);
+        crate::apply_window_requests(doc);
         let console_due = self.refresh_console(doc, now, false);
         [self.next_timer, console_due].into_iter().flatten().min()
     }

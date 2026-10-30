@@ -141,6 +141,16 @@ var __styleProto = (function () {
     });
     return p;
 })();
+// Every declaration an element's style object holds: they all go when its
+// style attribute is set or removed, as in the DOM. Only what the new text
+// said was added, so `display:none` taken out of the attribute stayed in the
+// object, and an element hidden that way -- a minimized window -- never showed
+// again.
+function __clearStyle(style) {
+    for (var k in style) {
+        if (Object.prototype.hasOwnProperty.call(style, k) && typeof style[k] === "string" && k !== "cssText") delete style[k];
+    }
+}
 function __camelProp(n) { return n.indexOf("--") === 0 ? n : n.replace(/-([a-z])/g, function (_, c) { return c.toUpperCase(); }); }
 function __makeStyle() {
     var s = Object.create(__styleProto);
@@ -347,7 +357,23 @@ var DOMNode = class DOMNode extends EventTarget {
     // to decide which nodes get events, so a listener removed here but left
     // there keeps being called for the life of the page.
     removeEventListener(t,fn) { if(this._listeners[t]) this._listeners[t]=this._listeners[t].filter(function(f){return f!==fn;}); var m=__eventHandlers[this._id]; if(m&&m[t]) m[t]=m[t].filter(function(f){return f!==fn;}); __listenerVersion++; }
-    dispatchEvent(ev) { ev.target=this; var h=this._listeners[ev.type]||[]; for(var i=0;i<h.length;i++) try{h[i].call(this,ev);}catch(e){} return true; }
+    // An event script dispatches: to this node's listeners, then -- one that
+    // bubbles -- each ancestor's, up to the document (which keeps the
+    // window's), until one stops it. It reached the target's own listeners
+    // only, so a bubbling event never got to its container, nor to React,
+    // which listens at its root; and what a listener threw was lost.
+    dispatchEvent(ev) {
+        try { ev.target = this; } catch (e) {}
+        for (var n = this; n; n = ev.bubbles ? n.parentNode : null) {
+            try { ev.currentTarget = n; ev.eventPhase = n === this ? 2 : 3; } catch (e) {}
+            var h = ((n._listeners && n._listeners[ev.type]) || []).slice();
+            for (var i = 0; i < h.length; i++) {
+                try { h[i].call(n, ev); } catch (e) { console.error("Uncaught " + ((e && (e.stack || e.message)) || e)); }
+            }
+            if (ev._stopped) break;
+        }
+        return !ev.defaultPrevented;
+    }
     get isConnected() { var n=this; while(n){if(n.nodeType===9)return true; n=n.parentNode;} return false; }
     getRootNode() { var n=this; while(n.parentNode) n=n.parentNode; return n; }
     hasChildNodes() { return this.childNodes.length>0; }
@@ -461,7 +487,7 @@ var Element = class Element extends DOMNode {
     setAttribute(n,v) {
         n=String(n); v=String(v);
         var old = __ceCount > 0 ? this.getAttribute(n) : null;
-        if(this.attributes[n]!==v) __domMutations++; this.attributes[n]=v; if(n==="class")this.className=v; if(n==="id")this.id=v; if(n==="style")this._ps(v);
+        if(this.attributes[n]!==v) __domMutations++; this.attributes[n]=v; if(n==="class")this.className=v; if(n==="id")this.id=v; if(n==="style"){__clearStyle(this.style);this._ps(v);}
         if (__ceCount > 0) __ceAttributeChanged(this, n, old, v);
     }
     getAttribute(n) { n=String(n); if(n==="class")return this.className||null; if(n==="id")return this.id||null; return Object.prototype.hasOwnProperty.call(this.attributes,n)?this.attributes[n]:null; }
@@ -470,7 +496,7 @@ var Element = class Element extends DOMNode {
         var old = this.getAttribute(n);
         if(old===null) return;
         __domMutations++; delete this.attributes[n];
-        if(n==="class")this.className=""; if(n==="id")this.id="";
+        if(n==="class")this.className=""; if(n==="id")this.id=""; if(n==="style")__clearStyle(this.style);
         if (__ceCount > 0) __ceAttributeChanged(this, n, old, null);
     }
     hasAttribute(n) { n=String(n); return Object.prototype.hasOwnProperty.call(this.attributes,n)||!!(n==="class"&&this.className)||!!(n==="id"&&this.id); }
@@ -516,6 +542,8 @@ var Element = class Element extends DOMNode {
     // Remembered, for the host to give the element focus (`__zippTakeFocus`):
     // a game's canvas, focused on mousedown, then reads the keys.
     focus() { doc._focusRequest = this; doc._activeElement = this; }
+    // A click, as script makes one: a MouseEvent that bubbles.
+    click() { if (!this.disabled) this.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window, detail: 1 })); }
     blur() { if (doc._activeElement === this) doc._activeElement = null; }
     // What an <input type=file> holds: set when its dialog closes on a choice.
     get files() { return this._files || (this.localName === "input" && this.getAttribute("type") === "file" ? [] : undefined); }
@@ -536,7 +564,17 @@ var Element = class Element extends DOMNode {
 };
 
 var Text = class Text extends DOMNode {
-    constructor(d) { super(3,"#text"); this.data=String(d||""); this.textContent=this.data; this.nodeValue=this.data; }
+    constructor(d) { super(3,"#text"); this._d=String(d||""); }
+    // `data`, `nodeValue` and `textContent` are one text, as in the DOM. They
+    // were three properties, of which only `data` was drawn: React changes a
+    // text node through `nodeValue` (a count going from 3 to 4), and nothing
+    // on the screen, or read back through `textContent`, changed.
+    get data() { return this._d; }
+    set data(v) { v = v == null ? "" : String(v); if (v !== this._d) { this._d = v; __domMutations++; } }
+    get nodeValue() { return this._d; }
+    set nodeValue(v) { this.data = v; }
+    get textContent() { return this._d; }
+    set textContent(v) { this.data = v; }
     cloneNode() { var t=new Text(this.data); t._html=this._html; return t; }
     get length() { return this.data.length; }
 };
@@ -583,6 +621,40 @@ DOMNode.DOCUMENT_POSITION_CONTAINED_BY = 16;
 DOMNode.DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC = 32;
 // On every node as well, as the DOM has them (monaco reads `n.TEXT_NODE`).
 Object.keys(DOMNode).forEach(function (k) { if (/_NODE$|^DOCUMENT_POSITION_/.test(k)) DOMNode.prototype[k] = DOMNode[k]; });
+
+// Event handler properties (`button.onclick = fn`): the handler is one of the
+// node's listeners, as in a browser, and one that returns false prevents the
+// default. They were plain properties nothing called -- and React, which asks
+// `'oninput' in document` whether the input event exists, took this for a
+// browser without one and ran old Internet Explorer's code (`attachEvent`)
+// instead, so typing into a React form changed nothing.
+("abort animationend animationiteration animationstart auxclick beforeinput blur cancel canplay " +
+ "canplaythrough change click close contextmenu copy cut dblclick drag dragend dragenter dragleave " +
+ "dragover dragstart drop ended error focus focusin focusout fullscreenchange input invalid keydown " +
+ "keypress keyup load loadeddata loadedmetadata mousedown mouseenter mouseleave mousemove mouseout " +
+ "mouseover mouseup paste pause play playing pointercancel pointerdown pointerenter pointerleave " +
+ "pointermove pointerout pointerover pointerup readystatechange reset resize scroll select " +
+ "selectionchange selectstart submit timeupdate toggle touchcancel touchend touchmove touchstart " +
+ "transitionend visibilitychange volumechange wheel").split(" ").forEach(function (type) {
+    var key = "__on" + type;
+    Object.defineProperty(DOMNode.prototype, "on" + type, {
+        configurable: true,
+        get: function () { var h = this[key]; return h ? h.fn : null; },
+        set: function (fn) {
+            var old = this[key];
+            if (old) { this.removeEventListener(type, old.listener); this[key] = null; }
+            if (typeof fn !== "function") return;
+            var node = this;
+            var entry = { fn: fn, listener: function (ev) {
+                var r = entry.fn.call(node, ev);
+                if (r === false && ev && typeof ev.preventDefault === "function") ev.preventDefault();
+                return r;
+            } };
+            Object.defineProperty(this, key, { value: entry, writable: true, configurable: true, enumerable: false });
+            this.addEventListener(type, entry.listener);
+        }
+    });
+});
 
 // Element subclasses that libraries name in `instanceof` checks. They need to
 // exist as CONSTRUCTORS even though nothing here ever constructs one: React
@@ -1919,7 +1991,46 @@ var DOMMatrix = class DOMMatrix extends DOMMatrixReadOnly {};
 doc.createNodeIterator = function(root) { return { nextNode:function(){return null;}, previousNode:function(){return null;} }; };
 doc.adoptNode = function(node) { node.ownerDocument=doc; return node; };
 doc.importNode = function(node,deep) { return node.cloneNode(deep); };
-doc.title = '__PAGE_TITLE__';
+// The title: the window's, when script sets it (SoftN names its app's window
+// this way). It was a plain property, and the window kept the page's <title>.
+var __docTitle = '__PAGE_TITLE__';
+Object.defineProperty(doc, 'title', {
+    get: function() { return __docTitle; },
+    set: function(v) {
+        v = String(v);
+        if (v === __docTitle) return;
+        __docTitle = v;
+        try { __zippHostCall("window_title", v); } catch (e) {}
+    },
+    configurable: true
+});
+
+// Full screen: the window, over the whole screen (under ZIPP OS the desktop
+// puts it there). The element asked for is not shown alone, as a browser
+// shows it: the page is, at the screen's size.
+var __fullscreenElement = null;
+function __fullscreenChange(el) {
+    __fullscreenElement = el;
+    try { doc.dispatchEvent(new Event("fullscreenchange", { bubbles: true })); } catch (e) {}
+}
+Object.defineProperty(doc, 'fullscreenElement', { get: function() { return __fullscreenElement; }, configurable: true });
+Object.defineProperty(doc, 'webkitFullscreenElement', { get: function() { return __fullscreenElement; }, configurable: true });
+Object.defineProperty(doc, 'fullscreen', { get: function() { return !!__fullscreenElement; }, configurable: true });
+doc.fullscreenEnabled = true;
+doc.webkitFullscreenEnabled = true;
+doc.exitFullscreen = function() {
+    if (!__fullscreenElement) return Promise.reject(new TypeError("The document is not in full screen"));
+    try { __zippHostCall("fullscreen", "0"); } catch (e) {}
+    __fullscreenChange(null);
+    return Promise.resolve();
+};
+doc.webkitExitFullscreen = doc.exitFullscreen;
+Element.prototype.requestFullscreen = function() {
+    try { __zippHostCall("fullscreen", "1"); } catch (e) { return Promise.reject(e); }
+    __fullscreenChange(this);
+    return Promise.resolve();
+};
+Element.prototype.webkitRequestFullscreen = Element.prototype.requestFullscreen;
 
 // Layout sizes: the element's boxes as the page was last laid out (the
 // host's `box`). Before the first layout there are none, and they are 0 --
@@ -2780,6 +2891,29 @@ var Response = class Response {
 };
 function __asResponse(r) { Object.setPrototypeOf(r, Response.prototype); return r; }
 
+// The machine's randomness, as WebCrypto's is. It was Math.random, which
+// starts the same way in every page: each launch of an app made the same
+// "random" ids, and a SoftN app's new record took the id of one it had saved
+// in an earlier session, over it.
+function __randomFill(arr) {
+    var n = arr && arr.byteLength !== undefined ? arr.byteLength : (arr ? arr.length : 0);
+    if (n > 65536) throw new DOMException("getRandomValues: more than 65536 bytes asked for", "QuotaExceededError");
+    var hex = __zippHostCall("random", String(n));
+    var view = ArrayBuffer.isView(arr) ? new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength) : arr;
+    for (var i = 0; i < n; i++) view[i] = parseInt(hex.substr(i * 2, 2), 16);
+    return arr;
+}
+function __randomUUID() {
+    var b = __randomFill(new Uint8Array(16)), s = "";
+    b[6] = (b[6] & 15) | 64;
+    b[8] = (b[8] & 63) | 128;
+    for (var i = 0; i < 16; i++) {
+        s += (b[i] < 16 ? "0" : "") + b[i].toString(16);
+        if (i === 3 || i === 5 || i === 7 || i === 9) s += "-";
+    }
+    return s;
+}
+
 // --- FormData class (basic) ---
 var FormData = function() { this._data = []; };
 FormData.prototype.append = function(name, value) { this._data.push([name, value]); };
@@ -3042,8 +3176,8 @@ var window = {
     requestIdleCallback:function(fn){fn({timeRemaining:function(){return 50;},didTimeout:false});return ++_tid;},
     cancelIdleCallback:function(){},
     crypto:{
-        getRandomValues:function(arr){for(var i=0;i<arr.length;i++)arr[i]=Math.floor(Math.random()*256);return arr;},
-        randomUUID:function(){var h="0123456789abcdef",s="",i;for(i=0;i<36;i++){if(i===8||i===13||i===18||i===23)s+="-";else if(i===14)s+="4";else if(i===19)s+=h[8+(Math.random()*4|0)];else s+=h[Math.random()*16|0];}return s;}
+        getRandomValues:__randomFill,
+        randomUUID:__randomUUID
     },
     isSecureContext:true,
     structuredClone:function(v){return JSON.parse(JSON.stringify(v));},

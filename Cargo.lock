@@ -7151,6 +7151,7 @@ dependencies = [
  "base64 0.22.1",
  "color",
  "embed-resource",
+ "getrandom 0.3.4",
  "glow",
  "hayro",
  "html5ever",

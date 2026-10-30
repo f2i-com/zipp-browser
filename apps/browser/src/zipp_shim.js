@@ -278,12 +278,19 @@
       wlWindows.delete(id);
       w.gone = true;
       if (w.ongone) w.ongone();
+    } else if (kind === "fullscreen") {
+      if (w.onfullscreen) w.onfullscreen(!!info.on);
+    } else if (kind === "minimize") {
+      if (w.onminimize) w.onminimize();
+    } else if (kind === "maximize") {
+      if (w.onmaximize) w.onmaximize(!!info.on);
     }
   };
   // A window: kind ("toplevel" or "popup"), parent (a popup's window), x and
   // y (a popup's place in its parent's frame), title, appId, pid (its
   // process), width, height;
-  // onsize, ontitle, onplace, ongone.
+  // onsize, ontitle, onplace, ongone; and what the app asks of its window:
+  // onfullscreen(on), onminimize(), onmaximize(on).
   function WlWindow(id, info) {
     this.id = id;
     this.kind = info.kind;
@@ -297,13 +304,17 @@
     this.height = info.height;
     this.gone = false;
     this.onsize = this.ontitle = this.onplace = this.ongone = null;
+    this.onfullscreen = this.onminimize = this.onmaximize = null;
   }
   // Input never throws: a window that has just gone takes none.
   function wl(command, w, a, b, c) {
     try { host("wl", command, w.id, a === undefined ? "" : a, b === undefined ? "" : b, c === undefined ? "" : c); } catch (e) {}
   }
   WlWindow.prototype.show = function (canvas) { wl("bind", this, canvas ? canvas._id : 0); };
-  WlWindow.prototype.configure = function (width, height, active) { wl("configure", this, Math.round(width), Math.round(height), !!active); };
+  // Its size, and whether it is the active window and over the whole screen.
+  WlWindow.prototype.configure = function (width, height, active, fullscreen) {
+    wl("configure", this, Math.round(width), Math.round(height), [active ? "active" : "", fullscreen ? "fullscreen" : ""].join(","));
+  };
   WlWindow.prototype.pointer = function (x, y) { wl("pointer", this, x, y); };
   WlWindow.prototype.leave = function () { wl("leave", this); };
   // button: as MouseEvent.button has it.
