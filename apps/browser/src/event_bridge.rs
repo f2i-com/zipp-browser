@@ -787,6 +787,33 @@ impl EventHandler for JsEventBridge {
                 self.run_due_work();
             }
         }
+        // Linux apps' windows (wayland.rs): what became of them, then their
+        // new frames, into the canvases the page shows them in.
+        #[cfg(target_os = "linux")]
+        {
+            let events = crate::wayland::take_events();
+            if !events.is_empty() {
+                if let Some(state) = self.js_state.as_mut() {
+                    for (kind, id, json) in events {
+                        let args = [JsValue::String(kind.into()), JsValue::Number(id as f64), JsValue::String(json)];
+                        if let Err(e) = state.call_global("__zippWaylandEvent", &args) {
+                            eprintln!("[ZIPP] delivering a Linux app's window failed: {e}");
+                        }
+                        state.run_microtasks();
+                    }
+                }
+                self.run_due_work();
+            }
+            let frames = crate::wayland::take_frames();
+            if !frames.is_empty() {
+                for frame in frames {
+                    crate::canvas::push_frame(frame);
+                }
+                if crate::apply_canvas_frames(doc) {
+                    doc.shell_provider.request_paint();
+                }
+            }
+        }
         // Programs a page ran that finished (system.rs): each settles its promise.
         let done = crate::system::take_completions();
         if !done.is_empty() {

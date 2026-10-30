@@ -48,6 +48,8 @@ mod audio;
 mod canvas;
 #[cfg(target_os = "linux")]
 mod pty;
+#[cfg(target_os = "linux")]
+mod wayland;
 mod system;
 #[cfg(target_os = "linux")]
 mod usb;

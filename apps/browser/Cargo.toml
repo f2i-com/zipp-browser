@@ -120,6 +120,10 @@ libloading = "0.8"
 libc = "0.2"
 # Sound out through ALSA (`audio.rs`).
 alsa = "0.9"
+# A Wayland server for Linux apps' windows (`wayland.rs`): the protocol in
+# Rust (no libwayland), and xdg-shell's and its decorations' definitions.
+wayland-server = "0.31"
+wayland-protocols = { version = "0.32", features = ["server", "unstable"] }
 
 # Reading the OS colour scheme before the window exists (`system_prefers_dark`).
 # Already in the tree through winit; this only adds the registry bindings.

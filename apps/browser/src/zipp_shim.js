@@ -5,6 +5,7 @@
 //                          stat, exists, mkdir, remove, rename, copy, drives
 //   navigator.zipp.system  run, spawn (on a terminal), info, network, reboot, powerOff
 //   navigator.zipp.linux   root (the Alpine system on the boot drive)
+//   navigator.zipp.wayland start, onwindow (Linux apps' windows)
 //   navigator.zipp.wifi    status, scan, connect, disconnect
 //
 // Every call returns a promise. Paths are absolute ("/media/sda1/notes.txt").
@@ -242,5 +243,77 @@
     root: function () { return call(function () { return host("linux_root"); }); },
   };
 
-  navigator.zipp = { fs: fs, system: system, wifi: wifi, linux: linux };
+  // Linux apps' windows: a Wayland server for the Linux system, whose
+  // windows the page is told of (onwindow) and shows in canvases (show), the
+  // pointer and keys over them going back to their apps.
+  var wlWindows = new Map();
+  globalThis.__zippWaylandEvent = function (kind, id, json) {
+    var info = json ? JSON.parse(json) : {};
+    var w = wlWindows.get(id);
+    if (kind === "window") {
+      w = new WlWindow(id, info);
+      wlWindows.set(id, w);
+      if (wayland.onwindow) wayland.onwindow(w);
+      return;
+    }
+    if (!w) return;
+    if (kind === "size") {
+      w.width = info.width;
+      w.height = info.height;
+      if (w.onsize) w.onsize(w.width, w.height);
+    } else if (kind === "title") {
+      w.title = info.title;
+      w.appId = info.appId;
+      if (w.ontitle) w.ontitle(w.title);
+    } else if (kind === "place") {
+      w.x = info.x;
+      w.y = info.y;
+      if (w.onplace) w.onplace(w.x, w.y);
+    } else if (kind === "gone") {
+      wlWindows.delete(id);
+      w.gone = true;
+      if (w.ongone) w.ongone();
+    }
+  };
+  // A window: kind ("toplevel" or "popup"), parent (a popup's window), x and
+  // y (a popup's place in its parent's frame), title, appId, width, height;
+  // onsize, ontitle, onplace, ongone.
+  function WlWindow(id, info) {
+    this.id = id;
+    this.kind = info.kind;
+    this.parent = (info.parent && wlWindows.get(info.parent)) || null;
+    this.x = info.x;
+    this.y = info.y;
+    this.title = info.title;
+    this.appId = info.appId;
+    this.width = info.width;
+    this.height = info.height;
+    this.gone = false;
+    this.onsize = this.ontitle = this.onplace = this.ongone = null;
+  }
+  // Input never throws: a window that has just gone takes none.
+  function wl(command, w, a, b, c) {
+    try { host("wl", command, w.id, a === undefined ? "" : a, b === undefined ? "" : b, c === undefined ? "" : c); } catch (e) {}
+  }
+  WlWindow.prototype.show = function (canvas) { wl("bind", this, canvas ? canvas._id : 0); };
+  WlWindow.prototype.configure = function (width, height, active) { wl("configure", this, Math.round(width), Math.round(height), !!active); };
+  WlWindow.prototype.pointer = function (x, y) { wl("pointer", this, x, y); };
+  WlWindow.prototype.leave = function () { wl("leave", this); };
+  // button: as MouseEvent.button has it.
+  WlWindow.prototype.button = function (button, pressed) { wl("button", this, button, !!pressed); };
+  WlWindow.prototype.scroll = function (dx, dy) { wl("axis", this, dx, dy); };
+  // code: as KeyboardEvent.code has it.
+  WlWindow.prototype.key = function (code, pressed) { wl("key", this, code, !!pressed); };
+  WlWindow.prototype.focus = function () { wl("focus", this); };
+  WlWindow.prototype.close = function () { wl("close", this); };
+  var wayland = {
+    // Start it for the Linux system at `root` (linux.root()): the socket's
+    // name, for WAYLAND_DISPLAY (in the system's /run/user/1000).
+    start: function (root) {
+      return call(function () { return host("wl_start", root, innerWidth || 1280, innerHeight || 720); });
+    },
+    onwindow: null,
+  };
+
+  navigator.zipp = { fs: fs, system: system, wifi: wifi, linux: linux, wayland: wayland };
 })();

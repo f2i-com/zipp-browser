@@ -32,6 +32,8 @@ pub(crate) fn new_page() {
     COMPLETIONS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     #[cfg(target_os = "linux")]
     crate::pty::new_page();
+    #[cfg(target_os = "linux")]
+    crate::wayland::new_page();
 }
 
 /// Programs finished since last asked, as `(id, result JSON)`.
@@ -213,6 +215,12 @@ pub(crate) fn host_call(ctx: &mut dyn HostCtx, args: &[String]) -> Result<String
         // The Alpine system on the boot drive's second partition, mounted.
         #[cfg(target_os = "linux")]
         "linux_root" => crate::pty::linux_root(),
+        // Linux apps' windows (wayland.rs): `wl_start root width height`,
+        // then `wl command window a b c`.
+        #[cfg(target_os = "linux")]
+        "wl_start" => crate::wayland::start(arg(1), arg(2).parse().unwrap_or(1280), arg(3).parse().unwrap_or(720)),
+        #[cfg(target_os = "linux")]
+        "wl" => crate::wayland::call(arg(1), arg(2).parse().unwrap_or(0), arg(3), arg(4), arg(5)).map(|_| String::new()),
         "wifi" => wifi(arg(1), arg(2), arg(3)),
         op => Err(format!("NotSupportedError: navigator.zipp has no operation {op}")),
     }
