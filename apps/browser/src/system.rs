@@ -30,6 +30,8 @@ static PAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0)
 pub(crate) fn new_page() {
     PAGE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     COMPLETIONS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    #[cfg(target_os = "linux")]
+    crate::pty::new_page();
 }
 
 /// Programs finished since last asked, as `(id, result JSON)`.
@@ -194,6 +196,23 @@ pub(crate) fn host_call(ctx: &mut dyn HostCtx, args: &[String]) -> Result<String
             Ok(String::new())
         }
         "power" => power(arg(1)),
+        // A program on a terminal of its own (pty.rs): `spawn id program
+        // argsJSON optionsJSON`, then its input, size and signals by id.
+        #[cfg(target_os = "linux")]
+        "spawn" => {
+            let argv: Vec<String> = serde_json::from_str(arg(3)).map_err(|e| format!("TypeError: zipp: arguments: {e}"))?;
+            let options = crate::pty::Options::from_json(arg(4))?;
+            crate::pty::spawn(num(1)?, arg(2), &argv, options).map(|pid| pid.to_string())
+        }
+        #[cfg(target_os = "linux")]
+        "pty_write" => crate::pty::write(num(1)?, arg(2)).map(|_| String::new()),
+        #[cfg(target_os = "linux")]
+        "pty_resize" => crate::pty::resize(num(1)?, arg(2).parse().unwrap_or(80), arg(3).parse().unwrap_or(24)).map(|_| String::new()),
+        #[cfg(target_os = "linux")]
+        "pty_kill" => crate::pty::kill(num(1)?, arg(2).parse().unwrap_or(libc::SIGTERM)).map(|_| String::new()),
+        // The Alpine system on the boot drive's second partition, mounted.
+        #[cfg(target_os = "linux")]
+        "linux_root" => crate::pty::linux_root(),
         "wifi" => wifi(arg(1), arg(2), arg(3)),
         op => Err(format!("NotSupportedError: navigator.zipp has no operation {op}")),
     }

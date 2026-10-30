@@ -46,6 +46,8 @@ mod site_storage;
 mod media;
 mod audio;
 mod canvas;
+#[cfg(target_os = "linux")]
+mod pty;
 mod system;
 #[cfg(target_os = "linux")]
 mod usb;

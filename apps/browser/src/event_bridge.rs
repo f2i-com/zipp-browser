@@ -770,6 +770,23 @@ impl EventHandler for JsEventBridge {
             }
             self.run_due_work();
         }
+        // What programs on the page's terminals printed, and their ends (pty.rs).
+        #[cfg(target_os = "linux")]
+        {
+            let events = crate::pty::take_events();
+            if !events.is_empty() {
+                if let Some(state) = self.js_state.as_mut() {
+                    for (id, kind, data) in events {
+                        let args = [JsValue::Number(id as f64), JsValue::String(kind.into()), JsValue::String(data)];
+                        if let Err(e) = state.call_global("__zippPtyEvent", &args) {
+                            eprintln!("[ZIPP] delivering a terminal's output failed: {e}");
+                        }
+                        state.run_microtasks();
+                    }
+                }
+                self.run_due_work();
+            }
+        }
         // Programs a page ran that finished (system.rs): each settles its promise.
         let done = crate::system::take_completions();
         if !done.is_empty() {

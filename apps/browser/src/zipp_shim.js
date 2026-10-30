@@ -3,7 +3,8 @@
 //
 //   navigator.zipp.fs      readFile, readText, writeFile, appendFile, list,
 //                          stat, exists, mkdir, remove, rename, copy, drives
-//   navigator.zipp.system  run, info, network, reboot, powerOff
+//   navigator.zipp.system  run, spawn (on a terminal), info, network, reboot, powerOff
+//   navigator.zipp.linux   root (the Alpine system on the boot drive)
 //   navigator.zipp.wifi    status, scan, connect, disconnect
 //
 // Every call returns a promise. Paths are absolute ("/media/sda1/notes.txt").
@@ -132,7 +133,61 @@
     else waiting.resolve(result);
   };
 
+  // Programs on terminals of their own: output comes as it is printed
+  // (__zippPtyEvent), kept until the page sets ondata.
+  var ptys = new Map();
+  var nextPty = 1;
+  globalThis.__zippPtyEvent = function (id, kind, data) {
+    var p = ptys.get(id);
+    if (!p) return;
+    if (kind === "data") {
+      if (p._ondata) p._ondata(data); else p._queued.push(data);
+      return;
+    }
+    ptys.delete(id);
+    p.code = +data;
+    if (p.onexit) p.onexit(p.code);
+    p._exited(p.code);
+  };
+  function Pty(id) {
+    var self = this;
+    this.id = id;
+    this.pid = 0;
+    this.code = null;
+    this.onexit = null;
+    this._ondata = null;
+    this._queued = [];
+    this.exited = new Promise(function (resolve) { self._exited = resolve; });
+  }
+  Object.defineProperty(Pty.prototype, "ondata", {
+    get: function () { return this._ondata; },
+    set: function (fn) {
+      this._ondata = fn;
+      while (fn && this._queued.length) fn(this._queued.shift());
+    },
+  });
+  Pty.prototype.write = function (text) { if (this.code === null) host("pty_write", this.id, text); };
+  Pty.prototype.resize = function (cols, rows) { if (this.code === null) host("pty_resize", this.id, cols, rows); };
+  Pty.prototype.kill = function (signal) { if (this.code === null) host("pty_kill", this.id, signal || 15); };
+
   var system = {
+    // spawn("/bin/sh", ["-l"], { cwd, cols, rows, env: {}, jail: { root, uid, gid } })
+    // -> a process: ondata(text), onexit(code), exited, write(text),
+    // resize(cols, rows), kill(signal).
+    spawn: function (program, args, options) {
+      return call(function () {
+        var id = nextPty++;
+        var p = new Pty(id);
+        ptys.set(id, p);
+        try {
+          p.pid = +host("spawn", id, program, JSON.stringify((args || []).map(String)), JSON.stringify(options || {}));
+        } catch (e) {
+          ptys.delete(id);
+          throw e;
+        }
+        return p;
+      });
+    },
     // run("/bin/ls", ["-l", "/media"], { cwd }) -> { code, stdout, stderr }
     run: function (program, args, options) {
       var id = nextRun++;
@@ -181,5 +236,11 @@
     disconnect: function () { return call(function () { host("wifi", "disconnect"); }); },
   };
 
-  navigator.zipp = { fs: fs, system: system, wifi: wifi };
+  var linux = {
+    // Where the Alpine system on the boot drive is mounted (mounting it the
+    // first time); NotFoundError on a machine without one.
+    root: function () { return call(function () { return host("linux_root"); }); },
+  };
+
+  navigator.zipp = { fs: fs, system: system, wifi: wifi, linux: linux };
 })();
