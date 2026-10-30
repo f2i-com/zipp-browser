@@ -103,6 +103,16 @@ impl ImportMap {
             .map(|(k, target)| format!("{target}{}", &key[k.len()..]))
     }
 
+    /// `spec`, imported from `base`, as a browser resolves it: through the
+    /// map, else as a URL -- or, a bare name the map does not have
+    /// (`import("esbuild")`), as it is, which is no module's URL: importing
+    /// it fails, as it does in a browser, rather than fetching whatever the
+    /// server has beside the importer.
+    pub fn resolve_specifier(&self, base: &str, spec: &str, resolve: &dyn Fn(&str, &str) -> String) -> String {
+        self.resolve(base, spec, resolve)
+            .unwrap_or_else(|| if url_like(spec) { resolve(base, spec) } else { spec.to_string() })
+    }
+
     /// The map as a JS object literal, for `import()` with a computed
     /// specifier, which resolves at runtime (`__zippResolveModuleUrl`).
     pub fn to_js(&self) -> String {
@@ -380,7 +390,11 @@ fn rewrite_module(
         let replacement = match syn_literal(arg_text) {
             Some(spec) => {
                 let abs = resolve(url, &spec);
-                deps.push(abs.clone());
+                // A bare name nothing maps is not fetched: the import fails
+                // when it runs, which a page that tries it is ready for.
+                if url_like(&abs) && !deps.contains(&abs) {
+                    deps.push(abs.clone());
+                }
                 format!("__dyn({})", js_string(&abs))
             }
             None => format!("__dynRel({},{})", js_string(url), arg_text),
@@ -513,6 +527,10 @@ pub fn link_more(
     let mut failures: Vec<(String, String)> = Vec::new();
 
     while let Some(url) = queue.pop() {
+        if !url_like(&url) {
+            failures.push((url.clone(), "a bare specifier, which no import map names".into()));
+            continue;
+        }
         let source = match fetch(&url) {
             Ok(s) => s,
             Err(e) => {
@@ -593,6 +611,8 @@ function __zippResolveModuleUrl(base, spec) {
         if (k.charAt(k.length - 1) === '/' && key.indexOf(k) === 0 && k.length > best.length) best = k;
     }
     if (best) return map[best] + key.slice(best.length);
+    // A bare name the map does not have stays one, and fails to import.
+    if (key === spec) return spec;
     try { return String(new URL(spec, base)); } catch (e) { return spec; }
 }
 // A module for `import()`: linked up front, or -- a chunk whose URL the page
@@ -601,6 +621,10 @@ function __zippResolveModuleUrl(base, spec) {
 // import resolved to an empty namespace, and a bundler's loader reported the
 // chunk as failed.
 function __zippImportModule(u) {
+    if (!/^[a-z][a-z0-9+.-]+:/i.test(u)) {
+        return Promise.reject(new TypeError('Failed to resolve module specifier "' + u +
+            '". Relative references must start with either "/", "./", or "../".'));
+    }
     if (!Object.prototype.hasOwnProperty.call(__zippModuleDefs, u)) {
         var src = '';
         try { src = __zippHostCall('esm_link', u, JSON.stringify(Object.keys(__zippModuleDefs))); } catch (e) {}
@@ -708,6 +732,21 @@ mod tests {
         assert_eq!(r("./other.js"), None);
         assert_eq!(r("react"), None);
         assert_eq!(map.to_js().contains("\"three/addons/\":\"http://x/lib/jsm/\""), true);
+    }
+
+    #[test]
+    fn bare_specifier_the_map_lacks_stays_bare() {
+        let mut map = ImportMap::default();
+        map.add(r#"{"imports": {"three": "./three.js"}}"#, "http://x/page.html", &res);
+        let r = |spec: &str| map.resolve_specifier("http://x/a.js", spec, &res);
+        assert_eq!(r("three"), "http://x/three.js");
+        assert_eq!(r("./b.js"), "http://x/b.js");
+        assert_eq!(r("esbuild"), "esbuild");
+        // Nor is it fetched for `import()`, which fails when it runs.
+        let resolve = |base: &str, spec: &str| map.resolve_specifier(base, spec, &res);
+        let rw = rewrite_module("http://x/a.js", "try { await import('esbuild'); } catch {}", &resolve).expect("parses");
+        assert!(rw.deps.is_empty(), "{:?}", rw.deps);
+        assert!(rw.body.contains(r#"__dyn("esbuild")"#), "{}", rw.body);
     }
 
     #[test]

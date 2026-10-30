@@ -642,13 +642,18 @@ impl EventHandler for JsEventBridge {
             .flatten();
         if console_key || console_link.is_some() {
             event_state.prevent_default();
-            if console_link.as_deref() == Some("__zipp_console_clear") {
+            let opened = if console_link.as_deref() == Some("__zipp_console_clear") {
                 console::clear();
+                false
             } else {
-                console::toggle();
-            }
+                console::toggle()
+            };
             let mut inner = _doc.inner_mut();
             self.show_console(&mut inner);
+            // Opened, its input line takes the keys, as a browser's console's does.
+            if opened && let Ok(Some(input)) = inner.query_selector("#__zipp_console_input") {
+                inner.set_focus_to(input);
+            }
             return;
         }
         // A file dialog closed on a choice: the page gets the files.
@@ -1108,6 +1113,32 @@ pub(crate) fn layout_rect(nid: &str) -> String {
             size.width,
             size.height
         )
+    })
+}
+
+/// The script's node at (`x`, `y`) in the viewport, from the last layout: the
+/// innermost element there with a `data-flid`, as `document.elementFromPoint`
+/// finds it; "" when there is none or no layout to read.
+pub(crate) fn layout_hit(x: &str, y: &str) -> String {
+    let (Ok(x), Ok(y)) = (x.parse::<f32>(), y.parse::<f32>()) else {
+        return String::new();
+    };
+    LAYOUT_DOC.with(|d| {
+        let ptr = d.get();
+        if ptr.is_null() {
+            return String::new();
+        }
+        // SAFETY: as in `layout_rect`.
+        let doc = unsafe { &*ptr };
+        let flid = LocalName::from("data-flid");
+        let mut at = doc.hit(x, y).map(|hit| hit.node_id);
+        while let Some(node) = at.and_then(|id| doc.get_node(id)) {
+            if let Some(val) = node.attr(flid.clone()) {
+                return val.to_string();
+            }
+            at = node.parent;
+        }
+        String::new()
     })
 }
 

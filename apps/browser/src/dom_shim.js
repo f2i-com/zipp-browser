@@ -276,6 +276,8 @@ var DOMNode = class DOMNode extends EventTarget {
     get nextSibling() { if(!this.parentNode) return null; var i=this.parentNode._findChild(this); return this.parentNode.childNodes[i+1]||null; }
     get previousSibling() { if(!this.parentNode) return null; var i=this.parentNode._findChild(this); return i>0?this.parentNode.childNodes[i-1]:null; }
     get parentElement() { return this.parentNode&&this.parentNode.nodeType===1?this.parentNode:null; }
+    get nextElementSibling() { var p=this.parentNode; if(!p) return null; for(var i=p._findChild(this)+1;i<p.childNodes.length;i++) if(p.childNodes[i].nodeType===1) return p.childNodes[i]; return null; }
+    get previousElementSibling() { var p=this.parentNode; if(!p) return null; for(var i=p._findChild(this)-1;i>=0;i--) if(p.childNodes[i].nodeType===1) return p.childNodes[i]; return null; }
     // ParentNode's element navigation, the document's included (GitHub reads
     // `document.firstElementChild.classList` as it starts).
     get firstElementChild() { for(var i=0;i<this.childNodes.length;i++) if(this.childNodes[i].nodeType===1) return this.childNodes[i]; return null; }
@@ -325,6 +327,20 @@ var DOMNode = class DOMNode extends EventTarget {
         return old;
     }
     contains(o) { if(this===o)return true; for(var i=0;i<this.childNodes.length;i++) if(this.childNodes[i].contains(o))return true; return false; }
+    isSameNode(o) { return this === o; }
+    // Where `o` is from here, in DOCUMENT_POSITION_* bits: React and xyflow
+    // put nodes in document order with it.
+    compareDocumentPosition(o) {
+        if (o === this) return 0;
+        function path(n) { var p = []; for (; n; n = n.parentNode) p.unshift(n); return p; }
+        var a = path(this), b = path(o);
+        if (a[0] !== b[0]) return 1 | 32 | (this._id < o._id ? 4 : 2);
+        var i = 0;
+        while (i < a.length && i < b.length && a[i] === b[i]) i++;
+        if (i === a.length) return 16 | 4;
+        if (i === b.length) return 8 | 2;
+        return a[i - 1]._findChild(a[i]) < a[i - 1]._findChild(b[i]) ? 4 : 2;
+    }
     cloneNode(deep) { var c=new DOMNode(this.nodeType,this.nodeName); if(deep) for(var i=0;i<this.childNodes.length;i++) c.appendChild(this.childNodes[i].cloneNode(true)); return c; }
     addEventListener(t,fn) { if(!this._listeners[t]) this._listeners[t]=[]; this._listeners[t].push(fn); if(!__eventHandlers[this._id]) __eventHandlers[this._id]={}; if(!__eventHandlers[this._id][t]) __eventHandlers[this._id][t]=[]; __eventHandlers[this._id][t].push(fn); __listenerVersion++; }
     // Must also drop it from __eventHandlers: that registry is what Rust reads
@@ -432,6 +448,10 @@ var Element = class Element extends DOMNode {
     get innerHTML() { return __sc(this); }
     set innerHTML(v) { if(this.childNodes.length) __domMutations++; this.childNodes=[]; if(v) this.appendChild(__markupText(String(v))); }
     get outerHTML() { return __sn(this); }
+    // As textContent: the shim lays out no lines for innerText to read its
+    // breaks from. Monaco sets its labels' text this way.
+    get innerText() { return this.textContent; }
+    set innerText(v) { this.textContent = v == null ? "" : String(v); }
     get children() { return this.childNodes.filter(function(c){return c.nodeType===1;}); }
     // Attribute names are DOMStrings: WebIDL stringifies whatever it is given,
     // so `setAttribute(undefined, x)` sets an attribute literally named
@@ -472,6 +492,22 @@ var Element = class Element extends DOMNode {
         return { x: r[0], y: r[1], left: r[0], top: r[1], width: r[2], height: r[3], right: r[0] + r[2], bottom: r[1] + r[3],
                  toJSON: function () { return { x: this.x, y: this.y, width: this.width, height: this.height, top: this.top, left: this.left, right: this.right, bottom: this.bottom }; } };
     }
+    // One box per element: the shim lays out no line fragments. None for one
+    // without a box (display: none, or out of the document).
+    getClientRects() { var r = this.getBoundingClientRect(); return r.width || r.height ? [r] : []; }
+    // The nearest positioned ancestor, or the body.
+    get offsetParent() {
+        if (!this.isConnected || this === doc.body || this === doc.documentElement) return null;
+        for (var n = this.parentNode; n && n.nodeType === 1 && n !== doc.body; n = n.parentNode) {
+            var p = __getComputedStyle(n).position;
+            if (p && p !== "static") return n;
+        }
+        return doc.body;
+    }
+    // The host scrolls the viewport on input only: an element asked to come
+    // into view stays where it is.
+    scrollIntoView() {}
+    scrollIntoViewIfNeeded() {}
     matches(sel) { return _sm(this,sel); }
     closest(sel) { var el=this; while(el){if(el.nodeType===1&&el.matches(sel))return el; el=el.parentNode;} return null; }
     cloneNode(deep) { var c=doc.createElementNS(this.namespaceURI,this.localName); c.className=this.className; c.id=this.id; for(var k in this.attributes) c.attributes[k]=this.attributes[k]; if(deep) for(var i=0;i<this.childNodes.length;i++) c.appendChild(this.childNodes[i].cloneNode(true)); return c; }
@@ -502,6 +538,7 @@ var Element = class Element extends DOMNode {
 var Text = class Text extends DOMNode {
     constructor(d) { super(3,"#text"); this.data=String(d||""); this.textContent=this.data; this.nodeValue=this.data; }
     cloneNode() { var t=new Text(this.data); t._html=this._html; return t; }
+    get length() { return this.data.length; }
 };
 // The shim has no HTML parser: `innerHTML` and `insertAdjacentHTML` keep their
 // markup as a single text node that the serialisers emit verbatim, and the real
@@ -538,6 +575,14 @@ DOMNode.COMMENT_NODE = 8;
 DOMNode.DOCUMENT_NODE = 9;
 DOMNode.DOCUMENT_TYPE_NODE = 10;
 DOMNode.DOCUMENT_FRAGMENT_NODE = 11;
+DOMNode.DOCUMENT_POSITION_DISCONNECTED = 1;
+DOMNode.DOCUMENT_POSITION_PRECEDING = 2;
+DOMNode.DOCUMENT_POSITION_FOLLOWING = 4;
+DOMNode.DOCUMENT_POSITION_CONTAINS = 8;
+DOMNode.DOCUMENT_POSITION_CONTAINED_BY = 16;
+DOMNode.DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC = 32;
+// On every node as well, as the DOM has them (monaco reads `n.TEXT_NODE`).
+Object.keys(DOMNode).forEach(function (k) { if (/_NODE$|^DOCUMENT_POSITION_/.test(k)) DOMNode.prototype[k] = DOMNode[k]; });
 
 // Element subclasses that libraries name in `instanceof` checks. They need to
 // exist as CONSTRUCTORS even though nothing here ever constructs one: React
@@ -1101,6 +1146,135 @@ var Event = class Event {
 var CustomEvent = class CustomEvent extends Event {
     constructor(type,opts) { super(type,opts); this.detail=opts?opts.detail:null; }
 };
+Event.NONE = 0; Event.CAPTURING_PHASE = 1; Event.AT_TARGET = 2; Event.BUBBLING_PHASE = 3;
+
+// Event's family, for pages that make their own (`new KeyboardEvent(...)`),
+// build on one (monaco declares `class extends UIEvent` as it loads, and
+// everything that imports it failed with it) or ask `instanceof MouseEvent`.
+// Each takes its fields from the init dictionary, or as browsers default them.
+function __eventInit(ev, opts, fields) {
+    for (var k in fields) {
+        var v = opts && opts[k] !== undefined ? opts[k] : fields[k];
+        ev[k] = Array.isArray(v) ? v.slice() : v;
+    }
+}
+function __modifierState(key) {
+    return key === "Control" ? !!this.ctrlKey : key === "Shift" ? !!this.shiftKey
+        : key === "Alt" ? !!this.altKey : key === "Meta" ? !!this.metaKey : false;
+}
+var __modifierFields = {ctrlKey:false, shiftKey:false, altKey:false, metaKey:false};
+var __mouseFields = {screenX:0, screenY:0, clientX:0, clientY:0, movementX:0, movementY:0,
+    ctrlKey:false, shiftKey:false, altKey:false, metaKey:false, button:0, buttons:0, relatedTarget:null};
+var UIEvent = class UIEvent extends Event {
+    constructor(type,opts) { super(type,opts); __eventInit(this, opts, {view:null, detail:0}); }
+};
+var MouseEvent = class MouseEvent extends UIEvent {
+    constructor(type,opts) {
+        super(type,opts); __eventInit(this, opts, __mouseFields);
+        this.pageX = this.offsetX = this.x = this.clientX;
+        this.pageY = this.offsetY = this.y = this.clientY;
+    }
+    getModifierState(key) { return __modifierState.call(this, key); }
+};
+var PointerEvent = class PointerEvent extends MouseEvent {
+    constructor(type,opts) {
+        super(type,opts);
+        __eventInit(this, opts, {pointerId:0, width:1, height:1, pressure:0, tangentialPressure:0,
+            tiltX:0, tiltY:0, twist:0, pointerType:"", isPrimary:false});
+    }
+    getCoalescedEvents() { return []; }
+    getPredictedEvents() { return []; }
+};
+var WheelEvent = class WheelEvent extends MouseEvent {
+    constructor(type,opts) { super(type,opts); __eventInit(this, opts, {deltaX:0, deltaY:0, deltaZ:0, deltaMode:0}); }
+};
+WheelEvent.DOM_DELTA_PIXEL = 0; WheelEvent.DOM_DELTA_LINE = 1; WheelEvent.DOM_DELTA_PAGE = 2;
+var DragEvent = class DragEvent extends MouseEvent {
+    constructor(type,opts) { super(type,opts); __eventInit(this, opts, {dataTransfer:null}); }
+};
+var KeyboardEvent = class KeyboardEvent extends UIEvent {
+    constructor(type,opts) {
+        super(type,opts);
+        __eventInit(this, opts, {key:"", code:"", location:0, repeat:false, isComposing:false,
+            charCode:0, keyCode:0, which:0});
+        __eventInit(this, opts, __modifierFields);
+    }
+    getModifierState(key) { return __modifierState.call(this, key); }
+};
+KeyboardEvent.DOM_KEY_LOCATION_STANDARD = 0; KeyboardEvent.DOM_KEY_LOCATION_LEFT = 1;
+KeyboardEvent.DOM_KEY_LOCATION_RIGHT = 2; KeyboardEvent.DOM_KEY_LOCATION_NUMPAD = 3;
+var FocusEvent = class FocusEvent extends UIEvent {
+    constructor(type,opts) { super(type,opts); __eventInit(this, opts, {relatedTarget:null}); }
+};
+var InputEvent = class InputEvent extends UIEvent {
+    constructor(type,opts) { super(type,opts); __eventInit(this, opts, {data:null, inputType:"", isComposing:false, dataTransfer:null}); }
+    getTargetRanges() { return []; }
+};
+var CompositionEvent = class CompositionEvent extends UIEvent {
+    constructor(type,opts) { super(type,opts); __eventInit(this, opts, {data:""}); }
+};
+var TouchEvent = class TouchEvent extends UIEvent {
+    constructor(type,opts) {
+        super(type,opts);
+        __eventInit(this, opts, {touches:[], targetTouches:[], changedTouches:[]});
+        __eventInit(this, opts, __modifierFields);
+    }
+};
+var ClipboardEvent = class ClipboardEvent extends Event {
+    constructor(type,opts) { super(type,opts); __eventInit(this, opts, {clipboardData:null}); }
+};
+var ErrorEvent = class ErrorEvent extends Event {
+    constructor(type,opts) { super(type,opts); __eventInit(this, opts, {message:"", filename:"", lineno:0, colno:0, error:null}); }
+};
+var MessageEvent = class MessageEvent extends Event {
+    constructor(type,opts) { super(type,opts); __eventInit(this, opts, {data:null, origin:"", lastEventId:"", source:null, ports:[]}); }
+};
+var ProgressEvent = class ProgressEvent extends Event {
+    constructor(type,opts) { super(type,opts); __eventInit(this, opts, {lengthComputable:false, loaded:0, total:0}); }
+};
+var PopStateEvent = class PopStateEvent extends Event {
+    constructor(type,opts) { super(type,opts); __eventInit(this, opts, {state:null}); }
+};
+var HashChangeEvent = class HashChangeEvent extends Event {
+    constructor(type,opts) { super(type,opts); __eventInit(this, opts, {oldURL:"", newURL:""}); }
+};
+var PageTransitionEvent = class PageTransitionEvent extends Event {
+    constructor(type,opts) { super(type,opts); __eventInit(this, opts, {persisted:false}); }
+};
+var StorageEvent = class StorageEvent extends Event {
+    constructor(type,opts) { super(type,opts); __eventInit(this, opts, {key:null, oldValue:null, newValue:null, url:"", storageArea:null}); }
+};
+var SubmitEvent = class SubmitEvent extends Event {
+    constructor(type,opts) { super(type,opts); __eventInit(this, opts, {submitter:null}); }
+};
+var AnimationEvent = class AnimationEvent extends Event {
+    constructor(type,opts) { super(type,opts); __eventInit(this, opts, {animationName:"", elapsedTime:0, pseudoElement:""}); }
+};
+var TransitionEvent = class TransitionEvent extends Event {
+    constructor(type,opts) { super(type,opts); __eventInit(this, opts, {propertyName:"", elapsedTime:0, pseudoElement:""}); }
+};
+var PromiseRejectionEvent = class PromiseRejectionEvent extends Event {
+    constructor(type,opts) { super(type,opts); __eventInit(this, opts, {promise:null, reason:undefined}); }
+};
+
+// The class a browser gives an event of this type, for the events the host
+// dispatches: they are plain objects, made what they are by this.
+function __nativeEventClass(type) {
+    type = String(type);
+    if (type.indexOf("pointer") >= 0) return PointerEvent;
+    if (type === "wheel") return WheelEvent;
+    if (type.lastIndexOf("drag", 0) === 0 || type === "drop") return DragEvent;
+    if (type.lastIndexOf("mouse", 0) === 0 || type === "click" || type === "dblclick"
+        || type === "auxclick" || type === "contextmenu") return MouseEvent;
+    if (type.lastIndexOf("key", 0) === 0) return KeyboardEvent;
+    if (type.lastIndexOf("focus", 0) === 0 || type === "blur") return FocusEvent;
+    if (type === "input" || type === "beforeinput") return InputEvent;
+    if (type.lastIndexOf("composition", 0) === 0) return CompositionEvent;
+    if (type.lastIndexOf("touch", 0) === 0) return TouchEvent;
+    if (type === "copy" || type === "cut" || type === "paste") return ClipboardEvent;
+    if (type === "resize") return UIEvent;
+    return Event;
+}
 
 var MutationObserver = class MutationObserver {
     constructor(cb) { this._cb=cb; }
@@ -1518,7 +1692,7 @@ doc.querySelectorAll = function(s) { return _qs(doc,s,true); };
 // Document missing methods/properties
 doc.readyState = "complete";
 doc.createTreeWalker = function(root,what,filter) { return { currentNode:root, nextNode:function(){return null;}, previousNode:function(){return null;}, firstChild:function(){return null;}, lastChild:function(){return null;}, nextSibling:function(){return null;}, previousSibling:function(){return null;}, parentNode:function(){return null;} }; };
-doc.createRange = function() { return { setStart:function(){}, setEnd:function(){}, collapse:function(){}, cloneRange:function(){return doc.createRange();}, selectNode:function(){}, selectNodeContents:function(){}, getBoundingClientRect:function(){return{top:0,left:0,right:0,bottom:0,width:0,height:0};}, createContextualFragment:function(html){var f=doc.createDocumentFragment();f.appendChild(doc.createTextNode(html));return f;} }; };
+doc.createRange = function() { return new Range(); };
 doc.scripts = [];
 doc.forms = [];
 doc.images = [];
@@ -1526,6 +1700,222 @@ doc.links = [];
 doc.styleSheets = [];
 Object.defineProperty(doc, 'activeElement', { get: function() { return doc._activeElement || doc.body; } });
 doc.hasFocus = function() { return true; };
+// Editing commands (`execCommand`) are not here: say so when asked, as a
+// browser does of one it lacks. Monaco asks of "copy" and "cut" as it loads.
+doc.queryCommandSupported = function() { return false; };
+doc.queryCommandEnabled = function() { return false; };
+doc.execCommand = function() { return false; };
+// Shown, as a page in a window is.
+doc.visibilityState = "visible";
+doc.hidden = false;
+doc.currentScript = null;
+doc.referrer = "";
+doc.getSelection = function() { return __selection; };
+// The innermost element at a point in the viewport, from the last layout
+// (xyflow finds the handle a connection is dropped on with it).
+doc.elementFromPoint = function(x, y) {
+    var s = "";
+    try { s = __zippHostCall("hit", String(x), String(y)); } catch (e) {}
+    return (s && __nodesById[s]) || null;
+};
+doc.elementsFromPoint = function(x, y) {
+    var out = [];
+    for (var el = doc.elementFromPoint(x, y); el && el.nodeType === 1; el = el.parentNode) out.push(el);
+    return out;
+};
+// The caret at a point: in the text of the element there, at the character
+// its share of the element's width puts it -- exact for monospaced text, as
+// an editor's lines are (monaco places its cursor on a click with this).
+doc.caretRangeFromPoint = function(x, y) {
+    var el = doc.elementFromPoint(x, y);
+    if (!el) return null;
+    var r = new Range();
+    var text = null;
+    for (var i = 0; i < el.childNodes.length; i++) if (el.childNodes[i].nodeType === 3) { text = el.childNodes[i]; break; }
+    if (!text) { r.setStart(el, 0); return r; }
+    var box = el.getBoundingClientRect(), len = text.data.length;
+    var at = box.width > 0 ? Math.round((x - box.left) / box.width * len) : 0;
+    r.setStart(text, Math.max(0, Math.min(len, at)));
+    return r;
+};
+
+// A stretch of the document between two boundary points. Its boxes come from
+// its nodes' (the shim lays out no glyphs): within one text node, the range
+// takes its share of the parent's box by characters, which is exact for
+// monospaced text -- how monaco measures where its cursor goes.
+var Range = class Range {
+    constructor() { this.startContainer = doc; this.startOffset = 0; this.endContainer = doc; this.endOffset = 0; }
+    get collapsed() { return this.startContainer === this.endContainer && this.startOffset === this.endOffset; }
+    get commonAncestorContainer() {
+        for (var n = this.startContainer; n; n = n.parentNode) if (n === this.endContainer || (n.contains && n.contains(this.endContainer))) return n;
+        return doc;
+    }
+    // A start past the end moves the end to it, and an end before the start
+    // the start (compared within one node; the initial end is before all).
+    setStart(n, o) {
+        this.startContainer = n; this.startOffset = o | 0;
+        if ((this.endContainer === doc && this.endOffset === 0) || (this.endContainer === n && this.endOffset < this.startOffset)) { this.endContainer = n; this.endOffset = this.startOffset; }
+    }
+    setEnd(n, o) {
+        this.endContainer = n; this.endOffset = o | 0;
+        if (this.startContainer === n && this.startOffset > this.endOffset) { this.startContainer = n; this.startOffset = this.endOffset; }
+    }
+    setStartBefore(n) { this.setStart(n.parentNode, n.parentNode._findChild(n)); }
+    setStartAfter(n) { this.setStart(n.parentNode, n.parentNode._findChild(n) + 1); }
+    setEndBefore(n) { this.setEnd(n.parentNode, n.parentNode._findChild(n)); }
+    setEndAfter(n) { this.setEnd(n.parentNode, n.parentNode._findChild(n) + 1); }
+    selectNode(n) { this.setStartBefore(n); this.setEndAfter(n); }
+    selectNodeContents(n) {
+        this.startContainer = this.endContainer = n; this.startOffset = 0;
+        this.endOffset = n.nodeType === 3 || n.nodeType === 8 ? String(n.data || "").length : n.childNodes.length;
+    }
+    collapse(toStart) {
+        if (toStart) { this.endContainer = this.startContainer; this.endOffset = this.startOffset; }
+        else { this.startContainer = this.endContainer; this.startOffset = this.endOffset; }
+    }
+    cloneRange() {
+        var r = new Range();
+        r.startContainer = this.startContainer; r.startOffset = this.startOffset;
+        r.endContainer = this.endContainer; r.endOffset = this.endOffset;
+        return r;
+    }
+    detach() {}
+    toString() {
+        var s = this.startContainer;
+        if (s === this.endContainer && s.nodeType === 3) return s.data.slice(this.startOffset, this.endOffset);
+        var c = this.commonAncestorContainer;
+        return c && c.textContent != null ? String(c.textContent) : "";
+    }
+    getClientRects() {
+        var s = this.startContainer, p = s.parentNode;
+        if (s === this.endContainer && s.nodeType === 3 && p && p.getBoundingClientRect) {
+            var box = p.getBoundingClientRect(), total = p.textContent.length, before = 0;
+            for (var i = 0; i < p.childNodes.length && p.childNodes[i] !== s; i++) before += String(p.childNodes[i].textContent || "").length;
+            if (!total) return box.width || box.height ? [box] : [];
+            var x0 = box.left + box.width * (before + this.startOffset) / total;
+            var x1 = box.left + box.width * (before + this.endOffset) / total;
+            return [new DOMRect(x0, box.top, x1 - x0, box.height)];
+        }
+        var n = this.commonAncestorContainer;
+        while (n && n.nodeType !== 1) n = n.parentNode;
+        return n && n.getClientRects ? n.getClientRects() : [];
+    }
+    getBoundingClientRect() {
+        var rects = this.getClientRects();
+        if (!rects.length) return new DOMRect(0, 0, 0, 0);
+        var l = Infinity, t = Infinity, r = -Infinity, b = -Infinity;
+        for (var i = 0; i < rects.length; i++) {
+            l = Math.min(l, rects[i].left); t = Math.min(t, rects[i].top);
+            r = Math.max(r, rects[i].right); b = Math.max(b, rects[i].bottom);
+        }
+        return new DOMRect(l, t, r - l, b - t);
+    }
+    createContextualFragment(html) { var f = doc.createDocumentFragment(); f.appendChild(__markupText(String(html))); return f; }
+};
+
+// The page's selection: one, as a browser keeps, with at most one range --
+// what script puts in it (React restores an editable's with it).
+var Selection = class Selection {
+    constructor() { this._range = null; }
+    get rangeCount() { return this._range ? 1 : 0; }
+    get anchorNode() { return this._range ? this._range.startContainer : null; }
+    get anchorOffset() { return this._range ? this._range.startOffset : 0; }
+    get focusNode() { return this._range ? this._range.endContainer : null; }
+    get focusOffset() { return this._range ? this._range.endOffset : 0; }
+    get isCollapsed() { return !this._range || this._range.collapsed; }
+    get type() { return !this._range ? "None" : this._range.collapsed ? "Caret" : "Range"; }
+    // A browser throws for a range it does not have; the shim's selection
+    // used to hand out an empty one, which pages have come to rely on.
+    getRangeAt() { return this._range || new Range(); }
+    addRange(r) { if (!this._range) this._range = r; }
+    removeRange(r) { if (this._range === r) this._range = null; }
+    removeAllRanges() { this._range = null; }
+    empty() { this._range = null; }
+    collapse(node, offset) { if (!node) { this._range = null; return; } var r = new Range(); r.setStart(node, offset || 0); this._range = r; }
+    setPosition(node, offset) { this.collapse(node, offset); }
+    collapseToStart() { if (this._range) { var r = this._range.cloneRange(); r.collapse(true); this._range = r; } }
+    collapseToEnd() { if (this._range) { var r = this._range.cloneRange(); r.collapse(false); this._range = r; } }
+    extend(node, offset) { if (this._range) { var r = this._range.cloneRange(); r.setEnd(node, offset || 0); this._range = r; } }
+    setBaseAndExtent(an, ao, fn, fo) { var r = new Range(); r.setStart(an, ao); r.setEnd(fn, fo); this._range = r; }
+    selectAllChildren(n) { var r = new Range(); r.selectNodeContents(n); this._range = r; }
+    containsNode(n) { if (!this._range) return false; var c = this._range.commonAncestorContainer; return c === n || !!(c.contains && c.contains(n)); }
+    toString() { return this._range ? this._range.toString() : ""; }
+};
+var __selection = new Selection();
+
+// Geometry: rectangles, and 2D matrices from numbers or a CSS transform --
+// xyflow reads its zoom off `new DOMMatrixReadOnly(getComputedStyle(viewport).transform)`.
+var DOMRectReadOnly = class DOMRectReadOnly {
+    constructor(x, y, width, height) { this.x = +x || 0; this.y = +y || 0; this.width = +width || 0; this.height = +height || 0; }
+    get left() { return Math.min(this.x, this.x + this.width); }
+    get right() { return Math.max(this.x, this.x + this.width); }
+    get top() { return Math.min(this.y, this.y + this.height); }
+    get bottom() { return Math.max(this.y, this.y + this.height); }
+    toJSON() { return { x: this.x, y: this.y, width: this.width, height: this.height, top: this.top, right: this.right, bottom: this.bottom, left: this.left }; }
+    static fromRect(r) { r = r || {}; return new this(r.x, r.y, r.width, r.height); }
+};
+var DOMRect = class DOMRect extends DOMRectReadOnly {};
+
+// [a, b, c, d, e, f] times [a, b, c, d, e, f]: `m` then `n`, as CSS lists them.
+function __matrixTimes(m, n) {
+    return [m[0] * n[0] + m[2] * n[1], m[1] * n[0] + m[3] * n[1], m[0] * n[2] + m[2] * n[3],
+            m[1] * n[2] + m[3] * n[3], m[0] * n[4] + m[2] * n[5] + m[4], m[1] * n[4] + m[3] * n[5] + m[5]];
+}
+// A CSS transform list as one 2D matrix ("none" is the identity).
+function __cssTransformMatrix(text) {
+    var m = [1, 0, 0, 1, 0, 0], re = /([a-zA-Z0-9]+)\(([^)]*)\)/g, f;
+    function angle(v) {
+        var n = parseFloat(v) || 0;
+        return /turn$/.test(v) ? n * 2 * Math.PI : /grad$/.test(v) ? n * Math.PI / 200 : /rad$/.test(v) ? n : n * Math.PI / 180;
+    }
+    while ((f = re.exec(String(text || "")))) {
+        var name = f[1].toLowerCase(), raw = f[2].split(/[\s,]+/).filter(Boolean), a = raw.map(parseFloat);
+        var t = null;
+        if (name === "matrix" && a.length === 6) t = a;
+        else if (name === "matrix3d" && a.length === 16) t = [a[0], a[1], a[4], a[5], a[12], a[13]];
+        else if (name === "translate" || name === "translate3d") t = [1, 0, 0, 1, a[0] || 0, a[1] || 0];
+        else if (name === "translatex") t = [1, 0, 0, 1, a[0] || 0, 0];
+        else if (name === "translatey") t = [1, 0, 0, 1, 0, a[0] || 0];
+        else if (name === "scale" || name === "scale3d") t = [a[0], 0, 0, a.length > 1 ? a[1] : a[0], 0, 0];
+        else if (name === "scalex") t = [a[0], 0, 0, 1, 0, 0];
+        else if (name === "scaley") t = [1, 0, 0, a[0], 0, 0];
+        else if (name === "rotate" || name === "rotatez") { var r = angle(raw[0] || "0"); t = [Math.cos(r), Math.sin(r), -Math.sin(r), Math.cos(r), 0, 0]; }
+        else if (name === "skewx") t = [1, 0, Math.tan(angle(raw[0] || "0")), 1, 0, 0];
+        else if (name === "skewy") t = [1, Math.tan(angle(raw[0] || "0")), 0, 1, 0, 0];
+        if (t && t.every(function (v) { return isFinite(v); })) m = __matrixTimes(m, t);
+    }
+    return m;
+}
+var DOMMatrixReadOnly = class DOMMatrixReadOnly {
+    constructor(init) {
+        var m = [1, 0, 0, 1, 0, 0];
+        if (typeof init === "string") m = __cssTransformMatrix(init);
+        else if (init && init.length === 6) m = Array.prototype.map.call(init, Number);
+        else if (init && init.length === 16) m = [init[0], init[1], init[4], init[5], init[12], init[13]].map(Number);
+        this.a = this.m11 = m[0]; this.b = this.m12 = m[1]; this.c = this.m21 = m[2];
+        this.d = this.m22 = m[3]; this.e = this.m41 = m[4]; this.f = this.m42 = m[5];
+        this.m13 = this.m14 = this.m23 = this.m24 = this.m31 = this.m32 = this.m34 = this.m43 = 0;
+        this.m33 = this.m44 = 1;
+        this.is2D = true;
+    }
+    get isIdentity() { return this.a === 1 && this.b === 0 && this.c === 0 && this.d === 1 && this.e === 0 && this.f === 0; }
+    _m() { return [this.a, this.b, this.c, this.d, this.e, this.f]; }
+    multiply(o) { o = o instanceof DOMMatrixReadOnly ? o : new DOMMatrix(o); return new DOMMatrix(__matrixTimes(this._m(), o._m())); }
+    translate(tx, ty) { return this.multiply([1, 0, 0, 1, tx || 0, ty || 0]); }
+    scale(sx, sy) { if (sx === undefined) sx = 1; return this.multiply([sx, 0, 0, sy === undefined ? sx : sy, 0, 0]); }
+    inverse() {
+        var m = this._m(), det = m[0] * m[3] - m[1] * m[2];
+        if (!det) return new DOMMatrix([NaN, NaN, NaN, NaN, NaN, NaN]);
+        return new DOMMatrix([m[3] / det, -m[1] / det, -m[2] / det, m[0] / det,
+            (m[2] * m[5] - m[3] * m[4]) / det, (m[1] * m[4] - m[0] * m[5]) / det]);
+    }
+    transformPoint(p) {
+        p = p || {}; var x = p.x || 0, y = p.y || 0;
+        return { x: this.a * x + this.c * y + this.e, y: this.b * x + this.d * y + this.f, z: p.z || 0, w: p.w === undefined ? 1 : p.w };
+    }
+    toString() { return "matrix(" + this._m().join(", ") + ")"; }
+};
+var DOMMatrix = class DOMMatrix extends DOMMatrixReadOnly {};
 doc.createNodeIterator = function(root) { return { nextNode:function(){return null;}, previousNode:function(){return null;} }; };
 doc.adoptNode = function(node) { node.ownerDocument=doc; return node; };
 doc.importNode = function(node,deep) { return node.cloneNode(deep); };
@@ -1748,7 +2138,15 @@ var navigator = {
     clipboard:{ writeText:function(){return Promise.resolve();}, readText:function(){return Promise.resolve("");} },
     permissions:{ query:function(){return Promise.resolve({state:"granted"});} },
     sendBeacon:function(){return true;},
-    serviceWorker:{ ready:Promise.resolve({active:null}), register:function(){return Promise.resolve();}, getRegistrations:function(){return Promise.resolve([]);} },
+    // Registering succeeds and nothing runs: the registration is there to
+    // listen on (oaiy watches it for `updatefound`), with no worker in it.
+    serviceWorker:{ ready:Promise.resolve({active:null}), controller:null,
+        register:function(url,opts){return Promise.resolve({scope:(opts&&opts.scope)||"/", active:null, installing:null, waiting:null,
+            addEventListener:function(){}, removeEventListener:function(){},
+            update:function(){return Promise.resolve();}, unregister:function(){return Promise.resolve(true);}});},
+        getRegistrations:function(){return Promise.resolve([]);},
+        getRegistration:function(){return Promise.resolve(undefined);},
+        addEventListener:function(){}, removeEventListener:function(){} },
     mediaDevices:{ getUserMedia:function(){return Promise.reject(new Error("not supported"));} },
     geolocation:{ getCurrentPosition:function(s,e){if(e)e(new Error("not supported"));} }
 };
@@ -2346,6 +2744,42 @@ Headers.prototype.has = function(name) { return name.toLowerCase() in this._head
 Headers.prototype.delete = function(name) { delete this._headers[name.toLowerCase()]; };
 Headers.prototype.forEach = function(fn) { for (var k in this._headers) fn(this._headers[k], k); };
 
+// A response made by script -- `new Response(blob).arrayBuffer()` reads a
+// body as bytes -- and what fetch's resolve to, for `instanceof Response`.
+var Response = class Response {
+    constructor(body, init) {
+        init = init || {};
+        this.status = init.status === undefined ? 200 : init.status;
+        this.statusText = init.statusText || "";
+        this.ok = this.status >= 200 && this.status < 300;
+        this.headers = new Headers(init.headers instanceof Headers ? init.headers._headers : init.headers);
+        this.url = ""; this.type = "default"; this.redirected = false; this.bodyUsed = false;
+        this._body = body === undefined ? null : body;
+        if (!this.headers.has("content-type")) {
+            if (body instanceof Blob && body.type) this.headers.set("content-type", body.type);
+            else if (typeof body === "string") this.headers.set("content-type", "text/plain;charset=UTF-8");
+        }
+    }
+    arrayBuffer() {
+        var b = this._body; this.bodyUsed = true;
+        function bytes(s) { return new TextEncoder().encode(String(s)).buffer; }
+        if (b === null) return Promise.resolve(new ArrayBuffer(0));
+        if (b instanceof ArrayBuffer) return Promise.resolve(b.slice(0));
+        if (ArrayBuffer.isView(b)) return Promise.resolve(b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength));
+        // The shim's Blob gives its parts as text.
+        if (b && typeof b.arrayBuffer === "function") return b.arrayBuffer().then(function (v) { return v instanceof ArrayBuffer ? v : bytes(v); });
+        return Promise.resolve(bytes(b));
+    }
+    text() { return this.arrayBuffer().then(function (ab) { return new TextDecoder().decode(new Uint8Array(ab)); }); }
+    json() { return this.text().then(JSON.parse); }
+    bytes() { return this.arrayBuffer().then(function (ab) { return new Uint8Array(ab); }); }
+    blob() { var type = this.headers.get("content-type") || ""; return this.arrayBuffer().then(function (ab) { return new Blob([new TextDecoder().decode(new Uint8Array(ab))], { type: type }); }); }
+    clone() { return new Response(this._body, { status: this.status, statusText: this.statusText, headers: this.headers }); }
+    static json(data, init) { init = init || {}; var r = new Response(JSON.stringify(data), init); r.headers.set("content-type", "application/json"); return r; }
+    static error() { var r = new Response(null, { status: 0 }); r.type = "error"; return r; }
+};
+function __asResponse(r) { Object.setPrototypeOf(r, Response.prototype); return r; }
+
 // --- FormData class (basic) ---
 var FormData = function() { this._data = []; };
 FormData.prototype.append = function(name, value) { this._data.push([name, value]); };
@@ -2517,6 +2951,13 @@ var window = {
     screen:{ width:__VIEWPORT_W__, height:__VIEWPORT_H__, availWidth:__VIEWPORT_W__, availHeight:__VIEWPORT_H__, colorDepth:24, pixelDepth:24, orientation:{type:"landscape-primary",angle:0} },
     MessageChannel:MessageChannel,
     MutationObserver:MutationObserver, Event:Event, CustomEvent:CustomEvent,
+    UIEvent:UIEvent, MouseEvent:MouseEvent, PointerEvent:PointerEvent, WheelEvent:WheelEvent,
+    DragEvent:DragEvent, KeyboardEvent:KeyboardEvent, FocusEvent:FocusEvent, InputEvent:InputEvent,
+    CompositionEvent:CompositionEvent, TouchEvent:TouchEvent, ClipboardEvent:ClipboardEvent,
+    ErrorEvent:ErrorEvent, MessageEvent:MessageEvent, ProgressEvent:ProgressEvent,
+    PopStateEvent:PopStateEvent, HashChangeEvent:HashChangeEvent, PageTransitionEvent:PageTransitionEvent,
+    StorageEvent:StorageEvent, SubmitEvent:SubmitEvent, AnimationEvent:AnimationEvent,
+    TransitionEvent:TransitionEvent, PromiseRejectionEvent:PromiseRejectionEvent,
     Node:DOMNode,
     HTMLElement:HTMLElement, DocumentFragment:DocumentFragment,
     HTMLIFrameElement:HTMLIFrameElement, HTMLInputElement:HTMLInputElement,
@@ -2544,7 +2985,11 @@ var window = {
     scrollTo:function(){}, scroll:function(){}, scrollBy:function(){},
     history:{state:null,pushState:function(s,t,u){this.state=s;__historyMove(u);},replaceState:function(s,t,u){this.state=s;__historyMove(u);},back:function(){},forward:function(){},go:function(n){},length:1},
     self:null, top:null, parent:null,
-    getSelection:function(){return {removeAllRanges:function(){},addRange:function(){},getRangeAt:function(){return doc.createRange();}};},
+    getSelection:function(){return __selection;},
+    Range:Range, Selection:Selection,
+    DOMRect:DOMRect, DOMRectReadOnly:DOMRectReadOnly, DOMMatrix:DOMMatrix, DOMMatrixReadOnly:DOMMatrixReadOnly,
+    // No cross-origin isolation (it is what SharedArrayBuffer waits on).
+    crossOriginIsolated:false,
     ResizeObserver:ResizeObserver,
     // A real IntersectionObserver delivers an initial observation for every
     // observed element once layout is known. Stubbing `observe` as a no-op means
@@ -2620,7 +3065,7 @@ var window = {
                     r = http.get(String(url));
                 }
                 var responseBody = r.body;
-                resolve({
+                resolve(__asResponse({
                     ok: r.ok,
                     status: r.status,
                     statusText: r.ok ? "OK" : "Error",
@@ -2642,7 +3087,7 @@ var window = {
                     clone: function() { return this; },
                     redirected: false,
                     type: "basic"
-                });
+                }));
             } catch(e) {
                 reject(e);
             }
@@ -2651,9 +3096,10 @@ var window = {
     XMLHttpRequest:XMLHttpRequest,
     WeakRef:WeakRef, FinalizationRegistry:FinalizationRegistry,
     Proxy:Proxy, Reflect:Reflect,
-    Headers:Headers, FormData:FormData, Blob:Blob, File:File
+    Headers:Headers, FormData:FormData, Blob:Blob, File:File, Response:Response
 };
 window.self=window; window.top=window; window.parent=window;
+window.origin = loc.origin;
 window.URL = URL;
 
 // `window` is the global object, as in a browser, so that `window.$ = jQuery`

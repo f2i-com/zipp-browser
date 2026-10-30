@@ -938,6 +938,10 @@ function __zippRunListeners(handlers, type, target, currentTarget, phase, detail
     // React reads `nativeEvent` off its synthetic wrapper; point it at itself so
     // either access works.
     ev.nativeEvent = ev;
+    ev.view = typeof window !== "undefined" ? window : null;
+    // What kind of event it is, for `instanceof MouseEvent` and the like
+    // (monaco asks), with the methods that kind has (`getModifierState`).
+    if (typeof __nativeEventClass === "function") Object.setPrototypeOf(ev, __nativeEventClass(type).prototype);
     if (details) {
         var more = JSON.parse(details);
         for (var key in more) ev[key] = more[key];
@@ -1189,7 +1193,7 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
             let linked: std::collections::HashSet<String> =
                 serde_json::from_str(args.get(1).map(String::as_str).unwrap_or("[]")).unwrap_or_default();
             let map = IMPORT_MAP.with(|m| m.borrow().clone());
-            let resolve_module = |base: &str, spec: &str| map.resolve(base, spec, &resolve).unwrap_or_else(|| resolve(base, spec));
+            let resolve_module = |base: &str, spec: &str| map.resolve_specifier(base, spec, &resolve);
             let out = esm::link_more(&[url], &linked, false, &fetch, &resolve_module);
             for (url, err) in &out.failures {
                 console::push(console::Level::Error, format!("module {url} failed to load: {err}"));
@@ -1229,6 +1233,11 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
         // Copy the pending bytes into `__zippHostBytes`.
         // An element's box in the viewport (`getBoundingClientRect`).
         "rect" => Ok(event_bridge::layout_rect(args.first().map(String::as_str).unwrap_or_default())),
+        // `document.elementFromPoint(x, y)`: the script's node there.
+        "hit" => Ok(event_bridge::layout_hit(
+            args.first().map(String::as_str).unwrap_or_default(),
+            args.get(1).map(String::as_str).unwrap_or_default(),
+        )),
         // `offsetWidth`, `clientWidth`, a ResizeObserver's boxes.
         "box" => Ok(event_bridge::layout_box(args.first().map(String::as_str).unwrap_or_default())),
         // `getComputedStyle(el)[name]`, from the last layout.
@@ -2202,8 +2211,7 @@ fn run_zipp_js_inner(
             Some(code) => Ok(code.clone()),
             None => fetch(url),
         };
-        let resolve_module =
-            |base: &str, spec: &str| import_map.resolve(base, spec, &resolve).unwrap_or_else(|| resolve(base, spec));
+        let resolve_module = |base: &str, spec: &str| import_map.resolve_specifier(base, spec, &resolve);
         let linked = esm::link_graph(&module_entries, &fetch_module, &resolve_module);
         IMPORT_MAP.with(|m| *m.borrow_mut() = import_map.clone());
         eprintln!(
