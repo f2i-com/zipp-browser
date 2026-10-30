@@ -1,5 +1,6 @@
 //! Inline layout construction using Parley text layout engine.
 
+use markup5ever::local_name;
 use parley::{AlignmentOptions, IndentOptions};
 use style::values::{computed::CSSPixelLength, generics::text::GenericTextIndent};
 use taffy::{
@@ -794,6 +795,26 @@ impl BaseDocument {
             height: final_size.height.max(height / scale),
         };
 
+        // The box's size: what it is given or styled, else its content's.
+        let clamped_size = inputs
+            .known_dimensions
+            .or(node_size)
+            .unwrap_or(final_size + content_box_inset.sum_axes())
+            .maybe_clamp(node_min_size, node_max_size);
+
+        // A button's content is centred in it, up and down, as browsers lay a
+        // button out: one taller than its text (`min-height: 44px`) had the
+        // text, and an icon beside it, at the top.
+        let is_button = self.nodes[node_id]
+            .data
+            .downcast_element()
+            .is_some_and(|e| e.name.local == local_name!("button"));
+        let v_center = if is_button {
+            ((clamped_size.height - content_box_inset.vertical_axis_sum() - height / scale) / 2.0).max(0.0)
+        } else {
+            0.0
+        };
+
         // Store sizes and positions of inline boxes (a real layout only, for the
         // same reason the lines are kept: a measurement must not move them).
         for line in inline_layout.layout.lines().filter(|_| !measuring) {
@@ -876,7 +897,7 @@ impl BaseDocument {
                         layout.size.width = (ibox.width / scale) - margin.left - margin.right;
                         layout.size.height = (ibox.height / scale) - margin.top - margin.bottom;
                         layout.location.x = (ibox.x / scale) + margin.left + container_pb.left;
-                        layout.location.y = (ibox.y / scale) + margin.top + container_pb.top;
+                        layout.location.y = (ibox.y / scale) + margin.top + container_pb.top + v_center;
                         layout.padding = padding; //.map(|p| p / scale);
                         layout.border = border; //.map(|p| p / scale);
                     }
@@ -890,6 +911,10 @@ impl BaseDocument {
         // println!("known_dimensions: w: {:?} h: {:?}", inputs.known_dimensions.width, inputs.known_dimensions.height);
         // println!("\n");
 
+        if !measuring {
+            inline_layout.v_offset = v_center;
+        }
+
         // Put layout back (the untouched one, if this was only a measurement)
         self.nodes[node_id]
             .data
@@ -899,11 +924,6 @@ impl BaseDocument {
 
         let measured_size = final_size;
 
-        let clamped_size = inputs
-            .known_dimensions
-            .or(node_size)
-            .unwrap_or(measured_size + content_box_inset.sum_axes())
-            .maybe_clamp(node_min_size, node_max_size);
         let size = Size {
             width: clamped_size.width,
             height: f32_max(

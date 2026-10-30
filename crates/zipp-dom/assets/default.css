@@ -86,12 +86,31 @@ input[type="button"] {
     padding: 1px 6px;
     color: black;
     background-color: #EFEFEF;
+    /* A button's label in its middle, as browsers have it (and up and down:
+       layout/inline.rs). */
+    text-align: center;
 }
 
 input[type="file"] {
     border: none;
     padding: 0;
     background-color: transparent;
+}
+
+/* A select is a box with its chosen option's text (the page's script writes
+   that in; options themselves are not drawn) and room on the right for the
+   arrow the renderer draws. It was inline, so with its options hidden it had
+   no size, and a page's select (a form's "Focus") was not there at all. */
+select {
+    display: inline-block;
+    border: 1px solid #999;
+    border-radius: 3px;
+    padding: 1px 24px 1px 4px;
+    color: black;
+    background-color: white;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 option {

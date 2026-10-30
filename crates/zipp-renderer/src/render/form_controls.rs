@@ -8,6 +8,35 @@ use peniko::Fill;
 use style::dom::TElement as _;
 
 impl ElementCx<'_> {
+    /// A select's arrow, at its right, in its text colour -- the native one,
+    /// unless the page draws its own as a background image, which is how a
+    /// page that turns the native one off (`appearance: none`) replaces it.
+    /// (`appearance` itself is Gecko's alone in this Stylo.)
+    pub(super) fn draw_select_arrow(&self, scene: &mut impl PaintScene) {
+        use style::values::generics::image::GenericImage;
+        if self.node.local_name() != "select" {
+            return;
+        }
+        let background = self.style.get_background();
+        if background.background_image.0.iter().any(|image| !matches!(image, GenericImage::None)) {
+            return;
+        }
+        let color = self.style.clone_color().as_srgb_color();
+        let frame = self.frame.border_box;
+        let s = self.scale;
+        if frame.width() < 24.0 * s || frame.height() < 8.0 * s {
+            return;
+        }
+        let (cx, cy) = (frame.x1 - 13.0 * s, frame.center().y);
+        let (w, h) = (4.0 * s, 2.4 * s);
+        let mut path = BezPath::new();
+        path.move_to((cx - w, cy - h));
+        path.line_to((cx, cy + h));
+        path.line_to((cx + w, cy - h));
+        let stroke = Stroke::new(1.6 * s).with_caps(Cap::Round).with_join(Join::Round);
+        scene.stroke(&stroke, self.transform, color, None, &path);
+    }
+
     pub(super) fn draw_input(&self, scene: &mut impl PaintScene) {
         if self.node.local_name() != "input" {
             return;

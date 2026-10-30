@@ -521,6 +521,9 @@ pub struct TextInputData {
     pub editor: Box<parley::PlainEditor<TextBrush>>,
     /// Whether the input is a singleline or multiline input
     pub is_multiline: bool,
+    /// The field's `placeholder`, laid out as its text is, for when it is
+    /// empty.
+    pub placeholder: Option<Box<parley::PlainEditor<TextBrush>>>,
 }
 
 // FIXME: Implement Clone for PlainEditor
@@ -536,6 +539,7 @@ impl TextInputData {
         Self {
             editor,
             is_multiline,
+            placeholder: None,
         }
     }
 
@@ -624,6 +628,8 @@ pub struct TextLayout {
     pub text: String,
     pub content_widths: Option<ContentWidths>,
     pub layout: parley::layout::Layout<TextBrush>,
+    /// How far down its box the text is drawn: a button's, centred in it.
+    pub v_offset: f32,
 }
 
 impl TextLayout {

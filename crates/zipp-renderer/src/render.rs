@@ -447,6 +447,7 @@ impl<'dom> DocumentPainter<'dom> {
                         cx.draw_canvas(scene);
                         cx.draw_sub_document(scene);
                         cx.draw_input(scene);
+                        cx.draw_select_arrow(scene);
                         cx.draw_text_input_text(scene, content_position);
                         cx.draw_inline_layout(scene, content_position);
                         cx.draw_marker(scene, content_position);
@@ -642,8 +643,10 @@ impl ElementCx<'_> {
                     panic!("Tried to render node marked as inline root that does not have an inline layout: {:?}", self.node);
                 });
 
+            // Down its box by its offset (a button's text, centred in it).
+            let y = pos.y + f64::from(text_layout.v_offset);
             let transform =
-                Affine::translate((pos.x * self.scale, pos.y * self.scale)) * self.transform;
+                Affine::translate((pos.x * self.scale, y * self.scale)) * self.transform;
 
             // Render text selection highlight (if any) using cached selection ranges
             if let Some(&(sel_start, sel_end)) = self.context.selection_ranges.get(&self.node.id) {
@@ -716,6 +719,16 @@ impl ElementCx<'_> {
                         &convert_rect(&cursor),
                     );
                 };
+            }
+
+            // Its placeholder, while it is empty -- which a field never given a
+            // value is with the single space its editor starts with.
+            let text = input_data.editor.text();
+            let empty = text == "" || (text == " " && self.node.attr(zipp_dom::local_name!("value")).is_none());
+            if empty
+                && let Some(layout) = input_data.placeholder.as_ref().and_then(|p| p.try_layout())
+            {
+                crate::text::draw_text_runs_faded(scene, layout.lines(), self.context.dom, transform, 0.55);
             }
 
             // Render text

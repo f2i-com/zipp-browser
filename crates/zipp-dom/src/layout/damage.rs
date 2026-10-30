@@ -324,6 +324,10 @@ impl BaseDocument {
                 input.editor.set_scale(scale);
                 let mut font_ctx = font_ctx.lock().unwrap();
                 input.editor.refresh_layout(&mut font_ctx, layout_ctx);
+                if let Some(placeholder) = input.placeholder.as_mut() {
+                    placeholder.set_scale(scale);
+                    placeholder.refresh_layout(&mut font_ctx, layout_ctx);
+                }
                 node.insert_damage(ONLY_RELAYOUT);
             }
         }

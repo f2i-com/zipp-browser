@@ -453,14 +453,13 @@ var Element = class Element extends DOMNode {
         // `element.options` — which is why a page with a select died in React's
         // updateOptions with "Cannot read properties of undefined (reading
         // 'length')" before this existed.
-        this.value = "";
+        // value, selected and selectedIndex are accessors (below): a default
+        // set here went through them, and every option's value read "".
         this.checked = false;
         this.defaultValue = "";
         this.defaultChecked = false;
-        this.selected = false;
         this.defaultSelected = false;
         this.disabled = false;
-        this.selectedIndex = -1;
         this.multiple = false;
     }
 
@@ -1083,19 +1082,156 @@ function __ceAttributeChanged(el, name, old, value) {
 Object.defineProperty(Element.prototype, "value", {
     configurable: true,
     get: function () {
+        // A select's is its chosen option's; an option's its value attribute,
+        // or else its text.
+        if (this.tagName === "SELECT") { var i = __selectIndex(this); return i < 0 ? "" : this.options[i].value; }
+        if (this.tagName === "OPTION") { var a = this.getAttribute("value"); return a !== null ? a : __optionText(this); }
         if (this._value !== undefined) return this._value;
         // Until script or the user sets one, the markup's.
         if (this.tagName === "TEXTAREA") return (this.textContent || "").replace(/\r\n?/g, "\n");
-        if (this.tagName === "INPUT" || this.tagName === "OPTION") return this.getAttribute("value") || "";
+        if (this.tagName === "INPUT") return this.getAttribute("value") || "";
         return "";
     },
     set: function (v) {
         v = v === null || v === undefined ? "" : String(v);
+        if (this.tagName === "SELECT") { __selectValue(this, v); return; }
+        if (this.tagName === "OPTION") { this.setAttribute("value", v); return; }
         if (this.tagName === "TEXTAREA") v = v.replace(/\r\n?/g, "\n");
         else if (this.tagName === "INPUT" && !/^(checkbox|radio|file|hidden|range|color)$/i.test(this.getAttribute && this.getAttribute("type") || "")) v = v.replace(/[\r\n]/g, "");
         this._value = v;
     }
 });
+// <select> and its <option>s, as the DOM has them: one option chosen (the
+// first, until one is), `value` and `selectedIndex` the chosen one's, and
+// choosing one unchoosing the rest. They were plain properties, so a
+// select's value was "" and React's controlled selects read nothing back.
+function __selectOf(option) {
+    for (var n = option.parentNode; n && n.nodeType === 1; n = n.parentNode) if (n.tagName === "SELECT") return n;
+    return null;
+}
+function __optionText(option) { return String(option.textContent || "").replace(/\s+/g, " ").trim(); }
+function __selectIndex(sel) {
+    var opts = sel.options || [], marked = -1;
+    for (var i = 0; i < opts.length; i++) {
+        var o = opts[i], on = o._sel !== undefined ? o._sel : o.hasAttribute("selected");
+        if (on) { marked = i; if (sel.multiple) break; }
+    }
+    if (marked >= 0 || sel.multiple || sel._noChoice) return marked;
+    for (var j = 0; j < opts.length; j++) if (!opts[j].disabled) return j;
+    return -1;
+}
+function __selectValue(sel, v) {
+    var opts = sel.options || [];
+    for (var i = 0; i < opts.length; i++) if (opts[i].value === v) { opts[i].selected = true; return; }
+    for (var k = 0; k < opts.length; k++) opts[k]._sel = false;
+    sel._noChoice = true;
+    __domMutations++;
+}
+Object.defineProperty(Element.prototype, "selected", {
+    configurable: true,
+    get: function () {
+        if (this.tagName !== "OPTION") return false;
+        var sel = __selectOf(this);
+        if (sel && !sel.multiple) return sel.options[__selectIndex(sel)] === this;
+        return this._sel !== undefined ? this._sel : this.hasAttribute("selected");
+    },
+    set: function (v) {
+        if (this.tagName !== "OPTION") return;
+        v = !!v;
+        var sel = __selectOf(this);
+        if (sel && !sel.multiple && v) {
+            var opts = sel.options;
+            for (var i = 0; i < opts.length; i++) if (opts[i] !== this) opts[i]._sel = false;
+        }
+        if (sel && v) sel._noChoice = false;
+        this._sel = v;
+        __domMutations++;
+    }
+});
+Object.defineProperty(Element.prototype, "selectedIndex", {
+    configurable: true,
+    get: function () { return this.tagName === "SELECT" ? __selectIndex(this) : undefined; },
+    set: function (i) {
+        if (this.tagName !== "SELECT") return;
+        var opts = this.options;
+        i = Number(i);
+        if (i >= 0 && i < opts.length) { opts[i].selected = true; return; }
+        for (var k = 0; k < opts.length; k++) opts[k]._sel = false;
+        this._noChoice = true;
+        __domMutations++;
+    }
+});
+Object.defineProperty(Element.prototype, "selectedOptions", {
+    configurable: true,
+    get: function () { return this.tagName === "SELECT" ? Array.prototype.filter.call(this.options, function (o) { return o.selected; }) : undefined; }
+});
+Object.defineProperty(Element.prototype, "text", {
+    configurable: true,
+    get: function () { return this.tagName === "OPTION" ? __optionText(this) : undefined; },
+    set: function (v) { if (this.tagName === "OPTION") this.textContent = v; }
+});
+Object.defineProperty(Element.prototype, "label", {
+    configurable: true,
+    get: function () { if (this.tagName !== "OPTION" && this.tagName !== "OPTGROUP") return undefined; var a = this.getAttribute("label"); return a !== null ? a : (this.tagName === "OPTION" ? __optionText(this) : ""); },
+    set: function (v) { this.setAttribute("label", v); }
+});
+// What a select shows: its chosen option's label (drawn as its text).
+function __selectLabel(sel) {
+    var i = __selectIndex(sel);
+    return i < 0 ? "" : sel.options[i].label;
+}
+
+// A select's list, as a browser opens its own: on a press on the select,
+// its options as rows below it, one chosen with a click; Escape or a press
+// elsewhere closes it, and the arrow keys choose on a focused select. There
+// was none: a select could not be changed at all.
+var __selectPopup = null;
+function __closeSelectPopup() {
+    var p = __selectPopup;
+    __selectPopup = null;
+    if (p && p.list.parentNode) p.list.parentNode.removeChild(p.list);
+    return p;
+}
+function __chooseOption(sel, index) {
+    var opts = sel.options || [];
+    if (index < 0 || index >= opts.length || opts[index].disabled || index === __selectIndex(sel)) return;
+    opts[index].selected = true;
+    sel.dispatchEvent(new Event("input", { bubbles: true }));
+    sel.dispatchEvent(new Event("change", { bubbles: true }));
+}
+function __openSelectPopup(sel) {
+    __closeSelectPopup();
+    var opts = sel.options || [];
+    if (!opts.length) return;
+    var r = sel.getBoundingClientRect(), cs = __getComputedStyle(sel);
+    // Placed in the body, from the document's corner -- or the body's, when
+    // it is positioned and so what an absolute box is placed from.
+    var left = r.left + (window.scrollX || 0), top = r.bottom + (window.scrollY || 0);
+    if (doc.body && /^(relative|absolute|fixed|sticky)$/.test(__getComputedStyle(doc.body).position || "")) {
+        var b = doc.body.getBoundingClientRect();
+        left = r.left - b.left; top = r.bottom - b.top;
+    }
+    var list = doc.createElement("div");
+    list.setAttribute("style", "position:absolute;left:" + left + "px;top:" + (top + 2) + "px;min-width:" + Math.max(r.width, 80) +
+        "px;max-height:320px;overflow-y:auto;box-sizing:border-box;padding:4px 0;background:#ffffff;color:#111827;" +
+        "border:1px solid #9ca3af;border-radius:6px;box-shadow:0 8px 24px rgba(0,0,0,0.35);z-index:2147483646;" +
+        "font-family:" + (cs.fontFamily || "sans-serif") + ";font-size:" + (cs.fontSize || "14px") + ";line-height:1.3;text-align:left");
+    var current = __selectIndex(sel);
+    for (var i = 0; i < opts.length; i++) (function (i) {
+        var o = opts[i], row = doc.createElement("div");
+        row.textContent = o.label || "\u00a0";
+        row.setAttribute("style", "padding:6px 14px;white-space:nowrap;" +
+            (i === current ? "background:#2563eb;color:#ffffff;" : "") + (o.disabled ? "color:#9ca3af;" : ""));
+        row.addEventListener("click", function () { __closeSelectPopup(); __chooseOption(sel, i); });
+        list.appendChild(row);
+    })(i);
+    (doc.body || doc.documentElement).appendChild(list);
+    __selectPopup = { sel: sel, list: list };
+}
+function __selectFrom(node) {
+    for (var n = node; n && n.nodeType === 1; n = n.parentNode) if (n.tagName === "SELECT") return n;
+    return null;
+}
 // Attributes their properties reflect, as an element's IDL attributes do:
 // `script.type`, `link.rel`, `input.name`, `meta.content`... They were
 // undefined, so a script asking `el.type === "application/json"` of the
@@ -1176,7 +1312,7 @@ function __reflectLater() {
     __reflectAttr([HTMLOListElement], "reversed", "reversed", "bool"); __reflectAttr([HTMLOListElement], "start", "start", "int", 1);
     __reflectAttr([HTMLQuoteElement, HTMLModElement], "cite", "cite");
     __reflectAttr([HTMLTrackElement], "kind", "kind", "", "subtitles"); __reflectAttr([HTMLTrackElement], "srclang", "srclang");
-    __reflectAttr([HTMLTrackElement, HTMLOptGroupElement, HTMLOptionElement], "label", "label");
+    __reflectAttr([HTMLTrackElement], "label", "label"); // an option's and an optgroup's: their text without one (Element.prototype.label)
     __reflectAttr([HTMLOptionElement], "defaultSelected", "selected", "bool");
 }
 
@@ -1772,6 +1908,30 @@ doc.links = [];
 doc.styleSheets = [];
 Object.defineProperty(doc, 'activeElement', { get: function() { return doc._activeElement || doc.body; } });
 doc.hasFocus = function() { return true; };
+// A select's list opens and closes on these (see __openSelectPopup).
+doc.addEventListener("mousedown", function (e) {
+    var t = e && e.target;
+    if (__selectPopup && t && __selectPopup.list.contains(t)) return;
+    var was = __closeSelectPopup();
+    var sel = __selectFrom(t);
+    if (sel && !sel.disabled && !sel.multiple && !(was && was.sel === sel)) __openSelectPopup(sel);
+});
+doc.addEventListener("keydown", function (e) {
+    var sel = __selectPopup ? __selectPopup.sel : __selectFrom(doc.activeElement);
+    if (!sel || sel.multiple) return;
+    var k = e.key, i = __selectIndex(sel), n = (sel.options || []).length;
+    if (k === "Escape" && __selectPopup) { __closeSelectPopup(); return; }
+    if (k === "Enter" || k === " ") {
+        if (__selectPopup) __closeSelectPopup(); else __openSelectPopup(sel);
+        if (e.preventDefault) e.preventDefault();
+        return;
+    }
+    var step = k === "ArrowDown" ? 1 : k === "ArrowUp" ? -1 : 0;
+    if (!step) return;
+    if (e.preventDefault) e.preventDefault();
+    for (var j = i + step; j >= 0 && j < n; j += step) if (!sel.options[j].disabled) { __chooseOption(sel, j); break; }
+    if (__selectPopup) __openSelectPopup(sel);
+});
 // Editing commands (`execCommand`) are not here: say so when asked, as a
 // browser does of one it lacks. Monaco asks of "copy" and "cut" as it loads.
 doc.queryCommandSupported = function() { return false; };
@@ -3405,6 +3565,8 @@ function __serializeNode(node) {
     if(st!==""&&st!==";") r+=" style=\""+__ea(st)+"\"";
     r+=" data-flid=\""+node._id+"\"";
     r+=">";
+    // A select shows its chosen option's label, written in as its text.
+    if(tag==="select") r+=__eh(__selectLabel(node));
     // Serialize SVG elements with their attributes for Rust-side SVG rendering
     if(tag==="svg") {
         var sw=node.getAttribute("width")||"24";
@@ -3490,7 +3652,7 @@ function __renderWhole() {
 function __tagOf(node) { return (node.tagName||node.nodeName||"div").toLowerCase(); }
 
 function __drawnWhole(node, tag) {
-    return tag === "svg" || (tag === "textarea" && node._value !== undefined);
+    return tag === "svg" || tag === "select" || (tag === "textarea" && node._value !== undefined);
 }
 
 // The attributes as __serializeNode writes them, as [name, value] pairs.

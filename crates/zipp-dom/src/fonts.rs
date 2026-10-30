@@ -139,6 +139,7 @@ const SYMBOL_FAMILIES: &[&str] = &[
     "Noto Sans Symbols 2",
     "Noto Sans Symbols",
     "DejaVu Sans",
+    "ZIPP Fullwidth",
 ];
 
 /// The scripts a symbol is looked up under: one in running text takes the
@@ -152,6 +153,10 @@ const SYMBOL_SCRIPTS: &[&str] = &["Latn", "Zyyy", "Zinh", "Grek", "Cyrl", "Arab"
 /// (Bitstream Vera's, and public domain) is in `assets/fonts/`.
 const SYMBOL_FACE: &[u8] = include_bytes!("../assets/fonts/DejaVuSans.ttf");
 
+/// The fullwidth forms (U+FF01-FF5E, "＋ Add task"), which none of the fonts
+/// here have: DejaVu Sans' ASCII in a square cell (`tools/fullwidth-font.py`).
+const FULLWIDTH_FACE: &[u8] = include_bytes!("../assets/fonts/ZippFullwidth.ttf");
+
 /// Put the symbol fonts behind each script's own fallback.
 ///
 /// The platform's fallback for Latin is a text font (Segoe UI on Windows),
@@ -161,6 +166,9 @@ const SYMBOL_FACE: &[u8] = include_bytes!("../assets/fonts/DejaVuSans.ttf");
 pub fn register_symbol_fallbacks(collection: &mut Collection) {
     if collection.family_id("DejaVu Sans").is_none() {
         collection.register_fonts(Blob::new(Arc::new(SYMBOL_FACE) as _), None);
+    }
+    if collection.family_id("ZIPP Fullwidth").is_none() {
+        collection.register_fonts(Blob::new(Arc::new(FULLWIDTH_FACE) as _), None);
     }
     let symbols: Vec<FamilyId> = SYMBOL_FAMILIES
         .iter()

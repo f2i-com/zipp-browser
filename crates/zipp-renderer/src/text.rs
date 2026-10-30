@@ -104,6 +104,19 @@ pub(crate) fn draw_text_runs<'a>(
     doc: &BaseDocument,
     transform: Affine,
 ) {
+    draw_text_runs_faded(scene, lines, doc, transform, 1.0);
+}
+
+/// As [`draw_text_runs`], in the text's colour at `alpha` of its own: a
+/// field's placeholder is the field's colour, fainter (as Chrome's grey is on
+/// black text), which stays legible on a dark field as on a light one.
+pub(crate) fn draw_text_runs_faded<'a>(
+    scene: &mut (impl PaintScene + BlurLayer),
+    lines: impl Iterator<Item = Line<'a, TextBrush>>,
+    doc: &BaseDocument,
+    transform: Affine,
+    alpha: f32,
+) {
     for line in lines {
         for item in line.items() {
             if let PositionedLayoutItem::GlyphRun(glyph_run) = item {
@@ -124,7 +137,7 @@ pub(crate) fn draw_text_runs<'a>(
                     .primary_styles()
                     .unwrap();
                 let itext_styles = styles.get_inherited_text();
-                let text_color = itext_styles.color.as_color_color();
+                let text_color = itext_styles.color.as_color_color().multiply_alpha(alpha);
 
                 // `text-decoration` does NOT inherit — it PROPAGATES from the
                 // box that declares it down through that box's inline

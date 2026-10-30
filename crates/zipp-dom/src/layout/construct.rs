@@ -691,6 +691,7 @@ fn create_text_editor(doc: &mut BaseDocument, input_element_id: usize, is_multil
         .as_ref()
         .map(|s| stylo_to_parley::style(node.id, s))
         .unwrap_or_default();
+    let placeholder = node.attr(local_name!("placeholder")).filter(|p| !p.is_empty()).map(str::to_string);
 
     let element = &mut node.data.downcast_element_mut().unwrap();
     if !matches!(element.special_data, SpecialElementData::TextInput(_)) {
@@ -704,25 +705,40 @@ fn create_text_editor(doc: &mut BaseDocument, input_element_id: usize, is_multil
         unreachable!();
     };
 
-    let editor = &mut text_input_data.editor;
-    editor.set_scale(doc.viewport.scale_f64() as f32);
-    editor.set_width(None);
+    let scale = doc.viewport.scale_f64() as f32;
+    let style_editor = |editor: &mut parley::PlainEditor<TextBrush>| {
+        editor.set_scale(scale);
+        editor.set_width(None);
+        let styles = editor.edit_styles();
+        styles.retain(|_| false);
+        styles.insert(StyleProperty::FontSize(parley_style.font_size));
+        styles.insert(StyleProperty::LineHeight(parley_style.line_height));
+        styles.insert(StyleProperty::Brush(parley_style.brush));
+        // The field's own font, not the default face: a monospace code editor
+        // typed in a proportional one, its caret drifting off the text a page
+        // draws over it, and clicks landing on the wrong letters.
+        styles.insert(StyleProperty::FontFamily(parley_style.font_family.clone()));
+        styles.insert(StyleProperty::FontWidth(parley_style.font_width));
+        styles.insert(StyleProperty::FontStyle(parley_style.font_style));
+        styles.insert(StyleProperty::FontWeight(parley_style.font_weight));
+        styles.insert(StyleProperty::LetterSpacing(parley_style.letter_spacing));
+    };
 
-    let styles = editor.edit_styles();
-    styles.retain(|_| false);
-    styles.insert(StyleProperty::FontSize(parley_style.font_size));
-    styles.insert(StyleProperty::LineHeight(parley_style.line_height));
-    styles.insert(StyleProperty::Brush(parley_style.brush));
-    // The field's own font, not the default face: a monospace code editor
-    // typed in a proportional one, its caret drifting off the text a page
-    // draws over it, and clicks landing on the wrong letters.
-    styles.insert(StyleProperty::FontFamily(parley_style.font_family.clone()));
-    styles.insert(StyleProperty::FontWidth(parley_style.font_width));
-    styles.insert(StyleProperty::FontStyle(parley_style.font_style));
-    styles.insert(StyleProperty::FontWeight(parley_style.font_weight));
-    styles.insert(StyleProperty::LetterSpacing(parley_style.letter_spacing));
+    style_editor(&mut text_input_data.editor);
+    text_input_data.editor.refresh_layout(&mut doc.font_ctx.lock().unwrap(), &mut doc.layout_ctx);
 
-    editor.refresh_layout(&mut doc.font_ctx.lock().unwrap(), &mut doc.layout_ctx);
+    // Its placeholder, in its font, for the renderer to show while it is
+    // empty. It was never drawn: an empty field gave no hint what it was for.
+    text_input_data.placeholder = placeholder.map(|text| {
+        let mut editor = text_input_data
+            .placeholder
+            .take()
+            .unwrap_or_else(|| Box::new(parley::PlainEditor::new(16.0)));
+        style_editor(&mut editor);
+        editor.set_text(&text);
+        editor.refresh_layout(&mut doc.font_ctx.lock().unwrap(), &mut doc.layout_ctx);
+        editor
+    });
 }
 
 fn create_checkbox_input(doc: &mut BaseDocument, input_element_id: usize) {
