@@ -61,7 +61,7 @@ impl Window for KmsWindow {
     fn set_outer_position(&self, _position: Position) {}
 
     fn surface_size(&self) -> PhysicalSize<u32> {
-        let (w, h) = self.shared.display.size;
+        let (w, h) = self.shared.display.size();
         PhysicalSize::new(w, h)
     }
 
@@ -76,7 +76,7 @@ impl Window for KmsWindow {
     fn safe_area(&self) -> PhysicalInsets<u32> {
         // A widened row pitch leaves columns past the mode's right edge that
         // are drawn but never shown.
-        let hidden = self.shared.display.size.0 - self.shared.display.mode.size().0 as u32;
+        let hidden = self.shared.display.size().0 - self.shared.display.visible_size().0;
         PhysicalInsets::new(0, 0, 0, hidden)
     }
 

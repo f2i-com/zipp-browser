@@ -45,6 +45,7 @@ mod display;
 mod input;
 mod keymap;
 mod pointer;
+mod vbox;
 mod window;
 
 pub use display::Display;
@@ -62,6 +63,9 @@ pub(crate) struct Shared {
     pub(crate) theme: Theme,
     proxy_woken: AtomicBool,
     wake_fd: OwnedFd,
+    /// A screen size asked for (a virtual machine's window resized), for the
+    /// loop to set.
+    pending_size: Mutex<Option<(u32, u32)>>,
 }
 
 impl Shared {
@@ -201,7 +205,17 @@ impl EventLoop {
             theme: if dark { Theme::Dark } else { Theme::Light },
             proxy_woken: AtomicBool::new(false),
             wake_fd,
+            pending_size: Mutex::new(None),
         });
+        // In VirtualBox the screen follows its window, unless a mode was
+        // named (ZIPP_KMS_MODE).
+        if std::env::var_os("ZIPP_KMS_MODE").is_none() {
+            let to = shared.clone();
+            vbox::watch(move |w, h| {
+                *to.pending_size.lock().unwrap_or_else(|e| e.into_inner()) = Some((w, h));
+                to.wake();
+            });
+        }
         Ok(EventLoop {
             target: Target {
                 shared,
@@ -324,6 +338,24 @@ impl EventLoop {
             }
             if shared.proxy_woken.swap(false, Ordering::AcqRel) {
                 app.proxy_wake_up(target);
+            }
+
+            // A new size for the screen: its mode, then the window's.
+            let wanted = shared.pending_size.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let (Some((w, h)), Some(id)) = (wanted, target.window.get())
+                && shared.display.visible_size() != (w, h)
+            {
+                let (w, h) = (w.clamp(640, 7680), h.clamp(400, 4320));
+                match shared.display.set_size(w, h) {
+                    Ok(()) => {
+                        self.input.set_screen(shared.display.visible_size());
+                        let (dw, dh) = shared.display.size();
+                        app.window_event(target, id, WindowEvent::SurfaceResized(dpi::PhysicalSize::new(dw, dh)));
+                        shared.redraw.store(true, Ordering::Release);
+                        flip_due = None;
+                    }
+                    Err(e) => eprintln!("[kms] {w}x{h}: {e}"),
+                }
             }
 
             if fds[2..].iter().any(|p| p.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0) {

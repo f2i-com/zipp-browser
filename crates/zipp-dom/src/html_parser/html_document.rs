@@ -153,74 +153,7 @@ impl HtmlDocument {
                     self.js_root_attrs = attrs.into_iter().map(|(name, _)| name).collect();
                 }
                 if let Some(body_id) = body_id {
-                    // What has focus, by the script's number for it (or its
-                    // id, for the browser's own console line), to give focus
-                    // back once its node is rebuilt: a page that re-renders
-                    // every frame would otherwise lose it at once (a game's
-                    // canvas, reading the arrow keys).
-                    let focused = self
-                        .inner
-                        .focus_node_id
-                        .and_then(|id| self.inner.get_node(id))
-                        .and_then(|n| {
-                            let attr = |name: &str| n.attr(markup5ever::LocalName::from(name)).map(str::to_string);
-                            attr("data-flid")
-                                .map(|flid| format!("[data-flid=\"{flid}\"]"))
-                                .or_else(|| attr("id").map(|id| format!("#{id}")))
-                        });
-                    // And how far each scrolled element was scrolled -- a
-                    // console following its output, an editor -- or every
-                    // re-render sent them all back to the top.
-                    // A focused text field keeps its editor -- the caret, the
-                    // selection -- when the re-render gives it the same text:
-                    // typing re-renders the page, and the caret went back to
-                    // the start with every key.
-                    let focused_editor = self.inner.focus_node_id.and_then(|id| {
-                        let el = self.inner.nodes.get_mut(id)?.element_data_mut()?;
-                        el.text_input_data()?;
-                        match std::mem::take(&mut el.special_data) {
-                            crate::node::SpecialElementData::TextInput(editor) => Some(editor),
-                            other => {
-                                el.special_data = other;
-                                None
-                            }
-                        }
-                    });
-                    let flid_attr = markup5ever::LocalName::from("data-flid");
-                    let scrolled: Vec<(String, crate::Point<f64>)> = self
-                        .inner
-                        .nodes
-                        .iter()
-                        .filter(|(_, n)| n.scroll_offset.x != 0.0 || n.scroll_offset.y != 0.0)
-                        .filter_map(|(_, n)| Some((n.attr(flid_attr.clone())?.to_string(), n.scroll_offset)))
-                        .collect();
-                    let mut mutator = crate::DocumentMutator::new(&mut self.inner);
-                    mutator.set_inner_html(body_id, &html);
-                    drop(mutator);
-                    for (flid, offset) in scrolled {
-                        if let Ok(Some(node)) = self.inner.query_selector(&format!("[data-flid=\"{flid}\"]")) {
-                            self.inner.nodes[node].scroll_offset = offset;
-                        }
-                    }
-                    // Animation state is keyed by node id and those ids are
-                    // recycled by the re-parse, so stale entries would attach
-                    // to whichever new element inherits the id.
-                    self.inner.clear_animation_state();
-                    // Hover/focus/mousedown ids point into the subtree that was
-                    // just freed; the next mouse move would index a dead id.
-                    self.inner.clear_interaction_state();
-                    if let Some(selector) = focused
-                        && let Ok(Some(node)) = self.inner.query_selector(&selector)
-                    {
-                        self.inner.set_focus_to(node);
-                        // (Its own editor is made at layout, from its text.)
-                        if let Some(editor) = focused_editor
-                            && self.inner.text_field_initial_text(node) == editor.editor.raw_text()
-                            && let Some(el) = self.inner.nodes[node].element_data_mut()
-                        {
-                            el.special_data = crate::node::SpecialElementData::TextInput(editor);
-                        }
-                    }
+                    replace_children(&mut self.inner, body_id, &html);
                     // Every node id the handler cached is stale now — the body's
                     // whole subtree was dropped and re-parsed. Let it rebuild
                     // before the next event arrives, or only the FIRST
@@ -230,8 +163,143 @@ impl HtmlDocument {
                     self.layout_stale = true;
                 }
             }
+            // Changes made since (the handler drops those made before a
+            // body it gives), applied after it.
+            let patches = handler.take_pending_patches();
+            if patches.is_empty() {
+                return;
+            }
+            if apply_patches(&mut self.inner, patches) {
+                // Nodes were re-made: the ids the handler cached are stale.
+                handler.document_rerendered(&mut self.inner);
+            }
+            self.inner.shell_provider.request_redraw();
+            self.layout_stale = true;
         }
+    }
+}
 
+/// Apply a handler's patches in place; whether any element's children were
+/// re-made (and with them node ids).
+fn apply_patches(doc: &mut BaseDocument, patches: Vec<crate::DomPatch>) -> bool {
+    let flid_attr = markup5ever::LocalName::from("data-flid");
+    let mut nodes: std::collections::HashMap<u32, usize> = doc
+        .nodes
+        .iter()
+        .filter_map(|(id, n)| Some((n.attr(flid_attr.clone())?.parse().ok()?, id)))
+        .collect();
+    let qual = |name: &str| markup5ever::QualName::new(None, markup5ever::ns!(), markup5ever::LocalName::from(name));
+    let mut remade = false;
+    for patch in patches {
+        match patch {
+            crate::DomPatch::Attributes { flid, attrs } => {
+                let Some(&node_id) = nodes.get(&flid) else {
+                    continue;
+                };
+                let Some(current) = doc.nodes.get(node_id).and_then(|n| n.attrs()) else {
+                    continue;
+                };
+                let current: Vec<(String, String)> =
+                    current.iter().map(|a| (a.name.local.to_string(), a.value.clone())).collect();
+                let mut mutator = crate::DocumentMutator::new(doc);
+                for (name, _) in &current {
+                    if !attrs.iter().any(|(n, _)| n == name) {
+                        mutator.clear_attribute(node_id, qual(name));
+                    }
+                }
+                for (name, value) in &attrs {
+                    if !current.iter().any(|(n, v)| n == name && v == value) {
+                        mutator.set_attribute(node_id, qual(name), value);
+                    }
+                }
+            }
+            crate::DomPatch::Children { flid, html } => {
+                let Some(&node_id) = nodes.get(&flid) else {
+                    continue;
+                };
+                replace_children(doc, node_id, &html);
+                remade = true;
+                // The ids of the subtree's nodes changed.
+                nodes = doc
+                    .nodes
+                    .iter()
+                    .filter_map(|(id, n)| Some((n.attr(flid_attr.clone())?.parse().ok()?, id)))
+                    .collect();
+            }
+        }
+    }
+    remade
+}
+
+/// Replace an element's children with those of `html`, keeping what the
+/// user had: the focused element (found again by its `data-flid` or id), a
+/// text field's caret and selection, and how far each element was scrolled.
+fn replace_children(doc: &mut BaseDocument, node_id: usize, html: &str) {
+    // What has focus, by the script's number for it (or its
+    // id, for the browser's own console line), to give focus
+    // back once its node is rebuilt: a page that re-renders
+    // every frame would otherwise lose it at once (a game's
+    // canvas, reading the arrow keys).
+    let focused = doc
+        .focus_node_id
+        .and_then(|id| doc.get_node(id))
+        .and_then(|n| {
+            let attr = |name: &str| n.attr(markup5ever::LocalName::from(name)).map(str::to_string);
+            attr("data-flid")
+                .map(|flid| format!("[data-flid=\"{flid}\"]"))
+                .or_else(|| attr("id").map(|id| format!("#{id}")))
+        });
+    // And how far each scrolled element was scrolled -- a
+    // console following its output, an editor -- or every
+    // re-render sent them all back to the top.
+    // A focused text field keeps its editor -- the caret, the
+    // selection -- when the re-render gives it the same text:
+    // typing re-renders the page, and the caret went back to
+    // the start with every key.
+    let focused_editor = doc.focus_node_id.and_then(|id| {
+        let el = doc.nodes.get_mut(id)?.element_data_mut()?;
+        el.text_input_data()?;
+        match std::mem::take(&mut el.special_data) {
+            crate::node::SpecialElementData::TextInput(editor) => Some(editor),
+            other => {
+                el.special_data = other;
+                None
+            }
+        }
+    });
+    let flid_attr = markup5ever::LocalName::from("data-flid");
+    let scrolled: Vec<(String, crate::Point<f64>)> = doc
+        .nodes
+        .iter()
+        .filter(|(_, n)| n.scroll_offset.x != 0.0 || n.scroll_offset.y != 0.0)
+        .filter_map(|(_, n)| Some((n.attr(flid_attr.clone())?.to_string(), n.scroll_offset)))
+        .collect();
+    let mut mutator = crate::DocumentMutator::new(doc);
+    mutator.set_inner_html(node_id, html);
+    drop(mutator);
+    for (flid, offset) in scrolled {
+        if let Ok(Some(node)) = doc.query_selector(&format!("[data-flid=\"{flid}\"]")) {
+            doc.nodes[node].scroll_offset = offset;
+        }
+    }
+    // Animation state is keyed by node id and those ids are
+    // recycled by the re-parse, so stale entries would attach
+    // to whichever new element inherits the id.
+    doc.clear_animation_state();
+    // Hover/focus/mousedown ids point into the subtree that was
+    // just freed; the next mouse move would index a dead id.
+    doc.clear_interaction_state();
+    if let Some(selector) = focused
+        && let Ok(Some(node)) = doc.query_selector(&selector)
+    {
+        doc.set_focus_to(node);
+        // (Its own editor is made at layout, from its text.)
+        if let Some(editor) = focused_editor
+            && doc.text_field_initial_text(node) == editor.editor.raw_text()
+            && let Some(el) = doc.nodes[node].element_data_mut()
+        {
+            el.special_data = crate::node::SpecialElementData::TextInput(editor);
+        }
     }
 }
 

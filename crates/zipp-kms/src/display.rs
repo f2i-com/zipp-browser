@@ -8,9 +8,10 @@
 
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use drm::buffer::DrmFourcc;
 use drm::control::dumbbuffer::DumbBuffer;
@@ -38,13 +39,23 @@ pub struct Display {
     pub(crate) path: PathBuf,
     pub(crate) crtc: crtc::Handle,
     pub(crate) plane: plane::Handle,
-    pub(crate) mode: Mode,
+    connector: connector::Handle,
+    /// The kernel driver's name (`vmwgfx`, `i915`, ...).
+    driver: String,
+    /// The mode set and what goes with it; a new mode (`set_size`) replaces it.
+    screen: Mutex<Screen>,
+    pointer: Pointer,
+}
+
+#[derive(Debug)]
+struct Screen {
+    mode: Mode,
     /// The size to draw at: the mode's, except that the width is widened to
     /// the driver's row pitch when that is padded. softbuffer reads a mapped
     /// buffer as rows of exactly `width` pixels.
-    pub(crate) size: (u32, u32),
-    pointer: Pointer,
-    _scanout: (DumbBuffer, framebuffer::Handle),
+    size: (u32, u32),
+    /// The buffer the CRTC was set to scan out with the mode.
+    scanout: (DumbBuffer, framebuffer::Handle),
 }
 
 impl Display {
@@ -112,26 +123,7 @@ impl Display {
         let mut last_error = io::Error::other("the output has no modes");
         for mode in modes_to_try(connector.modes()) {
             let (w, h) = mode.size();
-            let attempt = (|| -> io::Result<(DumbBuffer, framebuffer::Handle)> {
-                let mut scanout = card.create_dumb_buffer((w as u32, h as u32), DrmFourcc::Xrgb8888, 32)?;
-                if let Ok(mut map) = card.map_dumb_buffer(&mut scanout) {
-                    map.as_mut().fill(0);
-                }
-                let fb = match card.add_framebuffer(&scanout, 24, 32) {
-                    Ok(fb) => fb,
-                    Err(e) => {
-                        let _ = card.destroy_dumb_buffer(scanout);
-                        return Err(e);
-                    }
-                };
-                if let Err(e) = card.set_crtc(crtc, Some(fb), (0, 0), &[connector.handle()], Some(mode)) {
-                    let _ = card.destroy_framebuffer(fb);
-                    let _ = card.destroy_dumb_buffer(scanout);
-                    return Err(e);
-                }
-                Ok((scanout, fb))
-            })();
-            match attempt {
+            match set_mode(&card, crtc, connector.handle(), mode) {
                 Ok((scanout, fb)) => {
                     chosen = Some((mode, scanout, fb));
                     break;
@@ -146,7 +138,7 @@ impl Display {
         let (mode_w, mode_h) = mode.size();
         let (mode_w, mode_h) = (mode_w as u32, mode_h as u32);
         let pitch = drm::buffer::Buffer::pitch(&scanout);
-        let width = if pitch % 4 == 0 && pitch / 4 > mode_w { pitch / 4 } else { mode_w };
+        let width = drawn_width(&scanout, mode_w);
 
         // The primary plane: the one now scanning out our framebuffer.
         let planes = card.plane_handles()?;
@@ -175,28 +167,58 @@ impl Display {
             if pointer.is_hardware() { "hardware" } else { "software" },
         );
 
+        let driver = card.get_driver().map(|d| d.name().to_string_lossy().into_owned()).unwrap_or_default();
         Ok(Display {
-            card,
             path: path.to_path_buf(),
             crtc,
             plane,
-            mode,
-            size: (width, mode_h),
+            connector: connector.handle(),
+            driver,
+            screen: Mutex::new(Screen { mode, size: (width, mode_h), scanout: (scanout, fb) }),
             pointer,
-            _scanout: (scanout, fb),
+            card,
         })
+    }
+
+    fn screen(&self) -> std::sync::MutexGuard<'_, Screen> {
+        self.screen.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The size the application draws at, in pixels: the mode's, or wider
     /// where the driver pads its rows.
     pub fn size(&self) -> (u32, u32) {
-        self.size
+        self.screen().size
     }
 
     /// The size of what is shown: the mode's. Input and layout go by this.
     pub fn visible_size(&self) -> (u32, u32) {
-        let (w, h) = self.mode.size();
+        let (w, h) = self.screen().mode.size();
         (w as u32, h as u32)
+    }
+
+    /// Show the screen at `width` x `height` from now on: the window a
+    /// virtual machine is shown in was resized. The output's own mode of that
+    /// size (vmwgfx makes one when told the new layout), or one made here.
+    pub(crate) fn set_size(&self, width: u32, height: u32) -> io::Result<()> {
+        if self.driver == "vmwgfx" {
+            vmw_update_layout(&self.card, width, height);
+        }
+        let wanted = (width.min(u16::MAX as u32) as u16, height.min(u16::MAX as u32) as u16);
+        let info = self.card.get_connector(self.connector, true)?;
+        let mode = info
+            .modes()
+            .iter()
+            .filter(|m| m.size() == wanted)
+            .max_by_key(|m| (m.mode_type().contains(ModeTypeFlags::PREFERRED), m.vrefresh()))
+            .copied()
+            .unwrap_or_else(|| made_mode(wanted.0, wanted.1));
+        let (scanout, fb) = set_mode(&self.card, self.crtc, self.connector, mode)?;
+        let size = (drawn_width(&scanout, wanted.0 as u32), wanted.1 as u32);
+        let old = std::mem::replace(&mut *self.screen(), Screen { mode, size, scanout: (scanout, fb) });
+        let _ = self.card.destroy_framebuffer(old.scanout.1);
+        let _ = self.card.destroy_dumb_buffer(old.scanout.0);
+        eprintln!("[kms] {}x{}@{} (drawn at {}x{})", wanted.0, wanted.1, mode.vrefresh(), size.0, size.1);
+        Ok(())
     }
 
     pub(crate) fn pointer_moved(&self, x: i32, y: i32) {
@@ -210,6 +232,89 @@ impl Display {
     /// A page flip finished: the new frame is on screen.
     pub(crate) fn frame_presented(&self) {
         self.pointer.frame_presented(&self.card, self.crtc);
+    }
+}
+
+/// A black buffer of the mode's size, scanned out by the CRTC with the mode.
+fn set_mode(card: &Card, crtc: crtc::Handle, connector: connector::Handle, mode: Mode) -> io::Result<(DumbBuffer, framebuffer::Handle)> {
+    let (w, h) = mode.size();
+    let mut scanout = card.create_dumb_buffer((w as u32, h as u32), DrmFourcc::Xrgb8888, 32)?;
+    if let Ok(mut map) = card.map_dumb_buffer(&mut scanout) {
+        map.as_mut().fill(0);
+    }
+    let fb = match card.add_framebuffer(&scanout, 24, 32) {
+        Ok(fb) => fb,
+        Err(e) => {
+            let _ = card.destroy_dumb_buffer(scanout);
+            return Err(e);
+        }
+    };
+    if let Err(e) = card.set_crtc(crtc, Some(fb), (0, 0), &[connector], Some(mode)) {
+        let _ = card.destroy_framebuffer(fb);
+        let _ = card.destroy_dumb_buffer(scanout);
+        return Err(e);
+    }
+    Ok((scanout, fb))
+}
+
+/// The width to draw at for a buffer shown `width` wide: its row pitch's,
+/// where the driver pads rows.
+fn drawn_width(scanout: &DumbBuffer, width: u32) -> u32 {
+    let pitch = drm::buffer::Buffer::pitch(scanout);
+    if pitch % 4 == 0 && pitch / 4 > width { pitch / 4 } else { width }
+}
+
+/// A 60 Hz mode of this size, for a virtual screen that takes any (real
+/// screens are only given their own).
+fn made_mode(width: u16, height: u16) -> Mode {
+    let (htotal, vtotal) = (width.saturating_add(160), height.saturating_add(30));
+    let mut name = [0; 32];
+    for (to, from) in name.iter_mut().zip(format!("{width}x{height}").bytes()) {
+        *to = from as std::ffi::c_char;
+    }
+    Mode::from(drm_ffi::drm_mode_modeinfo {
+        clock: (htotal as u32 * vtotal as u32 * 60) / 1000,
+        hdisplay: width,
+        hsync_start: width.saturating_add(48),
+        hsync_end: width.saturating_add(80),
+        htotal,
+        hskew: 0,
+        vdisplay: height,
+        vsync_start: height.saturating_add(3),
+        vsync_end: height.saturating_add(8),
+        vtotal,
+        vscan: 0,
+        vrefresh: 60,
+        flags: 0,
+        type_: 1 << 5, // DRM_MODE_TYPE_USERDEF
+        name,
+    })
+}
+
+/// Tell vmwgfx (VirtualBox's VMSVGA, VMware) the screen's new size, which
+/// it then offers as the output's preferred mode.
+fn vmw_update_layout(card: &Card, width: u32, height: u32) {
+    #[repr(C)]
+    struct Rect {
+        x: i32,
+        y: i32,
+        w: u32,
+        h: u32,
+    }
+    #[repr(C)]
+    struct Layout {
+        num_outputs: u32,
+        pad64: u32,
+        rects: u64,
+    }
+    let rect = Rect { x: 0, y: 0, w: width, h: height };
+    let mut layout = Layout { num_outputs: 1, pad64: 0, rects: &rect as *const Rect as u64 };
+    // DRM_IOW(DRM_COMMAND_BASE + DRM_VMW_UPDATE_LAYOUT, struct drm_vmw_update_layout_arg)
+    let request = (1u32 << 30) | ((std::mem::size_of::<Layout>() as u32) << 16) | ((b'd' as u32) << 8) | (0x40 + 20);
+    // SAFETY: the layout and its one rectangle outlive the call.
+    let rc = unsafe { libc::ioctl(card.as_fd().as_raw_fd(), request as _, &mut layout as *mut Layout) };
+    if rc != 0 {
+        eprintln!("[kms] vmwgfx layout {width}x{height}: {}", io::Error::last_os_error());
     }
 }
 

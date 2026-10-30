@@ -387,6 +387,12 @@ impl Input {
         self.event(index, report(), out);
     }
 
+    /// The screen is now this size: the pointer stays on it.
+    pub(crate) fn set_screen(&mut self, screen: (u32, u32)) {
+        self.screen = (screen.0 as f64, screen.1 as f64);
+        self.pointer = (self.pointer.0.min(self.screen.0 - 1.0), self.pointer.1.min(self.screen.1 - 1.0));
+    }
+
     /// One SYN_REPORT's worth of motion, wheel and touch, as events.
     fn flush(&mut self, index: usize, device_id: Option<DeviceId>, out: &mut Vec<WindowEvent>) {
         let (w, h) = self.screen;

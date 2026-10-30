@@ -6,6 +6,18 @@ use crate::traits_src::events::{
 };
 use std::collections::VecDeque;
 
+/// A change a handler made to the document, to apply in place rather than
+/// re-render the body: the nodes are found by the `data-flid` the handler
+/// gave them.
+#[derive(Debug, Clone)]
+pub enum DomPatch {
+    /// The element's attributes are now these; those it had that are not
+    /// named go.
+    Attributes { flid: u32, attrs: Vec<(String, String)> },
+    /// The element's children are now this HTML's.
+    Children { flid: u32, html: String },
+}
+
 pub trait EventHandler {
     fn handle_event(
         &mut self,
@@ -19,6 +31,14 @@ pub trait EventHandler {
     /// return it here. The caller replaces the document body with it.
     fn take_pending_rerender(&mut self) -> Option<String> {
         None
+    }
+
+    /// Changes to apply to the document in place, when the handler can say
+    /// what changed rather than give a whole new body (a re-render, if there
+    /// is one too, wins). Far cheaper: what did not change keeps its style,
+    /// its layout and its state (hover, focus, scroll, images).
+    fn take_pending_patches(&mut self) -> Vec<DomPatch> {
+        Vec::new()
     }
 
     /// Called after a `take_pending_rerender` result has been applied.
@@ -86,6 +106,9 @@ impl EventHandler for Box<dyn EventHandler> {
     fn take_pending_rerender(&mut self) -> Option<String> {
         (**self).take_pending_rerender()
     }
+    fn take_pending_patches(&mut self) -> Vec<DomPatch> {
+        (**self).take_pending_patches()
+    }
     fn document_element_attributes(&mut self) -> Option<Vec<(String, String)>> {
         (**self).document_element_attributes()
     }
@@ -108,6 +131,9 @@ impl EventHandler for Box<dyn EventHandler> {
 impl EventHandler for &mut dyn EventHandler {
     fn take_pending_rerender(&mut self) -> Option<String> {
         (**self).take_pending_rerender()
+    }
+    fn take_pending_patches(&mut self) -> Vec<DomPatch> {
+        (**self).take_pending_patches()
     }
     fn document_element_attributes(&mut self) -> Option<Vec<(String, String)>> {
         (**self).document_element_attributes()

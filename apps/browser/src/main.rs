@@ -2443,6 +2443,15 @@ impl NavigationProvider for BrowserNavProvider {
                 match command {
                     "back" => history.back(),
                     "forward" => history.forward(),
+                    // The first page (the start page, or a kiosk's app), as a
+                    // new step: Back returns to where it was asked from.
+                    "home" => {
+                        let home = history.entries.first().cloned();
+                        if let Some(home) = &home {
+                            history.push(home);
+                        }
+                        home
+                    }
                     "reload" => {
                         let current = history.current();
                         PAGE_CACHE.lock().unwrap().remove(&current);
@@ -2868,7 +2877,7 @@ fn inline_images(html: &str, base_url: &str) -> String {
 /// `https://en.wikipedia.org//upload.wikimedia.org/...` -- why Wikipedia's
 /// article images never loaded. It also matched inside `data-src="`, and put
 /// bare relative paths at the site root rather than beside the page.
-fn make_urls_absolute(html: &str, page_url: &str) -> String {
+pub(crate) fn make_urls_absolute(html: &str, page_url: &str) -> String {
     let Ok(base) = url::Url::parse(page_url) else {
         return html.to_string();
     };

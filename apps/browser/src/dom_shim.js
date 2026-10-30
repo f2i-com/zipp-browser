@@ -1782,7 +1782,12 @@ var __locUrl = {};
 })();
 // DOM_SHIM URL parsed: pathname available for React Router
 var loc = {
-    href: __pageUrl,
+    _href: __pageUrl,
+    // Setting it goes there, as `assign` does: it used to be a plain property,
+    // so `location.href = "/next.html"` -- how most pages navigate -- only
+    // changed the string.
+    get href() { return this._href; },
+    set href(v) { this.assign(v); },
     protocol: __locUrl.protocol || "https:",
     host: __locUrl.hostname + (__locUrl.port ? ":" + __locUrl.port : ""),
     hostname: __locUrl.hostname || "",
@@ -1792,12 +1797,19 @@ var loc = {
     hash: __locUrl.hash || "",
     origin: __locUrl.origin || (__locUrl.protocol + "//" + __locUrl.hostname + (__locUrl.port ? ":" + __locUrl.port : "")),
     // These only wrote to a plain `href` property that nothing observed, so
-    // script-driven navigation silently did nothing.
-    assign: function(url) { this.href = url; if(url) { try { __zippHostCall("navigate", String(url)); } catch(e) {} } },
-    replace: function(url) { this.href = url; if(url) { try { __zippHostCall("navigate", String(url)); } catch(e) {} } },
-    reload: function() {},
-    toString: function() { return this.href; }
+    // script-driven navigation silently did nothing. A fragment alone ("#top")
+    // moves within the page, without loading it again.
+    assign: function(url) { __locationGo(url); },
+    replace: function(url) { __locationGo(url); },
+    reload: function() { try { __zippHostCall("navigate", String(this._href)); } catch(e) {} },
+    toString: function() { return this._href; }
 };
+function __locationGo(url) {
+    if (url == null || url === "") return;
+    url = String(url);
+    if (url.charAt(0) === "#") { __historyMove(url); return; }
+    try { __zippHostCall("navigate", url); } catch(e) {}
+}
 
 // `pushState`/`replaceState`: the URL moves, resolved against the current one
 // -- `href`, path, query and fragment. Only `pathname` used to, set to the
@@ -1807,7 +1819,7 @@ function __historyMove(u) {
     if (u == null || u === "") return;
     var p;
     try { p = JSON.parse(__zippHostCall("url", String(u), String(loc.href))); } catch (e) { return; }
-    loc.href = p.href; loc.pathname = p.pathname; loc.search = p.search; loc.hash = p.hash;
+    loc._href = p.href; loc.pathname = p.pathname; loc.search = p.search; loc.hash = p.hash;
 }
 
 var _rafId=0, _tid=1000;
@@ -2701,6 +2713,18 @@ var location = loc;
 // property really was on `globalThis` and the bare read still threw.
 var innerWidth = window.innerWidth;
 var innerHeight = window.innerHeight;
+// The viewport is now this size (the host calls it: a new screen mode, a
+// resized window): what the page reads of it, and a `resize` event.
+function __zippViewportResized(w, h) {
+    window.innerWidth = window.outerWidth = innerWidth = outerWidth = w;
+    window.innerHeight = window.outerHeight = innerHeight = outerHeight = h;
+    var s = window.screen;
+    s.width = s.availWidth = w;
+    s.height = s.availHeight = h;
+    var ev = new Event("resize");
+    try { window.dispatchEvent(ev); } catch (e) {}
+    if (typeof window.onresize === "function") { try { window.onresize(ev); } catch (e) {} }
+}
 var outerWidth = window.outerWidth;
 var outerHeight = window.outerHeight;
 var devicePixelRatio = window.devicePixelRatio;
@@ -2830,21 +2854,139 @@ function __serializeNode(node) {
     return r;
 }
 
-// The page as script left it, when that is what to show: once script filled
+// Whether the page is drawn from the script's tree: once script filled
 // `#root`, or once a canvas draws (its frames reach the element through the
 // serialised tree's `data-flid`). Otherwise the page's own HTML is shown.
-function __getRenderedHTML() {
+function __drawnFromScript() {
     var root = doc.getElementById("root");
-    if(root && root.childNodes.length > 0) return __serializeNode(doc.body);
+    if(root && root.childNodes.length > 0) return true;
     // An app on this machine (a file: page) that changes the page its HTML
     // made -- a status line's text, a list it fills -- is drawn from the
     // script's tree from then on. A web page keeps the HTML it came with
     // until its script fills #root or draws on a canvas.
-    if(__locUrl.protocol === "file:" && __domMutations !== __zippSeedMutations) return __serializeNode(doc.body);
+    if(__locUrl.protocol === "file:" && __domMutations !== __zippSeedMutations) return true;
     // A canvas drawing in the page -- not one kept off it to measure text or
     // test emoji, which many pages make and never show.
-    if(typeof __zippCanvasContexts !== "undefined" && __zippCanvasContexts.some(function(c){return c.canvas && c.canvas.isConnected;})) return __serializeNode(doc.body);
-    return null;
+    if(typeof __zippCanvasContexts !== "undefined" && __zippCanvasContexts.some(function(c){return c.canvas && c.canvas.isConnected;})) return true;
+    return false;
+}
+
+// The page as script left it, when that is what to show.
+function __getRenderedHTML() {
+    return __drawnFromScript() ? __renderWhole() : null;
+}
+
+// ---- Drawing the page in pieces -------------------------------------------
+// Each element drawn remembers what it was drawn with: its attributes (`_ra`)
+// and its children (`_rk`), or its whole markup (`_rf`) where it is drawn
+// whole (an <svg>, a <textarea> showing its value). __zippRenderPatch
+// compares the tree with that and says what changed, so the host changes
+// those nodes in place. Moving a window is one attribute: re-parsing,
+// restyling and laying out the whole page for it made dragging slow.
+
+var __drawnBody = null;
+
+// The body, all of it, remembered as drawn.
+function __renderWhole() {
+    var html = __serializeNode(doc.body);
+    __remember(doc.body);
+    __drawnBody = doc.body;
+    return html;
+}
+
+function __tagOf(node) { return (node.tagName||node.nodeName||"div").toLowerCase(); }
+
+function __drawnWhole(node, tag) {
+    return tag === "svg" || (tag === "textarea" && node._value !== undefined);
+}
+
+// The attributes as __serializeNode writes them, as [name, value] pairs.
+function __attrPairs(node, tag) {
+    var out = [];
+    if (node.id) out.push(["id", String(node.id)]);
+    if (node.className) out.push(["class", String(node.className)]);
+    var fieldValue = (tag==="input"||tag==="textarea") && node._value!==undefined && !/^file$/i.test(node.attributes.type||"");
+    for (var k in node.attributes) {
+        if (k==="id"||k==="class"||k==="style") continue;
+        if (k==="value"&&fieldValue&&tag==="input") continue;
+        out.push([k, String(node.attributes[k])]);
+    }
+    if (fieldValue && tag==="input") out.push(["value", String(node._value)]);
+    var st=(node.attributes&&node.attributes.style?String(node.attributes.style).replace(/;?\s*$/,";"):"")+(node.style?__styleText(node.style):"");
+    if (st!==""&&st!==";") out.push(["style", st]);
+    out.push(["data-flid", String(node._id)]);
+    return out;
+}
+function __attrSig(pairs) {
+    var s = "";
+    for (var i = 0; i < pairs.length; i++) s += pairs[i][0] + "\u0001" + pairs[i][1] + "\u0002";
+    return s;
+}
+// The children: elements by number, text by what it says.
+function __kidsSig(node) {
+    var s = "";
+    for (var i = 0; i < node.childNodes.length; i++) {
+        var c = node.childNodes[i];
+        if (c.nodeType === 1) s += "\u0001" + c._id;
+        else if (c.nodeType === 3) s += (c._html ? "\u0003" : "\u0002") + (c.data || "");
+    }
+    return s;
+}
+
+// Remember an element, and what is in it, as drawn now.
+function __remember(node) {
+    var tag = __tagOf(node);
+    if (__drawnWhole(node, tag)) { node._rf = __serializeNode(node); return; }
+    node._ra = __attrSig(__attrPairs(node, tag));
+    node._rk = __kidsSig(node);
+    for (var i = 0; i < node.childNodes.length; i++) {
+        if (node.childNodes[i].nodeType === 1) __remember(node.childNodes[i]);
+    }
+}
+
+// Its children drawn again, from their markup.
+function __redrawKids(node, ops) {
+    var h = "";
+    for (var i = 0; i < node.childNodes.length; i++) h += __serializeNode(node.childNodes[i]);
+    ops.push(["k", node._id, h]);
+    node._rk = __kidsSig(node);
+    for (var j = 0; j < node.childNodes.length; j++) {
+        if (node.childNodes[j].nodeType === 1) __remember(node.childNodes[j]);
+    }
+}
+
+// Bring a drawn element up to date with patches; false when it is drawn
+// whole and changed, for its parent to draw its children again.
+function __patchNode(node, ops) {
+    var tag = __tagOf(node);
+    if (__drawnWhole(node, tag)) return node._rf === __serializeNode(node);
+    var pairs = __attrPairs(node, tag), a = __attrSig(pairs);
+    if (a !== node._ra) { ops.push(["a", node._id, pairs]); node._ra = a; }
+    if (__kidsSig(node) !== node._rk) { __redrawKids(node, ops); return true; }
+    for (var i = 0; i < node.childNodes.length; i++) {
+        var c = node.childNodes[i];
+        if (c.nodeType === 1 && !__patchNode(c, ops)) { __redrawKids(node, ops); return true; }
+    }
+    return true;
+}
+
+// What to draw: null for nothing, a JSON list of patches
+// (["a", flid, [[name, value], ...]] an element's attributes, ["k", flid,
+// html] its children), or the whole body's markup the first time, or when
+// the body's own attributes or children changed.
+function __zippRenderPatch() {
+    if (!__drawnFromScript()) return null;
+    var body = doc.body;
+    if (__drawnBody !== body || body._ra === undefined) return __renderWhole();
+    if (__attrSig(__attrPairs(body, "body")) !== body._ra || __kidsSig(body) !== body._rk) return __renderWhole();
+    var ops = [];
+    for (var i = 0; i < body.childNodes.length; i++) {
+        var c = body.childNodes[i];
+        if (c.nodeType === 1 && !__patchNode(c, ops)) return __renderWhole();
+    }
+    if (!ops.length) return null;
+    if (ops.length > 400) return __renderWhole();
+    return JSON.stringify(ops);
 }
 
 // Return a JSON string mapping JS node IDs to their event types.

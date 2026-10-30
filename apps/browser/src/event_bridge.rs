@@ -104,6 +104,9 @@ pub struct JsEventBridge {
     /// If a click handler caused a DOM update, this holds the new HTML.
     /// The shell should check this after event dispatch and re-render if set.
     pub pending_rerender: Option<String>,
+    /// Changes to the drawn page, for the shell to make in place
+    /// (`take_pending_patches`): what changed since it was last drawn.
+    pending_patches: Vec<zipp_dom::DomPatch>,
     /// A `focus()` on an element not shown yet (made by the same listener):
     /// given when the re-render that shows it lands.
     pending_focus: Option<u32>,
@@ -131,6 +134,9 @@ pub struct JsEventBridge {
     scrollers: Option<Vec<usize>>,
     /// What the script was last told of each one (`Node::scroll_metrics`).
     scroll_metrics: HashMap<u32, [f64; 6]>,
+    /// The viewport's size as the script was last told it (`innerWidth`,
+    /// `innerHeight`); `None` until the first task.
+    viewport_told: Option<(u32, u32)>,
     /// A hash of the tree as last rendered: background work (timers, worker
     /// messages) compares against it, which sees every kind of change.
     rendered_hash: Option<u64>,
@@ -168,6 +174,7 @@ impl JsEventBridge {
             reverse_flid,
             js_state,
             pending_rerender: None,
+            pending_patches: Vec::new(),
             pending_focus: None,
             page_url: page_url.to_string(),
             started: std::time::Instant::now(),
@@ -177,6 +184,7 @@ impl JsEventBridge {
             rendered_mutations: 0.0,
             scrollers: None,
             scroll_metrics: HashMap::new(),
+            viewport_told: None,
             rendered_hash: None,
             console_shown: 0,
             console_refreshed: Instant::now(),
@@ -219,32 +227,90 @@ impl JsEventBridge {
         // queued the re-render at this point.
         run_page_tasks(state, 400, 2, std::time::Duration::from_secs(1));
         print_console(state);
-        if let Ok(JsValue::String(new_html)) =
-            state.call_global("__getRenderedHTML", &[])
-        {
-            if !new_html.is_empty() {
-                // `__getRenderedHTML` returns the page's own
-                // <body> element; its contents replace the
-                // document body's. Relative URLs need
-                // re-absolutising: the initial render did it,
-                // and without it images broke on the first
-                // click. The <html> attributes (the theme)
-                // travel separately, through
-                // `document_element_attributes`.
-                let rebuilt =
-                    crate::rerender_body(&new_html, &self.page_url);
-                eprintln!(
-                    "[EVENT] DOM updated after click ({} bytes)",
-                    rebuilt.len()
-                );
-                if let Ok(path) = std::env::var("ZIPP_DUMP_RERENDER") {
-                    let _ = std::fs::write(&path, &rebuilt);
-                }
-                self.pending_rerender = Some(rebuilt);
-            }
-        }
+        self.collect_render(false);
         self.note_rendered();
         self.refresh_next_timer();
+    }
+
+    /// What the page changed since it was last drawn, ready for the shell:
+    /// patches for the elements that changed, or the whole body (the first
+    /// time, or when the body's own attributes or children changed), which
+    /// `check_hash` skips when it is what was drawn already.
+    fn collect_render(&mut self, check_hash: bool) {
+        let Some(state) = self.js_state.as_mut() else {
+            return;
+        };
+        let Ok(JsValue::String(out)) = state.call_global("__zippRenderPatch", &[]) else {
+            return;
+        };
+        if out.starts_with('[') {
+            let ops: Vec<serde_json::Value> = match serde_json::from_str(&out) {
+                Ok(ops) => ops,
+                Err(e) => {
+                    eprintln!("[EVENT] the page's changes were not readable: {e}");
+                    return;
+                }
+            };
+            let base = url::Url::parse(&self.page_url).ok();
+            for op in ops {
+                let Some(flid) = op[1].as_u64().map(|n| n as u32) else {
+                    continue;
+                };
+                match op[0].as_str() {
+                    Some("a") => {
+                        let attrs = op[2]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|pair| {
+                                let name = pair[0].as_str()?.to_string();
+                                let mut value = pair[1].as_str()?.to_string();
+                                // As the whole body's markup has them: absolute.
+                                if matches!(name.as_str(), "src" | "href" | "poster" | "action")
+                                    && let Some(full) = base.as_ref().and_then(|b| b.join(&value).ok())
+                                {
+                                    value = full.to_string();
+                                }
+                                Some((name, value))
+                            })
+                            .collect();
+                        self.pending_patches.push(zipp_dom::DomPatch::Attributes { flid, attrs });
+                    }
+                    Some("k") => {
+                        let html = crate::make_urls_absolute(op[2].as_str().unwrap_or(""), &self.page_url);
+                        self.pending_patches.push(zipp_dom::DomPatch::Children { flid, html });
+                    }
+                    _ => {}
+                }
+            }
+            // What is drawn is no longer any body's markup as a whole.
+            self.rendered_hash = None;
+            return;
+        }
+        if out.is_empty() {
+            return;
+        }
+        if check_hash {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            out.hash(&mut hasher);
+            let hash = hasher.finish();
+            if self.rendered_hash == Some(hash) {
+                return;
+            }
+            self.rendered_hash = Some(hash);
+        }
+        // `__zippRenderPatch` gives the page's own <body> element; its
+        // contents replace the document body's, its relative URLs made
+        // absolute as the first render's were. The <html> attributes (the
+        // theme) travel separately (`document_element_attributes`).
+        let rebuilt = crate::rerender_body(&out, &self.page_url);
+        if let Ok(path) = std::env::var("ZIPP_DUMP_RERENDER") {
+            let _ = std::fs::write(&path, &rebuilt);
+        }
+        self.pending_rerender = Some(rebuilt);
+        // Changes from before it are in it.
+        self.pending_patches.clear();
     }
 
     /// Hand the page what was picked in a file dialog -- `value` is zipp-dom's
@@ -411,22 +477,7 @@ impl JsEventBridge {
         };
         run_page_tasks(state, 250, 0, std::time::Duration::from_millis(250));
         print_console(state);
-        if let Ok(JsValue::String(html)) = state.call_global("__getRenderedHTML", &[])
-            && !html.is_empty()
-        {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            html.hash(&mut hasher);
-            let hash = hasher.finish();
-            if self.rendered_hash != Some(hash) {
-                self.rendered_hash = Some(hash);
-                let rebuilt = crate::rerender_body(&html, &self.page_url);
-                if let Ok(path) = std::env::var("ZIPP_DUMP_RERENDER") {
-                    let _ = std::fs::write(&path, &rebuilt);
-                }
-                self.pending_rerender = Some(rebuilt);
-            }
-        }
+        self.collect_render(true);
         self.note_rendered();
         self.refresh_next_timer();
     }
@@ -539,11 +590,7 @@ impl EventHandler for JsEventBridge {
         }
         // The frame changed the DOM as well: lay the page out again.
         if flags & 2 != 0 {
-            if let Ok(JsValue::String(html)) = state.call_global("__getRenderedHTML", &[]) {
-                if !html.is_empty() {
-                    self.pending_rerender = Some(crate::rerender_body(&html, &self.page_url));
-                }
-            }
+            self.collect_render(false);
         }
         self.note_rendered();
         self.refresh_next_timer();
@@ -752,6 +799,25 @@ impl EventHandler for JsEventBridge {
     fn run_tasks(&mut self, doc: &mut BaseDocument) -> Option<Instant> {
         let _layout = LayoutScope::enter(doc);
         let now = Instant::now();
+        // The viewport changed size (the screen's new mode, a resized
+        // window): the script's innerWidth and innerHeight follow, and it
+        // hears `resize`.
+        let viewport = doc.viewport();
+        let size = (
+            (viewport.window_size.0 as f32 / viewport.scale()).round() as u32,
+            (viewport.window_size.1 as f32 / viewport.scale()).round() as u32,
+        );
+        if self.viewport_told.is_some_and(|told| told != size) && size.0 > 0 && size.1 > 0 {
+            if let Some(state) = self.js_state.as_mut() {
+                let args = [JsValue::Number(size.0 as f64), JsValue::Number(size.1 as f64)];
+                if let Err(e) = state.call_global("__zippViewportResized", &args) {
+                    eprintln!("[ZIPP] telling the page its new size failed: {e}");
+                }
+                state.run_microtasks();
+            }
+            self.run_due_work();
+        }
+        self.viewport_told = Some(size);
         // What the page's workers sent: each message is a task of its own.
         let messages = crate::worker::take_messages();
         if !messages.is_empty() {
@@ -875,6 +941,10 @@ impl EventHandler for JsEventBridge {
 
     fn take_pending_rerender(&mut self) -> Option<String> {
         self.pending_rerender.take()
+    }
+
+    fn take_pending_patches(&mut self) -> Vec<zipp_dom::DomPatch> {
+        std::mem::take(&mut self.pending_patches)
     }
 
     /// The attributes the page currently has on `<html>`.

@@ -6,7 +6,7 @@ mod pointer;
 
 use crate::util::Point;
 use crate::traits_src::events::{DomEvent, DomEventData, PointerCoords, UiEvent};
-pub use driver::{EventDriver, EventHandler, NoopEventHandler};
+pub use driver::{DomPatch, EventDriver, EventHandler, NoopEventHandler};
 use focus::generate_focus_events;
 pub(crate) use ime::handle_ime_event;
 pub(crate) use keyboard::handle_keypress;

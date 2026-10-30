@@ -498,6 +498,8 @@ where
                         let command = match key_code {
                             KeyCode::ArrowLeft if alt => Some("back"),
                             KeyCode::ArrowRight if alt => Some("forward"),
+                            KeyCode::Home if alt => Some("home"),
+                            KeyCode::BrowserHome => Some("home"),
                             KeyCode::BrowserBack => Some("back"),
                             KeyCode::BrowserForward => Some("forward"),
                             KeyCode::F5 | KeyCode::BrowserRefresh => Some("reload"),
