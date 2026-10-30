@@ -1861,6 +1861,31 @@ impl skrifa::outline::OutlinePen for GlyphOutlinePen<'_> {
 // TinySkiaWindowRenderer -- softbuffer presentation (works without GPU / on RDP)
 // ============================================================================
 
+/// How the picture goes onto the screen: the quarter turns clockwise it is
+/// turned by (a panel mounted on its side, as a GPD Win Max's is), and the
+/// size of the screen's buffers then -- the picture's turned, or wider where
+/// a driver pads its rows. (0, 0, 0) for a picture shown as it is.
+static SCREEN_TRANSFORM: std::sync::Mutex<(u8, u32, u32)> = std::sync::Mutex::new((0, 0, 0));
+
+/// Turn what windows draw by `rotation` quarter turns clockwise onto buffers
+/// of `width` x `height` (zipp-kms says both). The window's own size, which
+/// the page is laid out at, is the picture's.
+pub fn set_screen_transform(rotation: u8, width: u32, height: u32) {
+    *SCREEN_TRANSFORM.lock().unwrap_or_else(|e| e.into_inner()) = (rotation % 4, width, height);
+}
+
+fn screen_transform() -> (u8, u32, u32) {
+    *SCREEN_TRANSFORM.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The surface's size for a picture of `width` x `height`: the screen's
+/// buffers' when the picture is turned.
+fn surface_size(width: u32, height: u32) -> (NonZeroU32, NonZeroU32) {
+    let (rotation, bw, bh) = screen_transform();
+    let (w, h) = if rotation != 0 && bw > 0 && bh > 0 { (bw, bh) } else { (width, height) };
+    (NonZeroU32::new(w.max(1)).unwrap(), NonZeroU32::new(h.max(1)).unwrap())
+}
+
 /// Window renderer that uses [`TinySkiaPainter`] for CPU rasterization and
 /// [`softbuffer`] for presenting the framebuffer to the OS window surface.
 ///
@@ -1902,10 +1927,8 @@ impl WindowRenderer for TinySkiaWindowRenderer {
 
         let ctx = softbuffer::Context::new(window.clone()).unwrap();
         let mut surface = softbuffer::Surface::new(&ctx, window).unwrap();
-        let _ = surface.resize(
-            NonZeroU32::new(width.max(1)).unwrap(),
-            NonZeroU32::new(height.max(1)).unwrap(),
-        );
+        let (w, h) = surface_size(width, height);
+        let _ = surface.resize(w, h);
 
         self.context = Some(ctx);
         self.surface = Some(surface);
@@ -1929,10 +1952,8 @@ impl WindowRenderer for TinySkiaWindowRenderer {
         self.painter.resize(width, height);
 
         if let Some(ref mut surface) = self.surface {
-            let _ = surface.resize(
-                NonZeroU32::new(width.max(1)).unwrap(),
-                NonZeroU32::new(height.max(1)).unwrap(),
-            );
+            let (w, h) = surface_size(width, height);
+            let _ = surface.resize(w, h);
         }
     }
 
@@ -1954,12 +1975,34 @@ impl WindowRenderer for TinySkiaWindowRenderer {
         // Convert RGBA (tiny-skia) to BGR0 (softbuffer)
         let rgba_pixels = self.painter.pixmap.data();
         let pixel_count = buffer.len().min((self.width * self.height) as usize);
+        let (rotation, buffer_width, _) = screen_transform();
 
-        for (i, chunk) in rgba_pixels.chunks_exact(4).enumerate().take(pixel_count) {
-            // Pack as 0x00RRGGBB (red in bits 16-23, green in 8-15, blue in 0-7)
-            buffer[i] = ((chunk[0] as u32) << 16)
-                | ((chunk[1] as u32) << 8)
-                | (chunk[2] as u32);
+        if rotation == 0 {
+            for (i, chunk) in rgba_pixels.chunks_exact(4).enumerate().take(pixel_count) {
+                // Pack as 0x00RRGGBB (red in bits 16-23, green in 8-15, blue in 0-7)
+                buffer[i] = ((chunk[0] as u32) << 16)
+                    | ((chunk[1] as u32) << 8)
+                    | (chunk[2] as u32);
+            }
+        } else {
+            // Turned onto the panel as it copies: the picture's (x, y) is the
+            // panel's (px, py), the panel's own size being the picture's turned.
+            let (lw, lh) = (self.width as usize, self.height as usize);
+            let (pw, ph) = if rotation % 2 == 1 { (lh, lw) } else { (lw, lh) };
+            let stride = buffer_width as usize;
+            let len = buffer.len();
+            for (i, chunk) in rgba_pixels.chunks_exact(4).enumerate().take(lw * lh) {
+                let (x, y) = (i % lw, i / lw);
+                let (px, py) = match rotation {
+                    1 => (pw - 1 - y, x),
+                    2 => (pw - 1 - x, ph - 1 - y),
+                    _ => (y, ph - 1 - x),
+                };
+                let at = py * stride + px;
+                if at < len {
+                    buffer[at] = ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | (chunk[2] as u32);
+                }
+            }
         }
 
         let _ = buffer.present();

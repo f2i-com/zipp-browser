@@ -12,6 +12,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use drm::buffer::DrmFourcc;
 use drm::control::dumbbuffer::DumbBuffer;
@@ -45,6 +46,12 @@ pub struct Display {
     /// The mode set and what goes with it; a new mode (`set_size`) replaces it.
     screen: Mutex<Screen>,
     pointer: Pointer,
+    /// Quarter turns clockwise the picture is turned to stand upright on the
+    /// panel (0-3): ZIPP_KMS_ROTATE's, or the panel's own.
+    rotation: AtomicU8,
+    /// The panel's own: how it is mounted (the kernel knows it per model,
+    /// a GPD Win Max's portrait panel lying on its side, say). "auto".
+    panel_rotation: u8,
 }
 
 #[derive(Debug)]
@@ -154,7 +161,12 @@ impl Display {
             })
             .ok_or_else(|| io::Error::other("no plane for the CRTC"))?;
 
-        let pointer = Pointer::new(&card, crtc);
+        let panel_rotation = panel_rotation(&card, connector.handle());
+        let rotation = match std::env::var("ZIPP_KMS_ROTATE").ok().as_deref().and_then(rotation_named) {
+            Some(r) => r,
+            None => panel_rotation,
+        };
+        let pointer = Pointer::new(&card, crtc, rotation);
         eprintln!(
             "[kms] {}: {} {}x{}@{} (drawn at {}x{}, pitch {pitch}), {} cursor",
             path.display(),
@@ -166,6 +178,9 @@ impl Display {
             mode_h,
             if pointer.is_hardware() { "hardware" } else { "software" },
         );
+        if rotation != 0 || panel_rotation != 0 {
+            eprintln!("[kms] turned {} degrees (the panel's own: {})", rotation as u32 * 90, panel_rotation as u32 * 90);
+        }
 
         let driver = card.get_driver().map(|d| d.name().to_string_lossy().into_owned()).unwrap_or_default();
         Ok(Display {
@@ -176,6 +191,8 @@ impl Display {
             driver,
             screen: Mutex::new(Screen { mode, size: (width, mode_h), scanout: (scanout, fb) }),
             pointer,
+            rotation: AtomicU8::new(rotation),
+            panel_rotation,
             card,
         })
     }
@@ -185,16 +202,61 @@ impl Display {
     }
 
     /// The size the application draws at, in pixels: the mode's, or wider
-    /// where the driver pads its rows.
+    /// where the driver pads its rows. Turned, the picture's own size (the
+    /// renderer turns it onto the panel, padding and all).
     pub fn size(&self) -> (u32, u32) {
+        if self.rotation() != 0 {
+            return self.visible_size();
+        }
         self.screen().size
     }
 
-    /// The size of what is shown: the mode's. Input and layout go by this.
+    /// The size of what is shown: the mode's, turned as the picture is.
+    /// Input and layout go by this.
     pub fn visible_size(&self) -> (u32, u32) {
+        let (w, h) = self.panel_size();
+        if self.rotation() % 2 == 1 { (h, w) } else { (w, h) }
+    }
+
+    /// The panel's own size, as the mode has it.
+    pub fn panel_size(&self) -> (u32, u32) {
         let (w, h) = self.screen().mode.size();
         (w as u32, h as u32)
     }
+
+    /// The size of the buffers scanned out: the mode's, or wider where the
+    /// driver pads its rows.
+    pub fn buffer_size(&self) -> (u32, u32) {
+        self.screen().size
+    }
+
+    /// Quarter turns clockwise the picture is turned by (0-3).
+    pub fn rotation(&self) -> u8 {
+        self.rotation.load(Ordering::Relaxed)
+    }
+
+    /// The panel's own turn: what "auto" gives.
+    pub fn panel_rotation(&self) -> u8 {
+        self.panel_rotation
+    }
+
+    pub(crate) fn set_rotation(&self, rotation: u8) {
+        self.rotation.store(rotation % 4, Ordering::Relaxed);
+        self.pointer.set_rotation(&self.card, self.crtc, rotation % 4);
+    }
+
+    /// Where a point of the picture is on the panel.
+    pub(crate) fn to_panel(&self, x: i32, y: i32) -> (i32, i32) {
+        let (pw, ph) = self.panel_size();
+        let (pw, ph) = (pw as i32, ph as i32);
+        match self.rotation() {
+            1 => (pw - 1 - y, x),
+            2 => (pw - 1 - x, ph - 1 - y),
+            3 => (y, ph - 1 - x),
+            _ => (x, y),
+        }
+    }
+
 
     /// Show the screen at `width` x `height` from now on: the window a
     /// virtual machine is shown in was resized. The output's own mode of that
@@ -221,7 +283,9 @@ impl Display {
         Ok(())
     }
 
+    /// The pointer moved to (x, y) of the picture.
     pub(crate) fn pointer_moved(&self, x: i32, y: i32) {
+        let (x, y) = self.to_panel(x, y);
         self.pointer.move_to(&self.card, self.crtc, x, y);
     }
 
@@ -233,6 +297,42 @@ impl Display {
     pub(crate) fn frame_presented(&self) {
         self.pointer.frame_presented(&self.card, self.crtc);
     }
+}
+
+/// "0", "90", "180", "270" (degrees clockwise) as quarter turns; "auto" (or
+/// anything else) as none, for the panel's own.
+pub fn rotation_named(name: &str) -> Option<u8> {
+    match name.trim() {
+        "0" => Some(0),
+        "90" => Some(1),
+        "180" => Some(2),
+        "270" => Some(3),
+        _ => None,
+    }
+}
+
+/// How the panel is mounted, from the connector's "panel orientation"
+/// (which the kernel sets from its quirks): the quarter turns clockwise that
+/// stand the picture upright on it.
+fn panel_rotation(card: &Card, connector: connector::Handle) -> u8 {
+    let Ok(props) = card.get_properties(connector) else {
+        return 0;
+    };
+    for (&id, &value) in props.iter() {
+        let Ok(info) = card.get_property(id) else {
+            continue;
+        };
+        if info.name().to_bytes() == b"panel orientation" {
+            // Normal, Upside Down, Left Side Up, Right Side Up.
+            return match value {
+                1 => 2,
+                2 => 3,
+                3 => 1,
+                _ => 0,
+            };
+        }
+    }
+    0
 }
 
 /// A black buffer of the mode's size, scanned out by the CRTC with the mode.

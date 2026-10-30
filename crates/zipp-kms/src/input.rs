@@ -119,6 +119,8 @@ struct Device {
     touch: Option<bool>,
     /// A touchpad's last position while a finger is down, for its motion.
     pad_last: Option<(i32, i32)>,
+    /// Where an absolute device last put the pointer, on the panel.
+    panel_pos: (f64, f64),
 }
 
 impl Device {
@@ -185,6 +187,7 @@ impl Device {
             abs: (None, None),
             touch: None,
             pad_last: None,
+            panel_pos: (0.0, 0.0),
         })
     }
 }
@@ -193,6 +196,12 @@ pub(crate) struct Input {
     devices: Vec<Device>,
     inotify: Option<OwnedFd>,
     screen: (f64, f64),
+    /// The panel's own size, and the quarter turns clockwise the picture is
+    /// turned by on it: a touchscreen or a tablet reports where on the
+    /// panel, which the picture's point is turned from. (A mouse's or a
+    /// touchpad's movement is the user's, whichever way the panel lies.)
+    panel: (f64, f64),
+    rotation: u8,
     pub(crate) pointer: (f64, f64),
     /// Whether the pointer last moved by touch rather than by a mouse.
     pub(crate) touched: bool,
@@ -211,6 +220,8 @@ impl Input {
             devices: Vec::new(),
             inotify,
             screen: (screen.0 as f64, screen.1 as f64),
+            panel: (screen.0 as f64, screen.1 as f64),
+            rotation: 0,
             pointer: (screen.0 as f64 / 2.0, screen.1 as f64 / 2.0),
             touched: false,
             mods: ModifiersKeys::empty(),
@@ -387,9 +398,12 @@ impl Input {
         self.event(index, report(), out);
     }
 
-    /// The screen is now this size: the pointer stays on it.
-    pub(crate) fn set_screen(&mut self, screen: (u32, u32)) {
+    /// The screen is now this size (the picture's), on a panel of that size
+    /// turned that way: the pointer stays on it.
+    pub(crate) fn set_screen(&mut self, screen: (u32, u32), panel: (u32, u32), rotation: u8) {
         self.screen = (screen.0 as f64, screen.1 as f64);
+        self.panel = (panel.0 as f64, panel.1 as f64);
+        self.rotation = rotation % 4;
         self.pointer = (self.pointer.0.min(self.screen.0 - 1.0), self.pointer.1.min(self.screen.1 - 1.0));
     }
 
@@ -426,13 +440,25 @@ impl Input {
                     device.pad_last = Some(now);
                 }
             } else {
+                // Where on the panel, then where in the picture turned on it.
+                let (pw, ph) = self.panel;
                 if let Some(x) = ax {
-                    self.pointer.0 = ((x - x0) as f64 * (w - 1.0) / (x1 - x0) as f64).clamp(0.0, w - 1.0);
+                    device.panel_pos.0 = ((x - x0) as f64 * (pw - 1.0) / (x1 - x0) as f64).clamp(0.0, pw - 1.0);
                     moved = true;
                 }
                 if let Some(y) = ay {
-                    self.pointer.1 = ((y - y0) as f64 * (h - 1.0) / (y1 - y0) as f64).clamp(0.0, h - 1.0);
+                    device.panel_pos.1 = ((y - y0) as f64 * (ph - 1.0) / (y1 - y0) as f64).clamp(0.0, ph - 1.0);
                     moved = true;
+                }
+                if moved {
+                    let (px, py) = device.panel_pos;
+                    let (x, y) = match self.rotation {
+                        1 => (py, pw - 1.0 - px),
+                        2 => (pw - 1.0 - px, ph - 1.0 - py),
+                        3 => (ph - 1.0 - py, px),
+                        _ => (px, py),
+                    };
+                    self.pointer = (x.clamp(0.0, w - 1.0), y.clamp(0.0, h - 1.0));
                 }
             }
             device.abs = (None, None);

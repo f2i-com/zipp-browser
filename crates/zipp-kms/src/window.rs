@@ -76,7 +76,8 @@ impl Window for KmsWindow {
     fn safe_area(&self) -> PhysicalInsets<u32> {
         // A widened row pitch leaves columns past the mode's right edge that
         // are drawn but never shown.
-        let hidden = self.shared.display.size().0 - self.shared.display.visible_size().0;
+        // (Turned, the renderer fills the panel's rows itself.)
+        let hidden = self.shared.display.size().0.saturating_sub(self.shared.display.visible_size().0);
         PhysicalInsets::new(0, 0, 0, hidden)
     }
 

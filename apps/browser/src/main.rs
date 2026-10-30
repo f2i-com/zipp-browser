@@ -378,10 +378,16 @@ impl Screen {
 /// The screen for `--kiosk`: the first DRM device with a connected output.
 #[cfg(target_os = "linux")]
 fn open_kms() -> zipp_kms::EventLoop {
-    zipp_kms::EventLoop::new().unwrap_or_else(|e| {
+    let event_loop = zipp_kms::EventLoop::new().unwrap_or_else(|e| {
         eprintln!("[BROWSER] cannot take the screen: {e}");
         std::process::exit(1);
-    })
+    });
+    // A panel mounted on its side (or one turned by hand): the page is laid
+    // out at the picture's size and the renderer turns it onto the panel.
+    let (rotation, (width, height)) = event_loop.screen_transform();
+    zipp_renderer::tinyskia::set_screen_transform(rotation, width, height);
+    zipp_kms::on_rotation(|rotation, (width, height)| zipp_renderer::tinyskia::set_screen_transform(rotation, width, height));
+    event_loop
 }
 
 /// Before the browser exits: write out what is waiting to be saved to the

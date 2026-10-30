@@ -48,7 +48,42 @@ mod pointer;
 mod vbox;
 mod window;
 
-pub use display::Display;
+pub use display::{Display, rotation_named};
+
+/// A turn asked for (`request_rotation`): 0-3 quarter turns, 4 the panel's
+/// own, 255 none.
+static ROTATION_ASKED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(255);
+/// The loop's wake-up, for `request_rotation` from any thread.
+static WAKE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+/// The screen's turn now, and the panel's own (quarter turns clockwise).
+static ROTATION_NOW: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static ROTATION_PANEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// Told of each turn: the quarter turns, and the size of the buffers the
+/// panel scans out (what a renderer turns its picture onto).
+static ON_ROTATION: std::sync::OnceLock<Box<dyn Fn(u8, (u32, u32)) + Send + Sync>> = std::sync::OnceLock::new();
+
+/// Turn the screen: `Some(0..=3)` quarter turns clockwise, or `None` for the
+/// panel's own (as the kernel knows the panel is mounted). Applied by the
+/// loop, which tells the window its new size.
+pub fn request_rotation(rotation: Option<u8>) {
+    ROTATION_ASKED.store(rotation.map_or(4, |r| r % 4), std::sync::atomic::Ordering::Relaxed);
+    let fd = WAKE_FD.load(std::sync::atomic::Ordering::Relaxed);
+    if fd >= 0 {
+        let one: u64 = 1;
+        unsafe { libc::write(fd, (&one as *const u64).cast(), 8) };
+    }
+}
+
+/// The screen's turn now and the panel's own, in quarter turns clockwise.
+pub fn rotation() -> (u8, u8) {
+    (ROTATION_NOW.load(std::sync::atomic::Ordering::Relaxed), ROTATION_PANEL.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Be told when the screen is turned: the quarter turns, and the size of the
+/// panel's buffers. Once.
+pub fn on_rotation(f: impl Fn(u8, (u32, u32)) + Send + Sync + 'static) {
+    let _ = ON_ROTATION.set(Box::new(f));
+}
 
 /// How long a presented frame may take to reach the screen before the next
 /// redraw goes ahead anyway (a redraw that presented nothing sends no flip).
@@ -187,7 +222,10 @@ impl EventLoop {
     /// `ZIPP_COLOR_SCHEME=dark` the theme the window reports.
     pub fn new() -> io::Result<EventLoop> {
         let display = Display::open()?;
-        let input = input::Input::new(display.visible_size());
+        let mut input = input::Input::new(display.visible_size());
+        input.set_screen(display.visible_size(), display.panel_size(), display.rotation());
+        ROTATION_NOW.store(display.rotation(), std::sync::atomic::Ordering::Relaxed);
+        ROTATION_PANEL.store(display.panel_rotation(), std::sync::atomic::Ordering::Relaxed);
         let wake_fd = unsafe {
             let fd = libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC);
             if fd < 0 {
@@ -207,6 +245,7 @@ impl EventLoop {
             wake_fd,
             pending_size: Mutex::new(None),
         });
+        WAKE_FD.store(shared.wake_fd.as_raw_fd(), std::sync::atomic::Ordering::Relaxed);
         // In VirtualBox the screen follows its window, unless a mode was
         // named (ZIPP_KMS_MODE).
         if std::env::var_os("ZIPP_KMS_MODE").is_none() {
@@ -231,6 +270,14 @@ impl EventLoop {
     /// The screen's size in pixels: what the application should lay out for.
     pub fn size(&self) -> (u32, u32) {
         self.target.shared.display.visible_size()
+    }
+
+    /// The quarter turns clockwise the picture is turned by onto the panel,
+    /// and the size of the buffers the panel scans out: what a renderer
+    /// drawing at `size()` turns its picture onto.
+    pub fn screen_transform(&self) -> (u8, (u32, u32)) {
+        let display = &self.target.shared.display;
+        (display.rotation(), display.buffer_size())
     }
 
     pub fn scale_factor(&self) -> f64 {
@@ -350,6 +397,24 @@ impl EventLoop {
                 app.proxy_wake_up(target);
             }
 
+            // A new turn for the picture on the panel: the window's new size.
+            let asked = ROTATION_ASKED.swap(255, Ordering::AcqRel);
+            if asked != 255 && let Some(id) = target.window.get() {
+                let display = &shared.display;
+                let rotation = if asked == 4 { display.panel_rotation() } else { asked };
+                display.set_rotation(rotation);
+                ROTATION_NOW.store(rotation, Ordering::Relaxed);
+                self.input.set_screen(display.visible_size(), display.panel_size(), rotation);
+                if let Some(f) = ON_ROTATION.get() {
+                    f(rotation, display.buffer_size());
+                }
+                let (dw, dh) = display.size();
+                eprintln!("[kms] turned {} degrees: {dw}x{dh}", rotation as u32 * 90);
+                app.window_event(target, id, WindowEvent::SurfaceResized(dpi::PhysicalSize::new(dw, dh)));
+                shared.redraw.store(true, Ordering::Release);
+                flip_due = None;
+            }
+
             // A new size for the screen: its mode, then the window's.
             let wanted = shared.pending_size.lock().unwrap_or_else(|e| e.into_inner()).take();
             if let (Some((w, h)), Some(id)) = (wanted, target.window.get())
@@ -358,7 +423,11 @@ impl EventLoop {
                 let (w, h) = (w.clamp(640, 7680), h.clamp(400, 4320));
                 match shared.display.set_size(w, h) {
                     Ok(()) => {
-                        self.input.set_screen(shared.display.visible_size());
+                        let display = &shared.display;
+                        self.input.set_screen(display.visible_size(), display.panel_size(), display.rotation());
+                        if let Some(f) = ON_ROTATION.get() {
+                            f(display.rotation(), display.buffer_size());
+                        }
                         let (dw, dh) = shared.display.size();
                         app.window_event(target, id, WindowEvent::SurfaceResized(dpi::PhysicalSize::new(dw, dh)));
                         shared.redraw.store(true, Ordering::Release);

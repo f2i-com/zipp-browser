@@ -206,6 +206,11 @@
     info: function () { return call(function () { return JSON.parse(host("info")); }); },
     // { interfaces: [{ name, kind, state, mac, addresses }], routes, dns }
     network: function () { return call(function () { return JSON.parse(host("network")); }); },
+    // The screen's turn: "auto" (the panel's own, as the kernel knows how it
+    // is mounted) or 0, 90, 180, 270 degrees clockwise; rotation() gives
+    // { rotation, panel } in degrees.
+    rotate: function (turn) { return call(function () { host("rotate", String(turn)); }); },
+    rotation: function () { return call(function () { return JSON.parse(host("rotation")); }); },
     reboot: function () { return call(function () { host("power", "reboot"); }); },
     powerOff: function () { return call(function () { host("power", "off"); }); },
   };

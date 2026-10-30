@@ -217,6 +217,22 @@ pub(crate) fn host_call(ctx: &mut dyn HostCtx, args: &[String]) -> Result<String
         "linux_root" => crate::pty::linux_root(),
         // Linux apps' windows (wayland.rs): `wl_start width height`, then
         // `wl command window a b c`.
+        // The screen's turn: `rotate auto|0|90|180|270`, `rotation` (degrees
+        // now, and the panel's own).
+        #[cfg(target_os = "linux")]
+        "rotate" => {
+            let turn = arg(1);
+            if turn != "auto" && zipp_kms::rotation_named(turn).is_none() {
+                return Err(format!("TypeError: rotate: auto, 0, 90, 180 or 270, not {turn:?}"));
+            }
+            zipp_kms::request_rotation(zipp_kms::rotation_named(turn));
+            Ok(String::new())
+        }
+        #[cfg(target_os = "linux")]
+        "rotation" => {
+            let (now, panel) = zipp_kms::rotation();
+            Ok(serde_json::json!({ "rotation": now as u32 * 90, "panel": panel as u32 * 90 }).to_string())
+        }
         #[cfg(target_os = "linux")]
         "wl_start" => crate::wayland::start(arg(1).parse().unwrap_or(1280), arg(2).parse().unwrap_or(720)),
         #[cfg(target_os = "linux")]
