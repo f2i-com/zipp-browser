@@ -290,11 +290,16 @@ impl<'dom> DocumentPainter<'dom> {
         let is_text_input = el_data
             .and_then(|el| el.text_input_data())
             .is_some();
+        // `overflow` on the root element is the viewport's (CSS Overflow 3,
+        // "propagation"), which the surface's own edges already clip: clipping
+        // `<html>`'s box too hid what is in its border -- the browser's
+        // toolbar, in the band its top border reserves -- on every page that
+        // sets `html { overflow: hidden }`, as full-screen apps do.
+        let is_root = node_id == self.dom.as_ref().root_element().id;
         let should_clip = is_image
             || is_sub_doc
             || is_text_input
-            || !matches!(overflow_x, Overflow::Visible)
-            || !matches!(overflow_y, Overflow::Visible);
+            || (!is_root && (!matches!(overflow_x, Overflow::Visible) || !matches!(overflow_y, Overflow::Visible)));
 
         // Apply padding/border offset to inline root
         let (layout, box_position) = self.node_position(node_id, location);

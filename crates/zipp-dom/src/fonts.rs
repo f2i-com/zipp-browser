@@ -145,6 +145,13 @@ const SYMBOL_FAMILIES: &[&str] = &[
 /// script of the text around it, so "Samples ▾" asks Latin's fallback.
 const SYMBOL_SCRIPTS: &[&str] = &["Latn", "Zyyy", "Zinh", "Grek", "Cyrl", "Arab", "Hebr"];
 
+/// A symbol face of our own, behind any installed ones: where no fonts are
+/// installed at all (zipp-linux) there were none, and the ▾ ▶ ■ ⚡ pages use
+/// as icons came out as nothing. DejaVu Sans has those, the arrows, shapes and
+/// dingbats around them, and the punctuation Liberation lacks. Its license
+/// (Bitstream Vera's, and public domain) is in `assets/fonts/`.
+const SYMBOL_FACE: &[u8] = include_bytes!("../assets/fonts/DejaVuSans.ttf");
+
 /// Put the symbol fonts behind each script's own fallback.
 ///
 /// The platform's fallback for Latin is a text font (Segoe UI on Windows),
@@ -152,6 +159,9 @@ const SYMBOL_SCRIPTS: &[&str] = &["Latn", "Zyyy", "Zinh", "Grek", "Cyrl", "Arab"
 /// Chrome, falling back per character, finds Segoe UI Symbol. Emoji were
 /// unaffected: those fall back to the emoji font on their own.
 pub fn register_symbol_fallbacks(collection: &mut Collection) {
+    if collection.family_id("DejaVu Sans").is_none() {
+        collection.register_fonts(Blob::new(Arc::new(SYMBOL_FACE) as _), None);
+    }
     let symbols: Vec<FamilyId> = SYMBOL_FAMILIES
         .iter()
         .filter_map(|name| collection.family_id(name))
