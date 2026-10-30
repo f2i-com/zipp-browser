@@ -247,6 +247,9 @@ struct JailPaths {
     procfs: CString,
     host_dev: CString,
     host_sys: CString,
+    /// The Wayland server's directory (wayland.rs), and where it shows in
+    /// the jail: the same /run/user/1000.
+    wayland: Option<(CString, CString)>,
     uid: u32,
     gid: u32,
 }
@@ -266,6 +269,13 @@ impl JailPaths {
         for dir in ["proc", "dev", "sys", "tmp"] {
             let _ = std::fs::create_dir_all(format!("{root}/{dir}"));
         }
+        let wayland = if std::path::Path::new(crate::wayland::RUNTIME_DIR).is_dir() {
+            let inside = format!("{root}{}", crate::wayland::RUNTIME_DIR);
+            let _ = std::fs::create_dir_all(&inside);
+            Some((c(crate::wayland::RUNTIME_DIR.into())?, c(inside)?))
+        } else {
+            None
+        };
         Ok(JailPaths {
             proc_: c(format!("{root}/proc"))?,
             dev: c(format!("{root}/dev"))?,
@@ -276,6 +286,7 @@ impl JailPaths {
             procfs: c("proc".into())?,
             host_dev: c("/dev".into())?,
             host_sys: c("/sys".into())?,
+            wayland,
             uid: jail.uid,
             gid: jail.gid,
         })
@@ -293,6 +304,9 @@ impl JailPaths {
             check(libc::mount(self.procfs.as_ptr(), self.proc_.as_ptr(), self.procfs.as_ptr(), libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, std::ptr::null()))?;
             check(libc::mount(self.host_dev.as_ptr(), self.dev.as_ptr(), none, libc::MS_BIND | libc::MS_REC, std::ptr::null()))?;
             check(libc::mount(self.host_sys.as_ptr(), self.sys.as_ptr(), none, libc::MS_BIND | libc::MS_REC | libc::MS_RDONLY, std::ptr::null()))?;
+            if let Some((host, inside)) = &self.wayland {
+                check(libc::mount(host.as_ptr(), inside.as_ptr(), none, libc::MS_BIND, std::ptr::null()))?;
+            }
             check(libc::chroot(self.root.as_ptr()))?;
             if libc::chdir(self.cwd.as_ptr()) != 0 {
                 check(libc::chdir(self.slash.as_ptr()))?;

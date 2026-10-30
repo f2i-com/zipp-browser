@@ -5,8 +5,10 @@
 //! those canvases go back to them.
 //!
 //! It runs on a thread of its own, speaking the protocol in Rust
-//! (wayland-server, no libwayland) on a socket in the Linux system's
-//! /run/user/1000, and offers what toolkits and simple clients need, with
+//! (wayland-server, no libwayland), on the socket /run/user/1000/wayland-0
+//! (which pty.rs's jail shows the Linux system's apps where they expect it,
+//! and which programs of the system's own use too: a browser of its own, in a
+//! window), and offers what toolkits and simple clients need, with
 //! buffers in shared memory only (no GPU buffers: an app's own OpenGL falls
 //! back to drawing on the CPU): wl_compositor, wl_subcompositor, wl_shm,
 //! wl_seat, wl_output, xdg_wm_base (windows and popups), server-side
@@ -57,8 +59,9 @@ use wayland_server::{Client, DataInit, Dispatch, Display, DisplayHandle, GlobalD
 static KEYMAP: &[u8] = include_bytes!("wayland_keymap.xkb");
 /// How long after a frame its callbacks are answered.
 const FRAME: Duration = Duration::from_millis(16);
-/// Where the server listens, in the Linux system's root.
+/// Where the server listens.
 const SOCKET: &str = "wayland-0";
+pub(crate) const RUNTIME_DIR: &str = "/run/user/1000";
 /// The user Linux apps run as (pty.rs's jail).
 const USER: u32 = 1000;
 
@@ -90,17 +93,18 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Start the server for the Linux system at `root`, on a screen of this size
-/// (once; later calls find it running): its socket's name, for
-/// WAYLAND_DISPLAY.
-pub(crate) fn start(root: &str, width: i32, height: i32) -> Result<String, String> {
+/// Start the server, for a screen of this size (once; later calls find it
+/// running): its socket's name, for WAYLAND_DISPLAY (with XDG_RUNTIME_DIR
+/// /run/user/1000).
+pub(crate) fn start(width: i32, height: i32) -> Result<String, String> {
     let mut server = lock(&SERVER);
     if server.is_some() {
         return Ok(SOCKET.into());
     }
-    let dir = std::path::Path::new(root).join(format!("run/user/{USER}"));
-    std::fs::create_dir_all(&dir).map_err(|e| format!("OperationError: {}: {e}", dir.display()))?;
-    let _ = std::os::unix::fs::chown(&dir, Some(USER), Some(USER));
+    let dir = std::path::Path::new(RUNTIME_DIR);
+    std::fs::create_dir_all(dir).map_err(|e| format!("OperationError: {}: {e}", dir.display()))?;
+    let _ = std::os::unix::fs::chown(dir, Some(USER), Some(USER));
+    let _ = std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700));
     let path = dir.join(SOCKET);
     let socket = ListeningSocket::bind_absolute(path.clone()).map_err(|e| format!("OperationError: the Wayland socket: {e:?}"))?;
     // The apps are the user zipp's: theirs to connect to.
@@ -747,11 +751,14 @@ impl State {
             return;
         };
         w.origin = origin;
+        // The process it is, for the page to know its own (a browser it ran).
+        let pid = w.xdg.client().and_then(|c| c.get_credentials(&self.dh).ok()).map_or(0, |c| c.pid);
         match w.shown {
             None => event(
                 "window",
                 window,
                 serde_json::json!({
+                    "pid": pid,
                     "kind": if w.popup.is_some() { "popup" } else { "toplevel" },
                     "parent": w.parent,
                     "x": w.place.0,

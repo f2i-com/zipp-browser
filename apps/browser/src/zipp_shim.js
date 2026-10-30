@@ -276,7 +276,8 @@
     }
   };
   // A window: kind ("toplevel" or "popup"), parent (a popup's window), x and
-  // y (a popup's place in its parent's frame), title, appId, width, height;
+  // y (a popup's place in its parent's frame), title, appId, pid (its
+  // process), width, height;
   // onsize, ontitle, onplace, ongone.
   function WlWindow(id, info) {
     this.id = id;
@@ -286,6 +287,7 @@
     this.y = info.y;
     this.title = info.title;
     this.appId = info.appId;
+    this.pid = info.pid || 0;
     this.width = info.width;
     this.height = info.height;
     this.gone = false;
@@ -307,11 +309,12 @@
   WlWindow.prototype.focus = function () { wl("focus", this); };
   WlWindow.prototype.close = function () { wl("close", this); };
   var wayland = {
-    // Start it for the Linux system at `root` (linux.root()): the socket's
-    // name, for WAYLAND_DISPLAY (in the system's /run/user/1000).
-    start: function (root) {
-      return call(function () { return host("wl_start", root, innerWidth || 1280, innerHeight || 720); });
+    // Start it: the socket's name, for WAYLAND_DISPLAY, with XDG_RUNTIME_DIR
+    // /run/user/1000 (where the Linux system's apps find it too).
+    start: function () {
+      return call(function () { return host("wl_start", innerWidth || 1280, innerHeight || 720); });
     },
+    runtimeDir: "/run/user/1000",
     onwindow: null,
   };
 
