@@ -452,6 +452,8 @@ pub(crate) fn handle_click(
     dispatch_event: &mut dyn FnMut(DomEvent),
 ) {
     let double_click_event = event.clone();
+    // The page cancelled the pointer down: the click leaves focus alone.
+    let keep_focus = doc.pointerdown_prevented;
 
     let mut maybe_node_id = Some(target);
     // Whether the click gave focus to something on the way up.
@@ -634,7 +636,7 @@ pub(crate) fn handle_click(
                 // a `tabindex` (a canvas a game reads keys on) -- gets it, as a
                 // click gives it in any browser. Before, only text fields did.
                 // The walk goes on: a button inside a link still follows it.
-                _ if el.is_focussable && !focused => {
+                _ if el.is_focussable && !focused && !keep_focus => {
                     generate_focus_events(
                         doc,
                         &mut |doc| {
@@ -656,7 +658,7 @@ pub(crate) fn handle_click(
     };
 
     // If nothing is matched (or focused) then clear focus
-    if !matched && !focused {
+    if !matched && !focused && !keep_focus {
         generate_focus_events(doc, &mut |doc| doc.clear_focus(), dispatch_event);
     }
 

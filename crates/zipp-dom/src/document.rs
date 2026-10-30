@@ -311,6 +311,9 @@ pub struct BaseDocument {
     pub(crate) mousedown_position: taffy::Point<f32>,
     /// How many clicks have been made in quick succession.
     pub(crate) click_count: u16,
+    /// The page cancelled the last pointer down: focus stays where it is,
+    /// and the click that follows does not move it either.
+    pub(crate) pointerdown_prevented: bool,
     /// Whether we're currently in a text selection drag (moved 2px+ from mousedown).
     pub(crate) drag_mode: DragMode,
     /// Whether and what kind of scroll animation is currently in progress.
@@ -537,6 +540,7 @@ impl BaseDocument {
             last_mousedown_time: None,
             mousedown_position: taffy::Point::ZERO,
             click_count: 0,
+            pointerdown_prevented: false,
             drag_mode: DragMode::None,
             scroll_animation: ScrollAnimationState::None,
             text_selection: TextSelection::default(),

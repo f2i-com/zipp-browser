@@ -377,6 +377,12 @@ impl<'doc, Handler: EventHandler> EventDriver<'doc, Handler> {
             let mut mouse_event = DomEvent::new(target, make_mouse_data(data));
             event_state = self.run_handler_event(&mut mouse_event, event_state);
         }
+        // In a browser, focus moves as a pointer down's default action, so a
+        // page cancelling it keeps focus where it is (a game's canvas, an
+        // app keeping its own field focused); the click after it remembers.
+        if matches!(ptr_event.data, DomEventData::PointerDown(_)) {
+            self.doc.inner_mut().pointerdown_prevented = event_state.is_cancelled();
+        }
         if !event_state.is_cancelled() {
             self.run_default_action(&mut ptr_event);
         }

@@ -653,7 +653,20 @@ where
                     ElementState::Released => UiEvent::PointerUp(event),
                 };
 
+                let focused_before = self.doc.inner().get_focussed_node_id();
                 self.doc.handle_ui_event(event);
+                // A click into the address bar from elsewhere selects all of
+                // it, as browsers do: what is typed then replaces the address
+                // (a search, another site) rather than going on the end of it.
+                let mut inner = self.doc.inner_mut();
+                let focused = inner.get_focussed_node_id();
+                if focused != focused_before
+                    && let Some(node) = focused
+                    && inner.query_selector("input[name=__nav_url]").ok().flatten() == Some(node)
+                {
+                    inner.focus_and_select_all(node);
+                }
+                drop(inner);
                 self.request_redraw();
             }
             WindowEvent::MouseWheel { delta, .. } => {
