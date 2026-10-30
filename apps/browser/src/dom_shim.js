@@ -179,6 +179,11 @@ function __makeStyle() {
 
 // Populated by addEventListener, read by Rust after SSR to wire up event dispatch.
 var __eventHandlers = {};
+// Counts listeners added and removed, so the host reads __eventHandlers again
+// when they change on elements already drawn (a re-render no longer comes
+// with every change to tell it).
+var __listenerVersion = 0;
+function __zippListenerVersion() { return __listenerVersion; }
 
 var ClassList = class ClassList {
     constructor(el) { this._el = el; }
@@ -321,11 +326,11 @@ var DOMNode = class DOMNode extends EventTarget {
     }
     contains(o) { if(this===o)return true; for(var i=0;i<this.childNodes.length;i++) if(this.childNodes[i].contains(o))return true; return false; }
     cloneNode(deep) { var c=new DOMNode(this.nodeType,this.nodeName); if(deep) for(var i=0;i<this.childNodes.length;i++) c.appendChild(this.childNodes[i].cloneNode(true)); return c; }
-    addEventListener(t,fn) { if(!this._listeners[t]) this._listeners[t]=[]; this._listeners[t].push(fn); if(!__eventHandlers[this._id]) __eventHandlers[this._id]={}; if(!__eventHandlers[this._id][t]) __eventHandlers[this._id][t]=[]; __eventHandlers[this._id][t].push(fn); }
+    addEventListener(t,fn) { if(!this._listeners[t]) this._listeners[t]=[]; this._listeners[t].push(fn); if(!__eventHandlers[this._id]) __eventHandlers[this._id]={}; if(!__eventHandlers[this._id][t]) __eventHandlers[this._id][t]=[]; __eventHandlers[this._id][t].push(fn); __listenerVersion++; }
     // Must also drop it from __eventHandlers: that registry is what Rust reads
     // to decide which nodes get events, so a listener removed here but left
     // there keeps being called for the life of the page.
-    removeEventListener(t,fn) { if(this._listeners[t]) this._listeners[t]=this._listeners[t].filter(function(f){return f!==fn;}); var m=__eventHandlers[this._id]; if(m&&m[t]) m[t]=m[t].filter(function(f){return f!==fn;}); }
+    removeEventListener(t,fn) { if(this._listeners[t]) this._listeners[t]=this._listeners[t].filter(function(f){return f!==fn;}); var m=__eventHandlers[this._id]; if(m&&m[t]) m[t]=m[t].filter(function(f){return f!==fn;}); __listenerVersion++; }
     dispatchEvent(ev) { ev.target=this; var h=this._listeners[ev.type]||[]; for(var i=0;i<h.length;i++) try{h[i].call(this,ev);}catch(e){} return true; }
     get isConnected() { var n=this; while(n){if(n.nodeType===9)return true; n=n.parentNode;} return false; }
     getRootNode() { var n=this; while(n.parentNode) n=n.parentNode; return n; }

@@ -107,6 +107,9 @@ pub struct JsEventBridge {
     /// Changes to the drawn page, for the shell to make in place
     /// (`take_pending_patches`): what changed since it was last drawn.
     pending_patches: Vec<zipp_dom::DomPatch>,
+    /// The page's listener count (`__zippListenerVersion`) when its handler
+    /// map was last read.
+    listener_version: f64,
     /// A `focus()` on an element not shown yet (made by the same listener):
     /// given when the re-render that shows it lands.
     pending_focus: Option<u32>,
@@ -175,6 +178,7 @@ impl JsEventBridge {
             js_state,
             pending_rerender: None,
             pending_patches: Vec::new(),
+            listener_version: -1.0,
             pending_focus: None,
             page_url: page_url.to_string(),
             started: std::time::Instant::now(),
@@ -230,6 +234,27 @@ impl JsEventBridge {
         self.collect_render(false);
         self.note_rendered();
         self.refresh_next_timer();
+    }
+
+    /// Listeners added to elements already drawn (or taken from them), which
+    /// no re-render announced: the handler map is read again.
+    fn refresh_listeners(&mut self, doc: &BaseDocument) {
+        let Some(state) = self.js_state.as_mut() else {
+            return;
+        };
+        let Ok(JsValue::Number(version)) = state.call_global("__zippListenerVersion", &[]) else {
+            return;
+        };
+        if version == self.listener_version {
+            return;
+        }
+        let Ok(JsValue::String(event_map_json)) = state.call_global("__getEventMap", &[]) else {
+            return;
+        };
+        self.listener_version = version;
+        let flid_map = build_flid_map(doc);
+        self.handler_map = parse_event_map(&flid_map, &event_map_json);
+        self.reverse_flid = flid_map.iter().map(|(&flid, &node)| (node, flid)).collect();
     }
 
     /// What the page changed since it was last drawn, ready for the shell:
@@ -606,6 +631,7 @@ impl EventHandler for JsEventBridge {
     ) {
         let event_name = event.data.name();
         let _layout = LayoutScope::enter(&_doc.inner());
+        self.refresh_listeners(&_doc.inner());
         // The console's button and links, and F12, are the browser's.
         let console_key = matches!(&event.data, DomEventData::KeyDown(k) if k.code == keyboard_types::Code::F12);
         let console_link = matches!(event.data, DomEventData::Click(_))
@@ -799,6 +825,7 @@ impl EventHandler for JsEventBridge {
     fn run_tasks(&mut self, doc: &mut BaseDocument) -> Option<Instant> {
         let _layout = LayoutScope::enter(doc);
         let now = Instant::now();
+        self.refresh_listeners(doc);
         // The viewport changed size (the screen's new mode, a resized
         // window): the script's innerWidth and innerHeight follow, and it
         // hears `resize`.
@@ -990,9 +1017,14 @@ impl EventHandler for JsEventBridge {
         let event_map_json = self
             .js_state
             .as_mut()
-            .and_then(|state| match state.call_global("__getEventMap", &[]) {
-                Ok(JsValue::String(s)) => Some(s),
-                _ => None,
+            .and_then(|state| {
+                if let Ok(JsValue::Number(version)) = state.call_global("__zippListenerVersion", &[]) {
+                    self.listener_version = version;
+                }
+                match state.call_global("__getEventMap", &[]) {
+                    Ok(JsValue::String(s)) => Some(s),
+                    _ => None,
+                }
             })
             .unwrap_or_else(|| "{}".to_string());
 
