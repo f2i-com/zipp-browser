@@ -166,9 +166,11 @@ mod alsa_out {
     /// then every card's playback devices -- speakers and headphones before
     /// HDMI, which is often a monitor without any -- then each card as ALSA's
     /// configuration for it has it (a Raspberry Pi's HDMI takes IEC958
-    /// frames, which only that makes), and then ALSA's "default". The page
-    /// is the only thing playing, so the devices are opened directly rather
-    /// than through a mixer.
+    /// frames, which only that makes), and then ALSA's "default". Each
+    /// device is tried through ALSA's mixer (dmix) first: other programs
+    /// play on the card at the same time -- a browser in a window of
+    /// zipp-linux's desktop, its Linux apps -- where a device opened
+    /// directly is one program's until it lets go.
     pub(super) fn open() -> Result<(PCM, u32), String> {
         let mut candidates: Vec<(String, String)> = Vec::new();
         if let Ok(name) = std::env::var("ZIPP_AUDIO_DEVICE") {
@@ -187,12 +189,11 @@ mod alsa_out {
             for device in alsa::ctl::DeviceIter::new(&ctl) {
                 let Ok(info) = ctl.pcm_info(device as u32, 0, Direction::Playback) else { continue };
                 let label = format!("{card_name}: {}", info.get_name().unwrap_or_default());
+                let mixed = format!("plug:\"dmix:CARD={},DEV={device}\"", card.get_index());
                 let name = format!("plughw:{},{device}", card.get_index());
-                if label.contains("HDMI") || label.contains("DisplayPort") {
-                    hdmi.push((name, label));
-                } else {
-                    candidates.push((name, label));
-                }
+                let list = if label.contains("HDMI") || label.contains("DisplayPort") { &mut hdmi } else { &mut candidates };
+                list.push((mixed, format!("{label}, mixed")));
+                list.push((name, label));
             }
         }
         candidates.extend(hdmi);
@@ -221,12 +222,13 @@ mod alsa_out {
     fn unmute(device: &str) {
         use alsa::Round;
         use alsa::mixer::{MilliBel, Mixer, Selem};
-        // "plughw:1,0" and the like name the card; anything else is card 0.
-        let card = device
-            .split_once(':')
-            .and_then(|(_, rest)| rest.split(',').next())
-            .and_then(|c| c.trim_start_matches("CARD=").parse::<u32>().ok())
-            .unwrap_or(0);
+        // "plughw:1,0" and `dmix:CARD=1,...` and the like name the card;
+        // anything else is card 0.
+        let card = match device.find("CARD=") {
+            Some(at) => device[at + 5..].split(|c: char| !c.is_ascii_digit()).next().and_then(|n| n.parse::<u32>().ok()),
+            None => device.split_once(':').and_then(|(_, rest)| rest.split(',').next()).and_then(|c| c.parse::<u32>().ok()),
+        }
+        .unwrap_or(0);
         let Ok(mixer) = Mixer::new(&format!("hw:{card}"), false) else { return };
         let mut on = Vec::new();
         for selem in mixer.iter().filter_map(Selem::new) {

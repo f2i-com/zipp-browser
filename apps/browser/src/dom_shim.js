@@ -2890,12 +2890,20 @@ function __getRenderedHTML() {
 // restyling and laying out the whole page for it made dragging slow.
 
 var __drawnBody = null;
+var __drawnHtmlAttrs = "";
+
+// <html>'s attributes, as the host applies them with a whole body: a theme
+// kept there (`data-theme`, a `dark` class) changes nothing in the body.
+function __htmlAttrs() {
+    return typeof __getHtmlAttrList === "function" ? __getHtmlAttrList() : "";
+}
 
 // The body, all of it, remembered as drawn.
 function __renderWhole() {
     var html = __serializeNode(doc.body);
     __remember(doc.body);
     __drawnBody = doc.body;
+    __drawnHtmlAttrs = __htmlAttrs();
     return html;
 }
 
@@ -2983,6 +2991,9 @@ function __zippRenderPatch() {
     if (!__drawnFromScript()) return null;
     var body = doc.body;
     if (__drawnBody !== body || body._ra === undefined) return __renderWhole();
+    // A theme switched on <html> goes with a whole body, which carries
+    // <html>'s attributes to the host.
+    if (__htmlAttrs() !== __drawnHtmlAttrs) return __renderWhole();
     if (__attrSig(__attrPairs(body, "body")) !== body._ra || __kidsSig(body) !== body._rk) return __renderWhole();
     var ops = [];
     for (var i = 0; i < body.childNodes.length; i++) {
