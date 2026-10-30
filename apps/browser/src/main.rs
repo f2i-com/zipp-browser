@@ -46,6 +46,7 @@ mod site_storage;
 mod media;
 mod audio;
 mod canvas;
+mod system;
 #[cfg(target_os = "linux")]
 mod usb;
 mod canvas2d;
@@ -204,6 +205,7 @@ fn main() {
     let viewport = INITIAL_WINDOW_SIZE;
     if kiosk {
         NO_CHROME.store(true, std::sync::atomic::Ordering::Relaxed);
+        system::KIOSK.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     let url = if arg.is_empty() { "https://lance.name".to_string() } else { arg };
@@ -1239,6 +1241,8 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
         "gpu" => webgpu::host_call(ctx, args),
         // Web Audio's output, and decoding (audio.rs).
         "audio" => audio::host_call(ctx, args),
+        // navigator.zipp: files, programs, the machine (system.rs).
+        "zipp" => system::host_call(ctx, args),
         // WebUSB (usb.rs).
         #[cfg(target_os = "linux")]
         "usb" => usb::host_call(args),
@@ -2101,8 +2105,9 @@ fn run_zipp_js_inner(
     let webgpu_shim = include_str!("webgpu_shim.js");
     let webusb_shim = include_str!("webusb_shim.js");
     let webaudio_shim = include_str!("webaudio_shim.js");
+    let zipp_shim = include_str!("zipp_shim.js");
     let dom_shim = &format!(
-        "{HOST_PRELUDE_JS}\n{dom_shim}\n{}\n{}\n{}\n{webgl_shim}\n{}\n{webgpu_shim}\n{webusb_shim}\n{webaudio_shim}",
+        "{HOST_PRELUDE_JS}\n{dom_shim}\n{}\n{}\n{}\n{webgl_shim}\n{}\n{webgpu_shim}\n{webusb_shim}\n{webaudio_shim}\n{zipp_shim}",
         include_str!("clone.js"),
         include_str!("indexeddb_shim.js"),
         include_str!("worker_page.js"),

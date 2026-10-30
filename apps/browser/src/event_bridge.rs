@@ -104,6 +104,9 @@ pub struct JsEventBridge {
     /// If a click handler caused a DOM update, this holds the new HTML.
     /// The shell should check this after event dispatch and re-render if set.
     pub pending_rerender: Option<String>,
+    /// A `focus()` on an element not shown yet (made by the same listener):
+    /// given when the re-render that shows it lands.
+    pending_focus: Option<u32>,
     /// The page URL, used to re-absolutise relative URLs and rebuild the
     /// browser chrome when a re-render replaces the document body.
     page_url: String,
@@ -165,6 +168,7 @@ impl JsEventBridge {
             reverse_flid,
             js_state,
             pending_rerender: None,
+            pending_focus: None,
             page_url: page_url.to_string(),
             started: std::time::Instant::now(),
             page: crate::worker::current_page(),
@@ -362,8 +366,12 @@ impl JsEventBridge {
             return;
         }
         let flid = n as u32;
-        if let Some((&node, _)) = self.reverse_flid.iter().find(|&(_, &f)| f == flid) {
-            doc.set_focus_to(node);
+        match self.reverse_flid.iter().find(|&(_, &f)| f == flid) {
+            Some((&node, _)) => {
+                doc.set_focus_to(node);
+                self.pending_focus = None;
+            }
+            None => self.pending_focus = Some(flid),
         }
     }
 
@@ -762,6 +770,20 @@ impl EventHandler for JsEventBridge {
             }
             self.run_due_work();
         }
+        // Programs a page ran that finished (system.rs): each settles its promise.
+        let done = crate::system::take_completions();
+        if !done.is_empty() {
+            if let Some(state) = self.js_state.as_mut() {
+                for (id, result) in done {
+                    let args = [JsValue::Number(id as f64), JsValue::String(result)];
+                    if let Err(e) = state.call_global("__zippSystemComplete", &args) {
+                        eprintln!("[ZIPP] delivering a program's result failed: {e}");
+                    }
+                    state.run_microtasks();
+                }
+            }
+            self.run_due_work();
+        }
         // USB transfers that finished (usb.rs): each settles its promise.
         #[cfg(target_os = "linux")]
         {
@@ -865,6 +887,11 @@ impl EventHandler for JsEventBridge {
             .iter()
             .map(|(&flid, &blitz_id)| (blitz_id, flid))
             .collect();
+        if let Some(flid) = self.pending_focus.take()
+            && let Some(&node) = flid_map.get(&flid)
+        {
+            doc.set_focus_to(node);
+        }
     }
 }
 
