@@ -142,6 +142,7 @@ pub(crate) fn map(code: u16) -> Mapped {
             113 => (Some(C::AudioVolumeMute), Standard, None, Some(N::AudioVolumeMute)),
             114 => (Some(C::AudioVolumeDown), Standard, None, Some(N::AudioVolumeDown)),
             115 => (Some(C::AudioVolumeUp), Standard, None, Some(N::AudioVolumeUp)),
+            116 => (Some(C::Power), Standard, None, Some(N::Power)),
             119 => (Some(C::Pause), Standard, None, Some(N::Pause)),
             125 => (Some(C::MetaLeft), Left, None, Some(N::Meta)),
             126 => (Some(C::MetaRight), Right, None, Some(N::Meta)),

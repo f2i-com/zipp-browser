@@ -6,7 +6,7 @@
 //   navigator.zipp.system  run, spawn (on a terminal), info, network, reboot, powerOff
 //   navigator.zipp.linux   root (the Alpine system on the boot drive)
 //   navigator.zipp.wayland start, onwindow (Linux apps' windows)
-//   navigator.zipp.wifi    status, scan, connect, disconnect
+//   navigator.zipp.wifi    status, scan, connect, keep, undo, disconnect
 //
 // Every call returns a promise. Paths are absolute ("/media/sda1/notes.txt").
 // Files cross in pieces through __zippHostBytes. Errors are DOMExceptions
@@ -239,6 +239,11 @@
     connect: function (ssid, passphrase) {
       return call(function () { host("wifi", "connect", ssid, passphrase || ""); });
     },
+    // After connect, which leaves the network in use known: `keep` when the
+    // new one has worked (drops the others), `undo` when it has not (drops it
+    // and goes back to them).
+    keep: function () { return call(function () { host("wifi", "keep"); }); },
+    undo: function () { return call(function () { host("wifi", "undo"); }); },
     disconnect: function () { return call(function () { host("wifi", "disconnect"); }); },
   };
 

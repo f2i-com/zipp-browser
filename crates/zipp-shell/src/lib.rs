@@ -97,6 +97,33 @@ pub struct WindowShellProvider {
     /// document restyled and laid out before it is painted again.
     needs_resolve: Arc<std::sync::atomic::AtomicBool>,
 }
+/// What was last copied in this program: the clipboard where the machine has
+/// none of its own.
+static COPIED: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// What this program last copied.
+pub fn clipboard_text() -> String {
+    COPIED.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Keep this as what was last copied.
+pub fn set_clipboard_text(text: String) {
+    *COPIED.lock().unwrap_or_else(|e| e.into_inner()) = text;
+}
+
+/// Whether a browser's own keys act (F5, Ctrl+R, Ctrl+L, zoom, the layout
+/// overlays): not where the page is the whole program.
+static BROWSER_KEYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn browser_keys() -> bool {
+    BROWSER_KEYS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Give those keys to the page.
+pub fn give_keys_to_page() {
+    BROWSER_KEYS.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
 impl WindowShellProvider {
     /// Wraps an existing window handle.
     pub fn new(window: Arc<dyn Window>) -> Self {
@@ -160,9 +187,13 @@ impl ShellProvider for WindowShellProvider {
         )
     ))]
     fn get_clipboard_text(&self) -> Result<String, zipp_dom::traits_src::shell::ClipboardError> {
-        let mut cb = arboard::Clipboard::new().unwrap();
-        cb.get_text()
-            .map_err(|_| zipp_dom::traits_src::shell::ClipboardError)
+        // The system's where it has one. A machine with no X server has none
+        // (a kiosk, a window on ZIPP OS): `new()` fails there, and unwrapping
+        // it took Ctrl+V for a crash of the whole desktop.
+        if let Ok(text) = arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
+            return Ok(text);
+        }
+        Ok(clipboard_text())
     }
 
     #[cfg(all(
@@ -178,9 +209,11 @@ impl ShellProvider for WindowShellProvider {
         )
     ))]
     fn set_clipboard_text(&self, text: String) -> Result<(), zipp_dom::traits_src::shell::ClipboardError> {
-        let mut cb = arboard::Clipboard::new().unwrap();
-        cb.set_text(text.to_owned())
-            .map_err(|_| zipp_dom::traits_src::shell::ClipboardError)
+        set_clipboard_text(text.clone());
+        if let Ok(mut cb) = arboard::Clipboard::new() {
+            let _ = cb.set_text(text);
+        }
+        Ok(())
     }
 
     #[cfg(all(

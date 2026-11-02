@@ -217,6 +217,41 @@ var ClassList = class ClassList {
 // carry data-flid, and registering text nodes would double the retention for
 // nothing.
 var __nodesById = {};
+// Kept here for ever, every element ever made would stay, with its listeners
+// and all they hold, for the life of the page: a desktop open for days builds
+// a good many. So once enough have been made those no longer in a document go
+// from here and from __eventHandlers (__sweepNodes), to live as long as script
+// holds them. One put back is registered again when it is next drawn, or given
+// a listener (__keepNode), with the listeners it has always had.
+var __nodeCount = 0, __sweepAt = 20000;
+function __keepNode(node) {
+    if (__nodesById[node._id]) return;
+    __nodesById[node._id] = node;
+    __nodeCount++;
+    var kept = null;
+    for (var t in node._listeners) {
+        if (node._listeners[t].length) {
+            kept = kept || {};
+            kept[t] = node._listeners[t].slice();
+        }
+    }
+    if (kept) { __eventHandlers[node._id] = kept; __listenerVersion++; }
+}
+function __inDocument(node) {
+    for (var n = node; n; n = n.parentNode || n.host) if (n.nodeType === 9) return true;
+    return false;
+}
+function __sweepNodes() {
+    var kept = 0, dropped = false;
+    for (var id in __nodesById) {
+        if (__inDocument(__nodesById[id])) { kept++; continue; }
+        delete __nodesById[id];
+        if (__eventHandlers[id]) { delete __eventHandlers[id]; dropped = true; }
+    }
+    __nodeCount = kept;
+    __sweepAt = Math.max(20000, kept * 2);
+    if (dropped) __listenerVersion++;
+}
 
 // What every node is, and what a script extends for its own event emitters
 // (`class Store extends EventTarget`): listeners in the order added, each once,
@@ -266,7 +301,7 @@ var DOMNode = class DOMNode extends EventTarget {
     constructor(nodeType, nodeName) {
         super();
         this._id = _nid++;
-        if (nodeType === 1) { __nodesById[this._id] = this; }
+        if (nodeType === 1) { __nodesById[this._id] = this; __nodeCount++; }
         this.nodeType = nodeType;
         this.nodeName = nodeName || "";
         this.childNodes = [];
@@ -352,7 +387,7 @@ var DOMNode = class DOMNode extends EventTarget {
         return a[i - 1]._findChild(a[i]) < a[i - 1]._findChild(b[i]) ? 4 : 2;
     }
     cloneNode(deep) { var c=new DOMNode(this.nodeType,this.nodeName); if(deep) for(var i=0;i<this.childNodes.length;i++) c.appendChild(this.childNodes[i].cloneNode(true)); return c; }
-    addEventListener(t,fn) { if(!this._listeners[t]) this._listeners[t]=[]; this._listeners[t].push(fn); if(!__eventHandlers[this._id]) __eventHandlers[this._id]={}; if(!__eventHandlers[this._id][t]) __eventHandlers[this._id][t]=[]; __eventHandlers[this._id][t].push(fn); __listenerVersion++; }
+    addEventListener(t,fn) { if(this.nodeType===1) __keepNode(this); if(!this._listeners[t]) this._listeners[t]=[]; this._listeners[t].push(fn); if(!__eventHandlers[this._id]) __eventHandlers[this._id]={}; if(!__eventHandlers[this._id][t]) __eventHandlers[this._id][t]=[]; __eventHandlers[this._id][t].push(fn); __listenerVersion++; }
     // Must also drop it from __eventHandlers: that registry is what Rust reads
     // to decide which nodes get events, so a listener removed here but left
     // there keeps being called for the life of the page.
@@ -1809,6 +1844,7 @@ function __sn(node) {
     for(var k in node.attributes) { if(k==="id"||k==="class") continue; h+=" "+k+"=\""+__ea(node.attributes[k])+"\""; }
     var sk=[]; for(var p in node.style) { if(typeof node.style[p]==="string"&&p!=="setProperty"&&p!=="getPropertyValue"&&p!=="removeProperty"&&p!=="cssText"&&p.indexOf("_")!==0) sk.push(p); }
     if(sk.length>0) { h+=" style=\""; for(var i=0;i<sk.length;i++) { var kk=sk[i].replace(/[A-Z]/g,function(m){return "-"+m.toLowerCase();}); h+=kk+":"+node.style[sk[i]]+";"; } h+="\""; }
+    __keepNode(node);
     h+=" data-flid=\""+node._id+"\"";
     h+=">";
     var voids=["area","base","br","col","embed","hr","img","input","link","meta","param","source","track","wbr"];
@@ -2186,7 +2222,11 @@ doc.exitFullscreen = function() {
 };
 doc.webkitExitFullscreen = doc.exitFullscreen;
 Element.prototype.requestFullscreen = function() {
-    try { __zippHostCall("fullscreen", "1"); } catch (e) { return Promise.reject(e); }
+    // The host refuses unless the person just did something (see
+    // `note_user_gesture`).
+    try {
+        if (__zippHostCall("fullscreen", "1") !== "1") return Promise.reject(new TypeError("requestFullscreen needs a click or a key press"));
+    } catch (e) { return Promise.reject(e); }
     __fullscreenChange(this);
     return Promise.resolve();
 };
@@ -2406,7 +2446,10 @@ var navigator = {
     language:"en-US", languages:["en-US","en"],
     platform:"Win32", vendor:"", onLine:true,
     cookieEnabled:true, hardwareConcurrency:4, maxTouchPoints:0,
-    clipboard:{ writeText:function(){return Promise.resolve();}, readText:function(){return Promise.resolve("");} },
+    clipboard:{
+        writeText:function(text){ try { __zippHostCall("clipboard_write", String(text)); return Promise.resolve(); } catch (e) { return Promise.reject(e); } },
+        readText:function(){ try { return Promise.resolve(__zippHostCall("clipboard_read")); } catch (e) { return Promise.reject(e); } }
+    },
     permissions:{ query:function(){return Promise.resolve({state:"granted"});} },
     sendBeacon:function(){return true;},
     // Registering succeeds and nothing runs: the registration is there to
@@ -2958,8 +3001,9 @@ XMLHttpRequest.prototype.send = function(body) {
     var self = this;
     try {
         var r;
-        if (self._method === "POST") r = http.post(self._url, String(body || ""), self._headers["Content-Type"] || "");
-        else if (self._method === "PUT") r = http.put(self._url, String(body || ""), self._headers["Content-Type"] || "");
+        __zippCredentials = self.withCredentials ? "include" : "";
+        if (self._method === "POST") r = http.post(self._url, String(body || ""), __headerNamed(self._headers, "content-type") || "");
+        else if (self._method === "PUT") r = http.put(self._url, String(body || ""), __headerNamed(self._headers, "content-type") || "");
         else if (self._method === "DELETE") r = http.delete(self._url);
         else r = http.get(self._url);
         self.status = r.status;
@@ -3050,6 +3094,15 @@ var Response = class Response {
     static error() { var r = new Response(null, { status: 0 }); r.type = "error"; return r; }
 };
 function __asResponse(r) { Object.setPrototypeOf(r, Response.prototype); return r; }
+
+// A header from what a page gives: a plain object in any case of name, or
+// Headers. Only the exact spelling "Content-Type" was found.
+function __headerNamed(headers, name) {
+    if (!headers) return "";
+    if (typeof headers.get === "function") return headers.get(name) || "";
+    for (var k in headers) if (k.toLowerCase() === name) return headers[k];
+    return "";
+}
 
 // The machine's randomness, as WebCrypto's is. It was Math.random, which
 // starts the same way in every page: each launch of an app made the same
@@ -3346,13 +3399,17 @@ var window = {
         var method = (opts.method || "GET").toUpperCase();
         var body = opts.body || null;
         var headers = opts.headers || {};
+        // As fetch has it: what a string body is, unless the page says.
+        var contentType = __headerNamed(headers, "content-type") || "text/plain;charset=UTF-8";
+        var credentials = opts.credentials === "include" ? "include" : "";
         return new Promise(function(resolve, reject) {
             try {
                 var r;
+                __zippCredentials = credentials;
                 if (method === "POST") {
-                    r = http.post(String(url), String(body || ""), headers["Content-Type"] || "application/json");
+                    r = http.post(String(url), String(body || ""), contentType);
                 } else if (method === "PUT") {
-                    r = http.put(String(url), String(body || ""), headers["Content-Type"] || "application/json");
+                    r = http.put(String(url), String(body || ""), contentType);
                 } else if (method === "DELETE") {
                     r = http.delete(String(url));
                 } else {
@@ -3375,7 +3432,7 @@ var window = {
                     // `WebAssembly.instantiateStreaming(fetch(url))` reads.
                     arrayBuffer: function() {
                         return new Promise(function(res, rej) {
-                            try { res(__zippFetchBytes(String(url))); } catch (e) { rej(e); }
+                            try { res(__zippFetchBytes(String(url), credentials)); } catch (e) { rej(e); }
                         });
                     },
                     clone: function() { return this; },
@@ -3563,6 +3620,7 @@ function __serializeNode(node) {
     // which come later so a value JS changed wins.
     var st=(node.attributes&&node.attributes.style?String(node.attributes.style).replace(/;?\s*$/,";"):"")+(node.style?__styleText(node.style):"");
     if(st!==""&&st!==";") r+=" style=\""+__ea(st)+"\"";
+    __keepNode(node);
     r+=" data-flid=\""+node._id+"\"";
     r+=">";
     // A select shows its chosen option's label, written in as its text.
@@ -3669,6 +3727,7 @@ function __attrPairs(node, tag) {
     if (fieldValue && tag==="input") out.push(["value", String(node._value)]);
     var st=(node.attributes&&node.attributes.style?String(node.attributes.style).replace(/;?\s*$/,";"):"")+(node.style?__styleText(node.style):"");
     if (st!==""&&st!==";") out.push(["style", st]);
+    __keepNode(node);
     out.push(["data-flid", String(node._id)]);
     return out;
 }
@@ -3730,6 +3789,7 @@ function __patchNode(node, ops) {
 // html] its children), or the whole body's markup the first time, or when
 // the body's own attributes or children changed.
 function __zippRenderPatch() {
+    if (__nodeCount >= __sweepAt) __sweepNodes();
     if (!__drawnFromScript()) return null;
     var body = doc.body;
     if (__drawnBody !== body || body._ra === undefined) return __renderWhole();

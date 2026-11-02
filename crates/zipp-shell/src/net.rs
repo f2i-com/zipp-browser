@@ -69,7 +69,9 @@ impl Provider {
     pub fn with_user_agent(waker: Option<Arc<dyn NetWaker>>, user_agent: String) -> Self {
         let builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::limited(10))
-            .danger_accept_invalid_certs(true); // Fix TLS on RDP/corporate environments
+            // Certificates are checked. This was on for everyone, for one
+            // proxy on one network, so anyone on the path could be any site.
+            .danger_accept_invalid_certs(std::env::var_os("ZIPP_ACCEPT_INVALID_CERTS").is_some());
         // The browser's one jar, which pages and their scripts share.
         #[cfg(feature = "cookies")]
         let builder = builder.cookie_provider(crate::cookies::jar());
@@ -106,6 +108,17 @@ impl Provider {
         Arc::strong_count(&self.waker) - 1
     }
 }
+/// Who decides whether a local file may be loaded for the page showing: the
+/// browser, which knows the page. Without one (a tool, not a browser showing
+/// the web) anything may be.
+static FILE_GATE: std::sync::OnceLock<fn(&std::path::Path) -> bool> = std::sync::OnceLock::new();
+
+/// Have `gate` decide which local files pages may load: stylesheets, images
+/// and fonts, which come here, as a page's `fetch` does not.
+pub fn set_file_gate(gate: fn(&std::path::Path) -> bool) {
+    let _ = FILE_GATE.set(gate);
+}
+
 impl Provider {
     async fn fetch_inner(
         client: Client,
@@ -139,6 +152,13 @@ impl Provider {
                             format!("not a valid file URL: {}", request.url),
                         )
                     })?;
+                if FILE_GATE.get().is_some_and(|gate| !gate(&path)) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!("{} is not this page's to load", request.url),
+                    )
+                    .into());
+                }
                 let file_content = std::fs::read(path)?;
                 (request.url.to_string(), Bytes::from(file_content))
             }

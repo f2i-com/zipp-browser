@@ -277,7 +277,23 @@ fn replace_children(doc: &mut BaseDocument, node_id: usize, html: &str) {
     // selection -- when the re-render gives it the same text:
     // typing re-renders the page, and the caret went back to
     // the start with every key.
-    let focused_editor = doc.focus_node_id.and_then(|id| {
+    //
+    // Only a field inside what is replaced: another one is not rebuilt, and
+    // has nothing to keep. Taken from every focused field, an editor ahead of
+    // its `value` attribute (a key typed in the same batch as this change)
+    // was not given back, and the desktop's taskbar refreshing on its timer
+    // sent the terminal's caret to the start of the line in mid-word.
+    let is_replaced = |doc: &BaseDocument, id: usize| {
+        let mut at = doc.get_node(id).and_then(|n| n.parent);
+        while let Some(parent) = at {
+            if parent == node_id {
+                return true;
+            }
+            at = doc.get_node(parent).and_then(|n| n.parent);
+        }
+        false
+    };
+    let focused_editor = doc.focus_node_id.filter(|&id| is_replaced(doc, id)).and_then(|id| {
         let el = doc.nodes.get_mut(id)?.element_data_mut()?;
         el.text_input_data()?;
         match std::mem::take(&mut el.special_data) {

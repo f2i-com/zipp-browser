@@ -99,6 +99,11 @@ pub(crate) fn handle_keypress<F: FnMut(DomEvent)>(
         let Some(element_data) = node.element_data_mut() else {
             return;
         };
+        // What a password field holds does not go to the clipboard: it would
+        // come out of the next paste, in plain sight.
+        let secret = element_data
+            .attr(local_name!("type"))
+            .is_some_and(|t| t.eq_ignore_ascii_case("password"));
 
         if let Some(input_data) = element_data.text_input_data_mut() {
             let generated_event = apply_keypress_event(
@@ -107,6 +112,7 @@ pub(crate) fn handle_keypress<F: FnMut(DomEvent)>(
                 &mut doc.layout_ctx,
                 &*doc.shell_provider,
                 event,
+                secret,
             );
 
             if let Some(generated_event) = generated_event {
@@ -145,6 +151,7 @@ fn apply_keypress_event(
     layout_ctx: &mut LayoutContext<TextBrush>,
     shell_provider: &dyn ShellProvider,
     event: KeyEvent,
+    secret: bool,
 ) -> Option<GeneratedEvent> {
     // Do nothing if it is a keyup event
     if !event.state.is_pressed() {
@@ -161,6 +168,7 @@ fn apply_keypress_event(
     match event.key {
         Key::Character(c) if action_mod && matches!(c.as_str(), "c" | "x" | "v") => {
             match c.to_lowercase().as_str() {
+                "c" | "x" if secret => {}
                 "c" => {
                     if let Some(text) = driver.editor.selected_text() {
                         let _ = shell_provider.set_clipboard_text(text.to_owned());

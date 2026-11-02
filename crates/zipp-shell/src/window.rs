@@ -492,6 +492,11 @@ where
                         let ctrl = self.keyboard_modifiers.state().control_key();
                         let meta = self.keyboard_modifiers.state().meta_key();
                         let alt = self.keyboard_modifiers.state().alt_key();
+                        // A kiosk's or an app's page is the whole program:
+                        // the keys of a browser around it are its own (Ctrl+R
+                        // in vim, in a terminal on ZIPP OS, reloaded the
+                        // desktop and every window with it).
+                        let browser = crate::browser_keys();
 
                         // History and reload, as in any browser. Consumed here:
                         // the page does not also see them.
@@ -502,8 +507,8 @@ where
                             KeyCode::BrowserHome => Some("home"),
                             KeyCode::BrowserBack => Some("back"),
                             KeyCode::BrowserForward => Some("forward"),
-                            KeyCode::F5 | KeyCode::BrowserRefresh => Some("reload"),
-                            KeyCode::KeyR if ctrl | meta => Some("reload"),
+                            KeyCode::F5 | KeyCode::BrowserRefresh if browser => Some("reload"),
+                            KeyCode::KeyR if browser && (ctrl | meta) => Some("reload"),
                             _ => None,
                         };
                         if let Some(command) = command {
@@ -514,7 +519,7 @@ where
                         // Ctrl+L / F6: into the address bar, its text selected. The
                         // browser's address bar is `input[name=__nav_url]`, the same
                         // embedder convention as `zipp-nav:` above.
-                        if (key_code == KeyCode::KeyL && (ctrl | meta)) || key_code == KeyCode::F6 {
+                        if browser && ((key_code == KeyCode::KeyL && (ctrl | meta)) || key_code == KeyCode::F6) {
                             let mut inner = self.doc.inner_mut();
                             if let Ok(Some(address_bar)) = inner.query_selector("input[name=__nav_url]") {
                                 inner.focus_and_select_all(address_bar);
@@ -525,7 +530,7 @@ where
                         }
 
                         // Ctrl/Super keyboard shortcuts
-                        if ctrl | meta {
+                        if browser && (ctrl | meta) {
                             match key_code {
                                 KeyCode::Equal => {
                                     self.doc.inner_mut().viewport_mut().zoom_by(0.1);
@@ -541,7 +546,7 @@ where
                         }
 
                         // Alt keyboard shortcuts
-                        if alt {
+                        if browser && alt {
                             match key_code {
                                 KeyCode::KeyD => {
                                     let mut inner = self.doc.inner_mut();

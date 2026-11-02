@@ -731,13 +731,18 @@ impl ElementCx<'_> {
                 crate::text::draw_text_runs_faded(scene, layout.lines(), self.context.dom, transform, 0.55);
             }
 
-            // Render text
-            crate::text::draw_text_runs(
-                scene,
-                input_data.editor.try_layout().unwrap().lines(),
-                self.context.dom,
-                transform,
-            );
+            // Render text: a password as dots. (An empty field's editor holds
+            // one space, which is no character typed.)
+            let lines = input_data.editor.try_layout().unwrap().lines();
+            let secret = self
+                .node
+                .attr(zipp_dom::local_name!("type"))
+                .is_some_and(|t| t.eq_ignore_ascii_case("password"));
+            if !secret {
+                crate::text::draw_text_runs(scene, lines, self.context.dom, transform);
+            } else if !empty {
+                crate::text::draw_password_dots(scene, lines, self.context.dom, transform);
+            }
         }
     }
 

@@ -423,14 +423,16 @@ fn flip_rows(data: &mut [u8], stride: usize, height: usize) {
     }
 }
 
-fn bytes_per_pixel(format: u32, ty: u32) -> usize {
+fn pixel_bytes(format: u32, ty: u32) -> Option<usize> {
     let channels = match format {
         glow::RGBA | glow::RGBA_INTEGER => 4,
         glow::RGB | glow::RGB_INTEGER => 3,
         glow::RG | glow::RG_INTEGER | glow::LUMINANCE_ALPHA => 2,
-        _ => 1,
+        glow::RED | glow::RED_INTEGER | glow::ALPHA | glow::LUMINANCE | glow::DEPTH_COMPONENT | glow::DEPTH_STENCIL => 1,
+        _ => return None,
     };
-    match ty {
+    Some(match ty {
+        glow::UNSIGNED_BYTE | glow::BYTE => channels,
         glow::FLOAT | glow::INT | glow::UNSIGNED_INT => channels * 4,
         glow::HALF_FLOAT | glow::SHORT | glow::UNSIGNED_SHORT => channels * 2,
         glow::UNSIGNED_SHORT_5_6_5 | glow::UNSIGNED_SHORT_4_4_4_4 | glow::UNSIGNED_SHORT_5_5_5_1 => 2,
@@ -439,9 +441,13 @@ fn bytes_per_pixel(format: u32, ty: u32) -> usize {
         | glow::UNSIGNED_INT_5_9_9_9_REV
         | glow::UNSIGNED_INT_24_8 => 4,
         glow::FLOAT_32_UNSIGNED_INT_24_8_REV => 8,
-        _ => channels,
-    }
+        _ => return None,
+    })
 }
+
+/// The most one read back may take. A page asking for more is refused, not
+/// answered by trying to allocate it.
+const MAX_READ_BYTES: usize = 1 << 30;
 
 /// The page's name for the canvas's color buffer, as the offscreen one's.
 fn canvas_buffer(buffer: u32) -> u32 {
@@ -473,7 +479,58 @@ impl Context {
             n => n,
         };
         let align = self.state.pixel_store(align).max(1) as usize;
-        (pixels.max(0) as usize * bytes_per_pixel(format, ty)).div_ceil(align) * align
+        // The largest pixel for what is not known: callers have refused it
+        // already (`image_bytes`).
+        (pixels.max(0) as usize).saturating_mul(pixel_bytes(format, ty).unwrap_or(16)).div_ceil(align).saturating_mul(align)
+    }
+
+    /// How many bytes the driver will touch reading or writing a `w`x`h`x`d`
+    /// image under the page's pixel store: rows, padding, and what the skips
+    /// step over. None for a format and type WebGL does not have, a negative
+    /// size, or a total that does not fit.
+    ///
+    /// This is what stands between a page and the heap: OpenGL takes a pointer
+    /// and no length. `readPixels` sized its buffer without the skips, and
+    /// counted a format it did not know as one channel, so
+    /// `pixelStorei(PACK_SKIP_ROWS, 100000)` had the driver write pixels the
+    /// page chose past the end of it; an upload was never compared with its
+    /// dimensions, so the driver read past the page's bytes, and the page could
+    /// read what it found back.
+    fn image_bytes(&self, w: i32, h: i32, d: i32, format: u32, ty: u32, pack: bool) -> Option<usize> {
+        if w < 0 || h < 0 || d < 0 {
+            return None;
+        }
+        let pixel = pixel_bytes(format, ty)?;
+        if w == 0 || h == 0 || d == 0 {
+            return Some(0);
+        }
+        let store = |name: u32| self.state.pixel_store(name).max(0) as usize;
+        let (skip_rows, skip_pixels, skip_images, image_height) = if pack {
+            (store(glow::PACK_SKIP_ROWS), store(glow::PACK_SKIP_PIXELS), 0, 0)
+        } else {
+            (
+                store(glow::UNPACK_SKIP_ROWS),
+                store(glow::UNPACK_SKIP_PIXELS),
+                store(glow::UNPACK_SKIP_IMAGES),
+                store(glow::UNPACK_IMAGE_HEIGHT),
+            )
+        };
+        let (w, h, d) = (w as usize, h as usize, d as usize);
+        let image_rows = if image_height == 0 { h } else { image_height };
+        let rows = skip_images.checked_add(d - 1)?.checked_mul(image_rows)?.checked_add(skip_rows)?.checked_add(h - 1)?;
+        let stride = self.row_stride(w.min(i32::MAX as usize) as i32, format, ty, pack);
+        rows.checked_mul(stride)?.checked_add(skip_pixels.checked_add(w)?.checked_mul(pixel)?)
+    }
+
+    /// `len` bytes of the page's are enough for this upload, or it is refused.
+    fn check_upload(&self, len: usize, w: i32, h: i32, d: i32, format: u32, ty: u32) -> Result<(), String> {
+        let need = self
+            .image_bytes(w, h, d, format, ty, false)
+            .ok_or_else(|| format!("InvalidEnumError: no such pixels: format {format:#x}, type {ty:#x}, {w}x{h}x{d}"))?;
+        if len < need {
+            return Err(format!("InvalidOperationError: {len} bytes of pixels for an image of {need}"));
+        }
+        Ok(())
     }
 
     /// Page bytes for a `width`x`height` upload, flipped if UNPACK_FLIP_Y
@@ -938,7 +995,9 @@ impl Context {
                     if at < 0.0 {
                         self.gl.tex_image_2d(target, level, internal, w, h, 0, format, ty, glow::PixelUnpackData::Slice(None));
                     } else {
-                        let data = self.unpack_bytes(bytes(at as usize, u(9) as usize)?, w, h, format, ty);
+                        let page = bytes(at as usize, u(9) as usize)?;
+                        self.check_upload(page.len(), w, h, 1, format, ty)?;
+                        let data = self.unpack_bytes(page, w, h, format, ty);
                         self.gl.tex_image_2d(target, level, internal, w, h, 0, format, ty, glow::PixelUnpackData::Slice(Some(&data)));
                     }
                 }
@@ -956,7 +1015,9 @@ impl Context {
                 }
                 "texSubImage2D" => {
                     let (target, level, x, y, w, h, format, ty) = (u(1), int(2), int(3), int(4), int(5), int(6), u(7), u(8));
-                    let data = self.unpack_bytes(bytes(u(9) as usize, u(10) as usize)?, w, h, format, ty);
+                    let page = bytes(u(9) as usize, u(10) as usize)?;
+                    self.check_upload(page.len(), w, h, 1, format, ty)?;
+                    let data = self.unpack_bytes(page, w, h, format, ty);
                     self.gl.tex_sub_image_2d(target, level, x, y, w, h, format, ty, glow::PixelUnpackData::Slice(Some(&data)));
                 }
                 "texSubImage2DPbo" => {
@@ -975,6 +1036,9 @@ impl Context {
                     let (target, level, internal, w, h, d, format, ty) = (u(1), int(2), int(3), int(4), int(5), int(6), u(7), u(8));
                     let at = num(9);
                     let data = if at < 0.0 { None } else { Some(bytes(at as usize, u(10) as usize)?) };
+                    if let Some(data) = data {
+                        self.check_upload(data.len(), w, h, d, format, ty)?;
+                    }
                     self.gl.tex_image_3d(target, level, internal, w, h, d, 0, format, ty, glow::PixelUnpackData::Slice(data));
                 }
                 "texImage3DPbo" => {
@@ -983,6 +1047,7 @@ impl Context {
                 }
                 "texSubImage3D" => {
                     let data = bytes(u(11) as usize, u(12) as usize)?;
+                    self.check_upload(data.len(), int(6), int(7), int(8), u(9), u(10))?;
                     let pixels = glow::PixelUnpackData::Slice(Some(data));
                     self.gl.tex_sub_image_3d(u(1), int(2), int(3), int(4), int(5), int(6), int(7), int(8), u(9), u(10), pixels);
                 }
@@ -1199,7 +1264,10 @@ impl Context {
                         let pixels = glow::PixelPackData::BufferOffset(u(7));
                         self.gl.read_pixels(x, y, w, h, format, ty, pixels);
                     } else {
-                        let len = self.row_stride(w, format, ty, true) * h.max(0) as usize;
+                        let len = self
+                            .image_bytes(w, h, 1, format, ty, true)
+                            .filter(|&len| len <= MAX_READ_BYTES)
+                            .ok_or_else(|| format!("InvalidOperationError: readPixels: format {format:#x}, type {ty:#x}, {w}x{h}"))?;
                         let mut buf = vec![0u8; len];
                         self.gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
                         self.gl.read_pixels(x, y, w, h, format, ty, glow::PixelPackData::Slice(Some(&mut buf)));

@@ -117,12 +117,17 @@ pub(crate) fn start(url: &str, module: bool) -> Result<u32, String> {
     let (to_tx, to_rx) = mpsc::channel();
     let (from_tx, from_rx) = mpsc::channel();
     let url = url.to_string();
+    // The page that started it, for good: see `page_url`.
+    let page = crate::page_url();
     std::thread::Builder::new()
         .name(format!("zipp-worker-{id}"))
         // Compiling a module graph recurses over its syntax tree on the native
         // stack, as the page's does (`run_zipp_js`).
         .stack_size(64 * 1024 * 1024)
-        .spawn(move || run(&url, module, to_rx, from_tx))
+        .spawn(move || {
+            crate::set_thread_page(page);
+            run(&url, module, to_rx, from_tx)
+        })
         .map_err(|e| format!("Error: cannot start a worker: {e}"))?;
     WORKERS.with(|w| w.borrow_mut().insert(id, Handle { to: to_tx, from: from_rx, page: PAGE.get() }));
     Ok(id)

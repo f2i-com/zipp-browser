@@ -144,7 +144,9 @@ fn allowed() -> bool {
     match std::env::var("ZIPP_WEBUSB").as_deref() {
         Ok("on") => true,
         Ok("off") => false,
-        _ => crate::CURRENT_URL.lock().map(|u| u.starts_with("file://")).unwrap_or(false),
+        // A page of this machine's; not an app (`--app`), whose code came in
+        // a file from anywhere, and which could reset the boot drive.
+        _ => crate::page_url().starts_with("file://") && !crate::is_app(),
     }
 }
 
@@ -453,7 +455,8 @@ fn describe(sysfs: &Path) -> Option<Json> {
         "productName": text("product"),
         "serialNumber": text("serial"),
         "activeConfiguration": active,
-        "configurations": configurations(&raw[raw[0] as usize..]),
+        // A device says how long its own descriptor is.
+        "configurations": configurations(raw.get(raw[0] as usize..).unwrap_or(&[])),
     }))
 }
 

@@ -633,6 +633,10 @@ impl EventHandler for JsEventBridge {
         event_state: &mut EventState,
     ) {
         let event_name = event.data.name();
+        // Only input reaches here: a page's own dispatchEvent stays in script.
+        if matches!(event.data, DomEventData::Click(_) | DomEventData::KeyDown(_) | DomEventData::MouseDown(_)) {
+            crate::note_user_gesture();
+        }
         let _layout = LayoutScope::enter(&_doc.inner());
         self.refresh_listeners(&_doc.inner());
         // The console's button and links, and F12, are the browser's -- when
@@ -955,7 +959,7 @@ impl EventHandler for JsEventBridge {
             self.run_console_input();
             // An empty line again, still focused, for the next.
             if let Ok(Some(form)) = doc.query_selector("#__zipp_console_form") {
-                doc.mutate().set_inner_html(form, crate::CONSOLE_INPUT);
+                doc.mutate().set_inner_html(form, &crate::console_input());
                 if let Ok(Some(input)) = doc.query_selector("#__zipp_console_input") {
                     doc.set_focus_to(input);
                 }

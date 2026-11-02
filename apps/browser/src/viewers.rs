@@ -35,6 +35,10 @@ const NAVIGATION_ACCEPT: &str =
 pub(crate) fn fetch_document(url: &str, allow_download: bool) -> Result<String, String> {
     if let Some(path) = url.strip_prefix("file://") {
         let path = local_path(path);
+        // An app (`--app`) shows its own files, not the machine's.
+        if !crate::within_app_files(&path) {
+            return Err(format!("{} is not this app's to read", path.display()));
+        }
         let bytes = std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         let mime = mime_from_extension(&path);
         return classify(url, bytes, mime.map(str::to_string), None, allow_download);

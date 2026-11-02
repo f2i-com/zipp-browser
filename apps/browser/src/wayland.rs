@@ -73,6 +73,11 @@ const BTN_EXTRA: u32 = 0x114;
 
 // ---- the page's side --------------------------------------------------------------------
 
+/// How many programs may have windows at once, and surfaces between them: a
+/// program that opens without end costs itself, not the desktop.
+const MAX_CLIENTS: usize = 64;
+const MAX_SURFACES: usize = 4096;
+
 /// What the page hears of: ("window" | "size" | "title" | "place" | "gone" |
 /// "fullscreen" | "minimize" | "maximize", window, JSON).
 static EVENTS: Mutex<Vec<(&'static str, u32, String)>> = Mutex::new(Vec::new());
@@ -372,6 +377,10 @@ fn run(socket: ListeningSocket, commands: Receiver<Command>, wake: Arc<OwnedFd>,
             unsafe { libc::read(wake.as_raw_fd(), (&mut n as *mut u64).cast(), 8) };
         }
         while let Ok(Some(stream)) = socket.accept() {
+            if state.clients.len() >= MAX_CLIENTS {
+                eprintln!("[wayland] {MAX_CLIENTS} programs have windows: refused another");
+                continue;
+            }
             match display.handle().insert_client(stream, Arc::new(ClientState)) {
                 Ok(client) => state.clients.push(client.id()),
                 Err(e) => eprintln!("[wayland] a client could not connect: {e}"),
@@ -523,15 +532,22 @@ impl Mapping {
         }
     }
 
-    /// The file's size now: a client can shrink it under the mapping, and
-    /// reading past its end would end the browser (SIGBUS).
-    fn file_len(&self) -> usize {
-        // SAFETY: fstat into a zeroed stat.
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(self.fd.as_raw_fd(), &mut st) } != 0 {
-            return 0;
+    /// `len` bytes of the file from `offset`; None if it is not that long now.
+    fn read(&self, offset: usize, len: usize) -> Option<Vec<u8>> {
+        let mut out = vec![0u8; len];
+        let mut got = 0;
+        while got < len {
+            // SAFETY: into the rest of `out`, from a descriptor this owns.
+            let n = unsafe {
+                libc::pread(self.fd.as_raw_fd(), out[got..].as_mut_ptr().cast(), len - got, (offset + got) as libc::off_t)
+            };
+            match n {
+                n if n > 0 => got += n as usize,
+                -1 if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {}
+                _ => return None,
+            }
         }
-        st.st_size.max(0) as usize
+        Some(out)
     }
 }
 
@@ -556,11 +572,14 @@ fn read_buffer(buffer: &WlBuffer) -> Option<Pixels> {
     let b = buffer.data::<ShmBuffer>().filter(|b| b.valid)?;
     let map = lock(&b.pool);
     let end = b.offset.checked_add(b.stride.checked_mul(b.height - 1)?)?.checked_add(b.width * 4)?;
-    if map.ptr.is_null() || end > map.len || end > map.file_len() {
+    if map.ptr.is_null() || end > map.len {
         return None;
     }
-    // SAFETY: inside the mapping, and the file is at least that long.
-    let bytes = unsafe { std::slice::from_raw_parts(map.ptr.add(b.offset), end - b.offset) };
+    // Read, not looked at through the mapping: a client can shrink its file
+    // at any moment, between any check and any look, and reading a mapping
+    // past the end of its file ends the program with SIGBUS -- here the
+    // desktop, and every window. Reading the file just comes up short.
+    let bytes = map.read(b.offset, end - b.offset)?;
     let mut rgba = Vec::with_capacity(b.width * b.height * 4);
     for row in 0..b.height {
         let line = &bytes[row * b.stride..row * b.stride + b.width * 4];
@@ -936,6 +955,29 @@ impl State {
         }
     }
 
+    /// Whether `parent` may take `child` as a subsurface.
+    fn can_hold(&self, parent: &ObjectId, child: &ObjectId) -> bool {
+        let Some(c) = self.surfaces.get(child) else {
+            return false;
+        };
+        if !matches!(c.role, Role::None) || self.surfaces.len() >= MAX_SURFACES {
+            return false;
+        }
+        let mut at = Some(parent.clone());
+        let mut depth = 0;
+        while let Some(id) = at {
+            if id == *child || depth > 16 {
+                return false;
+            }
+            depth += 1;
+            at = match self.surfaces.get(&id).map(|s| &s.role) {
+                Some(Role::Sub { parent, .. }) => Some(parent.clone()),
+                _ => None,
+            };
+        }
+        true
+    }
+
     fn window_surface(&self, window: u32) -> Option<WlSurface> {
         let w = self.windows.get(&window)?;
         Some(self.surfaces.get(&w.surface)?.wl.clone())
@@ -1226,6 +1268,12 @@ impl Dispatch<WlSubcompositor, ()> for State {
         if let wl_subcompositor::Request::GetSubsurface { id, surface, parent } = request {
             let (child, parent) = (surface.id(), parent.id());
             init.init(id, child.clone());
+            // A tree: a surface already placed, or one under itself (drawing
+            // that would go round for as long as a client liked, with the
+            // desktop waiting), gets no place. It is the client's error.
+            if !state.can_hold(&parent, &child) {
+                return;
+            }
             if let Some(s) = state.surfaces.get_mut(&child) {
                 s.role = Role::Sub { parent: parent.clone(), x: 0, y: 0 };
             }

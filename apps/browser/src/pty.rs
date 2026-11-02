@@ -77,6 +77,9 @@ pub(crate) struct Options {
     env: HashMap<String, String>,
     /// Run it in this root, as this user (see the module docs).
     jail: Option<Jail>,
+    /// Run it as this user, on this system: a program that has no need to be
+    /// root, and that shows what the web sends it (a browser in a window).
+    user: Option<u32>,
 }
 
 pub(crate) struct Jail {
@@ -99,6 +102,7 @@ impl Options {
                 uid: v["jail"]["uid"].as_u64().unwrap_or(0) as u32,
                 gid: v["jail"]["gid"].as_u64().unwrap_or(0) as u32,
             }),
+            user: v["user"].as_u64().filter(|&n| n > 0 && n <= u32::MAX as u64).map(|n| n as u32),
         })
     }
 }
@@ -130,6 +134,7 @@ pub(crate) fn spawn(id: u64, program: &str, args: &[String], options: Options) -
 
     // Everything the child needs is made here, before it is forked: after
     // the fork it may only make system calls.
+    let user = options.user;
     let jail = match &options.jail {
         Some(j) => Some(JailPaths::new(j, options.cwd.as_deref())?),
         None => {
@@ -145,8 +150,19 @@ pub(crate) fn spawn(id: u64, program: &str, args: &[String], options: Options) -
             // A session of its own, with this terminal as its controlling one.
             libc::setsid();
             libc::ioctl(0, libc::TIOCSCTTY as _, 0);
+            // The desktop is the last thing the kernel kills for memory
+            // (zipp-init); what it starts is among the first, and a window
+            // that runs away costs that window.
+            let adj = libc::open(c"/proc/self/oom_score_adj".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+            if adj >= 0 {
+                libc::write(adj, c"300".as_ptr().cast(), 3);
+                libc::close(adj);
+            }
             if let Some(jail) = &jail {
                 jail.enter()?;
+            }
+            if let Some(uid) = user {
+                drop_to(uid)?;
             }
             Ok(())
         });
@@ -237,6 +253,12 @@ pub(crate) fn kill(id: u64, signal: i32) -> Result<(), String> {
 }
 
 /// A jail's paths and user, made ready before the fork.
+/// Capabilities no program in a jail has: `CAP_NET_ADMIN`, `CAP_SYS_MODULE`,
+/// `CAP_SYS_RAWIO`, `CAP_SYS_PTRACE`, `CAP_SYS_ADMIN`, `CAP_SYS_BOOT`,
+/// `CAP_SYS_TIME`, `CAP_MKNOD`, `CAP_MAC_ADMIN`, `CAP_MAC_OVERRIDE`,
+/// `CAP_SYSLOG`, `CAP_BPF`, `CAP_PERFMON`.
+const JAIL_DROPS: [libc::c_ulong; 13] = [12, 16, 17, 19, 21, 22, 25, 27, 32, 33, 34, 39, 38];
+
 struct JailPaths {
     root: CString,
     proc_: CString,
@@ -264,7 +286,11 @@ impl JailPaths {
         // Its own name servers: the system's /etc/resolv.conf is a link
         // into /run, which the jail does not see.
         if let Ok(dns) = std::fs::read_to_string("/etc/resolv.conf") {
-            let _ = std::fs::write(format!("{root}/etc/resolv.conf"), dns);
+            // Replaced, not written through: root in the jail can make this
+            // a link to anywhere, and this runs as the desktop.
+            let target = format!("{root}/etc/resolv.conf");
+            let _ = std::fs::remove_file(&target);
+            let _ = std::fs::write(&target, dns);
         }
         for dir in ["proc", "dev", "sys", "tmp"] {
             let _ = std::fs::create_dir_all(format!("{root}/{dir}"));
@@ -303,13 +329,22 @@ impl JailPaths {
             check(libc::mount(none, self.slash.as_ptr(), none, libc::MS_REC | libc::MS_PRIVATE, std::ptr::null()))?;
             check(libc::mount(self.procfs.as_ptr(), self.proc_.as_ptr(), self.procfs.as_ptr(), libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, std::ptr::null()))?;
             check(libc::mount(self.host_dev.as_ptr(), self.dev.as_ptr(), none, libc::MS_BIND | libc::MS_REC, std::ptr::null()))?;
-            check(libc::mount(self.host_sys.as_ptr(), self.sys.as_ptr(), none, libc::MS_BIND | libc::MS_REC | libc::MS_RDONLY, std::ptr::null()))?;
+            check(libc::mount(self.host_sys.as_ptr(), self.sys.as_ptr(), none, libc::MS_BIND | libc::MS_REC, std::ptr::null()))?;
+            // Read-only takes a second step: a bind ignores the flag.
+            check(libc::mount(none, self.sys.as_ptr(), none, libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY, std::ptr::null()))?;
             if let Some((host, inside)) = &self.wayland {
                 check(libc::mount(host.as_ptr(), inside.as_ptr(), none, libc::MS_BIND, std::ptr::null()))?;
             }
             check(libc::chroot(self.root.as_ptr()))?;
             if libc::chdir(self.cwd.as_ptr()) != 0 {
                 check(libc::chdir(self.slash.as_ptr()))?;
+            }
+            // Root in here is for installing packages. It keeps what that
+            // takes and not what reaches out of the jail: with these, /proc/1
+            // was the desktop's whole system, and modules, raw disks and
+            // mounts were all open to it.
+            for cap in JAIL_DROPS {
+                check(libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0))?;
             }
             if self.uid != 0 {
                 check(libc::setgroups(0, std::ptr::null()))?;
@@ -320,6 +355,20 @@ impl JailPaths {
         }
         Ok(())
     }
+}
+
+/// Become `uid` for good, in a group of the same number, in no others and with
+/// no way back. Between fork and exec, so system calls only.
+fn drop_to(uid: u32) -> std::io::Result<()> {
+    let check = |rc: libc::c_int| if rc == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) };
+    // SAFETY: system calls on no memory of ours.
+    unsafe {
+        check(libc::setgroups(0, std::ptr::null()))?;
+        check(libc::setgid(uid))?;
+        check(libc::setuid(uid))?;
+        check(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))?;
+    }
+    Ok(())
 }
 
 /// The Linux system on the boot drive's second partition (an ext4 one
@@ -334,18 +383,38 @@ pub(crate) fn linux_root() -> Result<String, String> {
     let source = CString::new(format!("/dev/{device}")).map_err(|e| e.to_string())?;
     let target = CString::new(ROOT).map_err(|e| e.to_string())?;
     let fs = CString::new("ext4").map_err(|e| e.to_string())?;
+    // No device files or set-uid programs from it: its files are its programs',
+    // and the jail has its own /dev.
+    let flags = libc::MS_NOATIME | libc::MS_NODEV | libc::MS_NOSUID;
     // SAFETY: valid strings for the call; no options.
-    if unsafe { libc::mount(source.as_ptr(), target.as_ptr(), fs.as_ptr(), libc::MS_NOATIME, std::ptr::null()) } != 0 {
+    if unsafe { libc::mount(source.as_ptr(), target.as_ptr(), fs.as_ptr(), flags, std::ptr::null()) } != 0 {
         return Err(format!("OperationError: cannot mount the Linux partition: {}", std::io::Error::last_os_error()));
     }
     Ok(ROOT.into())
+}
+
+/// The whole disk a partition is on (`sda` for `sda2`), as sysfs has it.
+fn disk_of(partition: &str) -> Option<String> {
+    let link = std::fs::read_link(format!("/sys/class/block/{partition}")).ok()?;
+    let parent = link.parent()?.file_name()?.to_string_lossy().into_owned();
+    Some(if parent == "block" { partition.to_string() } else { parent })
+}
+
+/// The disk `/boot` is mounted from.
+fn boot_disk() -> Option<String> {
+    let mounts = std::fs::read_to_string("/proc/mounts").ok()?;
+    let device = mounts.lines().find(|l| l.split_whitespace().nth(1) == Some("/boot"))?.split_whitespace().next()?;
+    disk_of(device.strip_prefix("/dev/")?)
 }
 
 /// The block device whose ext4 volume has this label.
 fn find_labelled(label: &str) -> Option<String> {
     let mut names: Vec<String> = std::fs::read_dir("/sys/class/block").ok()?.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
     names.sort();
-    names.into_iter().find(|name| {
+    // On the drive the system started from, when it did from one: any stick
+    // can call itself this, and an internal disk from another install too.
+    let boot = boot_disk();
+    names.into_iter().filter(|name| boot.is_none() || disk_of(name) == boot).find(|name| {
         let Ok(mut file) = std::fs::File::open(format!("/dev/{name}")) else { return false };
         let mut sb = [0u8; 136];
         use std::io::Seek;

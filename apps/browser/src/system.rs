@@ -47,7 +47,7 @@ fn allowed() -> bool {
         Ok("off") => false,
         _ => {
             KIOSK.load(std::sync::atomic::Ordering::Relaxed)
-                && crate::CURRENT_URL.lock().map(|u| u.starts_with("file://")).unwrap_or(false)
+                && crate::page_url().starts_with("file://")
         }
     }
 }
@@ -95,6 +95,12 @@ pub(crate) fn host_call(ctx: &mut dyn HostCtx, args: &[String]) -> Result<String
             }
             // SAFETY: the engine pinned `count` bytes at `addr` for this call.
             let buf = unsafe { std::slice::from_raw_parts_mut(addr as *mut u8, length) };
+            // Files: a device or a FIFO never ends, or never starts, and this
+            // is the desktop's own thread.
+            let meta = std::fs::metadata(&p).map_err(|e| io_error(&p, e))?;
+            if !meta.is_file() {
+                return Err(format!("NotSupportedError: {}: not a file", p.display()));
+            }
             let mut file = std::fs::File::open(&p).map_err(|e| io_error(&p, e))?;
             file.seek(SeekFrom::Start(offset)).map_err(|e| io_error(&p, e))?;
             let mut got = 0;
@@ -124,9 +130,12 @@ pub(crate) fn host_call(ctx: &mut dyn HostCtx, args: &[String]) -> Result<String
             };
             let append = arg(0) == "append";
             changing(&p, || {
-                let mut file = std::fs::OpenOptions::new().write(true).create(true).append(append).truncate(!append).open(&p)?;
-                file.write_all(&bytes)?;
-                file.sync_all()
+                if append {
+                    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&p)?;
+                    file.write_all(&bytes)?;
+                    return file.sync_all();
+                }
+                write_whole(&p, &bytes)
             })
             .map_err(|e| io_error(&p, e))?;
             Ok(String::new())
@@ -152,7 +161,8 @@ pub(crate) fn host_call(ctx: &mut dyn HostCtx, args: &[String]) -> Result<String
         "rename" => {
             let (from, to) = (path(1)?, path(2)?);
             // Across drives a rename cannot be done: a copy, then the original gone.
-            changing(&to, || match std::fs::rename(&from, &to) {
+            refuse_into_itself(&from, &to).map_err(|e| io_error(&both(&from, &to), e))?;
+            changing_both(&from, &to, || match std::fs::rename(&from, &to) {
                 Err(e) if e.raw_os_error() == Some(18) => copy_tree(&from, &to).and_then(|_| remove_tree(&from)),
                 other => other,
             })
@@ -161,6 +171,7 @@ pub(crate) fn host_call(ctx: &mut dyn HostCtx, args: &[String]) -> Result<String
         }
         "copy" => {
             let (from, to) = (path(1)?, path(2)?);
+            refuse_into_itself(&from, &to).map_err(|e| io_error(&both(&from, &to), e))?;
             changing(&to, || copy_tree(&from, &to)).map_err(|e| io_error(&both(&from, &to), e))?;
             Ok(String::new())
         }
@@ -278,16 +289,70 @@ fn entry_json(name: Option<&str>, meta: &std::fs::Metadata) -> String {
     json.to_string()
 }
 
+/// Write `bytes` as the file at `p`, whole or not at all: to a new file beside
+/// it, then over it. Truncating it first meant a power cut, or a drive with no
+/// room, left nothing of what was there: `zipp.conf`, the desktop's settings,
+/// the file being saved.
+fn write_whole(p: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let name = p.file_name().ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let mut temp = std::ffi::OsString::from(".");
+    temp.push(name);
+    temp.push(".new");
+    let temp = dir.join(temp);
+    let written = (|| {
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temp, p)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp);
+        return written;
+    }
+    // The name too, as far as the drive can say.
+    if let Ok(dir) = std::fs::File::open(dir) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+/// Copying a folder into itself never ends (each copy is more to copy, until
+/// the drive is full), and a file onto itself empties it.
+fn refuse_into_itself(from: &Path, to: &Path) -> std::io::Result<()> {
+    let from = std::fs::canonicalize(from)?;
+    // What does not exist yet: where it would go.
+    let target = std::fs::canonicalize(to).or_else(|_| {
+        let parent = to.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
+        Ok::<_, std::io::Error>(std::fs::canonicalize(parent)?.join(to.file_name().unwrap_or_default()))
+    })?;
+    if target == from || (from.is_dir() && target.starts_with(&from)) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "cannot copy or move something into itself"));
+    }
+    Ok(())
+}
+
+/// A folder's contents, not followed through links (one pointing up it, on a
+/// stick from anywhere, would be a copy without end): a link is copied as a
+/// link, or left out on a drive that has none, and only files are read.
 fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
-    if std::fs::metadata(from)?.is_dir() {
+    let meta = std::fs::symlink_metadata(from)?;
+    if meta.is_dir() {
         std::fs::create_dir_all(to)?;
         for entry in std::fs::read_dir(from)? {
             let entry = entry?;
             copy_tree(&entry.path(), &to.join(entry.file_name()))?;
         }
         Ok(())
-    } else {
+    } else if meta.is_file() {
         std::fs::copy(from, to).map(|_| ())
+    } else if meta.file_type().is_symlink() {
+        #[cfg(unix)]
+        let _ = std::os::unix::fs::symlink(std::fs::read_link(from)?, to);
+        Ok(())
+    } else {
+        Ok(())
     }
 }
 
@@ -304,6 +369,12 @@ fn changing<T>(p: &Path, change: impl FnOnce() -> std::io::Result<T>) -> std::io
     }
     let _ = p;
     change()
+}
+
+/// A change at both `a` and `b`. Moving something off the boot drive deletes
+/// it there, and that needs the drive writable as much as the other end does.
+fn changing_both<T>(a: &Path, b: &Path, change: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
+    if a.starts_with("/boot") { changing(a, change) } else { changing(b, change) }
 }
 
 #[cfg(target_os = "linux")]
@@ -659,25 +730,54 @@ fn wifi(op: &str, ssid: &str, passphrase: &str) -> Result<String, String> {
                 if !passphrase.is_empty() && !hex && !(8..=63).contains(&passphrase.len()) {
                     return Err("TypeError: a passphrase is 8 to 63 characters".into());
                 }
-                ok("REMOVE_NETWORK all")?;
+                // Added beside the network in use, not over it: a wrong
+                // password must not cost the connection there was. `undo` takes
+                // this one away again, `keep` the others.
                 let id = ask("ADD_NETWORK")?.trim().to_string();
                 if id.parse::<u32>().is_err() {
                     return Err(format!("OperationError: wpa_supplicant: {id}"));
                 }
                 let name: String = ssid.bytes().map(|b| format!("{b:02x}")).collect();
-                ok(&format!("SET_NETWORK {id} ssid {name}"))?;
-                ok(&format!("SET_NETWORK {id} scan_ssid 1"))?;
-                if passphrase.is_empty() {
-                    ok(&format!("SET_NETWORK {id} key_mgmt NONE"))?;
-                } else if hex {
-                    ok(&format!("SET_NETWORK {id} key_mgmt WPA-PSK WPA-PSK-SHA256"))?;
-                    ok(&format!("SET_NETWORK {id} psk {passphrase}"))?;
-                } else {
-                    ok(&format!("SET_NETWORK {id} key_mgmt WPA-PSK WPA-PSK-SHA256 SAE"))?;
-                    ok(&format!("SET_NETWORK {id} ieee80211w 1"))?;
-                    ok(&format!("SET_NETWORK {id} psk \"{passphrase}\""))?;
+                let set_up = || -> Result<(), String> {
+                    ok(&format!("SET_NETWORK {id} ssid {name}"))?;
+                    ok(&format!("SET_NETWORK {id} scan_ssid 1"))?;
+                    if passphrase.is_empty() {
+                        ok(&format!("SET_NETWORK {id} key_mgmt NONE"))?;
+                    } else if hex {
+                        ok(&format!("SET_NETWORK {id} key_mgmt WPA-PSK WPA-PSK-SHA256"))?;
+                        ok(&format!("SET_NETWORK {id} psk {passphrase}"))?;
+                    } else {
+                        ok(&format!("SET_NETWORK {id} key_mgmt WPA-PSK WPA-PSK-SHA256 SAE"))?;
+                        ok(&format!("SET_NETWORK {id} ieee80211w 1"))?;
+                        ok(&format!("SET_NETWORK {id} psk \"{passphrase}\""))?;
+                    }
+                    ok(&format!("SELECT_NETWORK {id}"))
+                };
+                set_up().inspect_err(|_| {
+                    let _ = ok(&format!("REMOVE_NETWORK {id}"));
+                })?;
+                Ok(String::new())
+            }
+            // The network just added did not work: gone, and the rest back.
+            "undo" => {
+                let list = ask("LIST_NETWORKS")?;
+                let newest = list.lines().skip(1).filter_map(|l| l.split('\t').next()?.parse::<u32>().ok()).max();
+                if let Some(id) = newest {
+                    ok(&format!("REMOVE_NETWORK {id}"))?;
                 }
-                ok(&format!("SELECT_NETWORK {id}"))?;
+                ok("ENABLE_NETWORK all")?;
+                ok("REASSOCIATE")?;
+                Ok(String::new())
+            }
+            // It worked: the ones before it are not wanted.
+            "keep" => {
+                for line in ask("LIST_NETWORKS")?.lines().skip(1) {
+                    if let Some(id) = line.split('\t').next().and_then(|id| id.parse::<u32>().ok())
+                        && !line.contains("[CURRENT]")
+                    {
+                        ok(&format!("REMOVE_NETWORK {id}"))?;
+                    }
+                }
                 Ok(String::new())
             }
             "disconnect" => {

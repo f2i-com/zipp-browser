@@ -65,7 +65,9 @@ fn origin_dir(doc: &url::Url) -> Option<PathBuf> {
                 .collect();
             format!("{scheme}_{host}_{}", doc.port_or_known_default()?)
         }
-        "file" => "file".to_string(),
+        // An app (`--app`) keeps its own: all that runs from disk under one
+        // name, one SoftN app read another's records.
+        "file" => crate::app_storage_name().unwrap_or_else(|| "file".to_string()),
         _ => return None,
     };
     Some(zipp_shell::profile::dir()?.join("storage").join(name))

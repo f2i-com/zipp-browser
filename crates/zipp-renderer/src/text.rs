@@ -2,7 +2,7 @@
 
 use anyrender::PaintScene;
 use zipp_dom::{BaseDocument, node::TextBrush, util::ToColorColor};
-use kurbo::{Affine, Stroke};
+use kurbo::{Affine, Circle, Stroke};
 use parley::{Affinity, Cursor, Layout, Line, PositionedLayoutItem, Selection};
 use peniko::Fill;
 use style::values::computed::TextDecorationLine;
@@ -105,6 +105,32 @@ pub(crate) fn draw_text_runs<'a>(
     transform: Affine,
 ) {
     draw_text_runs_faded(scene, lines, doc, transform, 1.0);
+}
+
+/// A password field's text: a dot where each character is, so that its caret
+/// and selection (which are the text's) stay where they belong.
+pub(crate) fn draw_password_dots<'a>(
+    scene: &mut (impl PaintScene + BlurLayer),
+    lines: impl Iterator<Item = Line<'a, TextBrush>>,
+    doc: &BaseDocument,
+    transform: Affine,
+) {
+    for line in lines {
+        for item in line.items() {
+            if let PositionedLayoutItem::GlyphRun(glyph_run) = item {
+                let size = glyph_run.run().font_size() as f64;
+                let Some(styles) = doc.get_node(glyph_run.style().brush.id).and_then(|n| n.primary_styles()) else {
+                    continue;
+                };
+                let color = styles.get_inherited_text().color.as_color_color();
+                let y = glyph_run.baseline() as f64 - size * 0.32;
+                for glyph in glyph_run.positioned_glyphs() {
+                    let x = glyph.x as f64 + glyph.advance as f64 / 2.0;
+                    scene.fill(Fill::NonZero, transform, color, None, &Circle::new((x, y), size * 0.2));
+                }
+            }
+        }
+    }
 }
 
 /// As [`draw_text_runs`], in the text's colour at `alpha` of its own: a

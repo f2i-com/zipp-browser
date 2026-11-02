@@ -82,9 +82,19 @@ lazy_static::lazy_static! {
     static ref PAGE_CACHE: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
     /// Shared blocking HTTP client -- reused across all fetch() calls to
     /// take advantage of connection pooling and avoid per-request TLS setup.
+    /// For what a page asks of another site: the same, with no cookies, as a
+    /// page does not get to act as the person on a site it is not.
+    static ref ANONYMOUS_CLIENT: reqwest::blocking::Client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .danger_accept_invalid_certs(std::env::var_os("ZIPP_ACCEPT_INVALID_CERTS").is_some())
+        .user_agent(USER_AGENT)
+        .build()
+        .expect("http client");
     static ref HTTP_CLIENT: reqwest::blocking::Client = reqwest::blocking::Client::builder()
         .redirect(reqwest::redirect::Policy::limited(10))
-        .danger_accept_invalid_certs(true)
+        // A proxy on the path that signs what it passes on is told apart by
+        // asking for it (`ZIPP_ACCEPT_INVALID_CERTS`), not by trusting anyone.
+        .danger_accept_invalid_certs(std::env::var_os("ZIPP_ACCEPT_INVALID_CERTS").is_some())
         .user_agent(USER_AGENT)
         // Every `fetch()` the page's JS makes goes through this client. Without
         // a cookie store it discarded every `Set-Cookie` the server sent, so a
@@ -143,10 +153,22 @@ pub(crate) fn platform_shim(js: &str) -> String {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    // Signals blocked by what started this one (zipp-init blocks its own, and
+    // Rust's Command passes a mask on) would be blocked in every thread here
+    // and every program started from here: a Ctrl+C in a terminal that never
+    // reaches its program, a SIGTERM at shutdown that never arrives.
+    #[cfg(target_os = "linux")]
+    // SAFETY: an empty set, made and given here.
+    unsafe {
+        let mut none: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut none);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
+    }
     let arg = std::env::args().nth(1).unwrap_or_default();
 
     // Quick JS test mode: run a suite through the VM and exit. Exit status
     // reflects the result so these are usable from a script or CI.
+    zipp_shell::net::set_file_gate(page_may_read);
     if arg == "--test-js" {
         let ok = run_js_suite("TEST", include_str!("js_tests.js"), 10);
         std::process::exit(if ok { 0 } else { 1 });
@@ -210,6 +232,7 @@ fn main() {
     if kiosk {
         NO_CHROME.store(true, std::sync::atomic::Ordering::Relaxed);
         system::KIOSK.store(true, std::sync::atomic::Ordering::Relaxed);
+        zipp_shell::give_keys_to_page();
     }
     // `--app <url> [file ...]`: the page as an application, in a window of
     // its own with no toolbar, that may read on disk only its own folder and
@@ -219,6 +242,7 @@ fn main() {
     let arg = if app { std::env::args().nth(2).unwrap_or_default() } else { arg };
     if app {
         NO_CHROME.store(true, std::sync::atomic::Ordering::Relaxed);
+        zipp_shell::give_keys_to_page();
         allow_app_files(&arg, std::env::args().skip(3));
     }
 
@@ -295,6 +319,10 @@ fn main() {
     // for (`window.open`, `location.assign`) -- it is a free function with no
     // other route to the shell.
     let _ = NAV_PROVIDER.set(nav_provider.clone() as Arc<dyn NavigationProvider>);
+    // Where the first page asked to go as it loaded (its last request).
+    if let Some(to) = EARLY_NAV.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        nav_provider.navigate_to(NavigationOptions::new(to, String::from("text/html"), 0));
+    }
     let config = DocumentConfig {
         font_ctx: Some(font_ctx),
         base_url: Some(url.clone()),
@@ -565,6 +593,9 @@ fn looks_like_page(href: &str) -> bool {
     }
 }
 
+/// How many of a page's links are fetched ahead of being followed.
+const MAX_PRERENDERED: usize = 8;
+
 /// Prefetch the same-origin pages `html` links to into `PAGE_CACHE`, so that
 /// following one starts without a network round trip.
 ///
@@ -586,13 +617,14 @@ fn prerender_linked_pages(html: &str, base_url: &str) {
         pos = start + 1;
     }
 
-    let base = url::Url::parse(base_url)
-        .ok()
-        .map(|u| format!("{}://{}", u.scheme(), u.host_str().unwrap_or("")))
-        .unwrap_or_default();
+    let origin = url::Url::parse(base_url).ok().map(|u| u.origin());
+    let same_origin = |link: &str| url::Url::parse(link).is_ok_and(|u| Some(u.origin()) == origin);
 
-    for link in &links {
-        if !link.starts_with(&base) || PAGE_CACHE.lock().unwrap().contains_key(link) {
+    // A few, as a request for each link is a request the person did not make
+    // (a text match on the address also took example.com.evil.org for
+    // example.com).
+    for link in links.iter().filter(|l| same_origin(l)).take(MAX_PRERENDERED) {
+        if PAGE_CACHE.lock().unwrap().contains_key(link) {
             continue;
         }
         eprintln!("[PRERENDER] {link}");
@@ -659,8 +691,8 @@ fn fetch(url: &str) -> Result<String, String> {
     // loading live sites.
     if let Some(path) = url.strip_prefix("file://") {
         let path = viewers::local_path(path);
-        if !within_app_files(&path) {
-            return Err(format!("{} is not this app's to read", path.display()));
+        if !page_may_read(&path) {
+            return Err(format!("{} is not this page's to read", path.display()));
         }
         return std::fs::read_to_string(&path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()));
@@ -727,15 +759,21 @@ var env = {
     }
 };
 
+// `credentials: "include"` for the next request (a page's fetch, an XHR's
+// withCredentials): cookies go to another site only where a page asks.
+var __zippCredentials = "";
 var http = (function () {
     function request(method, url, body, contentType) {
+        var credentials = __zippCredentials;
+        __zippCredentials = "";
         // Host contract: strings in, JSON string out. A transport failure is a
         // JS throw (the host returns Err), which fetch()'s try/catch turns into
         // a rejected promise — same shape as a real browser network error.
         var raw = __zippHostCall(
             "http", method, String(url),
             body == null ? "" : String(body),
-            contentType == null ? "" : String(contentType)
+            contentType == null ? "" : String(contentType),
+            credentials
         );
         var r = JSON.parse(raw);
         return { status: r.status, ok: r.ok, body: r.body };
@@ -752,8 +790,8 @@ var http = (function () {
 // into this array, found by name, so it must be a top-level binding; it grows
 // by doubling, as the engine keeps every array it has copied into pinned.
 var __zippHostBytes = new Uint8Array(0);
-function __zippFetchBytes(url) {
-    var info = JSON.parse(__zippHostCall("http_bytes", url));
+function __zippFetchBytes(url, credentials) {
+    var info = JSON.parse(__zippHostCall("http_bytes", url, credentials || ""));
     if (__zippHostBytes.length < info.len) {
         __zippHostBytes = new Uint8Array(Math.max(info.len, __zippHostBytes.length * 2));
     }
@@ -1104,6 +1142,8 @@ function __zippChosenBytes(path) {
 /// `fetch` resolves its promise synchronously from this result, and the whole
 /// SSR pass runs to completion before anything is rendered, so there is no
 /// event loop to yield to yet.
+/// A navigation the first page asked for before NAV_PROVIDER was set.
+static EARLY_NAV: std::sync::Mutex<Option<url::Url>> = std::sync::Mutex::new(None);
 /// Set once the window's navigation provider exists; see `browser_host_call`.
 static NAV_PROVIDER: std::sync::OnceLock<Arc<dyn NavigationProvider>> =
     std::sync::OnceLock::new();
@@ -1145,13 +1185,32 @@ fn resolve_page_url(raw: &str) -> String {
 /// was given, as they are on disk (links followed). Empty when not in `--app`.
 static APP_FILES: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
 
+/// Under what name an `--app` page keeps what it stores, from its file: its
+/// own, as what it runs from is its own.
+static APP_STORAGE: Mutex<Option<String>> = Mutex::new(None);
+
+pub(crate) fn app_storage_name() -> Option<String> {
+    APP_STORAGE.lock().unwrap().clone()
+}
+
+/// Set for a run that loads a trusted tree of test pages (`--reftest`), whose
+/// tests share support files in other folders.
+static ANY_FILE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// `--app <url> [file ...]`: the page's folder, when it is on disk, and the files.
 fn allow_app_files(url: &str, files: impl Iterator<Item = String>) {
     let mut allowed = APP_FILES.lock().unwrap();
     if let Some(dir) = url::Url::parse(url).ok().and_then(|u| u.to_file_path().ok()).and_then(|p| p.parent().map(Into::into)) {
         allowed.extend(std::fs::canonicalize::<std::path::PathBuf>(dir));
     }
-    allowed.extend(files.filter_map(|f| std::fs::canonicalize(f).ok()));
+    let files: Vec<std::path::PathBuf> = files.filter_map(|f| std::fs::canonicalize(f).ok()).collect();
+    // FNV-1a of what it runs: the same file, the same name, in every version.
+    let named = files.first().map(|f| {
+        let hash = f.to_string_lossy().bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+        format!("app_{hash:016x}")
+    });
+    *APP_STORAGE.lock().unwrap() = named;
+    allowed.extend(files);
     // Nothing that exists: then nothing at all, rather than everything.
     if allowed.is_empty() {
         allowed.push(std::path::PathBuf::from("/nonexistent/zipp-app"));
@@ -1159,18 +1218,102 @@ fn allow_app_files(url: &str, files: impl Iterator<Item = String>) {
 }
 
 /// Whether `path` is within what `--app` allowed (anything, outside `--app`).
-fn within_app_files(path: &std::path::Path) -> bool {
+pub(crate) fn is_app() -> bool {
+    !APP_FILES.lock().unwrap().is_empty()
+}
+
+pub(crate) fn within_app_files(path: &std::path::Path) -> bool {
     let allowed = APP_FILES.lock().unwrap();
     allowed.is_empty() || std::fs::canonicalize(path).is_ok_and(|real| allowed.iter().any(|a| real.starts_with(a)))
 }
 
-/// Whether page script may read the file at `path`. A page from the web may
-/// not read the machine's files at all -- a browser keeps `file:` to `file:`
-/// pages; here any page's `fetch("file:///...")` read anything the browser
-/// could, root's files under zipp-linux -- and an `--app` page only what it
-/// was given.
-fn page_may_read(path: &std::path::Path) -> bool {
-    CURRENT_URL.lock().unwrap().starts_with("file:") && within_app_files(path)
+thread_local! {
+    /// The page a worker's thread belongs to: the one that started it.
+    static THREAD_PAGE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// This thread works for `page`, whatever the window goes on to show.
+pub(crate) fn set_thread_page(page: String) {
+    THREAD_PAGE.with(|p| *p.borrow_mut() = Some(page));
+}
+
+/// The page asking: a worker's own, or the one showing. Rights go by this, not
+/// by what is showing now: a worker in a loop outlives its page, and when the
+/// window went on to a page on disk it would have had that page's rights.
+pub(crate) fn page_url() -> String {
+    THREAD_PAGE
+        .with(|p| p.borrow().clone())
+        .unwrap_or_else(|| CURRENT_URL.lock().unwrap_or_else(|e| e.into_inner()).clone())
+}
+
+/// Folders any page on disk may read, besides its own: `ZIPP_FILE_ROOTS`,
+/// separated by `:`. zipp-linux names the pages of its image, which load from
+/// beside each other.
+fn file_roots() -> Vec<std::path::PathBuf> {
+    std::env::var("ZIPP_FILE_ROOTS")
+        .map(|roots| roots.split(':').filter(|r| !r.is_empty()).filter_map(|r| std::fs::canonicalize(r).ok()).collect())
+        .unwrap_or_default()
+}
+
+/// Whether the page showing may load the file at `path`, by any means: script,
+/// a stylesheet, an image, a module, a worker. This is the one rule, and every
+/// way of reading a page's files asks it:
+///
+/// - A page from the web loads nothing from disk, as in any browser. Only
+///   `fetch` used to ask, so `<script src="file:///...">`, a stylesheet, an
+///   image or a worker read what the browser could, root's files under
+///   zipp-linux.
+/// - An `--app` page: what it was given.
+/// - Any other page on disk: its own folder and what is below it, and
+///   `ZIPP_FILE_ROOTS`. A page saved from the web and opened here does not get
+///   the rest of the machine.
+/// - The desktop (a kiosk's page on disk) has `navigator.zipp`, so the machine
+///   already.
+pub(crate) fn page_may_read(path: &std::path::Path) -> bool {
+    if ANY_FILE.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    let page = page_url();
+    let Some(page) = url::Url::parse(&page).ok().filter(|u| u.scheme() == "file").and_then(|u| u.to_file_path().ok()) else {
+        return false;
+    };
+    // Files, not what only looks like one: `file:///dev/zero` never ends.
+    if !within_app_files(path) || !std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
+        return false;
+    }
+    if system::KIOSK.load(std::sync::atomic::Ordering::Relaxed) || is_app() {
+        return true;
+    }
+    let Ok(real) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let own = page.parent().and_then(|p| std::fs::canonicalize(p).ok());
+    own.is_some_and(|dir| real.starts_with(dir)) || file_roots().iter().any(|root| real.starts_with(root))
+}
+
+/// The proof a form is the browser's own: page script cannot read the
+/// toolbar or the console's line, so it cannot put this in a URL. Their forms
+/// used to be told apart by a field's name alone, which a link could carry
+/// too: `?__nav_url=file:///...` went where the address bar goes, and
+/// `?__js=...`, on any link on a page, ran as what was typed into the console.
+fn chrome_token() -> &'static str {
+    static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TOKEN.get_or_init(|| {
+        let mut bytes = [0u8; 16];
+        // Without randomness (it cannot fail on a running system) no form
+        // passes: the empty value is refused.
+        if getrandom::fill(&mut bytes).is_err() {
+            return String::new();
+        }
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    })
+}
+
+/// Whether `url` was submitted by the browser's own toolbar or console.
+fn from_chrome(url: &str) -> bool {
+    let token = chrome_token();
+    !token.is_empty()
+        && url::Url::parse(url).is_ok_and(|u| u.query_pairs().any(|(k, v)| k == "__zipp_chrome" && v == token))
 }
 
 /// GET a URL for page script, as bytes: http(s) through the shared client,
@@ -1189,10 +1332,66 @@ fn fetch_bytes_for_page(url: &str) -> Result<(u16, Vec<u8>), String> {
             };
         }
     }
-    let resp = HTTP_CLIENT.get(url).send().map_err(|e| format!("Error: GET {url}: {e}"))?;
+    let resp = client_for_page(url, false).get(url).send().map_err(|e| format!("Error: GET {url}: {e}"))?;
     let status = resp.status().as_u16();
     let bytes = resp.bytes().map_err(|e| format!("Error: reading {url}: {e}"))?;
     Ok((status, bytes.to_vec()))
+}
+
+/// The origin of the page asking, when it is on the web: what the same-origin
+/// rule compares. None for a page on disk, which is this machine's own.
+fn web_origin(page: &str) -> Option<url::Origin> {
+    url::Url::parse(page).ok().filter(|u| matches!(u.scheme(), "http" | "https")).map(|u| u.origin())
+}
+
+/// Whether `url` is the page's own site.
+fn same_origin(url: &str) -> bool {
+    let Some(mine) = web_origin(&page_url()) else {
+        return false;
+    };
+    url::Url::parse(url).is_ok_and(|u| u.origin() == mine)
+}
+
+/// The client for a request by the page: cookies go with its own site's, and
+/// with another's only where it asked (`credentials: "include"`).
+fn client_for_page(url: &str, credentials: bool) -> &'static reqwest::blocking::Client {
+    if credentials || same_origin(url) { &HTTP_CLIENT } else { &ANONYMOUS_CLIENT }
+}
+
+/// The same-origin rule, for a page on the web reading another site: the
+/// response is the page's to see only if that site says so. Without this, any
+/// page read any site it could reach: the person's mail if logged in, the
+/// router, `127.0.0.1`.
+fn cors_allows(resp: &reqwest::blocking::Response, origin: &str, credentials: bool) -> bool {
+    let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let allowed = header("access-control-allow-origin").trim();
+    if credentials {
+        allowed == origin && header("access-control-allow-credentials").trim() == "true"
+    } else {
+        allowed == "*" || allowed == origin
+    }
+}
+
+/// A request a form could not make (a PUT, a JSON POST) asks first, so that
+/// a site that never heard of CORS is not sent one by a page elsewhere.
+fn cors_preflight(method: &str, url: &str, origin: &str, content_type: &str, credentials: bool) -> Result<(), String> {
+    let resp = client_for_page(url, credentials)
+        .request(reqwest::Method::OPTIONS, url)
+        .header("Origin", origin)
+        .header("Access-Control-Request-Method", method)
+        .header("Access-Control-Request-Headers", "content-type")
+        .send()
+        .map_err(|e| format!("TypeError: Failed to fetch: {method} {url}: {e}"))?;
+    let methods = resp.headers().get("access-control-allow-methods").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let allowed = resp.status().is_success()
+        && cors_allows(&resp, origin, credentials)
+        && (matches!(method, "GET" | "HEAD" | "POST")
+            || methods.split(',').any(|m| m.trim() == "*" || m.trim().eq_ignore_ascii_case(method)));
+    if allowed {
+        Ok(())
+    } else {
+        Err(format!("TypeError: Failed to fetch: {url} does not allow {method} from {origin} (content type {content_type})"))
+    }
 }
 
 thread_local! {
@@ -1280,7 +1479,24 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
         // scratch array big enough first.
         "http_bytes" => {
             let url = resolve_page_url(args.first().map(String::as_str).unwrap_or_default());
-            let (status, bytes) = fetch_bytes_for_page(&url)?;
+            let credentials = args.get(1).is_some_and(|c| c == "include");
+            let origin = web_origin(&page_url()).map(|o| o.ascii_serialization());
+            let foreign = origin.filter(|_| url.starts_with("http") && !same_origin(&url));
+            let (status, bytes) = match &foreign {
+                None => fetch_bytes_for_page(&url)?,
+                Some(origin) => {
+                    let resp = client_for_page(&url, credentials)
+                        .get(&url)
+                        .header("Origin", origin.as_str())
+                        .send()
+                        .map_err(|e| format!("TypeError: Failed to fetch: GET {url}: {e}"))?;
+                    if !cors_allows(&resp, origin, credentials) {
+                        return Err(format!("TypeError: Failed to fetch: {url} does not allow {origin} to read it"));
+                    }
+                    let status = resp.status().as_u16();
+                    (status, resp.bytes().map_err(|e| format!("Error: reading {url}: {e}"))?.to_vec())
+                }
+            };
             let len = bytes.len();
             PENDING_BYTES.with(|p| *p.borrow_mut() = bytes);
             Ok(format!(
@@ -1289,6 +1505,21 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
             ))
         }
         // Copy the pending bytes into `__zippHostBytes`.
+        // navigator.clipboard: as the person just did something, as a browser
+        // has it, so a page cannot read what was copied elsewhere by itself.
+        "clipboard_read" => {
+            if !user_just_acted() {
+                return Err("NotAllowedError: reading the clipboard needs a click or a key press".into());
+            }
+            Ok(zipp_shell::clipboard_text())
+        }
+        "clipboard_write" => {
+            if !user_just_acted() {
+                return Err("NotAllowedError: writing the clipboard needs a click or a key press".into());
+            }
+            zipp_shell::set_clipboard_text(args.first().cloned().unwrap_or_default());
+            Ok(String::new())
+        }
         // `document.title = ...`: the window's title.
         "window_title" => {
             push_window_request(WindowRequest::Title(args.first().cloned().unwrap_or_default()));
@@ -1296,8 +1527,15 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
         }
         // `requestFullscreen()` ("1") and `exitFullscreen()` ("0").
         "fullscreen" => {
-            push_window_request(WindowRequest::Fullscreen(args.first().is_some_and(|a| a == "1")));
-            Ok(String::new())
+            let on = args.first().is_some_and(|a| a == "1");
+            // Going full screen takes the person's doing (leaving does not):
+            // a page that could when it liked could draw a whole desktop of
+            // its own, and ask for a password in it.
+            if on && !user_just_acted() {
+                return Ok("0".into());
+            }
+            push_window_request(WindowRequest::Fullscreen(on));
+            Ok("1".into())
         }
         // An element's box in the viewport (`getBoundingClientRect`).
         "rect" => Ok(event_bridge::layout_rect(args.first().map(String::as_str).unwrap_or_default())),
@@ -1409,15 +1647,40 @@ fn browser_host_call(kind: &str, args: &[String]) -> Result<String, String> {
                     json_quote(&String::from_utf8_lossy(&bytes))
                 ));
             }
-            let req = match method {
-                "POST" => HTTP_CLIENT.post(url).header("Content-Type", content_type).body(body),
-                "PUT" => HTTP_CLIENT.put(url).header("Content-Type", content_type).body(body),
-                "DELETE" => HTTP_CLIENT.delete(url),
-                _ => HTTP_CLIENT.get(url),
+            let credentials = args.get(4).is_some_and(|c| c == "include");
+            let origin = web_origin(&page_url()).map(|o| o.ascii_serialization());
+            let foreign = origin.filter(|_| !same_origin(url));
+            if let Some(origin) = &foreign {
+                let simple = match method {
+                    "GET" => true,
+                    "POST" => matches!(
+                        content_type.split(';').next().unwrap_or("").trim(),
+                        "text/plain" | "application/x-www-form-urlencoded" | "multipart/form-data"
+                    ),
+                    _ => false,
+                };
+                if !simple {
+                    cors_preflight(method, url, origin, content_type, credentials)?;
+                }
+            }
+            let client = client_for_page(url, credentials);
+            let mut req = match method {
+                "POST" => client.post(url).header("Content-Type", content_type).body(body),
+                "PUT" => client.put(url).header("Content-Type", content_type).body(body),
+                "DELETE" => client.delete(url),
+                _ => client.get(url),
             };
+            if let Some(origin) = &foreign {
+                req = req.header("Origin", origin.as_str());
+            }
             // Errors carry the `Error: ` prefix so the script sees an ordinary
             // JS error rather than a bare string.
             let resp = req.send().map_err(|e| format!("Error: {method} {url}: {e}"))?;
+            if let Some(origin) = &foreign
+                && !cors_allows(&resp, origin, credentials)
+            {
+                return Err(format!("TypeError: Failed to fetch: {url} does not allow {origin} to read it"));
+            }
             let status = resp.status().as_u16();
             let ok = resp.status().is_success();
             let body = resp.text().map_err(|e| format!("Error: reading {url}: {e}"))?;
@@ -1443,12 +1706,17 @@ fn browser_host_call(kind: &str, args: &[String]) -> Result<String, String> {
             match full.parse::<url::Url>() {
                 Ok(parsed) => {
                     eprintln!("[NAV] page requested {full}");
-                    if let Some(provider) = NAV_PROVIDER.get() {
-                        provider.navigate_to(NavigationOptions::new(
+                    match NAV_PROVIDER.get() {
+                        Some(provider) => provider.navigate_to(NavigationOptions::new(
                             parsed,
                             String::from("text/html"),
                             0,
-                        ));
+                        )),
+                        // The first page's script runs before there is a
+                        // window to navigate: kept until there is (a page
+                        // that sends the reader on at once was left where it
+                        // was, saying nothing).
+                        None => *EARLY_NAV.lock().unwrap_or_else(|e| e.into_inner()) = Some(parsed),
                     }
                     Ok(String::new())
                 }
@@ -1607,6 +1875,24 @@ pub(crate) fn chrome_shown() -> bool {
     !NO_CHROME.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// When the person last pressed a key or a button, in ms since the first time.
+static LAST_GESTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+fn since_start() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// The person pressed something (the event bridge says; a page cannot).
+pub(crate) fn note_user_gesture() {
+    LAST_GESTURE.store(since_start(), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn user_just_acted() -> bool {
+    let last = LAST_GESTURE.load(std::sync::atomic::Ordering::Relaxed);
+    last != u64::MAX && since_start().saturating_sub(last) < 5000
+}
+
 /// What page script asks of its window, for the event bridge to carry out
 /// where it has the document (and its shell).
 pub(crate) enum WindowRequest {
@@ -1657,6 +1943,7 @@ fn reftest_batch(pairs: &str, results: &str) -> bool {
         return false;
     };
     NO_CHROME.store(true, std::sync::atomic::Ordering::Relaxed);
+    ANY_FILE.store(true, std::sync::atomic::Ordering::Relaxed);
     // Stylesheets, fonts and images land asynchronously: a runtime for the run.
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
     // One network client for the run, as a window has one for its pages: a
@@ -2558,7 +2845,9 @@ impl NavigationProvider for BrowserNavProvider {
                     // The first page (the start page, or a kiosk's app), as a
                     // new step: Back returns to where it was asked from.
                     "home" => {
-                        let home = history.entries.first().cloned();
+                        // Already there, nothing to do: on the desktop this
+                        // reloaded it, and closed every window.
+                        let home = history.entries.first().cloned().filter(|home| *home != history.current());
                         if let Some(home) = &home {
                             history.push(home);
                         }
@@ -2587,7 +2876,8 @@ impl NavigationProvider for BrowserNavProvider {
         // Code typed into the console. Its line is a form posting back to the
         // page, like the address bar's; the code waits here for the page's
         // thread (`JsEventBridge::run_tasks`).
-        if url.contains("__js=") {
+        let chrome = from_chrome(&url);
+        if chrome && url.contains("__js=") {
             if let Ok(parsed) = url::Url::parse(&url) {
                 if let Some((_, code)) = parsed.query_pairs().find(|(k, _)| k == "__js") {
                     console::submit(code.into_owned());
@@ -2600,6 +2890,12 @@ impl NavigationProvider for BrowserNavProvider {
         // viewer again with a note of where it went.
         if let Some(target) = url.strip_prefix("zipp-save:") {
             let target = target.to_string();
+            // The file showing, and no other: a page's link could otherwise
+            // copy any file to Downloads.
+            if target != *self.current_url.lock().unwrap() {
+                eprintln!("[NAV] refused to save {target}: it is not the page showing");
+                return;
+            }
             let proxy = self.proxy.clone();
             std::thread::spawn(move || match viewers::save_pdf(&target) {
                 Ok(html) => proxy.send_event(zipp_shell::ShellEvent::NavigationLoad {
@@ -2645,7 +2941,7 @@ impl NavigationProvider for BrowserNavProvider {
         }
 
         // Check if this is an address bar form submission
-        if url.contains("__nav_url=") {
+        if chrome && url.contains("__nav_url=") {
             if let Some(pos) = url.find("__nav_url=") {
                 let typed = &url[pos + 10..];
                 let typed = typed.split('&').next().unwrap_or(typed);
@@ -2653,6 +2949,12 @@ impl NavigationProvider for BrowserNavProvider {
                 url = normalize_url(&typed);
                 eprintln!("[NAV] Address bar -> {url}");
             }
+        } else if url.starts_with("file:") && !self.current_url.lock().unwrap().starts_with("file:") {
+            // A page on the web does not open the machine's files, by a link
+            // or by script. The person can, by typing the address.
+            eprintln!("[NAV] refused: a page on the web may not open {url}");
+            console::push(console::Level::Error, format!("Not allowed to load local resource: {url}"));
+            return;
         }
 
         self.history.lock().unwrap().push(&url);
@@ -2894,7 +3196,11 @@ pub(crate) fn rerender_body(rendered_body: &str, page_url: &str) -> String {
 /// the band; a real browser clips that at the viewport edge, here the chrome
 /// has to cover it, or a `z-index:100` skip link paints over the URL bar.
 /// The console's input line, inside its form (put back empty after each run).
-pub(crate) const CONSOLE_INPUT: &str = r#"<span style="color:#1c7ed6">›</span><input id="__zipp_console_input" type="text" name="__js" placeholder="Run JavaScript in the page, then Enter" style="flex:1;min-width:0;height:22px;border:0;outline:none;font-family:Consolas,'Liberation Mono',monospace;font-size:12px;background:white;color:#212529" />"#;
+pub(crate) fn console_input() -> String {
+    format!(r#"<input type="hidden" name="__zipp_chrome" value="{}">{CONSOLE_INPUT}"#, chrome_token())
+}
+
+const CONSOLE_INPUT: &str = r#"<span style="color:#1c7ed6">›</span><input id="__zipp_console_input" type="text" name="__js" placeholder="Run JavaScript in the page, then Enter" style="flex:1;min-width:0;height:22px;border:0;outline:none;font-family:Consolas,'Liberation Mono',monospace;font-size:12px;background:white;color:#212529" />"#;
 
 /// The console button's icon, and its badge counting the page's errors.
 pub(crate) fn console_button_inner(badge: &str) -> String {
@@ -2906,12 +3212,15 @@ pub(crate) fn console_button_inner(badge: &str) -> String {
 
 fn toolbar_markup(current_url: &str) -> String {
     let css = chrome_css(console::is_open());
+    let token = chrome_token();
+    let console_line = console_input();
     let button = console_button_inner(&console::badge_text());
     let counts = console::counts_text();
     let lines = console::lines_html();
     format!(
         r#"<form id="__zipp_chrome" action="{current_url}" method="GET" style="position:absolute;left:0;right:0;z-index:2147483647;color:#212529;height:42px;background:#f8f9fa;border-bottom:1px solid #dee2e6;display:flex;align-items:center;padding:4px 8px;gap:6px;font-family:Arial,sans-serif;font-size:14px;line-height:normal;text-align:left;box-sizing:border-box;margin:0">
     <style id="__zipp_chrome_css">{css}</style>
+    <input type="hidden" name="__zipp_chrome" value="{token}">
     <a href="zipp-nav:back" title="Back (Alt+Left)" style="display:flex;align-items:center;padding:3px;border-radius:4px;text-decoration:none;color:#495057"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg></a>
     <a href="zipp-nav:forward" title="Forward (Alt+Right)" style="display:flex;align-items:center;padding:3px;border-radius:4px;text-decoration:none;color:#495057"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg></a>
     <a href="zipp-nav:reload" title="Reload (F5)" style="display:flex;align-items:center;padding:3px;border-radius:4px;text-decoration:none;color:#495057"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg></a>
@@ -2925,7 +3234,7 @@ fn toolbar_markup(current_url: &str) -> String {
       <a href="zipp-console:toggle" id="__zipp_console_close" style="color:#1c7ed6;text-decoration:none">Close</a>
     </div>
     <div id="__zipp_console_lines" style="flex:1;overflow:auto;min-height:0">{lines}</div>
-    <form id="__zipp_console_form" action="{current_url}" method="GET" style="display:flex;align-items:center;gap:6px;margin:0;padding:3px 10px;border-top:1px solid #dee2e6;flex-shrink:0">{CONSOLE_INPUT}</form>
+    <form id="__zipp_console_form" action="{current_url}" method="GET" style="display:flex;align-items:center;gap:6px;margin:0;padding:3px 10px;border-top:1px solid #dee2e6;flex-shrink:0">{console_line}</form>
   </div>"#
     )
 }
