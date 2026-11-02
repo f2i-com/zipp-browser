@@ -107,28 +107,56 @@ pub(crate) fn draw_text_runs<'a>(
     draw_text_runs_faded(scene, lines, doc, transform, 1.0);
 }
 
-/// A password field's text: a dot where each character is, so that its caret
-/// and selection (which are the text's) stay where they belong.
-pub(crate) fn draw_password_dots<'a>(
-    scene: &mut (impl PaintScene + BlurLayer),
-    lines: impl Iterator<Item = Line<'a, TextBrush>>,
-    doc: &BaseDocument,
-    transform: Affine,
-) {
-    for line in lines {
+/// How a password field is drawn: one dot per character, evenly spaced, as
+/// browsers draw it. Drawn where the letters were, dots would show which are
+/// narrow and which wide, and where the spaces are.
+pub(crate) struct PasswordMask {
+    /// Where the first dot's cell starts, and each cell's width.
+    pub x0: f64,
+    pub pitch: f64,
+    /// The text's baseline, and its line's top and bottom (for the caret).
+    pub baseline: f64,
+    pub top: f64,
+    pub bottom: f64,
+    size: f64,
+    color: peniko::Color,
+}
+
+impl PasswordMask {
+    /// From the field's laid-out text: its first run's font, place and colour.
+    pub(crate) fn new<'a>(mut lines: impl Iterator<Item = Line<'a, TextBrush>>, doc: &BaseDocument) -> Option<PasswordMask> {
+        let line = lines.next()?;
         for item in line.items() {
             if let PositionedLayoutItem::GlyphRun(glyph_run) = item {
-                let size = glyph_run.run().font_size() as f64;
-                let Some(styles) = doc.get_node(glyph_run.style().brush.id).and_then(|n| n.primary_styles()) else {
-                    continue;
-                };
-                let color = styles.get_inherited_text().color.as_color_color();
-                let y = glyph_run.baseline() as f64 - size * 0.32;
-                for glyph in glyph_run.positioned_glyphs() {
-                    let x = glyph.x as f64 + glyph.advance as f64 / 2.0;
-                    scene.fill(Fill::NonZero, transform, color, None, &Circle::new((x, y), size * 0.2));
-                }
+                let run = glyph_run.run();
+                let size = run.font_size() as f64;
+                let styles = doc.get_node(glyph_run.style().brush.id).and_then(|n| n.primary_styles())?;
+                let baseline = glyph_run.baseline() as f64;
+                let metrics = run.metrics();
+                return Some(PasswordMask {
+                    x0: glyph_run.offset() as f64,
+                    pitch: (size * 0.6).max(4.0),
+                    baseline,
+                    top: baseline - metrics.ascent as f64,
+                    bottom: baseline + metrics.descent as f64,
+                    size,
+                    color: styles.get_inherited_text().color.as_color_color(),
+                });
             }
+        }
+        None
+    }
+
+    /// The left edge of character `n`'s cell.
+    pub(crate) fn x(&self, n: usize) -> f64 {
+        self.x0 + n as f64 * self.pitch
+    }
+
+    pub(crate) fn draw(&self, scene: &mut (impl PaintScene + BlurLayer), transform: Affine, count: usize) {
+        let y = self.baseline - self.size * 0.32;
+        for n in 0..count {
+            let centre = (self.x(n) + self.pitch / 2.0, y);
+            scene.fill(Fill::NonZero, transform, self.color, None, &Circle::new(centre, self.size * 0.18));
         }
     }
 }

@@ -693,9 +693,41 @@ impl ElementCx<'_> {
             let transform =
                 Affine::translate((pos.x * self.scale, pos.y * self.scale)) * self.transform;
 
+            // A field never given a value holds the single space its editor
+            // starts with: empty, as far as what was typed goes.
+            let text = input_data.editor.text().to_string();
+            let empty = text.is_empty() || (text == " " && self.node.attr(zipp_dom::local_name!("value")).is_none());
+            // A password: evenly spaced dots, the caret and selection placed
+            // by how many characters come before them.
+            let secret = self
+                .node
+                .attr(zipp_dom::local_name!("type"))
+                .is_some_and(|t| t.eq_ignore_ascii_case("password"));
+            let mask = if secret && !empty {
+                crate::text::PasswordMask::new(input_data.editor.try_layout().unwrap().lines(), self.context.dom)
+            } else {
+                None
+            };
+            let before = |index: usize| text.get(..index).map_or_else(|| text.chars().count(), |s| s.chars().count());
+
             if self.node.is_focussed() {
                 // Render selection/caret
-                for (rect, _line_idx) in input_data.editor.selection_geometry().iter() {
+                if let Some(mask) = &mask {
+                    let selection = input_data.editor.raw_selection();
+                    let (a, b) = (before(selection.anchor().index()), before(selection.focus().index()));
+                    if a != b {
+                        let rect = kurbo::Rect::new(mask.x(a.min(b)), mask.top, mask.x(a.max(b)), mask.bottom);
+                        scene.fill(Fill::NonZero, transform, SELECTION_COLOR, None, &rect);
+                    }
+                    let color = self.style.get_inherited_text().color;
+                    let caret_color = match &self.style.get_inherited_ui().caret_color.0 {
+                        ColorOrAuto::Auto => color,
+                        ColorOrAuto::Color(caret_color) => caret_color.resolve_to_absolute(&color),
+                    };
+                    let caret = kurbo::Rect::new(mask.x(b), mask.top, mask.x(b) + 1.5, mask.bottom);
+                    scene.fill(Fill::NonZero, transform, caret_color.as_srgb_color(), None, &caret);
+                }
+                for (rect, _line_idx) in input_data.editor.selection_geometry().iter().filter(|_| mask.is_none()) {
                     scene.fill(
                         Fill::NonZero,
                         transform,
@@ -704,7 +736,7 @@ impl ElementCx<'_> {
                         &convert_rect(rect),
                     );
                 }
-                if let Some(cursor) = input_data.editor.cursor_geometry(1.5) {
+                if let Some(cursor) = input_data.editor.cursor_geometry(1.5).filter(|_| mask.is_none()) {
                     let color = self.style.get_inherited_text().color;
                     let caret_color = match &self.style.get_inherited_ui().caret_color.0 {
                         ColorOrAuto::Auto => color,
@@ -721,27 +753,23 @@ impl ElementCx<'_> {
                 };
             }
 
-            // Its placeholder, while it is empty -- which a field never given a
-            // value is with the single space its editor starts with.
-            let text = input_data.editor.text();
-            let empty = text == "" || (text == " " && self.node.attr(zipp_dom::local_name!("value")).is_none());
+            // Its placeholder, while it is empty.
             if empty
                 && let Some(layout) = input_data.placeholder.as_ref().and_then(|p| p.try_layout())
             {
                 crate::text::draw_text_runs_faded(scene, layout.lines(), self.context.dom, transform, 0.55);
             }
 
-            // Render text: a password as dots. (An empty field's editor holds
-            // one space, which is no character typed.)
-            let lines = input_data.editor.try_layout().unwrap().lines();
-            let secret = self
-                .node
-                .attr(zipp_dom::local_name!("type"))
-                .is_some_and(|t| t.eq_ignore_ascii_case("password"));
-            if !secret {
-                crate::text::draw_text_runs(scene, lines, self.context.dom, transform);
-            } else if !empty {
-                crate::text::draw_password_dots(scene, lines, self.context.dom, transform);
+            // Render text: a password as its dots.
+            if let Some(mask) = &mask {
+                mask.draw(scene, transform, text.chars().count());
+            } else if !secret {
+                crate::text::draw_text_runs(
+                    scene,
+                    input_data.editor.try_layout().unwrap().lines(),
+                    self.context.dom,
+                    transform,
+                );
             }
         }
     }
