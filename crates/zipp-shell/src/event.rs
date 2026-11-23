@@ -44,6 +44,13 @@ pub enum ShellEvent {
         retain_scroll_position: bool,
         is_md: bool,
     },
+
+    /// Resize the primary browser window to `(width, height)` in logical pixels
+    /// (used by Desktop ↔ Mobile viewport toggling).
+    ResizeWindow {
+        width: u32,
+        height: u32,
+    },
 }
 impl ShellEvent {
     #[inline]

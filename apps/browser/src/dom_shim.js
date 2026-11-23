@@ -3210,8 +3210,8 @@ function __zippMediaMatches(list) {
             case "prefers-color-scheme": return val === (__zippPrefersDark ? "dark" : "light");
             case "prefers-reduced-motion": return val === null ? false : val === "no-preference";
             case "prefers-contrast": return val === "no-preference";
-            case "hover": case "any-hover": return val === null || val === "hover";
-            case "pointer": case "any-pointer": return val === null || val === "fine";
+            case "hover": case "any-hover": return val === null || val === (navigator.maxTouchPoints > 0 ? "none" : "hover");
+            case "pointer": case "any-pointer": return val === null || val === (navigator.maxTouchPoints > 0 ? "coarse" : "fine");
             case "color": return true;
             case "display-mode": return val === "browser";
             default: return false;
@@ -3523,9 +3523,29 @@ function __zippViewportResized(w, h) {
     var s = window.screen;
     s.width = s.availWidth = w;
     s.height = s.availHeight = h;
+    if (s.orientation) {
+        s.orientation.type = h >= w ? "portrait-primary" : "landscape-primary";
+    }
     var ev = new Event("resize");
     try { window.dispatchEvent(ev); } catch (e) {}
     if (typeof window.onresize === "function") { try { window.onresize(ev); } catch (e) {} }
+}
+var __zippDesktopUA = navigator.userAgent;
+var __zippDesktopPlatform = navigator.platform;
+var __zippMobileUA = "Mozilla/5.0 (Linux; Android 16; Pixel 9a) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36 Zipp/1.0";
+function __zippSetMobileMode(on) {
+    navigator.maxTouchPoints = on ? 5 : 0;
+    if (on) {
+        if (!("ontouchstart" in window)) window.ontouchstart = null;
+        navigator.userAgent = __zippMobileUA;
+        navigator.platform = "Linux armv8l";
+    } else {
+        try { delete window.ontouchstart; } catch (e) {}
+        navigator.userAgent = __zippDesktopUA === __zippMobileUA
+            ? "Mozilla/5.0 (Windows NT " + "10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Zipp/1.0"
+            : __zippDesktopUA;
+        navigator.platform = __zippDesktopPlatform === "Linux armv8l" ? "Win32" : __zippDesktopPlatform;
+    }
 }
 var outerWidth = window.outerWidth;
 var outerHeight = window.outerHeight;
@@ -3591,6 +3611,54 @@ function __styleText(style) {
     return t;
 }
 
+var __svgTagCase = {
+    lineargradient:"linearGradient", radialgradient:"radialGradient", clippath:"clipPath",
+    textpath:"textPath", foreignobject:"foreignObject", fegaussianblur:"feGaussianBlur",
+    feoffset:"feOffset", feblend:"feBlend", fecolormatrix:"feColorMatrix",
+    fecomponenttransfer:"feComponentTransfer", fecomposite:"feComposite",
+    fedropshadow:"feDropShadow", feflood:"feFlood", femerge:"feMerge",
+    femergenode:"feMergeNode", femorphology:"feMorphology", feturbulence:"feTurbulence",
+    fedisplacementmap:"feDisplacementMap", feconvolvematrix:"feConvolveMatrix",
+    fediffuselighting:"feDiffuseLighting", fespecularlighting:"feSpecularLighting",
+    fepointlight:"fePointLight", fespotlight:"feSpotLight", fedistantlight:"feDistantLight",
+    feimage:"feImage", fetile:"feTile"
+};
+var __svgAttrCase = {
+    viewbox:"viewBox", preserveaspectratio:"preserveAspectRatio",
+    gradientunits:"gradientUnits", gradienttransform:"gradientTransform",
+    patternunits:"patternUnits", patterntransform:"patternTransform",
+    patterncontentunits:"patternContentUnits", clippathunits:"clipPathUnits",
+    maskunits:"maskUnits", maskcontentunits:"maskContentUnits",
+    filterunits:"filterUnits", primitiveunits:"primitiveUnits",
+    spreadmethod:"spreadMethod", stddeviation:"stdDeviation",
+    markerwidth:"markerWidth", markerheight:"markerHeight",
+    markerunits:"markerUnits", refx:"refX", refy:"refY",
+    textlength:"textLength", lengthadjust:"lengthAdjust", startoffset:"startOffset",
+    basefrequency:"baseFrequency", numoctaves:"numOctaves",
+    tablevalues:"tableValues", pathlength:"pathLength"
+};
+function __serializeSvgChild(cn) {
+    if(!cn) return "";
+    if(cn.nodeType===3) return cn._html ? (cn.data||"") : __eh(cn.data||"");
+    if(cn.nodeType!==1) return "";
+    var raw=(cn.localName||cn.tagName||"").toLowerCase();
+    var ct=__svgTagCase[raw]||raw;
+    var ca="";
+    if(cn.id) ca+=" id=\""+__ea(cn.id)+"\"";
+    if(cn.className) ca+=" class=\""+__ea(cn.className)+"\"";
+    for(var ak in cn.attributes) {
+        var al=ak.toLowerCase();
+        if(al==="id"||al==="class"||al==="style") continue;
+        var mapped=__svgAttrCase[al]||ak;
+        ca+=" "+mapped+"=\""+__ea(cn.attributes[ak])+"\"";
+    }
+    var cst=(cn.attributes&&cn.attributes.style?String(cn.attributes.style).replace(/;?\s*$/,";"):"")+(cn.style?__styleText(cn.style):"");
+    if(cst!==""&&cst!==";") ca+=" style=\""+__ea(cst)+"\"";
+    var inner="";
+    for(var i=0;i<cn.childNodes.length;i++) inner+=__serializeSvgChild(cn.childNodes[i]);
+    return inner==="" ? "<"+ct+ca+"/>" : "<"+ct+ca+">"+inner+"</"+ct+">";
+}
+
 function __serializeNode(node) {
     if(node.nodeType===3) {
         // Markup set through innerHTML goes out as markup. Otherwise <style>
@@ -3625,31 +3693,41 @@ function __serializeNode(node) {
     r+=">";
     // A select shows its chosen option's label, written in as its text.
     if(tag==="select") r+=__eh(__selectLabel(node));
-    // Serialize SVG elements with their attributes for Rust-side SVG rendering
+    // Serialize SVG elements recursively (including <text>, <g>, <defs>,
+    // gradients, and clip paths) with proper XML camelCase tag/attribute names
+    // for Rust-side usvg rendering.
     if(tag==="svg") {
-        var sw=node.getAttribute("width")||"24";
-        var sh=node.getAttribute("height")||"24";
-        var svgChildren="";
-        for(var i=0;i<node.childNodes.length;i++) {
-            var cn=node.childNodes[i];
-            if(cn.nodeType!==1) continue;
-            var ct=(cn.tagName||"").toLowerCase();
-            var ca="";
-            for(var ak in cn.attributes) ca+=" "+ak+"=\""+cn.attributes[ak]+"\"";
-            svgChildren+="<"+ct+ca+"/>";
+        var sw=node.getAttribute("width");
+        var sh=node.getAttribute("height");
+        var vb=node.getAttribute("viewBox")||node.getAttribute("viewbox");
+        if(!sw&&!sh&&vb) {
+            var vbp=String(vb).trim().split(/[\s,]+/);
+            if(vbp.length===4) { sw=vbp[2]; sh=vbp[3]; }
         }
-        var vb=node.getAttribute("viewBox")||("0 0 "+sw+" "+sh);
-        var fill=node.getAttribute("fill")||"none";
-        var svgAttrs=" xmlns=\"http://www.w3.org/2000/svg\" width=\""+sw+"\" height=\""+sh+"\" viewBox=\""+vb+"\" fill=\""+fill+"\"";
-        var stroke=node.getAttribute("stroke");
-        if(stroke!==null&&stroke!==undefined) svgAttrs+=" stroke=\""+__ea(stroke)+"\"";
-        var sw2=node.getAttribute("stroke-width");
-        if(sw2!==null&&sw2!==undefined) svgAttrs+=" stroke-width=\""+__ea(sw2)+"\"";
-        var slc=node.getAttribute("stroke-linecap");
-        if(slc!==null&&slc!==undefined) svgAttrs+=" stroke-linecap=\""+__ea(slc)+"\"";
-        var slj=node.getAttribute("stroke-linejoin");
-        if(slj!==null&&slj!==undefined) svgAttrs+=" stroke-linejoin=\""+__ea(slj)+"\"";
-        return "<svg"+svgAttrs+" style=\"width:"+sw+"px;height:"+sh+"px;display:inline-block;flex-shrink:0\">"+svgChildren+"</svg>";
+        if(!sw) sw="24";
+        if(!sh) sh="24";
+        if(!vb) vb="0 0 "+sw+" "+sh;
+        var svgChildren="";
+        for(var i=0;i<node.childNodes.length;i++) svgChildren+=__serializeSvgChild(node.childNodes[i]);
+        var svgAttrs="";
+        if(node.id) svgAttrs+=" id=\""+__ea(node.id)+"\"";
+        if(node.className) svgAttrs+=" class=\""+__ea(node.className)+"\"";
+        svgAttrs+=" xmlns=\"http://www.w3.org/2000/svg\"";
+        svgAttrs+=" width=\""+__ea(sw)+"\" height=\""+__ea(sh)+"\" viewBox=\""+__ea(vb)+"\"";
+        var hasFill=false;
+        for(var ak in node.attributes) {
+            var al=ak.toLowerCase();
+            if(al==="id"||al==="class"||al==="style"||al==="xmlns"||al==="width"||al==="height"||al==="viewbox") continue;
+            if(al==="fill") hasFill=true;
+            var mapped=__svgAttrCase[al]||ak;
+            svgAttrs+=" "+mapped+"=\""+__ea(node.attributes[ak])+"\"";
+        }
+        if(!hasFill&&node.getAttribute("stroke")!==null) svgAttrs+=" fill=\"none\"";
+        svgAttrs+=" data-flid=\""+node._id+"\"";
+        var swCss=/^\d+(\.\d+)?$/.test(String(sw))?(sw+"px"):String(sw);
+        var shCss=/^\d+(\.\d+)?$/.test(String(sh))?(sh+"px"):String(sh);
+        var svgStyle="width:"+swCss+";height:"+shCss+";display:inline-block;flex-shrink:0;"+(st&&st!==";"?st:"");
+        return "<svg"+svgAttrs+" style=\""+__ea(svgStyle)+"\">"+svgChildren+"</svg>";
     }
     // Skip SVG child elements (they're serialized inline above)
     if(node.namespaceURI && node.namespaceURI.indexOf("svg")>=0) return "";

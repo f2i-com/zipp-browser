@@ -1,9 +1,13 @@
 use super::convert;
+#[cfg(feature = "grid")]
 use convert::stylo;
 use std::ops::Deref;
+use style::Atom;
 use style::properties::ComputedValues;
+#[cfg(feature = "grid")]
+use style::OwnedSlice;
+#[cfg(feature = "grid")]
 use style::values::CustomIdent;
-use style::{Atom, OwnedSlice};
 
 #[cfg(feature = "grid")]
 use style::values::{

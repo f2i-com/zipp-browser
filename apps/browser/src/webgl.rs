@@ -662,11 +662,11 @@ impl Context {
     fn uniform_location(&mut self, program: u32, name: &str) -> Option<glow::UniformLocation> {
         let key = (program, name.to_string());
         if let Some(found) = self.uniforms.get(&key) {
-            return found.clone();
+            return *found;
         }
         let p = *self.programs.get(&program)?;
         let found = unsafe { self.gl.get_uniform_location(p, name) };
-        self.uniforms.insert(key, found.clone());
+        self.uniforms.insert(key, found);
         found
     }
 

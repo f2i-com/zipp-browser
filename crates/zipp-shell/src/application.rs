@@ -147,6 +147,21 @@ where
                         contents.len());
                 }
             }
+            ShellEvent::ResizeWindow { width, height } => {
+                if let Some((_, view)) = self.windows.iter_mut().next() {
+                    let logical = winit::dpi::LogicalSize::new(
+                        f64::from(width.max(240)),
+                        f64::from(height.max(240)),
+                    );
+                    if let Some(physical) = view.window.request_surface_size(winit::dpi::Size::Logical(logical)) {
+                        let insets = view.safe_area_insets;
+                        let pw = physical.width.saturating_sub(insets.left + insets.right);
+                        let ph = physical.height.saturating_sub(insets.top + insets.bottom);
+                        view.with_viewport(|v| v.window_size = (pw, ph));
+                    }
+                    view.request_redraw();
+                }
+            }
         }
     }
 }

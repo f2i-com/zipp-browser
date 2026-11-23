@@ -21,8 +21,11 @@ pub(crate) mod stylo {
     pub(crate) use style::values::specified::box_::{
         Display, DisplayInside, DisplayOutside, Overflow,
     };
+    #[cfg(feature = "grid")]
     pub(crate) use style::values::specified::position::GridTemplateAreas;
+    #[cfg(feature = "grid")]
     pub(crate) use style::values::specified::position::NamedArea;
+    #[cfg(feature = "grid")]
     pub(crate) use style_atoms::atom;
     pub(crate) type MarginVal = GenericMargin<LengthPercentage>;
     pub(crate) type InsetVal = GenericInset<Percentage, LengthPercentage>;
@@ -608,6 +611,7 @@ pub fn to_taffy_style(style: &stylo::ComputedValues) -> taffy::Style<Atom> {
         self::overflow(raw_overflow_y)
     };
 
+    #[allow(clippy::needless_update)]
     taffy::Style {
         dummy: core::marker::PhantomData,
         display: self::display(display),
@@ -755,5 +759,6 @@ pub fn to_taffy_style(style: &stylo::ComputedValues) -> taffy::Style<Atom> {
             start: self::grid_line(&pos.grid_column_start),
             end: self::grid_line(&pos.grid_column_end),
         },
+        ..taffy::Style::default()
     }
 }

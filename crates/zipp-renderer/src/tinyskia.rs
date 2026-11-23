@@ -2227,9 +2227,9 @@ impl PaintScene for TinySkiaPainter {
                 } else {
                     1
                 };
-                let pad_ds = ((pad as u32) + ds - 1) / ds;
-                let rw_ds = (rw + ds - 1) / ds;
-                let rh_ds = (rh + ds - 1) / ds;
+                let pad_ds = (pad as u32).div_ceil(ds);
+                let rw_ds = rw.div_ceil(ds);
+                let rh_ds = rh.div_ceil(ds);
                 let cw = (rw_ds + pad_ds * 2).max(1);
                 let ch = (rh_ds + pad_ds * 2).max(1);
                 let shape = kurbo::RoundedRect::from_rect(
@@ -2603,6 +2603,12 @@ pub struct TinySkiaWindowRenderer {
     surface: Option<softbuffer::Surface<Arc<dyn WindowHandle>, Arc<dyn WindowHandle>>>,
     width: u32,
     height: u32,
+}
+
+impl Default for TinySkiaWindowRenderer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TinySkiaWindowRenderer {

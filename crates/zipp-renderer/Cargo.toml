@@ -15,7 +15,7 @@ window-renderer = ["dep:softbuffer", "dep:raw-window-handle"]
 
 [dependencies]
 # In-repo
-zipp-dom = { workspace = true }
+zipp-dom = { workspace = true, features = ["block", "flexbox", "grid"] }
 
 # AnyRender
 anyrender = { workspace = true }

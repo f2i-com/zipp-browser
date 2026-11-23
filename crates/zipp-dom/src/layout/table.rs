@@ -346,8 +346,8 @@ pub(crate) fn collect_table_cells(
                 if occupied.len() < end {
                     occupied.resize(end, 0);
                 }
-                for c in (*col as usize)..end {
-                    occupied[c] = occupied[c].max(last_row);
+                for slot in &mut occupied[(*col as usize)..end] {
+                    *slot = (*slot).max(last_row);
                 }
             }
 

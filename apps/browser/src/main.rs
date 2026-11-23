@@ -107,18 +107,194 @@ lazy_static::lazy_static! {
         .cookie_provider(zipp_shell::cookies::jar())
         .build()
         .expect("failed to build HTTP client");
+    static ref ANONYMOUS_MOBILE_CLIENT: reqwest::blocking::Client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .danger_accept_invalid_certs(std::env::var_os("ZIPP_ACCEPT_INVALID_CERTS").is_some())
+        .user_agent(MOBILE_USER_AGENT)
+        .build()
+        .expect("mobile http client");
+    static ref MOBILE_HTTP_CLIENT: reqwest::blocking::Client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .danger_accept_invalid_certs(std::env::var_os("ZIPP_ACCEPT_INVALID_CERTS").is_some())
+        .user_agent(MOBILE_USER_AGENT)
+        .cookie_provider(zipp_shell::cookies::jar())
+        .build()
+        .expect("failed to build mobile HTTP client");
 }
 
-/// Viewport the page's JavaScript is told about on the windowed path.
-///
-/// The window does not exist yet when the page's script runs, so this is the
-/// size the shim reports for `window.innerWidth`/`innerHeight` and answers
-/// `matchMedia` against — and the window opens at it, so that JS and CSS agree
-/// on load. It used to open at the platform default (800x600) while the
-/// script was told 1280x800: a page branching on a breakpoint in JS chose one
-/// layout while its CSS chose another. CSS is laid out against the real window
-/// (the Stylo device is rebuilt from it, and again on every resize).
+/// Active HTTP client matching Desktop vs Mobile View (`--mobile` / toolbar toggle).
+pub(crate) fn http_client() -> &'static reqwest::blocking::Client {
+    if is_mobile_view() { &MOBILE_HTTP_CLIENT } else { &HTTP_CLIENT }
+}
+
+/// Active anonymous (cookie-free) HTTP client matching Desktop vs Mobile View.
+pub(crate) fn anonymous_http_client() -> &'static reqwest::blocking::Client {
+    if is_mobile_view() { &ANONYMOUS_MOBILE_CLIENT } else { &ANONYMOUS_CLIENT }
+}
+
+/// Default desktop viewport (logical CSS pixels).
 const INITIAL_WINDOW_SIZE: (u32, u32) = (1280, 800);
+
+/// Default mobile viewport (logical CSS pixels), matching Android Pixel 9a
+/// (`1080×2424` @ `2.625×` DPR) used by the SoftN Mobile runtime.
+const MOBILE_WINDOW_SIZE: (u32, u32) = (412, 915);
+
+/// Mobile User-Agent string matching the SoftN Mobile Android viewport.
+const MOBILE_USER_AGENT: &str = "Mozilla/5.0 (Linux; Android 16; Pixel 9a) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36 Zipp/1.0";
+
+static MOBILE_VIEW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SHELL_PROXY: std::sync::OnceLock<ShellProxy> = std::sync::OnceLock::new();
+
+pub(crate) fn is_mobile_view() -> bool {
+    MOBILE_VIEW.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Toggle between Desktop (`1280×800`) and Mobile (`412×915`) viewports at runtime.
+pub(crate) fn toggle_mobile_view() -> (bool, (u32, u32)) {
+    let now_mobile = !MOBILE_VIEW.fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
+    let target = if now_mobile { MOBILE_WINDOW_SIZE } else { INITIAL_WINDOW_SIZE };
+    if let Some(proxy) = SHELL_PROXY.get() {
+        proxy.send_event(zipp_shell::ShellEvent::ResizeWindow {
+            width: target.0,
+            height: target.1,
+        });
+    }
+    eprintln!(
+        "[BROWSER] View mode -> {} ({}x{})",
+        if now_mobile { "mobile" } else { "desktop" },
+        target.0,
+        target.1,
+    );
+    (now_mobile, target)
+}
+
+/// Parse a `WxH` viewport specifier (e.g. `412x915` or `1440x900`).
+fn parse_viewport(spec: &str) -> Option<(u32, u32)> {
+    let (w, h) = spec.split_once('x').or_else(|| spec.split_once('X'))?;
+    let w: u32 = w.trim().parse().ok()?;
+    let h: u32 = h.trim().parse().ok()?;
+    if w >= 240 && h >= 240 && w <= 7680 && h <= 4320 {
+        Some((w, h))
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CliAction {
+    Help,
+    Version,
+    TestJs,
+    TestVm,
+    TestCompat,
+    Screenshot { out: String, url: String, width: u32, height: u32, mobile: bool, no_chrome: bool },
+    Reftest { pairs: String, results: String },
+    Run { url: String, mobile: bool, viewport: Option<(u32, u32)>, kiosk: bool, app: bool, app_files: Vec<String> },
+}
+
+fn parse_cli_args(args: &[String]) -> Result<CliAction, String> {
+    let mut mobile = false;
+    let mut custom_viewport: Option<(u32, u32)> = None;
+    let mut kiosk = false;
+    let mut app = false;
+    let mut screenshot_mode = false;
+    let mut positional: Vec<String> = Vec::new();
+    let mut i = 0;
+
+    while i < args.len() {
+        let a = args[i].as_str();
+        if !positional.is_empty() && (app || screenshot_mode) {
+            positional.push(args[i].clone());
+            i += 1;
+            continue;
+        }
+        match a {
+            "-h" | "--help" => return Ok(CliAction::Help),
+            "-V" | "--version" => return Ok(CliAction::Version),
+            "--test-js" => return Ok(CliAction::TestJs),
+            "--test-vm" => return Ok(CliAction::TestVm),
+            "--test-compat" => return Ok(CliAction::TestCompat),
+            "--reftest" => {
+                let pairs = args.get(i + 1).cloned().ok_or("usage: zipp-browser --reftest pairs.tsv results.tsv")?;
+                let results = args.get(i + 2).cloned().ok_or("usage: zipp-browser --reftest pairs.tsv results.tsv")?;
+                return Ok(CliAction::Reftest { pairs, results });
+            }
+            "--mobile" => {
+                mobile = true;
+                i += 1;
+            }
+            "--viewport" => {
+                let spec = args.get(i + 1).ok_or("--viewport requires WxH (e.g. --viewport 412x915)")?;
+                custom_viewport = Some(parse_viewport(spec).ok_or_else(|| format!("invalid --viewport {spec:?}, expected WxH"))?);
+                i += 2;
+            }
+            "--kiosk" => {
+                kiosk = true;
+                i += 1;
+            }
+            "--app" => {
+                app = true;
+                i += 1;
+            }
+            "--screenshot" => {
+                screenshot_mode = true;
+                i += 1;
+            }
+            _ => {
+                positional.push(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+
+    if screenshot_mode {
+        let out = positional.first().cloned().unwrap_or_else(|| "screenshot.png".to_string());
+        let url = positional.get(1).cloned().unwrap_or_else(|| "https://lance.name".to_string());
+        let (def_w, def_h) = custom_viewport.unwrap_or(if mobile { MOBILE_WINDOW_SIZE } else { (1280, 2000) });
+        let width = positional.get(2).and_then(|s| s.parse().ok()).unwrap_or(def_w);
+        let height = positional.get(3).and_then(|s| s.parse().ok()).unwrap_or(def_h);
+        return Ok(CliAction::Screenshot { out, url, width, height, mobile, no_chrome: app || kiosk });
+    }
+
+    let url = positional.first().cloned().unwrap_or_default();
+    let app_files = if app && positional.len() > 1 {
+        positional[1..].to_vec()
+    } else {
+        Vec::new()
+    };
+    Ok(CliAction::Run { url, mobile, viewport: custom_viewport, kiosk, app, app_files })
+}
+
+fn print_usage() {
+    println!(
+        "Zipp Browser v{} (zipp-vm 0.0.39 + Stylo + Taffy + TinySkia)\n\
+         \n\
+         USAGE:\n\
+         \x20 zipp-browser [OPTIONS] [URL]\n\
+         \x20 zipp-browser [--mobile] [--viewport WxH] --app <URL> [FILE ...]\n\
+         \x20 zipp-browser [--mobile] [--viewport WxH] --screenshot <OUT.png> [URL] [W] [H]\n\
+         \n\
+         OPTIONS:\n\
+         \x20 --mobile              Open in Mobile View (412x915 Pixel 9a logical viewport + mobile UA/touch)\n\
+         \x20 --viewport <WxH>      Set initial logical viewport size (e.g. 390x844, 1440x900)\n\
+         \x20 --app                 Chromeless application window (restricted local file access)\n\
+         \x20 --kiosk               Full-screen DRM/KMS mode (Linux only)\n\
+         \x20 --screenshot          Headless render to PNG and exit\n\
+         \x20 --test-js             Run built-in DOM/browser JS test suite\n\
+         \x20 --test-compat         Run JS compatibility test suite\n\
+         \x20 --test-vm             Run quick zipp-vm sanity check\n\
+         \x20 -h, --help            Show this help message\n\
+         \x20 -V, --version         Print version information\n\
+         \n\
+         SHORTCUTS:\n\
+         \x20 Ctrl+Shift+M          Toggle Desktop <-> Mobile View live in the browser window\n\
+         \x20 F12                   Toggle developer console\n\
+         \x20 Ctrl+L / F6           Focus address bar\n\
+         \x20 Alt+Left / Alt+Right  History Back / Forward\n\
+         \x20 F5 / Ctrl+R           Reload page",
+        env!("CARGO_PKG_VERSION")
+    );
+}
 
 /// Seconds to advance the animation clock before a headless screenshot, so CSS
 /// entrance animations land on their final keyframe rather than frame zero.
@@ -137,6 +313,15 @@ const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KH
 /// Windows (`navigator.userAgent`, `navigator.platform`), as `USER_AGENT` does
 /// there.
 pub(crate) fn platform_shim(js: &str) -> String {
+    if is_mobile_view() {
+        return js
+            .replace(USER_AGENT, MOBILE_USER_AGENT)
+            .replace("Windows NT 10.0; Win64; x64", "Linux; Android 16; Pixel 9a")
+            .replace("platform:\"Win32\"", "platform:\"Linux armv8l\"")
+            .replace("platform: \"Win32\"", "platform: \"Linux armv8l\"")
+            .replace("maxTouchPoints:0", "maxTouchPoints:5")
+            .replace("orientation:{type:\"landscape-primary\",angle:0}", "orientation:{type:\"portrait-primary\",angle:0}");
+    }
     #[cfg(target_os = "linux")]
     {
         let platform = if cfg!(target_arch = "aarch64") { "Linux aarch64" } else { "Linux x86_64" };
@@ -164,57 +349,63 @@ fn main() {
         libc::sigemptyset(&mut none);
         libc::pthread_sigmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
     }
-    let arg = std::env::args().nth(1).unwrap_or_default();
 
-    // Quick JS test mode: run a suite through the VM and exit. Exit status
-    // reflects the result so these are usable from a script or CI.
-    zipp_shell::net::set_file_gate(page_may_read);
-    if arg == "--test-js" {
-        let ok = run_js_suite("TEST", include_str!("js_tests.js"), 10);
-        std::process::exit(if ok { 0 } else { 1 });
-    }
-    if arg == "--test-vm" {
-        run_vm_test();
-        return;
-    }
-    if arg == "--test-compat" {
-        let ok = run_js_suite("COMPAT", include_str!("js_compat_tests.js"), 20);
-        std::process::exit(if ok { 0 } else { 1 });
-    }
-    // Headless render: load a page, lay it out and paint it to a PNG without
-    // opening a window. This is how the rendering is checked against a real
-    // browser — a screenshot is the only honest way to compare CSS output.
-    //   zipp-browser --screenshot out.png [url] [width] [height]
-    if arg == "--screenshot" {
-        let mut rest = std::env::args().skip(2);
-        let out = rest.next().unwrap_or_else(|| "screenshot.png".to_string());
-        let url = rest.next().unwrap_or_else(|| "https://lance.name".to_string());
-        let width: u32 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(1280);
-        let height: u32 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(2000);
-        let ok = screenshot(&normalize_url(&url), &out, width, height);
-        save_profile();
-        std::process::exit(if ok { 0 } else { 1 });
-    }
-    // WPT reftests, many in one process: `tools/wpt_reftest.py` drives it.
-    //   zipp-browser --reftest pairs.tsv results.tsv
-    if arg == "--reftest" {
-        let mut rest = std::env::args().skip(2);
-        let (Some(pairs), Some(results)) = (rest.next(), rest.next()) else {
-            eprintln!("usage: zipp-browser --reftest pairs.tsv results.tsv");
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let action = match parse_cli_args(&raw_args) {
+        Ok(action) => action,
+        Err(msg) => {
+            eprintln!("error: {msg}");
             std::process::exit(2);
-        };
-        let ok = reftest_batch(&pairs, &results);
-        save_profile();
-        std::process::exit(if ok { 0 } else { 1 });
+        }
+    };
+
+    zipp_shell::net::set_file_gate(page_may_read);
+    let (raw_url, mobile, custom_viewport, kiosk, app, app_files) = match action {
+        CliAction::Help => {
+            print_usage();
+            return;
+        }
+        CliAction::Version => {
+            println!("zipp-browser {} (zipp-vm 0.0.39)", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        CliAction::TestJs => {
+            let ok = run_js_suite("TEST", include_str!("js_tests.js"), 10);
+            std::process::exit(if ok { 0 } else { 1 });
+        }
+        CliAction::TestVm => {
+            run_vm_test();
+            return;
+        }
+        CliAction::TestCompat => {
+            let ok = run_js_suite("COMPAT", include_str!("js_compat_tests.js"), 20);
+            std::process::exit(if ok { 0 } else { 1 });
+        }
+        CliAction::Screenshot { out, url, width, height, mobile, no_chrome } => {
+            if mobile {
+                MOBILE_VIEW.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            if no_chrome {
+                NO_CHROME.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            let ok = screenshot(&normalize_url(&url), &out, width, height);
+            save_profile();
+            std::process::exit(if ok { 0 } else { 1 });
+        }
+        CliAction::Reftest { pairs, results } => {
+            let ok = reftest_batch(&pairs, &results);
+            save_profile();
+            std::process::exit(if ok { 0 } else { 1 });
+        }
+        CliAction::Run { url, mobile, viewport, kiosk, app, app_files } => {
+            (url, mobile, viewport, kiosk, app, app_files)
+        }
+    };
+
+    if mobile {
+        MOBILE_VIEW.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    // `--kiosk <url>`: the page is the whole screen, with no toolbar. On Linux
-    // the screen is taken through DRM/KMS with input from evdev (zipp-kms), so
-    // no display server is needed: zipp-linux runs the browser this way. The
-    // screen is opened first because its size is the viewport the page's
-    // script is told about on its first run.
-    let kiosk = arg == "--kiosk";
-    let arg = if kiosk { std::env::args().nth(2).unwrap_or_default() } else { arg };
     #[cfg(not(target_os = "linux"))]
     if kiosk {
         eprintln!("[BROWSER] --kiosk runs on Linux's DRM/KMS only");
@@ -222,32 +413,42 @@ fn main() {
     }
     #[cfg(target_os = "linux")]
     let kms = kiosk.then(open_kms);
+    let default_viewport = custom_viewport.unwrap_or(if mobile { MOBILE_WINDOW_SIZE } else { INITIAL_WINDOW_SIZE });
     #[cfg(target_os = "linux")]
-    let viewport = kms.as_ref().map_or(INITIAL_WINDOW_SIZE, |kms| {
+    let viewport = kms.as_ref().map_or(default_viewport, |kms| {
         let (w, h) = kms.size();
         ((w as f64 / kms.scale_factor()) as u32, (h as f64 / kms.scale_factor()) as u32)
     });
     #[cfg(not(target_os = "linux"))]
-    let viewport = INITIAL_WINDOW_SIZE;
+    let viewport = default_viewport;
     if kiosk {
         NO_CHROME.store(true, std::sync::atomic::Ordering::Relaxed);
         system::KIOSK.store(true, std::sync::atomic::Ordering::Relaxed);
         zipp_shell::give_keys_to_page();
     }
-    // `--app <url> [file ...]`: the page as an application, in a window of
-    // its own with no toolbar, that may read on disk only its own folder and
-    // the files named after it. ZIPP OS runs a .softn app this way: the page
-    // is SoftN's runtime, the file the app.
-    let app = arg == "--app";
-    let arg = if app { std::env::args().nth(2).unwrap_or_default() } else { arg };
     if app {
         NO_CHROME.store(true, std::sync::atomic::Ordering::Relaxed);
         zipp_shell::give_keys_to_page();
-        allow_app_files(&arg, std::env::args().skip(3));
+        allow_app_files(&raw_url, app_files.into_iter());
     }
 
-    let url = if arg.is_empty() { "https://lance.name".to_string() } else { arg };
-    eprintln!("[BROWSER] Loading {url}");
+    let url = if raw_url.is_empty() {
+        "https://lance.name".to_string()
+    } else if raw_url.starts_with("http://") || raw_url.starts_with("https://") || raw_url.starts_with("file://") {
+        raw_url
+    } else if let Ok(canon) = std::fs::canonicalize(&raw_url) {
+        let s = canon.to_string_lossy().replace('\\', "/");
+        let s = s.strip_prefix("//?/").unwrap_or(&s);
+        format!("file:///{}", s.trim_start_matches('/'))
+    } else {
+        normalize_url(&raw_url)
+    };
+    eprintln!(
+        "[BROWSER] Loading {url} ({} {}x{})",
+        if mobile { "mobile" } else { "desktop" },
+        viewport.0,
+        viewport.1,
+    );
     // The window's page runs on this thread: its console is the one shown,
     // and it may start workers.
     console::record_this_thread();
@@ -297,6 +498,7 @@ fn main() {
     #[cfg(not(target_os = "linux"))]
     let screen = Screen::Window(create_default_event_loop());
     let (proxy, receiver) = ShellProxy::new(screen.create_proxy());
+    let _ = SHELL_PROXY.set(proxy.clone());
     // A worker that has sent its page something wakes the window, whose event
     // bridge hands it over (`JsEventBridge::run_tasks`).
     let wake_proxy = std::sync::Mutex::new(proxy.clone());
@@ -365,7 +567,7 @@ fn main() {
     }));
     let renderer = TinySkiaWindowRenderer::new();
     let attributes = winit::window::WindowAttributes::default()
-        .with_surface_size(winit::dpi::LogicalSize::new(INITIAL_WINDOW_SIZE.0, INITIAL_WINDOW_SIZE.1))
+        .with_surface_size(winit::dpi::LogicalSize::new(viewport.0, viewport.1))
         .with_window_icon(app_icon(false));
     #[cfg(windows)]
     let attributes = attributes.with_platform_attributes(Box::new(
@@ -483,11 +685,10 @@ fn run_js_suite(tag: &str, tests: &str, max_failures: usize) -> bool {
     };
     eprintln!("[{tag}] {passed}/{} passed", passed + failed);
     for i in 0..max_failures {
-        if let Ok(JsValue::String(s)) = state.eval_in_context(&format!("_e[{i}] || ''")) {
-            if !s.is_empty() {
+        if let Ok(JsValue::String(s)) = state.eval_in_context(&format!("_e[{i}] || ''"))
+            && !s.is_empty() {
                 eprintln!("[{tag}]   {s}");
             }
-        }
     }
     failed == 0.0
 }
@@ -700,12 +901,11 @@ fn fetch(url: &str) -> Result<String, String> {
 
     let is_static = url.contains("/static/") || url.ends_with(".js") || url.ends_with(".css");
     // Check cache for static assets
-    if is_static {
-        if let Some(cached) = FETCH_CACHE.lock().unwrap().get(url) {
+    if is_static
+        && let Some(cached) = FETCH_CACHE.lock().unwrap().get(url) {
             return Ok(cached.clone());
         }
-    }
-    let text = HTTP_CLIENT
+    let text = http_client()
         .get(url)
         .send()
         .map_err(|e| e.to_string())?
@@ -1320,8 +1520,8 @@ fn from_chrome(url: &str) -> bool {
 /// `file:` from disk (a page opened from disk fetches its neighbours; see
 /// `page_may_read`).
 fn fetch_bytes_for_page(url: &str) -> Result<(u16, Vec<u8>), String> {
-    if let Ok(parsed) = url::Url::parse(url) {
-        if parsed.scheme() == "file" {
+    if let Ok(parsed) = url::Url::parse(url)
+        && parsed.scheme() == "file" {
             let path = parsed.to_file_path().map_err(|_| format!("Error: GET {url}: not a file path"))?;
             if !page_may_read(&path) {
                 return Ok((403, Vec::new()));
@@ -1331,7 +1531,6 @@ fn fetch_bytes_for_page(url: &str) -> Result<(u16, Vec<u8>), String> {
                 Err(_) => Ok((404, Vec::new())),
             };
         }
-    }
     let resp = client_for_page(url, false).get(url).send().map_err(|e| format!("Error: GET {url}: {e}"))?;
     let status = resp.status().as_u16();
     let bytes = resp.bytes().map_err(|e| format!("Error: reading {url}: {e}"))?;
@@ -1355,7 +1554,7 @@ fn same_origin(url: &str) -> bool {
 /// The client for a request by the page: cookies go with its own site's, and
 /// with another's only where it asked (`credentials: "include"`).
 fn client_for_page(url: &str, credentials: bool) -> &'static reqwest::blocking::Client {
-    if credentials || same_origin(url) { &HTTP_CLIENT } else { &ANONYMOUS_CLIENT }
+    if credentials || same_origin(url) { http_client() } else { anonymous_http_client() }
 }
 
 /// The same-origin rule, for a page on the web reading another site: the
@@ -2064,8 +2263,6 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1);
             for n in 0..repeats {
-            if n == 0 {
-            }
             eprintln!("[CLICK] dispatch {} handler=#{root_flid} target=#{flid}", n + 1);
             match state.call_global(
                 "__zippDispatchEvent",
@@ -2079,8 +2276,8 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
                 Err(e) => eprintln!("[CLICK] dispatch failed: {e}"),
             }
             event_bridge::run_page_tasks(state, 400, 2, std::time::Duration::from_secs(1));
-            if let Ok(JsValue::String(updated)) = state.call_global("__getRenderedHTML", &[]) {
-                if !updated.is_empty() {
+            if let Ok(JsValue::String(updated)) = state.call_global("__getRenderedHTML", &[])
+                && !updated.is_empty() {
                     eprintln!(
                         "[CLICK] after dispatch {}: {} bytes, menu_open={}",
                         n + 1,
@@ -2102,7 +2299,6 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
                         })
                         .unwrap_or(final_html);
                 }
-            }
         }
     }
     // Write the HTML the renderer sees alongside the image. When a screenshot
@@ -2250,7 +2446,7 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
     // the same path a mouse takes. `ZIPP_CLICK` bypasses all of that and only
     // proves the JS half, which is why it once reported success while clicking
     // in the window still did nothing.
-    if let Some(spec) = std::env::var("ZIPP_UICLICK").ok() {
+    if let Ok(spec) = std::env::var("ZIPP_UICLICK") {
         // Semicolon-separated points, clicked in order: `x,y;x,y;...`. A single
         // point is the common case and behaves exactly as before. A SEQUENCE is
         // what you need to reproduce anything that depends on getting somewhere
@@ -2330,14 +2526,13 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
                 for step in [0.0, 4.0, 12.0, 30.0] {
                     doc.as_mut().resolve(after + ANIMATION_SETTLE_SECS * step);
                 }
-                if let Some(state) = js_state.as_mut() {
-                    if let Ok(JsValue::String(after)) =
+                if let Some(state) = js_state.as_mut()
+                    && let Ok(JsValue::String(after)) =
                         state.call_global("__getRenderedHTML", &[])
                     {
                         let _ = std::fs::write(format!("{out_path}.click.html"), &after);
                         eprintln!("[UICLICK] wrote {out_path}.click.html");
                     }
-                }
             }
         }
     }
@@ -2478,11 +2673,10 @@ fn run_zipp_js_inner(
             let full = resolve(page_url, &src);
             if ty == "module" {
                 module_entries.push(full);
-            } else if is_js {
-                if let Ok(source) = fetch(&full) {
+            } else if is_js
+                && let Ok(source) = fetch(&full) {
                     external_scripts.push((full, source));
                 }
-            }
         } else if is_js || ty == "importmap" {
             // INLINE script. These were skipped entirely, so a page whose
             // behaviour lives in a `<script>` block ran none of it — the tag was
@@ -2554,6 +2748,9 @@ fn run_zipp_js_inner(
         );
 
     let mut full = shim;
+    if is_mobile_view() {
+        full.push_str("\nif (typeof __zippSetMobileMode === \"function\") __zippSetMobileMode(true);\n");
+    }
     full.push_str("\n;\n");
     for (_url, source) in &external_scripts {
         let patched = source
@@ -2649,7 +2846,6 @@ var __zippEsmDebug=true;
             // the program is the shim and every script run together, so the
             // number alone says little.
             let line = e
-                .to_string()
                 .split("<anonymous>:")
                 .nth(1)
                 .and_then(|at| at.split(':').next()?.trim().parse::<usize>().ok())
@@ -2719,8 +2915,8 @@ var __zippEsmDebug=true;
         console::push(console::Level::Error, line);
     }
 
-    if let Ok(JsValue::String(rendered)) = state.eval_in_context("__getRenderedHTML()") {
-        if !rendered.is_empty() {
+    if let Ok(JsValue::String(rendered)) = state.eval_in_context("__getRenderedHTML()")
+        && !rendered.is_empty() {
             // Extract the event handler map before we lose the state.
             let event_map_json = match state.eval_in_context("__getEventMap()") {
                 Ok(JsValue::String(s)) => s,
@@ -2754,7 +2950,6 @@ var __zippEsmDebug=true;
             );
             return Some((html_out, event_map_json, state));
         }
-    }
     // The page shows its own markup, not the script's tree (see
     // `__getRenderedHTML`), but its script lives on: its timers run and the
     // console can reach it. An empty event map says so (`JsEventBridge::new`).
@@ -2868,23 +3063,20 @@ impl NavigationProvider for BrowserNavProvider {
             return;
         }
 
-        // The console's own links: the event bridge opens, closes and clears it
-        // itself.
-        if url.starts_with("zipp-console:") {
+        // The console's and viewport toggle's own links: handled directly by the event bridge.
+        if url.starts_with("zipp-console:") || url.starts_with("zipp-view:") {
             return;
         }
         // Code typed into the console. Its line is a form posting back to the
         // page, like the address bar's; the code waits here for the page's
         // thread (`JsEventBridge::run_tasks`).
         let chrome = from_chrome(&url);
-        if chrome && url.contains("__js=") {
-            if let Ok(parsed) = url::Url::parse(&url) {
-                if let Some((_, code)) = parsed.query_pairs().find(|(k, _)| k == "__js") {
+        if chrome && url.contains("__js=")
+            && let Ok(parsed) = url::Url::parse(&url)
+                && let Some((_, code)) = parsed.query_pairs().find(|(k, _)| k == "__js") {
                     console::submit(code.into_owned());
                     return;
                 }
-            }
-        }
 
         // The PDF viewer's Save button: write the file to Downloads and show the
         // viewer again with a note of where it went.
@@ -2915,8 +3107,8 @@ impl NavigationProvider for BrowserNavProvider {
         // `https://lance.name/#about`, so it never matched: every in-page nav
         // link reloaded the page, which left it with no live JS and nothing
         // on it responding. Parsed URLs compare equal across that slash.
-        if let Ok(target) = url::Url::parse(&url) {
-            if let Some(fragment) = target.fragment() {
+        if let Ok(target) = url::Url::parse(&url)
+            && let Some(fragment) = target.fragment() {
                 let current = self.current_url.lock().unwrap().clone();
                 let same_document = url::Url::parse(&current).is_ok_and(|mut current| {
                     let mut target = target.clone();
@@ -2934,7 +3126,6 @@ impl NavigationProvider for BrowserNavProvider {
                     return;
                 }
             }
-        }
         // Another document: the server never sees the fragment.
         if let Some((base, _)) = url.split_once('#') {
             url = base.to_string();
@@ -3030,15 +3221,17 @@ impl BrowserNavProvider {
 /// a page's own `html` padding still applies. With the console open the band
 /// grows to hold it too, under the toolbar; opening and closing it rewrites
 /// this stylesheet (`JsEventBridge::show_console`).
-pub(crate) fn chrome_css(console_open: bool) -> String {
+pub(crate) fn chrome_css(console_open: bool, mobile_open: bool) -> String {
     let panel = console::PANEL_HEIGHT;
     let band = if console_open { 42 + panel } else { 42 };
     let (display, button) = if console_open { ("flex", "#dbe4ff") } else { ("none", "transparent") };
+    let mobile_bg = if mobile_open { "#dbe4ff" } else { "transparent" };
     format!(
         "html {{ border-top:{band}px solid transparent !important; margin:0 !important; max-width:none !important; }}\n\
          #__zipp_chrome {{ top:-{band}px; }}\n\
          #__zipp_console {{ display:{display}; top:-{panel}px; height:{panel}px; }}\n\
-         #__zipp_console_button {{ background:{button}; }}\n"
+         #__zipp_console_button {{ background:{button}; }}\n\
+         #__zipp_mobile_button {{ background:{mobile_bg}; }}\n"
     )
 }
 
@@ -3211,7 +3404,7 @@ pub(crate) fn console_button_inner(badge: &str) -> String {
 }
 
 fn toolbar_markup(current_url: &str) -> String {
-    let css = chrome_css(console::is_open());
+    let css = chrome_css(console::is_open(), is_mobile_view());
     let token = chrome_token();
     let console_line = console_input();
     let button = console_button_inner(&console::badge_text());
@@ -3225,6 +3418,7 @@ fn toolbar_markup(current_url: &str) -> String {
     <a href="zipp-nav:forward" title="Forward (Alt+Right)" style="display:flex;align-items:center;padding:3px;border-radius:4px;text-decoration:none;color:#495057"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg></a>
     <a href="zipp-nav:reload" title="Reload (F5)" style="display:flex;align-items:center;padding:3px;border-radius:4px;text-decoration:none;color:#495057"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg></a>
     <input type="text" name="__nav_url" value="{current_url}" style="flex:1;min-width:0;height:32px;padding:0 12px;border:1px solid #ced4da;border-radius:8px;font-family:Arial,sans-serif;font-size:14px;font-weight:normal;font-style:normal;letter-spacing:normal;background:white;color:#212529;outline:none;box-sizing:border-box" />
+    <a id="__zipp_mobile_button" href="zipp-view:mobile" title="Toggle Mobile View (Ctrl+Shift+M)" style="display:flex;align-items:center;padding:4px 5px;border-radius:4px;text-decoration:none;color:#495057"><svg xmlns="http://www.w3.org/2000/svg" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><path d="M12 18h.01"/></svg></a>
     <a id="__zipp_console_button" href="zipp-console:toggle" title="Console (F12)" style="display:flex;align-items:center;gap:4px;padding:4px 6px;border-radius:4px;text-decoration:none;color:#495057">{button}</a>
   </form>
   <div id="__zipp_console" style="position:absolute;left:0;right:0;z-index:2147483646;flex-direction:column;background:white;border-bottom:2px solid #ced4da;font-family:Consolas,'Liberation Mono',monospace;font-size:12px;line-height:16px;color:#212529;text-align:left;box-sizing:border-box;margin:0">
@@ -3318,13 +3512,12 @@ pub(crate) fn make_urls_absolute(html: &str, page_url: &str) -> String {
             .rfind(|c: char| c.is_ascii_whitespace())
             .map_or(eq, |ws| ws + 1);
         let name = &html[name_start..eq];
-        if name.eq_ignore_ascii_case("src") || name.eq_ignore_ascii_case("href") {
-            if let Some(absolute) = absolutize(&base, &html[value_start..value_end]) {
+        if (name.eq_ignore_ascii_case("src") || name.eq_ignore_ascii_case("href"))
+            && let Some(absolute) = absolutize(&base, &html[value_start..value_end]) {
                 out.push_str(&html[copied..value_start]);
                 out.push_str(&absolute);
                 copied = value_end;
             }
-        }
         pos = value_end + 1;
     }
     out.push_str(&html[copied..]);
@@ -3621,5 +3814,75 @@ mod tests {
         assert!(!looks_like_page("https://lance.name/favicon.svg"));
         assert!(!looks_like_page("https://lance.name/downloads/Lance-Baker-Resume.pdf"));
         assert!(!looks_like_page("not a url"));
+    }
+
+    #[test]
+    fn cli_parses_mobile_viewport_and_app_modes() {
+        let s = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(parse_cli_args(&s(&["--help"])), Ok(CliAction::Help));
+        assert_eq!(parse_cli_args(&s(&["-V"])), Ok(CliAction::Version));
+        assert_eq!(
+            parse_cli_args(&s(&["--mobile", "https://example.com"])),
+            Ok(CliAction::Run {
+                url: "https://example.com".into(),
+                mobile: true,
+                viewport: None,
+                kiosk: false,
+                app: false,
+                app_files: vec![],
+            })
+        );
+        assert_eq!(
+            parse_cli_args(&s(&["--mobile", "--app", "index.html", "app.softn"])),
+            Ok(CliAction::Run {
+                url: "index.html".into(),
+                mobile: true,
+                viewport: None,
+                kiosk: false,
+                app: true,
+                app_files: vec!["app.softn".into()],
+            })
+        );
+        assert_eq!(
+            parse_cli_args(&s(&["--viewport", "390x844", "https://example.com"])),
+            Ok(CliAction::Run {
+                url: "https://example.com".into(),
+                mobile: false,
+                viewport: Some((390, 844)),
+                kiosk: false,
+                app: false,
+                app_files: vec![],
+            })
+        );
+        assert_eq!(
+            parse_cli_args(&s(&["--mobile", "--screenshot", "out.png", "https://example.com"])),
+            Ok(CliAction::Screenshot {
+                out: "out.png".into(),
+                url: "https://example.com".into(),
+                width: MOBILE_WINDOW_SIZE.0,
+                height: MOBILE_WINDOW_SIZE.1,
+                mobile: true,
+                no_chrome: false,
+            })
+        );
+        assert_eq!(
+            parse_cli_args(&s(&["--mobile", "--app", "--screenshot", "out.png", "index.html"])),
+            Ok(CliAction::Screenshot {
+                out: "out.png".into(),
+                url: "index.html".into(),
+                width: MOBILE_WINDOW_SIZE.0,
+                height: MOBILE_WINDOW_SIZE.1,
+                mobile: true,
+                no_chrome: true,
+            })
+        );
+        assert!(parse_cli_args(&s(&["--viewport", "bad"])).is_err());
+    }
+
+    #[test]
+    fn toolbar_includes_mobile_view_toggle() {
+        let out = wrap_with_toolbar("<p>hi</p>", "https://example.com/");
+        assert!(out.contains(r#"id="__zipp_mobile_button""#));
+        assert!(out.contains(r#"href="zipp-view:mobile""#));
     }
 }

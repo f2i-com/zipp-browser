@@ -5,7 +5,7 @@ use crate::traits_src::events::{
     PointerEvent, PointerId, DomEventData, HitResult, PointerCoords,
 };
 use crate::traits_src::shell::ShellProvider;
-use html_escape::encode_quoted_attribute_to_string;
+use html_escape::{encode_quoted_attribute_to_string, encode_text_to_string};
 use keyboard_types::Modifiers;
 use kurbo::Affine;
 use markup5ever::{LocalName, local_name};
@@ -847,7 +847,7 @@ impl Node {
             NodeData::AnonymousBlock(_) => {}
             // NodeData::Doctype { name, .. } => write!(s, "DOCTYPE {name}"),
             NodeData::Text(data) => {
-                writer.push_str(data.content.as_str());
+                encode_text_to_string(data.content.as_str(), writer);
             }
             NodeData::Element(data) => {
                 writer.push('<');
@@ -1454,6 +1454,21 @@ mod test {
         assert!(
             node.element_state.contains(ElementState::ENABLED),
             "Button should be enabled by default"
+        );
+    }
+
+    #[test]
+    fn outer_html_escapes_text_entities() {
+        let mut document = BaseDocument::new(DocumentConfig::default());
+        let el = document.create_node(NodeData::Element(ElementData::new(
+            qual_name!("text"),
+            vec![],
+        )));
+        let txt = document.create_text_node("SoftN Mobile & Desktop <1>");
+        document.nodes[el].children.push(txt);
+        assert_eq!(
+            document.get_node(el).unwrap().outer_html(),
+            "<text>SoftN Mobile &amp; Desktop &lt;1&gt;</text>"
         );
     }
 }

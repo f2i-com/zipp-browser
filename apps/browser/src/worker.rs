@@ -377,9 +377,9 @@ pub(crate) fn url_set(href: &str, part: &str, value: &str) -> Result<String, Str
         "host" => q::set_host(&mut u, value),
         "hostname" => q::set_hostname(&mut u, value),
         "port" => q::set_port(&mut u, value),
-        "pathname" => Ok(q::set_pathname(&mut u, value)),
-        "search" => Ok(q::set_search(&mut u, value)),
-        "hash" => Ok(q::set_hash(&mut u, value)),
+        "pathname" => { q::set_pathname(&mut u, value); Ok(()) }
+        "search" => { q::set_search(&mut u, value); Ok(()) }
+        "hash" => { q::set_hash(&mut u, value); Ok(()) }
         _ => return Err(format!("unknown URL part {part:?}")),
     };
     Ok(parts_json(&u))

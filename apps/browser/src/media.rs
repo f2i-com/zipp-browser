@@ -368,12 +368,11 @@ fn play(
             if debug {
                 eprintln!("[MEDIA] event {event} t={:.2}", unsafe { engine.GetCurrentTime() });
             }
-            if event == MF_MEDIA_ENGINE_EVENT_ERROR.0 {
-                if let Ok(error) = unsafe { engine.GetError() } {
+            if event == MF_MEDIA_ENGINE_EVENT_ERROR.0
+                && let Ok(error) = unsafe { engine.GetError() } {
                     let (code, extended) = unsafe { (error.GetErrorCode(), error.GetExtendedErrorCode()) };
                     eprintln!("[MEDIA] error {code} ({:?})", extended);
                 }
-            }
             if event == MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA.0 {
                 metadata = true;
                 relayout = true;
@@ -401,9 +400,9 @@ fn play(
 
         // A new frame, if the engine has one.
         let mut new_frame = false;
-        if metadata && unsafe { engine.HasVideo() }.as_bool() {
-            if let Ok(pts) = unsafe { engine.OnVideoStreamTick() } {
-                if last_pts != Some(pts) {
+        if metadata && unsafe { engine.HasVideo() }.as_bool()
+            && let Ok(pts) = unsafe { engine.OnVideoStreamTick() }
+                && last_pts != Some(pts) {
                     last_pts = Some(pts);
                     let display_size = *shared.display_size.lock().unwrap();
                     if let Some(frame) = read_frame(engine, device, context, &mut textures, display_size)? {
@@ -411,8 +410,6 @@ fn play(
                         new_frame = true;
                     }
                 }
-            }
-        }
 
         // Publish the state.
         let status = unsafe {

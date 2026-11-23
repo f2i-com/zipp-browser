@@ -49,6 +49,7 @@ pub fn paint_scene(
 /// Partial-scene repaint starting from `target_nodes` (such as updated opaque `<canvas>`
 /// elements): skips all painting prior to the first target node while preserving ancestor
 /// clips/scroll offsets, then paints the target nodes and any subsequent overlays normally.
+#[allow(clippy::too_many_arguments)]
 pub fn paint_scene_from_nodes(
     scene: &mut (impl PaintScene + crate::tinyskia::BlurLayer),
     dom: &BaseDocument,

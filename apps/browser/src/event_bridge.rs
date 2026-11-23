@@ -47,8 +47,8 @@ pub(crate) fn run_page_tasks(state: &mut ScriptState, max_tasks: usize, mut fram
     let mut ran = 0;
     while ran < max_tasks && start.elapsed() < budget {
         match state.call_global("__zippRunTask", &[JsValue::Bool(frames > 0)]) {
-            Ok(JsValue::Number(n)) if n == 1.0 => ran += 1,
-            Ok(JsValue::Number(n)) if n == 2.0 => frames = frames.saturating_sub(1),
+            Ok(JsValue::Number(1.0)) => ran += 1,
+            Ok(JsValue::Number(2.0)) => frames = frames.saturating_sub(1),
             _ => break,
         }
         state.run_microtasks();
@@ -75,11 +75,10 @@ fn walk_node(
     map: &mut HashMap<u32, usize>,
 ) {
     if let Some(node) = doc.get_node(node_id) {
-        if let Some(val) = node.attr(flid_attr.clone()) {
-            if let Ok(flid) = val.parse::<u32>() {
+        if let Some(val) = node.attr(flid_attr.clone())
+            && let Ok(flid) = val.parse::<u32>() {
                 map.insert(flid, node_id);
             }
-        }
         // Visit children
         let child_ids: Vec<usize> = node.children.clone();
         for child_id in child_ids {
@@ -158,7 +157,7 @@ impl JsEventBridge {
     /// Build the bridge from:
     ///  - `flid_map`: JS node _id -> blitz-dom node id  (from `build_flid_map`)
     ///  - `event_map_json`: JSON string `{"<js_nid>": ["click", ...], ...}`
-    ///     produced by `__getEventMap()` in the dom shim.
+    ///    produced by `__getEventMap()` in the dom shim.
     ///  - `js_state`: optional live ScriptState for calling handlers.
     pub fn new(
         flid_map: HashMap<u32, usize>,
@@ -536,7 +535,10 @@ impl JsEventBridge {
     /// Open or close the console panel as `console::is_open` says, and fill it.
     fn show_console(&mut self, doc: &mut BaseDocument) {
         if let Ok(Some(style)) = doc.query_selector("#__zipp_chrome_css") {
-            doc.mutate().set_inner_html(style, &crate::chrome_css(console::is_open()));
+            doc.mutate().set_inner_html(
+                style,
+                &crate::chrome_css(console::is_open(), crate::is_mobile_view()),
+            );
         }
         self.console_shown = u64::MAX;
         self.refresh_console(doc, Instant::now(), true);
@@ -639,6 +641,42 @@ impl EventHandler for JsEventBridge {
         }
         let _layout = LayoutScope::enter(&_doc.inner());
         self.refresh_listeners(&_doc.inner());
+        // Desktop <-> Mobile View toggle (toolbar phone icon or Ctrl+Shift+M).
+        let mobile_key = crate::chrome_shown()
+            && matches!(
+                &event.data,
+                DomEventData::KeyDown(k)
+                    if k.code == keyboard_types::Code::KeyM
+                        && k.modifiers.contains(keyboard_types::Modifiers::SHIFT)
+                        && (k.modifiers.contains(keyboard_types::Modifiers::CONTROL)
+                            || k.modifiers.contains(keyboard_types::Modifiers::META))
+            );
+        let mobile_link = matches!(event.data, DomEventData::Click(_))
+            && chain_element_id(_doc, chain, &["__zipp_mobile_button"]).is_some();
+        if mobile_key || mobile_link {
+            event_state.prevent_default();
+            let (now_mobile, (w, h)) = crate::toggle_mobile_view();
+            {
+                let mut inner = _doc.inner_mut();
+                if let Ok(Some(style)) = inner.query_selector("#__zipp_chrome_css") {
+                    inner.mutate().set_inner_html(
+                        style,
+                        &crate::chrome_css(console::is_open(), now_mobile),
+                    );
+                }
+                inner.shell_provider.request_redraw();
+            }
+            if let Some(state) = self.js_state.as_mut() {
+                let _ = state.call_global("__zippSetMobileMode", &[JsValue::Bool(now_mobile)]);
+                let _ = state.call_global(
+                    "__zippViewportResized",
+                    &[JsValue::Number(f64::from(w)), JsValue::Number(f64::from(h))],
+                );
+                self.viewport_told = Some((w, h));
+                self.run_due_work();
+            }
+            return;
+        }
         // The console's button and links, and F12, are the browser's -- when
         // it shows its toolbar: without one (a kiosk, an app) there is no
         // console to open, and F12 is the page's, as ZIPP OS's windows need.
@@ -721,8 +759,8 @@ impl EventHandler for JsEventBridge {
         // the scrolled element's own: it does not bubble.
         let chain = if scrolled { &chain[..chain.len().min(1)] } else { chain };
         for &node_id in chain {
-            if let Some(types) = self.handler_map.get(&node_id) {
-                if types.iter().any(|t| t == event_name) {
+            if let Some(types) = self.handler_map.get(&node_id)
+                && types.iter().any(|t| t == event_name) {
                     // Look up the JS flid for this blitz-dom node.
                     let flid = self.reverse_flid.get(&node_id).copied();
 
@@ -787,7 +825,6 @@ impl EventHandler for JsEventBridge {
                         );
                     }
                 }
-            }
             if event_state.propagation_is_stopped() {
                 break;
             }
@@ -797,8 +834,8 @@ impl EventHandler for JsEventBridge {
         // keeps on the document): drag handlers that follow the pointer off
         // their element listen there, as do a game's keys. Not for the toolbar,
         // which is the browser's, not the page's.
-        if self.live_dom && !scrolled && !event_state.propagation_is_stopped() && !in_chrome(_doc, chain) {
-            if let Some(state) = self.js_state.as_mut() {
+        if self.live_dom && !scrolled && !event_state.propagation_is_stopped() && !in_chrome(_doc, chain)
+            && let Some(state) = self.js_state.as_mut() {
                 let result = state.call_global(
                     "__zippDispatchToDocument",
                     &[
@@ -820,7 +857,6 @@ impl EventHandler for JsEventBridge {
                     Err(e) => eprintln!("[EVENT] document handler for \"{event_name}\" failed: {e}"),
                 }
             }
-        }
         if ran_listener && event_name == "click" {
             self.settle_after_click();
         } else if ran_listener && self.dom_changed() {
@@ -1445,11 +1481,10 @@ fn parse_event_map(
             }
         }
 
-        if let Some(bid) = blitz_id {
-            if !types.is_empty() {
+        if let Some(bid) = blitz_id
+            && !types.is_empty() {
                 result.entry(bid).or_insert_with(Vec::new).extend(types);
             }
-        }
     }
     result
 }
@@ -1506,7 +1541,7 @@ mod tests {
         let bridge = JsEventBridge::new(flid_map, json, None, "http://example.com/");
 
         assert_eq!(bridge.handler_count(), 2);
-        assert!(bridge.has_js_state() == false);
+        assert!(!bridge.has_js_state());
         assert_eq!(bridge.event_types_for(50), Some(vec!["click".to_string()].as_slice()));
         assert_eq!(bridge.event_types_for(999), None);
     }

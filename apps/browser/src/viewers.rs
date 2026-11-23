@@ -31,7 +31,6 @@ const NAVIGATION_ACCEPT: &str =
 ///
 /// With `allow_download` false (prerendering), content that would be saved to
 /// disk is an error instead -- a background prefetch must never write files.
-
 pub(crate) fn fetch_document(url: &str, allow_download: bool) -> Result<String, String> {
     if let Some(path) = url.strip_prefix("file://") {
         let path = local_path(path);
@@ -49,7 +48,7 @@ pub(crate) fn fetch_document(url: &str, allow_download: bool) -> Result<String, 
     // (`/play/<name>`) only to a request that accepts HTML, and the rest of
     // its site's "there is no page here" to anything else -- which is what
     // every app opened in this browser showed.
-    let response = crate::HTTP_CLIENT
+    let response = crate::http_client()
         .get(url)
         .header(reqwest::header::ACCEPT, NAVIGATION_ACCEPT)
         .header("Sec-Fetch-Dest", "document")
@@ -116,7 +115,7 @@ pub(crate) fn save_pdf(url: &str) -> Result<String, String> {
     let bytes = if let Some(path) = url.strip_prefix("file://") {
         std::fs::read(local_path(path)).map_err(|e| e.to_string())?
     } else {
-        let response = crate::HTTP_CLIENT.get(url).send().map_err(|e| e.to_string())?;
+        let response = crate::http_client().get(url).send().map_err(|e| e.to_string())?;
         response.bytes().map_err(|e| e.to_string())?.to_vec()
     };
     let saved = save_to_downloads(&filename_from_url(url), &bytes)?;

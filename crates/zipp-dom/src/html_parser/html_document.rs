@@ -224,7 +224,7 @@ fn apply_patches(doc: &mut BaseDocument, patches: Vec<crate::DomPatch>) -> bool 
                     .collect();
                 let mut mutator = crate::DocumentMutator::new(doc);
                 for (name, _) in &current {
-                    if !(noted && name == "value") && !attrs.iter().any(|(n, _)| n == name) {
+                    if !(attrs.iter().any(|(n, _)| n == name) || (noted && name == "value")) {
                         mutator.clear_attribute(node_id, qual(name));
                     }
                 }

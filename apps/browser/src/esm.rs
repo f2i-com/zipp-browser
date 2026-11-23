@@ -484,7 +484,7 @@ fn collect_pattern_names<'a>(kind: &ox::BindingPattern<'a>, out: &mut Vec<String
         }
         ox::BindingPattern::ArrayPattern(a) => {
             for e in a.elements.iter().flatten() {
-                collect_pattern_names(&e, out);
+                collect_pattern_names(e, out);
             }
             if let Some(rest) = &a.rest {
                 collect_pattern_names(&rest.argument, out);
@@ -704,9 +704,9 @@ mod tests {
     use super::*;
 
     fn res(base: &str, spec: &str) -> String {
-        if spec.starts_with("./") {
+        if let Some(rest) = spec.strip_prefix("./") {
             let dir = &base[..base.rfind('/').unwrap_or(0)];
-            format!("{dir}/{}", &spec[2..])
+            format!("{dir}/{rest}")
         } else {
             spec.to_string()
         }
@@ -731,7 +731,7 @@ mod tests {
         assert_eq!(r("./old.js").as_deref(), Some("http://x/new.js"));
         assert_eq!(r("./other.js"), None);
         assert_eq!(r("react"), None);
-        assert_eq!(map.to_js().contains("\"three/addons/\":\"http://x/lib/jsm/\""), true);
+        assert!(map.to_js().contains("\"three/addons/\":\"http://x/lib/jsm/\""));
     }
 
     #[test]
