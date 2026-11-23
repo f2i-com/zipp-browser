@@ -7145,7 +7145,7 @@ dependencies = [
 
 [[package]]
 name = "zipp-browser"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "alsa",
  "base64 0.22.1",
@@ -7195,7 +7195,7 @@ dependencies = [
 
 [[package]]
 name = "zipp-dom"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "app_units",
  "atomic_refcell",
@@ -7242,7 +7242,7 @@ dependencies = [
 
 [[package]]
 name = "zipp-kms"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dpi",
  "drm",
@@ -7275,7 +7275,7 @@ dependencies = [
 
 [[package]]
 name = "zipp-renderer"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyrender",
  "anyrender_svg",
@@ -7299,7 +7299,7 @@ dependencies = [
 
 [[package]]
 name = "zipp-shell"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "android-activity",
  "anyrender",

@@ -49,8 +49,8 @@ pub enum Resource {
     /// A parsed SVG tree (requires the `svg` feature).
     #[cfg(feature = "svg")]
     Svg(ImageType, Arc<usvg::Tree>),
-    /// A parsed CSS stylesheet.
-    Css(DocumentStyleSheet),
+    /// A parsed CSS stylesheet plus extracted SVG presentation rules.
+    Css(DocumentStyleSheet, String),
     /// Raw font bytes (possibly decompressed from WOFF/WOFF2), and the family
     /// name its `@font-face` rule gives it.
     Font(Bytes, Option<String>),
@@ -182,9 +182,10 @@ impl NetHandler for ResourceHandler<StylesheetHandler> {
             AllowImportRules::Yes,
         );
 
+        let svg_css = crate::util::extract_svg_css_rules(css);
         self.respond(
             resolved_url,
-            Ok(Resource::Css(DocumentStyleSheet(ServoArc::new(sheet)))),
+            Ok(Resource::Css(DocumentStyleSheet(ServoArc::new(sheet)), svg_css)),
         );
     }
 }

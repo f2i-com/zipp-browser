@@ -47,3 +47,9 @@ that hovers, sRGB, no preference for reduced motion, contrast or data, no
 forced or inverted colours, scripting enabled. Most of the names are not
 among servo's static atoms, so `MEDIA_FEATURES` is built on first use (a
 `LazyLock`), and `queries/feature_expression.rs` takes it as a slice.
+
+## `parallel.rs`: `STYLE_THREAD_STACK_SIZE_KB`
+
+Raised the Servo style worker thread stack size default from `512` KB to `4096` KB
+so complex deeply-nested Shadow DOM / Tailwind / SoftN business apps do not
+overflow `StyleThread#N` stacks on Windows.

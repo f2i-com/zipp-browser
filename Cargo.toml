@@ -9,16 +9,16 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 license = "MIT OR Apache-2.0"
 edition = "2024"
 rust-version = "1.92.0"
 
 [workspace.dependencies]
 # In-repo crates
-zipp-dom = { version = "0.1.0", path = "./crates/zipp-dom", default-features = false }
-zipp-renderer = { version = "0.1.0", path = "./crates/zipp-renderer", default-features = false }
-zipp-shell = { version = "0.1.0", path = "./crates/zipp-shell", default-features = false }
+zipp-dom = { version = "0.1.1", path = "./crates/zipp-dom", default-features = false }
+zipp-renderer = { version = "0.1.1", path = "./crates/zipp-renderer", default-features = false }
+zipp-shell = { version = "0.1.1", path = "./crates/zipp-shell", default-features = false }
 
 # Servo dependencies
 style = { version = "0.14.0", package = "stylo" }

@@ -32,3 +32,17 @@ its content, `min-content` and `max-content` children contribute that size.
 GitHub's activity strip is a `width: max-content` grid of columns; stretched
 to the window, each column was a few characters wide and the text ran down
 the page.
+
+## `compute/flexbox.rs`: `flex-shrink: 0` with negative margin
+
+In `determine_container_main_size` (intrinsic `MinContent`/`MaxContent` sizing),
+`content_flex_fraction` divided a negative `diff` by
+`f32_max(1.0, item.flex_shrink * item.inner_flex_basis)` (= `1.0` when
+`flex_shrink == 0.0`), while the reconstruction step multiplied back by
+`f32_max(1.0, item.flex_shrink) * item.inner_flex_basis` (= `inner_flex_basis`).
+Any `flex-shrink: 0` child with a negative margin (such as SoftN's
+`.softn-frame-home { margin-left: -0.3rem }` or Tailwind `-ml-*`) therefore
+subtracted `inner_flex_basis * margin` from its parent flex container and
+collapsed the container (and its sibling `.softn-frame-name`) to `0px`.
+Fixed the multiplier to match the divisor:
+`f32_max(1.0, item.flex_shrink * item.inner_flex_basis)`.

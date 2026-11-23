@@ -119,6 +119,15 @@ pub fn set_file_gate(gate: fn(&std::path::Path) -> bool) {
     let _ = FILE_GATE.set(gate);
 }
 
+/// Resolves in-memory `blob:` URLs registered by `URL.createObjectURL` so
+/// `<img>`, CSS `url(blob:...)`, and `<link href="blob:...">` load natively.
+pub type BlobResolver = fn(&str) -> Option<Vec<u8>>;
+static BLOB_RESOLVER: std::sync::OnceLock<BlobResolver> = std::sync::OnceLock::new();
+
+pub fn set_blob_resolver(resolver: BlobResolver) {
+    let _ = BLOB_RESOLVER.set(resolver);
+}
+
 impl Provider {
     async fn fetch_inner(
         client: Client,
@@ -126,6 +135,19 @@ impl Provider {
         user_agent: String,
     ) -> Result<(String, Bytes), ProviderError> {
         Ok(match request.url.scheme() {
+            "blob" => {
+                let url_str = request.url.as_str();
+                let bytes = BLOB_RESOLVER
+                    .get()
+                    .and_then(|resolve| resolve(url_str))
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("blob URL not found: {url_str}"),
+                        )
+                    })?;
+                (url_str.to_string(), Bytes::from(bytes))
+            }
             "data" => {
                 let url_str = request.url.as_str();
                 let data_url = DataUrl::process(url_str)?;

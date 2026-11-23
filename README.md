@@ -16,9 +16,10 @@ fetch → zipp-vm (0.0.39 JIT) runs JS/TS/Wasm → Stylo cascade → Taffy layou
 
 ## Status
 
-Zipp Browser renders modern React/Tailwind/Three.js web apps and SoftN v2 apps with live
-event handlers, WebGL 1 & 2, WebGPU, Canvas 2D, WebAssembly, Web Workers, IndexedDB,
-cookies, PDF viewing, and both **Desktop** and **Mobile View** modes.
+Zipp Browser renders modern React/Tailwind/Three.js web apps and SoftN v2 apps (including
+Shadow DOM + PHP/SQLite Wasm container apps, 2D tilemaps, and Three.js `.glb`/`.hdr` PBR
+scenes) with live event handlers, WebGL 1 & 2, WebGPU, Canvas 2D, WebAssembly, Web Workers,
+IndexedDB, cookies, PDF viewing, and both **Desktop** and **Mobile View** modes.
 
 <!-- A screenshot lives at docs/screenshot.png once you generate one with --screenshot. -->
 
@@ -134,6 +135,7 @@ Environment switches for automated visual tests:
 - `ZIPP_RESIZE=w,h[;w,h…]` — resizes the live page through each size in turn.
 - `ZIPP_COLOR_SCHEME=light|dark` — overrides OS `prefers-color-scheme` for both CSS and `matchMedia`.
 - `ZIPP_EMBEDDED_FONTS_ONLY=1` — forces embedded Liberation fonts only for deterministic cross-machine renders.
+- `ZIPP_DEBUG_CONSOLE=1` — mirrors page/worker `console.*` messages and errors to `stderr`.
 
 ## Rendering & Performance
 
@@ -175,8 +177,13 @@ On other platforms and in `--screenshot`, `<video>` renders its poster image.
 - **WebGL 1 & 2 and WebGPU:** Available on **Windows** (desktop WGL OpenGL; Vulkan/D3D12
   WebGPU) and **Linux** (EGL OpenGL; Vulkan WebGPU), with shared `webgl_shim.js` also
   powering Android EGL OpenGL ES 3 in SoftN Mobile. Current Three.js (`WebGL2`) scenes —
-  lighting, shadow maps, textures, instancing, transparency, and `OrbitControls` — run
-  natively.
+  `.glb`/`.gltf` models, `.hdr` IBL environments, PBR materials, SVG/image/canvas textures,
+  lighting, shadow maps, instancing, transparency, and `OrbitControls` — run natively via
+  `Request`, binary `Blob`/`URL.createObjectURL`, and `createImageBitmap`.
+- **Shadow DOM & Constructable Stylesheets:** `attachShadow`, scoped `CSSStyleSheet`
+  (`adoptedStyleSheets`), full `CSSStyleDeclaration` (`cssText`, `!important`, custom
+  properties), `html5ever`-backed `DOMParser`, `XMLSerializer`, and Shadow-DOM-crossing
+  form/event dispatch (`composedPath`, `.form`, `FormData`, `checkValidity`).
 - **ES Modules & Import Maps:** Inline and external `<script type="module">` graphs and
   `<script type="importmap">` are parsed via `oxc` and linked automatically.
 

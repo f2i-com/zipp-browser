@@ -164,6 +164,11 @@ pub(crate) fn terminate_page(page: u64) {
     }
 }
 
+/// Whether this thread's page currently has any live worker threads.
+pub(crate) fn has_active() -> bool {
+    WORKERS.with(|w| !w.borrow().is_empty())
+}
+
 /// What this thread's workers have sent since last asked.
 pub(crate) fn take_messages() -> Vec<(u32, FromWorker)> {
     WORKERS.with(|w| {
@@ -260,7 +265,9 @@ fn program(url: &str, module: bool) -> Result<String, String> {
         let source = crate::fetch(url).map_err(|e| format!("worker script {url} failed to load: {e}"))?;
         return Ok(format!("{prelude}\n;\n{source}"));
     }
-    let linked = crate::esm::link_graph(&[url.to_string()], &crate::fetch, &crate::resolve);
+    let import_map = crate::esm::ImportMap::default();
+    let resolve_module = |base: &str, spec: &str| import_map.resolve_specifier(base, spec, &crate::resolve);
+    let linked = crate::esm::link_graph(&[url.to_string()], &crate::fetch, &resolve_module);
     for (failed, e) in &linked.failures {
         eprintln!("[ESM] FAILED {failed}: {e}");
         console::push(Level::Error, format!("module {failed} failed to load: {e}"));

@@ -390,9 +390,10 @@ fn rewrite_module(
         let replacement = match syn_literal(arg_text) {
             Some(spec) => {
                 let abs = resolve(url, &spec);
-                // A bare name nothing maps is not fetched: the import fails
-                // when it runs, which a page that tries it is ready for.
-                if url_like(&abs) && !deps.contains(&abs) {
+                // A bare name nothing maps (or a Node builtin like `node:fs`) is
+                // not fetched: the import fails when it runs, which a page that
+                // tries it is ready for.
+                if url_like(&abs) && !abs.starts_with("node:") && !deps.contains(&abs) {
                     deps.push(abs.clone());
                 }
                 format!("__dyn({})", js_string(&abs))

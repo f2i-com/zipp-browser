@@ -136,7 +136,7 @@ var _nid = 1;
 // `for...in` over a style -- the serialiser's -- sees only what is set.
 var __styleProto = (function () {
     var p = {};
-    "-servo-overflow-clip-box -servo-top-layer -webkit-line-clamp -webkit-perspective -webkit-text-fill-color -webkit-text-security -webkit-text-stroke -webkit-text-stroke-color -webkit-text-stroke-width -webkit-transform -x-lang -x-span -x-text-scale ServoOverflowClipBox ServoTopLayer WebkitLineClamp WebkitPerspective WebkitTextFillColor WebkitTextSecurity WebkitTextStroke WebkitTextStrokeColor WebkitTextStrokeWidth WebkitTransform XLang XSpan XTextScale accent-color accentColor align-content align-items align-self alignContent alignItems alignSelf alignment-baseline alignmentBaseline anchor-name anchor-scope anchorName anchorScope animation animation-composition animation-delay animation-direction animation-duration animation-fill-mode animation-iteration-count animation-name animation-play-state animation-range animation-range-end animation-range-start animation-timeline animation-timing-function animationComposition animationDelay animationDirection animationDuration animationFillMode animationIterationCount animationName animationPlayState animationRange animationRangeEnd animationRangeStart animationTimeline animationTimingFunction appearance aspect-ratio aspectRatio backdrop-filter backdropFilter backface-visibility backfaceVisibility background background-attachment background-blend-mode background-clip background-color background-image background-origin background-position background-position-x background-position-y background-repeat background-size backgroundAttachment backgroundBlendMode backgroundClip backgroundColor backgroundImage backgroundOrigin backgroundPosition backgroundPositionX backgroundPositionY backgroundRepeat backgroundSize baseline-shift baseline-source baselineShift baselineSource block-size blockSize border border-block border-block-color border-block-end border-block-end-color border-block-end-style border-block-end-width border-block-start border-block-start-color border-block-start-style border-block-start-width border-block-style border-block-width border-bottom border-bottom-color border-bottom-left-radius border-bottom-right-radius border-bottom-style border-bottom-width border-collapse border-color border-end-end-radius border-end-start-radius border-image border-image-outset border-image-repeat border-image-slice border-image-source border-image-width border-inline border-inline-color border-inline-end border-inline-end-color border-inline-end-style border-inline-end-width border-inline-start border-inline-start-color border-inline-start-style border-inline-start-width border-inline-style border-inline-width border-left border-left-color border-left-style border-left-width border-radius border-right border-right-color border-right-style border-right-width border-spacing border-start-end-radius border-start-start-radius border-style border-top border-top-color border-top-left-radius border-top-right-radius border-top-style border-top-width border-width borderBlock borderBlockColor borderBlockEnd borderBlockEndColor borderBlockEndStyle borderBlockEndWidth borderBlockStart borderBlockStartColor borderBlockStartStyle borderBlockStartWidth borderBlockStyle borderBlockWidth borderBottom borderBottomColor borderBottomLeftRadius borderBottomRightRadius borderBottomStyle borderBottomWidth borderCollapse borderColor borderEndEndRadius borderEndStartRadius borderImage borderImageOutset borderImageRepeat borderImageSlice borderImageSource borderImageWidth borderInline borderInlineColor borderInlineEnd borderInlineEndColor borderInlineEndStyle borderInlineEndWidth borderInlineStart borderInlineStartColor borderInlineStartStyle borderInlineStartWidth borderInlineStyle borderInlineWidth borderLeft borderLeftColor borderLeftStyle borderLeftWidth borderRadius borderRight borderRightColor borderRightStyle borderRightWidth borderSpacing borderStartEndRadius borderStartStartRadius borderStyle borderTop borderTopColor borderTopLeftRadius borderTopRightRadius borderTopStyle borderTopWidth borderWidth bottom box-decoration-break box-shadow box-sizing boxDecorationBreak boxShadow boxSizing break-after break-before break-inside breakAfter breakBefore breakInside caption-side captionSide caret-color caretColor clear clip clip-path clip-rule clipPath clipRule color color-interpolation color-interpolation-filters color-scheme colorInterpolation colorInterpolationFilters colorScheme column-count column-fill column-gap column-rule column-rule-color column-rule-style column-rule-width column-span column-width columnCount columnFill columnGap columnRule columnRuleColor columnRuleStyle columnRuleWidth columnSpan columnWidth columns contain contain-intrinsic-block-size contain-intrinsic-height contain-intrinsic-inline-size contain-intrinsic-size contain-intrinsic-width containIntrinsicBlockSize containIntrinsicHeight containIntrinsicInlineSize containIntrinsicSize containIntrinsicWidth container container-name container-type containerName containerType content content-visibility contentVisibility counter-increment counter-reset counter-set counterIncrement counterReset counterSet cssFloat cursor cx cy d direction display dominant-baseline dominantBaseline empty-cells emptyCells field-sizing fieldSizing fill fill-opacity fill-rule fillOpacity fillRule filter flex flex-basis flex-direction flex-flow flex-grow flex-shrink flex-wrap flexBasis flexDirection flexFlow flexGrow flexShrink flexWrap float flood-color flood-opacity floodColor floodOpacity font font-family font-feature-settings font-kerning font-language-override font-optical-sizing font-palette font-size font-size-adjust font-stretch font-style font-synthesis font-synthesis-position font-synthesis-small-caps font-synthesis-style font-synthesis-weight font-variant font-variant-alternates font-variant-caps font-variant-east-asian font-variant-emoji font-variant-ligatures font-variant-numeric font-variant-position font-variation-settings font-weight fontFamily fontFeatureSettings fontKerning fontLanguageOverride fontOpticalSizing fontPalette fontSize fontSizeAdjust fontStretch fontStyle fontSynthesis fontSynthesisPosition fontSynthesisSmallCaps fontSynthesisStyle fontSynthesisWeight fontVariant fontVariantAlternates fontVariantCaps fontVariantEastAsian fontVariantEmoji fontVariantLigatures fontVariantNumeric fontVariantPosition fontVariationSettings fontWeight forced-color-adjust forcedColorAdjust gap grid grid-area grid-auto-columns grid-auto-flow grid-auto-rows grid-column grid-column-end grid-column-start grid-row grid-row-end grid-row-start grid-template grid-template-areas grid-template-columns grid-template-rows gridArea gridAutoColumns gridAutoFlow gridAutoRows gridColumn gridColumnEnd gridColumnStart gridRow gridRowEnd gridRowStart gridTemplate gridTemplateAreas gridTemplateColumns gridTemplateRows height hyphenate-character hyphenate-limit-chars hyphenateCharacter hyphenateLimitChars hyphens image-orientation image-rendering imageOrientation imageRendering ime-mode imeMode initial-letter initialLetter inline-size inlineSize inset inset-block inset-block-end inset-block-start inset-inline inset-inline-end inset-inline-start insetBlock insetBlockEnd insetBlockStart insetInline insetInlineEnd insetInlineStart isolation justify-content justify-items justify-self justifyContent justifyItems justifySelf left letter-spacing letterSpacing lighting-color lightingColor line-break line-height lineBreak lineHeight list-style list-style-image list-style-position list-style-type listStyle listStyleImage listStylePosition listStyleType margin margin-block margin-block-end margin-block-start margin-bottom margin-inline margin-inline-end margin-inline-start margin-left margin-right margin-top marginBlock marginBlockEnd marginBlockStart marginBottom marginInline marginInlineEnd marginInlineStart marginLeft marginRight marginTop marker marker-end marker-mid marker-start markerEnd markerMid markerStart mask mask-clip mask-composite mask-image mask-mode mask-origin mask-position mask-position-x mask-position-y mask-repeat mask-size mask-type maskClip maskComposite maskImage maskMode maskOrigin maskPosition maskPositionX maskPositionY maskRepeat maskSize maskType masonry-auto-flow masonryAutoFlow math-depth math-shift math-style mathDepth mathShift mathStyle max-block-size max-height max-inline-size max-width maxBlockSize maxHeight maxInlineSize maxWidth min-block-size min-height min-inline-size min-width minBlockSize minHeight minInlineSize minWidth mix-blend-mode mixBlendMode object-fit object-position objectFit objectPosition offset offset-anchor offset-distance offset-path offset-position offset-rotate offsetAnchor offsetDistance offsetPath offsetPosition offsetRotate opacity order outline outline-color outline-offset outline-style outline-width outlineColor outlineOffset outlineStyle outlineWidth overflow overflow-anchor overflow-block overflow-clip-margin overflow-inline overflow-wrap overflow-x overflow-y overflowAnchor overflowBlock overflowClipMargin overflowInline overflowWrap overflowX overflowY overscroll-behavior overscroll-behavior-block overscroll-behavior-inline overscroll-behavior-x overscroll-behavior-y overscrollBehavior overscrollBehaviorBlock overscrollBehaviorInline overscrollBehaviorX overscrollBehaviorY padding padding-block padding-block-end padding-block-start padding-bottom padding-inline padding-inline-end padding-inline-start padding-left padding-right padding-top paddingBlock paddingBlockEnd paddingBlockStart paddingBottom paddingInline paddingInlineEnd paddingInlineStart paddingLeft paddingRight paddingTop page page-break-after page-break-before page-break-inside page-orientation pageBreakAfter pageBreakBefore pageBreakInside pageOrientation paint-order paintOrder perspective perspective-origin perspectiveOrigin place-content place-items place-self placeContent placeItems placeSelf pointer-events pointerEvents position position-anchor position-area position-try position-try-fallbacks position-try-order position-visibility positionAnchor positionArea positionTry positionTryFallbacks positionTryOrder positionVisibility print-color-adjust printColorAdjust quotes r resize right rotate row-gap rowGap ruby-align ruby-position rubyAlign rubyPosition rx ry scale scroll-behavior scroll-margin scroll-margin-block scroll-margin-block-end scroll-margin-block-start scroll-margin-bottom scroll-margin-inline scroll-margin-inline-end scroll-margin-inline-start scroll-margin-left scroll-margin-right scroll-margin-top scroll-padding scroll-padding-block scroll-padding-block-end scroll-padding-block-start scroll-padding-bottom scroll-padding-inline scroll-padding-inline-end scroll-padding-inline-start scroll-padding-left scroll-padding-right scroll-padding-top scroll-snap-align scroll-snap-stop scroll-snap-type scroll-timeline scroll-timeline-axis scroll-timeline-name scrollBehavior scrollMargin scrollMarginBlock scrollMarginBlockEnd scrollMarginBlockStart scrollMarginBottom scrollMarginInline scrollMarginInlineEnd scrollMarginInlineStart scrollMarginLeft scrollMarginRight scrollMarginTop scrollPadding scrollPaddingBlock scrollPaddingBlockEnd scrollPaddingBlockStart scrollPaddingBottom scrollPaddingInline scrollPaddingInlineEnd scrollPaddingInlineStart scrollPaddingLeft scrollPaddingRight scrollPaddingTop scrollSnapAlign scrollSnapStop scrollSnapType scrollTimeline scrollTimelineAxis scrollTimelineName scrollbar-color scrollbar-gutter scrollbar-width scrollbarColor scrollbarGutter scrollbarWidth servoOverflowClipBox servoTopLayer shape-image-threshold shape-margin shape-outside shape-rendering shapeImageThreshold shapeMargin shapeOutside shapeRendering size stop-color stop-opacity stopColor stopOpacity stroke stroke-dasharray stroke-dashoffset stroke-linecap stroke-linejoin stroke-miterlimit stroke-opacity stroke-width strokeDasharray strokeDashoffset strokeLinecap strokeLinejoin strokeMiterlimit strokeOpacity strokeWidth tab-size tabSize table-layout tableLayout text-align text-align-last text-anchor text-autospace text-box text-box-edge text-box-trim text-combine-upright text-decoration text-decoration-color text-decoration-inset text-decoration-line text-decoration-skip-ink text-decoration-style text-decoration-thickness text-emphasis text-emphasis-color text-emphasis-position text-emphasis-style text-indent text-justify text-orientation text-overflow text-rendering text-shadow text-transform text-underline-offset text-underline-position text-wrap text-wrap-mode text-wrap-style textAlign textAlignLast textAnchor textAutospace textBox textBoxEdge textBoxTrim textCombineUpright textDecoration textDecorationColor textDecorationInset textDecorationLine textDecorationSkipInk textDecorationStyle textDecorationThickness textEmphasis textEmphasisColor textEmphasisPosition textEmphasisStyle textIndent textJustify textOrientation textOverflow textRendering textShadow textTransform textUnderlineOffset textUnderlinePosition textWrap textWrapMode textWrapStyle timeline-scope timelineScope top touch-action touchAction transform transform-box transform-origin transform-style transformBox transformOrigin transformStyle transition transition-behavior transition-delay transition-duration transition-property transition-timing-function transitionBehavior transitionDelay transitionDuration transitionProperty transitionTimingFunction translate unicode-bidi unicodeBidi user-select userSelect vector-effect vectorEffect vertical-align verticalAlign view-timeline view-timeline-axis view-timeline-inset view-timeline-name view-transition-class view-transition-name viewTimeline viewTimelineAxis viewTimelineInset viewTimelineName viewTransitionClass viewTransitionName visibility webkitLineClamp webkitPerspective webkitTextFillColor webkitTextSecurity webkitTextStroke webkitTextStrokeColor webkitTextStrokeWidth webkitTransform white-space white-space-collapse whiteSpace whiteSpaceCollapse width will-change willChange word-break word-spacing wordBreak wordSpacing writing-mode writingMode x xLang xSpan xTextScale y z-index zIndex zoom".split(" ").forEach(function (n) {
+    "-servo-overflow-clip-box -servo-top-layer -webkit-line-clamp -webkit-perspective -webkit-text-fill-color -webkit-text-security -webkit-text-stroke -webkit-text-stroke-color -webkit-text-stroke-width -webkit-transform -x-lang -x-span -x-text-scale ServoOverflowClipBox ServoTopLayer WebkitLineClamp WebkitPerspective WebkitTextFillColor WebkitTextSecurity WebkitTextStroke WebkitTextStrokeColor WebkitTextStrokeWidth WebkitTransform XLang XSpan XTextScale accent-color accentColor align-content align-items align-self alignContent alignItems alignSelf alignment-baseline alignmentBaseline all anchor-name anchor-scope anchorName anchorScope animation animation-composition animation-delay animation-direction animation-duration animation-fill-mode animation-iteration-count animation-name animation-play-state animation-range animation-range-end animation-range-start animation-timeline animation-timing-function animationComposition animationDelay animationDirection animationDuration animationFillMode animationIterationCount animationName animationPlayState animationRange animationRangeEnd animationRangeStart animationTimeline animationTimingFunction appearance aspect-ratio aspectRatio backdrop-filter backdropFilter backface-visibility backfaceVisibility background background-attachment background-blend-mode background-clip background-color background-image background-origin background-position background-position-x background-position-y background-repeat background-size backgroundAttachment backgroundBlendMode backgroundClip backgroundColor backgroundImage backgroundOrigin backgroundPosition backgroundPositionX backgroundPositionY backgroundRepeat backgroundSize baseline-shift baseline-source baselineShift baselineSource block-size blockSize border border-block border-block-color border-block-end border-block-end-color border-block-end-style border-block-end-width border-block-start border-block-start-color border-block-start-style border-block-start-width border-block-style border-block-width border-bottom border-bottom-color border-bottom-left-radius border-bottom-right-radius border-bottom-style border-bottom-width border-collapse border-color border-end-end-radius border-end-start-radius border-image border-image-outset border-image-repeat border-image-slice border-image-source border-image-width border-inline border-inline-color border-inline-end border-inline-end-color border-inline-end-style border-inline-end-width border-inline-start border-inline-start-color border-inline-start-style border-inline-start-width border-inline-style border-inline-width border-left border-left-color border-left-style border-left-width border-radius border-right border-right-color border-right-style border-right-width border-spacing border-start-end-radius border-start-start-radius border-style border-top border-top-color border-top-left-radius border-top-right-radius border-top-style border-top-width border-width borderBlock borderBlockColor borderBlockEnd borderBlockEndColor borderBlockEndStyle borderBlockEndWidth borderBlockStart borderBlockStartColor borderBlockStartStyle borderBlockStartWidth borderBlockStyle borderBlockWidth borderBottom borderBottomColor borderBottomLeftRadius borderBottomRightRadius borderBottomStyle borderBottomWidth borderCollapse borderColor borderEndEndRadius borderEndStartRadius borderImage borderImageOutset borderImageRepeat borderImageSlice borderImageSource borderImageWidth borderInline borderInlineColor borderInlineEnd borderInlineEndColor borderInlineEndStyle borderInlineEndWidth borderInlineStart borderInlineStartColor borderInlineStartStyle borderInlineStartWidth borderInlineStyle borderInlineWidth borderLeft borderLeftColor borderLeftStyle borderLeftWidth borderRadius borderRight borderRightColor borderRightStyle borderRightWidth borderSpacing borderStartEndRadius borderStartStartRadius borderStyle borderTop borderTopColor borderTopLeftRadius borderTopRightRadius borderTopStyle borderTopWidth borderWidth bottom box-decoration-break box-shadow box-sizing boxDecorationBreak boxShadow boxSizing break-after break-before break-inside breakAfter breakBefore breakInside caption-side captionSide caret-color caretColor clear clip clip-path clip-rule clipPath clipRule color color-interpolation color-interpolation-filters color-scheme colorInterpolation colorInterpolationFilters colorScheme column-count column-fill column-gap column-rule column-rule-color column-rule-style column-rule-width column-span column-width columnCount columnFill columnGap columnRule columnRuleColor columnRuleStyle columnRuleWidth columnSpan columnWidth columns contain contain-intrinsic-block-size contain-intrinsic-height contain-intrinsic-inline-size contain-intrinsic-size contain-intrinsic-width containIntrinsicBlockSize containIntrinsicHeight containIntrinsicInlineSize containIntrinsicSize containIntrinsicWidth container container-name container-type containerName containerType content content-visibility contentVisibility counter-increment counter-reset counter-set counterIncrement counterReset counterSet cssFloat cursor cx cy d direction display dominant-baseline dominantBaseline empty-cells emptyCells field-sizing fieldSizing fill fill-opacity fill-rule fillOpacity fillRule filter flex flex-basis flex-direction flex-flow flex-grow flex-shrink flex-wrap flexBasis flexDirection flexFlow flexGrow flexShrink flexWrap float flood-color flood-opacity floodColor floodOpacity font font-family font-feature-settings font-kerning font-language-override font-optical-sizing font-palette font-size font-size-adjust font-stretch font-style font-synthesis font-synthesis-position font-synthesis-small-caps font-synthesis-style font-synthesis-weight font-variant font-variant-alternates font-variant-caps font-variant-east-asian font-variant-emoji font-variant-ligatures font-variant-numeric font-variant-position font-variation-settings font-weight fontFamily fontFeatureSettings fontKerning fontLanguageOverride fontOpticalSizing fontPalette fontSize fontSizeAdjust fontStretch fontStyle fontSynthesis fontSynthesisPosition fontSynthesisSmallCaps fontSynthesisStyle fontSynthesisWeight fontVariant fontVariantAlternates fontVariantCaps fontVariantEastAsian fontVariantEmoji fontVariantLigatures fontVariantNumeric fontVariantPosition fontVariationSettings fontWeight forced-color-adjust forcedColorAdjust gap grid grid-area grid-auto-columns grid-auto-flow grid-auto-rows grid-column grid-column-end grid-column-start grid-row grid-row-end grid-row-start grid-template grid-template-areas grid-template-columns grid-template-rows gridArea gridAutoColumns gridAutoFlow gridAutoRows gridColumn gridColumnEnd gridColumnStart gridRow gridRowEnd gridRowStart gridTemplate gridTemplateAreas gridTemplateColumns gridTemplateRows height hyphenate-character hyphenate-limit-chars hyphenateCharacter hyphenateLimitChars hyphens image-orientation image-rendering imageOrientation imageRendering ime-mode imeMode initial-letter initialLetter inline-size inlineSize inset inset-block inset-block-end inset-block-start inset-inline inset-inline-end inset-inline-start insetBlock insetBlockEnd insetBlockStart insetInline insetInlineEnd insetInlineStart isolation justify-content justify-items justify-self justifyContent justifyItems justifySelf left letter-spacing letterSpacing lighting-color lightingColor line-break line-height lineBreak lineHeight list-style list-style-image list-style-position list-style-type listStyle listStyleImage listStylePosition listStyleType margin margin-block margin-block-end margin-block-start margin-bottom margin-inline margin-inline-end margin-inline-start margin-left margin-right margin-top marginBlock marginBlockEnd marginBlockStart marginBottom marginInline marginInlineEnd marginInlineStart marginLeft marginRight marginTop marker marker-end marker-mid marker-start markerEnd markerMid markerStart mask mask-clip mask-composite mask-image mask-mode mask-origin mask-position mask-position-x mask-position-y mask-repeat mask-size mask-type maskClip maskComposite maskImage maskMode maskOrigin maskPosition maskPositionX maskPositionY maskRepeat maskSize maskType masonry-auto-flow masonryAutoFlow math-depth math-shift math-style mathDepth mathShift mathStyle max-block-size max-height max-inline-size max-width maxBlockSize maxHeight maxInlineSize maxWidth min-block-size min-height min-inline-size min-width minBlockSize minHeight minInlineSize minWidth mix-blend-mode mixBlendMode object-fit object-position objectFit objectPosition offset offset-anchor offset-distance offset-path offset-position offset-rotate offsetAnchor offsetDistance offsetPath offsetPosition offsetRotate opacity order outline outline-color outline-offset outline-style outline-width outlineColor outlineOffset outlineStyle outlineWidth overflow overflow-anchor overflow-block overflow-clip-margin overflow-inline overflow-wrap overflow-x overflow-y overflowAnchor overflowBlock overflowClipMargin overflowInline overflowWrap overflowX overflowY overscroll-behavior overscroll-behavior-block overscroll-behavior-inline overscroll-behavior-x overscroll-behavior-y overscrollBehavior overscrollBehaviorBlock overscrollBehaviorInline overscrollBehaviorX overscrollBehaviorY padding padding-block padding-block-end padding-block-start padding-bottom padding-inline padding-inline-end padding-inline-start padding-left padding-right padding-top paddingBlock paddingBlockEnd paddingBlockStart paddingBottom paddingInline paddingInlineEnd paddingInlineStart paddingLeft paddingRight paddingTop page page-break-after page-break-before page-break-inside page-orientation pageBreakAfter pageBreakBefore pageBreakInside pageOrientation paint-order paintOrder perspective perspective-origin perspectiveOrigin place-content place-items place-self placeContent placeItems placeSelf pointer-events pointerEvents position position-anchor position-area position-try position-try-fallbacks position-try-order position-visibility positionAnchor positionArea positionTry positionTryFallbacks positionTryOrder positionVisibility print-color-adjust printColorAdjust quotes r resize right rotate row-gap rowGap ruby-align ruby-position rubyAlign rubyPosition rx ry scale scroll-behavior scroll-margin scroll-margin-block scroll-margin-block-end scroll-margin-block-start scroll-margin-bottom scroll-margin-inline scroll-margin-inline-end scroll-margin-inline-start scroll-margin-left scroll-margin-right scroll-margin-top scroll-padding scroll-padding-block scroll-padding-block-end scroll-padding-block-start scroll-padding-bottom scroll-padding-inline scroll-padding-inline-end scroll-padding-inline-start scroll-padding-left scroll-padding-right scroll-padding-top scroll-snap-align scroll-snap-stop scroll-snap-type scroll-timeline scroll-timeline-axis scroll-timeline-name scrollBehavior scrollMargin scrollMarginBlock scrollMarginBlockEnd scrollMarginBlockStart scrollMarginBottom scrollMarginInline scrollMarginInlineEnd scrollMarginInlineStart scrollMarginLeft scrollMarginRight scrollMarginTop scrollPadding scrollPaddingBlock scrollPaddingBlockEnd scrollPaddingBlockStart scrollPaddingBottom scrollPaddingInline scrollPaddingInlineEnd scrollPaddingInlineStart scrollPaddingLeft scrollPaddingRight scrollPaddingTop scrollSnapAlign scrollSnapStop scrollSnapType scrollTimeline scrollTimelineAxis scrollTimelineName scrollbar-color scrollbar-gutter scrollbar-width scrollbarColor scrollbarGutter scrollbarWidth servoOverflowClipBox servoTopLayer shape-image-threshold shape-margin shape-outside shape-rendering shapeImageThreshold shapeMargin shapeOutside shapeRendering size stop-color stop-opacity stopColor stopOpacity stroke stroke-dasharray stroke-dashoffset stroke-linecap stroke-linejoin stroke-miterlimit stroke-opacity stroke-width strokeDasharray strokeDashoffset strokeLinecap strokeLinejoin strokeMiterlimit strokeOpacity strokeWidth tab-size tabSize table-layout tableLayout text-align text-align-last text-anchor text-autospace text-box text-box-edge text-box-trim text-combine-upright text-decoration text-decoration-color text-decoration-inset text-decoration-line text-decoration-skip-ink text-decoration-style text-decoration-thickness text-emphasis text-emphasis-color text-emphasis-position text-emphasis-style text-indent text-justify text-orientation text-overflow text-rendering text-shadow text-transform text-underline-offset text-underline-position text-wrap text-wrap-mode text-wrap-style textAlign textAlignLast textAnchor textAutospace textBox textBoxEdge textBoxTrim textCombineUpright textDecoration textDecorationColor textDecorationInset textDecorationLine textDecorationSkipInk textDecorationStyle textDecorationThickness textEmphasis textEmphasisColor textEmphasisPosition textEmphasisStyle textIndent textJustify textOrientation textOverflow textRendering textShadow textTransform textUnderlineOffset textUnderlinePosition textWrap textWrapMode textWrapStyle timeline-scope timelineScope top touch-action touchAction transform transform-box transform-origin transform-style transformBox transformOrigin transformStyle transition transition-behavior transition-delay transition-duration transition-property transition-timing-function transitionBehavior transitionDelay transitionDuration transitionProperty transitionTimingFunction translate unicode-bidi unicodeBidi user-select userSelect vector-effect vectorEffect vertical-align verticalAlign view-timeline view-timeline-axis view-timeline-inset view-timeline-name view-transition-class view-transition-name viewTimeline viewTimelineAxis viewTimelineInset viewTimelineName viewTransitionClass viewTransitionName visibility webkitLineClamp webkitPerspective webkitTextFillColor webkitTextSecurity webkitTextStroke webkitTextStrokeColor webkitTextStrokeWidth webkitTransform white-space white-space-collapse whiteSpace whiteSpaceCollapse width will-change willChange word-break word-spacing wordBreak wordSpacing writing-mode writingMode x xLang xSpan xTextScale y z-index zIndex zoom".split(" ").forEach(function (n) {
         Object.defineProperty(p, n, { value: "", writable: true, enumerable: false, configurable: true });
     });
     return p;
@@ -150,39 +150,157 @@ function __clearStyle(style) {
     for (var k in style) {
         if (Object.prototype.hasOwnProperty.call(style, k) && typeof style[k] === "string" && k !== "cssText") delete style[k];
     }
+    if (style._imp) style._imp = {};
 }
 function __camelProp(n) { return n.indexOf("--") === 0 ? n : n.replace(/-([a-z])/g, function (_, c) { return c.toUpperCase(); }); }
-function __makeStyle() {
+function __parseCssDecls(style, text) {
+    if (!text) return;
+    var s = String(text), n = s.length, i = 0;
+    while (i < n) {
+        var start = i, q = "", paren = 0;
+        while (i < n) {
+            var c = s.charAt(i);
+            if (q) {
+                if (c === "\\" && i + 1 < n) i++;
+                else if (c === q) q = "";
+                i++;
+                continue;
+            }
+            if (c === "/" && s.charAt(i + 1) === "*") {
+                var ce = s.indexOf("*/", i + 2);
+                i = ce < 0 ? n : ce + 2;
+                continue;
+            }
+            if (c === '"' || c === "'") { q = c; i++; continue; }
+            if (c === "(") paren++;
+            else if (c === ")" && paren > 0) paren--;
+            else if (c === ";" && paren === 0) break;
+            i++;
+        }
+        var decl = s.slice(start, i).trim();
+        if (i < n && s.charAt(i) === ";") i++;
+        if (!decl) continue;
+        decl = decl.replace(/^\/\*[\s\S]*?\*\/\s*/, "");
+        var colon = decl.indexOf(":");
+        if (colon <= 0) continue;
+        var rawName = decl.slice(0, colon).trim();
+        var rawVal = decl.slice(colon + 1).trim();
+        if (!rawName) continue;
+        var imp = false;
+        if (/\s*!\s*important\s*$/i.test(rawVal)) {
+            imp = true;
+            rawVal = rawVal.replace(/\s*!\s*important\s*$/i, "").trim();
+        }
+        var name = rawName.indexOf("--") === 0 ? rawName : rawName.toLowerCase();
+        var key = __camelProp(name);
+        if (rawVal === "") {
+            delete style[key];
+            if (name !== key) delete style[name];
+            if (style._imp) { delete style._imp[key]; delete style._imp[name]; }
+            continue;
+        }
+        if (name !== key) delete style[name];
+        style[key] = rawVal;
+        if (style._imp) {
+            if (imp) style._imp[key] = true;
+            else delete style._imp[key];
+        }
+    }
+}
+function __makeStyle(el) {
     var s = Object.create(__styleProto);
+    Object.defineProperty(s, '_el', { value: el || null, enumerable: false, writable: true, configurable: true });
+    Object.defineProperty(s, '_imp', { value: {}, enumerable: false, writable: true, configurable: true });
     function def(name, fn) {
         Object.defineProperty(s, name, { value: fn, enumerable: false, writable: true, configurable: true });
     }
-    // Names are stored exactly as given. The serialiser lowercases camelCase to
-    // dashed on the way out, and a dashed or `--custom` name passes through it
-    // unchanged, so both spellings land correctly.
-    def('setProperty', function (name, value) {
+    Object.defineProperty(s, 'cssText', {
+        enumerable: false,
+        configurable: true,
+        get: function () { return __styleText(s); },
+        set: function (v) {
+            __clearStyle(s);
+            __parseCssDecls(s, v);
+            if (s._el && s._el.attributes) delete s._el.attributes.style;
+            __domMutations++;
+        }
+    });
+    Object.defineProperty(s, 'length', {
+        enumerable: false,
+        configurable: true,
+        get: function () {
+            var count = 0;
+            for (var k in s) { if (typeof s[k] === 'string' && s[k] !== '' && k !== 'cssText' && k.indexOf('_') !== 0) count++; }
+            return count;
+        }
+    });
+    // Names are stored normalized (camelCase for standard props, raw for `--*`),
+    // with `!important` tracked in `_imp` so `setProperty`, `cssText`, and
+    // direct property assignments stay consistent and round-trip cleanly.
+    def('setProperty', function (name, value, priority) {
         if (name == null) return;
-        s[String(name)] = value == null ? '' : String(value);
+        var rawName = String(name).trim();
+        if (!rawName) return;
+        var n = rawName.indexOf("--") === 0 ? rawName : rawName.toLowerCase();
+        var k = __camelProp(n);
+        var val = value == null ? '' : String(value).trim();
+        var imp = typeof priority === 'string' && priority.trim().toLowerCase() === 'important';
+        if (!imp && /\s*!\s*important\s*$/i.test(val)) {
+            imp = true;
+            val = val.replace(/\s*!\s*important\s*$/i, '').trim();
+        }
+        if (val === '') {
+            delete s[k];
+            if (n !== k) delete s[n];
+            delete s._imp[k];
+            delete s._imp[n];
+        } else {
+            if (n !== k) delete s[n];
+            s[k] = val;
+            if (imp) s._imp[k] = true;
+            else delete s._imp[k];
+        }
+        if (s._el && s._el.attributes) delete s._el.attributes.style;
+        __domMutations++;
     });
     // Either spelling: `style.backgroundColor = x` then
     // `getPropertyValue("background-color")` finds it.
     def('getPropertyValue', function (name) {
         if (name == null) return '';
-        var k = String(name), v = Object.prototype.hasOwnProperty.call(s, k) ? s[k] : s[__camelProp(k)];
+        var rawName = String(name).trim();
+        var n = rawName.indexOf("--") === 0 ? rawName : rawName.toLowerCase();
+        var k = __camelProp(n);
+        var v = Object.prototype.hasOwnProperty.call(s, k) ? s[k]
+              : (Object.prototype.hasOwnProperty.call(s, n) ? s[n] : '');
         return typeof v === 'string' ? v : '';
     });
     def('removeProperty', function (name) {
         if (name == null) return '';
-        var k = String(name);
-        var v = typeof s[k] === 'string' ? s[k] : '';
+        var rawName = String(name).trim();
+        var n = rawName.indexOf("--") === 0 ? rawName : rawName.toLowerCase();
+        var k = __camelProp(n);
+        var v = Object.prototype.hasOwnProperty.call(s, k) && typeof s[k] === 'string' ? s[k]
+              : (Object.prototype.hasOwnProperty.call(s, n) && typeof s[n] === 'string' ? s[n] : '');
         delete s[k];
+        if (n !== k) delete s[n];
+        delete s._imp[k];
+        delete s._imp[n];
+        if (s._el && s._el.attributes) delete s._el.attributes.style;
+        __domMutations++;
         return v;
     });
-    def('getPropertyPriority', function () { return ''; });
+    def('getPropertyPriority', function (name) {
+        if (name == null) return '';
+        var rawName = String(name).trim();
+        var n = rawName.indexOf("--") === 0 ? rawName : rawName.toLowerCase();
+        var k = __camelProp(n);
+        return (s._imp[k] || s._imp[n]) ? 'important' : '';
+    });
     def('item', function (i) {
         var keys = [];
-        for (var k in s) { if (typeof s[k] === 'string' && k !== 'cssText') keys.push(k); }
-        return keys[i] || '';
+        for (var k in s) { if (typeof s[k] === 'string' && s[k] !== '' && k !== 'cssText' && k.indexOf('_') !== 0) keys.push(k); }
+        var p = keys[i] || '';
+        return p === 'cssFloat' ? 'float' : (p.indexOf('--') === 0 ? p : p.replace(/[A-Z]/g, function (m) { return '-' + m.toLowerCase(); }));
     });
     return s;
 }
@@ -387,11 +505,38 @@ var DOMNode = class DOMNode extends EventTarget {
         return a[i - 1]._findChild(a[i]) < a[i - 1]._findChild(b[i]) ? 4 : 2;
     }
     cloneNode(deep) { var c=new DOMNode(this.nodeType,this.nodeName); if(deep) for(var i=0;i<this.childNodes.length;i++) c.appendChild(this.childNodes[i].cloneNode(true)); return c; }
-    addEventListener(t,fn) { if(this.nodeType===1) __keepNode(this); if(!this._listeners[t]) this._listeners[t]=[]; this._listeners[t].push(fn); if(!__eventHandlers[this._id]) __eventHandlers[this._id]={}; if(!__eventHandlers[this._id][t]) __eventHandlers[this._id][t]=[]; __eventHandlers[this._id][t].push(fn); __listenerVersion++; }
+    addEventListener(t,fn,opts) {
+        if (!fn) return;
+        var cap = typeof opts === "boolean" ? opts : !!(opts && opts.capture);
+        var once = !!(opts && typeof opts === "object" && opts.once);
+        var signal = opts && typeof opts === "object" ? opts.signal : null;
+        if (signal && signal.aborted) return;
+        var self_ = this;
+        var wrapped = once ? function (e) { self_.removeEventListener(t, wrapped, cap); if (typeof fn === "function") fn.call(this, e); else if (fn && fn.handleEvent) fn.handleEvent(e); } : fn;
+        if (once) wrapped.__orig = fn;
+        if (cap) wrapped.__cap = true;
+        if(this.nodeType===1) __keepNode(this);
+        function insert(arr, item) {
+            if (cap) {
+                var idx = 0;
+                while (idx < arr.length && arr[idx] && arr[idx].__cap) idx++;
+                arr.splice(idx, 0, item);
+            } else {
+                arr.push(item);
+            }
+        }
+        if(!this._listeners[t]) this._listeners[t]=[];
+        insert(this._listeners[t], wrapped);
+        if(!__eventHandlers[this._id]) __eventHandlers[this._id]={};
+        if(!__eventHandlers[this._id][t]) __eventHandlers[this._id][t]=[];
+        insert(__eventHandlers[this._id][t], wrapped);
+        if (signal && signal.addEventListener) signal.addEventListener("abort", function () { self_.removeEventListener(t, fn, opts); });
+        __listenerVersion++;
+    }
     // Must also drop it from __eventHandlers: that registry is what Rust reads
     // to decide which nodes get events, so a listener removed here but left
     // there keeps being called for the life of the page.
-    removeEventListener(t,fn) { if(this._listeners[t]) this._listeners[t]=this._listeners[t].filter(function(f){return f!==fn;}); var m=__eventHandlers[this._id]; if(m&&m[t]) m[t]=m[t].filter(function(f){return f!==fn;}); __listenerVersion++; }
+    removeEventListener(t,fn) { if(this._listeners[t]) this._listeners[t]=this._listeners[t].filter(function(f){return f!==fn && f.__orig!==fn;}); var m=__eventHandlers[this._id]; if(m&&m[t]) m[t]=m[t].filter(function(f){return f!==fn && f.__orig!==fn;}); __listenerVersion++; }
     // An event script dispatches: to this node's listeners, then -- one that
     // bubbles -- each ancestor's, up to the document (which keeps the
     // window's), until one stops it. It reached the target's own listeners
@@ -399,18 +544,22 @@ var DOMNode = class DOMNode extends EventTarget {
     // which listens at its root; and what a listener threw was lost.
     dispatchEvent(ev) {
         try { ev.target = this; } catch (e) {}
-        for (var n = this; n; n = ev.bubbles ? n.parentNode : null) {
+        for (var n = this; n; n = ev.bubbles ? (n.parentNode || (ev.composed !== false ? n.host : null)) : null) {
             try { ev.currentTarget = n; ev.eventPhase = n === this ? 2 : 3; } catch (e) {}
             var h = ((n._listeners && n._listeners[ev.type]) || []).slice();
             for (var i = 0; i < h.length; i++) {
-                try { h[i].call(n, ev); } catch (e) { console.error("Uncaught " + ((e && (e.stack || e.message)) || e)); }
+                try {
+                    if (typeof h[i] === "function") h[i].call(n, ev);
+                    else if (h[i] && typeof h[i].handleEvent === "function") h[i].handleEvent(ev);
+                } catch (e) { console.error("Uncaught " + ((e && (e.stack || e.message)) || e)); }
+                if (ev._immStopped) break;
             }
             if (ev._stopped) break;
         }
         return !ev.defaultPrevented;
     }
-    get isConnected() { var n=this; while(n){if(n.nodeType===9)return true; n=n.parentNode;} return false; }
-    getRootNode() { var n=this; while(n.parentNode) n=n.parentNode; return n; }
+    get isConnected() { var n=this; while(n){if(n.nodeType===9)return true; n=n.parentNode||n.host;} return false; }
+    getRootNode(opts) { var n=this; while(n.parentNode||(opts&&opts.composed&&n.host)) n=n.parentNode||n.host; return n; }
     hasChildNodes() { return this.childNodes.length>0; }
     normalize() {}
 };
@@ -476,7 +625,7 @@ var Element = class Element extends DOMNode {
         this.namespaceURI = ns || "http://www.w3.org/1999/xhtml";
         this.attributes = Object.create(__attrMapProto);
         Object.defineProperty(this.attributes, "__el", { value: this });
-        this.style = __makeStyle();
+        this.style = __makeStyle(this);
         this.className = "";
         this.id = "";
         this.dataset = _makeDataset(this);
@@ -524,7 +673,7 @@ var Element = class Element extends DOMNode {
         if(this.attributes[n]!==v) __domMutations++; this.attributes[n]=v; if(n==="class")this.className=v; if(n==="id")this.id=v; if(n==="style"){__clearStyle(this.style);this._ps(v);}
         if (__ceCount > 0) __ceAttributeChanged(this, n, old, v);
     }
-    getAttribute(n) { n=String(n); if(n==="class")return this.className||null; if(n==="id")return this.id||null; return Object.prototype.hasOwnProperty.call(this.attributes,n)?this.attributes[n]:null; }
+    getAttribute(n) { n=String(n); if(n==="class")return this.className||null; if(n==="id")return this.id||null; if(n==="style"){ if(Object.prototype.hasOwnProperty.call(this.attributes,"style"))return this.attributes.style; var st=__styleText(this.style); return st||null; } return Object.prototype.hasOwnProperty.call(this.attributes,n)?this.attributes[n]:null; }
     removeAttribute(n) {
         n=String(n);
         var old = this.getAttribute(n);
@@ -533,7 +682,7 @@ var Element = class Element extends DOMNode {
         if(n==="class")this.className=""; if(n==="id")this.id=""; if(n==="style")__clearStyle(this.style);
         if (__ceCount > 0) __ceAttributeChanged(this, n, old, null);
     }
-    hasAttribute(n) { n=String(n); return Object.prototype.hasOwnProperty.call(this.attributes,n)||!!(n==="class"&&this.className)||!!(n==="id"&&this.id); }
+    hasAttribute(n) { n=String(n); return Object.prototype.hasOwnProperty.call(this.attributes,n)||!!(n==="class"&&this.className)||!!(n==="id"&&this.id)||!!(n==="style"&&__styleText(this.style)); }
     hasAttributes() { return __attrNames(this.attributes).length>0; }
     setAttributeNS(ns,n,v) { this.setAttribute(n,v); }
     getAttributeNS(ns,n) { return this.getAttribute(n); }
@@ -570,9 +719,9 @@ var Element = class Element extends DOMNode {
     scrollIntoViewIfNeeded() {}
     matches(sel) { return _sm(this,sel); }
     closest(sel) { var el=this; while(el){if(el.nodeType===1&&el.matches(sel))return el; el=el.parentNode;} return null; }
-    cloneNode(deep) { var c=doc.createElementNS(this.namespaceURI,this.localName); c.className=this.className; c.id=this.id; for(var k in this.attributes) c.attributes[k]=this.attributes[k]; if(deep) for(var i=0;i<this.childNodes.length;i++) c.appendChild(this.childNodes[i].cloneNode(true)); return c; }
-    _ps(s) { var p=s.split(";"); for(var i=0;i<p.length;i++){var kv=p[i].split(":"); if(kv.length===2) this.style[kv[0].trim()]=kv[1].trim();} }
-    get isConnected() { var n=this; while(n){if(n.nodeType===9)return true; n=n.parentNode;} return false; }
+    cloneNode(deep) { var c=doc.createElementNS(this.namespaceURI,this.localName); c.className=this.className; c.id=this.id; for(var k in this.attributes) { if(k==="style") continue; c.attributes[k]=this.attributes[k]; } var st=__elementStyleAttr(this); if(st) c.setAttribute("style", st); if(deep) for(var i=0;i<this.childNodes.length;i++) c.appendChild(this.childNodes[i].cloneNode(true)); return c; }
+    _ps(s) { __parseCssDecls(this.style, s); }
+    get isConnected() { var n=this; while(n){if(n.nodeType===9)return true; n=n.parentNode||n.host;} return false; }
     // Remembered, for the host to give the element focus (`__zippTakeFocus`):
     // a game's canvas, focused on mousedown, then reads the keys.
     focus() { doc._focusRequest = this; doc._activeElement = this; }
@@ -824,12 +973,19 @@ var HTMLFormElement = class HTMLFormElement extends HTMLElement {
     // no navigation to follow it: a form that is not handled in script goes
     // nowhere.
     requestSubmit(submitter) {
-        var ev = new Event("submit", { bubbles: true, cancelable: true });
-        ev.submitter = submitter || null;
+        var ev = new SubmitEvent("submit", { bubbles: true, cancelable: true, submitter: submitter || null });
         this.dispatchEvent(ev);
     }
     submit() {}
     reset() { this.dispatchEvent(new Event("reset", { bubbles: true, cancelable: true })); }
+    checkValidity() {
+        var els = this.elements;
+        for (var i = 0; i < els.length; i++) {
+            if (typeof els[i].checkValidity === "function" && !els[i].checkValidity()) return false;
+        }
+        return true;
+    }
+    reportValidity() { return this.checkValidity(); }
     get elements() { return this.querySelectorAll("input, select, textarea, button, fieldset, output, object"); }
 };
 var SVGElement = class SVGElement extends Element {};
@@ -889,11 +1045,99 @@ Object.defineProperty(HTMLFormElement.prototype, "action", {
     });
 });
 
-// A shadow root: a tree of the element's own that its scripts build and
-// query (`this.shadowRoot.querySelector(...)`). It is not drawn yet -- the
-// page shows the element's own children, as server-rendered -- but a
-// component that keeps its parts there works. GitHub's elements, and its
-// polyfill for `command`, call `attachShadow` and assumed it was there.
+    // Build a standalone Document hydrated from Rust's html5ever parser.
+    var __NS_MAP = { s: "http://www.w3.org/2000/svg", m: "http://www.w3.org/1998/Math/MathML" };
+    function __hydrateTree(n, parent, ownerDoc) {
+        if (typeof n === "string") {
+            var t = doc.createTextNode(n);
+            t.ownerDocument = ownerDoc;
+            parent.appendChild(t);
+            return;
+        }
+        var el = n[3] ? doc.createElementNS(__NS_MAP[n[3]], n[0]) : doc.createElement(n[0]);
+        el.ownerDocument = ownerDoc;
+        var a = n[1], c = n[2];
+        for (var i = 0; i < a.length; i += 2) el.setAttribute(a[i], a[i + 1]);
+        for (var j = 0; j < c.length; j++) __hydrateTree(c[j], el, ownerDoc);
+        parent.appendChild(el);
+    }
+    var DOMParser = class DOMParser {
+        parseFromString(str, type) {
+            var kind = String(type || "text/html").toLowerCase();
+            if (kind !== "text/html" && kind !== "text/xml" && kind !== "application/xml" && kind !== "application/xhtml+xml" && kind !== "image/svg+xml") {
+                throw new TypeError("Failed to execute 'parseFromString' on 'DOMParser': The provided value '" + type + "' is not a valid enum value of type SupportedType.");
+            }
+            var parsedDoc = new Document(9, "#document");
+            parsedDoc.contentType = kind;
+            parsedDoc.compatMode = "CSS1Compat";
+            parsedDoc.documentElement = new HTMLHtmlElement("html");
+            parsedDoc.head = new HTMLHeadElement("head");
+            parsedDoc.body = new HTMLBodyElement("body");
+            parsedDoc.documentElement.ownerDocument = parsedDoc;
+            parsedDoc.head.ownerDocument = parsedDoc;
+            parsedDoc.body.ownerDocument = parsedDoc;
+            parsedDoc.documentElement.appendChild(parsedDoc.head);
+            parsedDoc.documentElement.appendChild(parsedDoc.body);
+            parsedDoc.appendChild(parsedDoc.documentElement);
+            parsedDoc.querySelector = function (s) { return _qs(parsedDoc, s, false); };
+            parsedDoc.querySelectorAll = function (s) { return _qs(parsedDoc, s, true); };
+            parsedDoc.getElementById = function (id) { return _qs(parsedDoc, "#" + id, false); };
+            parsedDoc.getElementsByTagName = function (t) { return parsedDoc.documentElement.getElementsByTagName(t); };
+            parsedDoc.getElementsByClassName = function (c) { return parsedDoc.documentElement.getElementsByClassName(c); };
+            parsedDoc.createElement = function (t) { var e = doc.createElement(t); e.ownerDocument = parsedDoc; return e; };
+            parsedDoc.createElementNS = function (ns, t) { var e = doc.createElementNS(ns, t); e.ownerDocument = parsedDoc; return e; };
+            parsedDoc.createTextNode = function (s) { var t = doc.createTextNode(s); t.ownerDocument = parsedDoc; return t; };
+            parsedDoc.createComment = function (s) { var c = doc.createComment(s); c.ownerDocument = parsedDoc; return c; };
+            parsedDoc.createDocumentFragment = function () { var f = doc.createDocumentFragment(); f.ownerDocument = parsedDoc; return f; };
+            Object.defineProperty(parsedDoc, "title", {
+                configurable: true,
+                get: function () {
+                    var t = parsedDoc.querySelector("title");
+                    return t ? (t.textContent || "").trim() : "";
+                },
+                set: function (v) {
+                    var t = parsedDoc.querySelector("title");
+                    if (!t) { t = parsedDoc.createElement("title"); parsedDoc.head.appendChild(t); }
+                    t.textContent = String(v);
+                }
+            });
+            var raw = "";
+            try { raw = __zippHostCall("parse_html", String(str == null ? "" : str)); } catch (e) {}
+            if (raw) {
+                try {
+                    var tree = JSON.parse(raw);
+                    for (var i = 0; i < tree[0].length; i += 2) parsedDoc.body.setAttribute(tree[0][i], tree[0][i + 1]);
+                    for (var j = 0; j < tree[1].length; j++) __hydrateTree(tree[1][j], parsedDoc.body, parsedDoc);
+                    if (tree[2]) for (var k = 0; k < tree[2].length; k++) __hydrateTree(tree[2][k], parsedDoc.head, parsedDoc);
+                    if (tree[3]) for (var m = 0; m < tree[3].length; m += 2) parsedDoc.documentElement.setAttribute(tree[3][m], tree[3][m + 1]);
+                } catch (e) {}
+            }
+            return parsedDoc;
+        }
+    };
+    var XMLSerializer = class XMLSerializer {
+        serializeToString(node) {
+            if (!node) throw new TypeError("Failed to execute 'serializeToString' on 'XMLSerializer': parameter 1 is not of type 'Node'.");
+            return __serializeNode(node);
+        }
+    };
+
+var CSSStyleSheet = class CSSStyleSheet {
+    constructor() { this._text = ""; this.cssRules = []; }
+    replaceSync(text) { this._text = String(text == null ? "" : text); __domMutations++; }
+    replace(text) { this.replaceSync(text); return Promise.resolve(this); }
+    insertRule(rule, idx) {
+        var s = String(rule || "");
+        this._text = this._text ? (this._text + "\n" + s) : s;
+        var pos = idx === undefined ? this.cssRules.length : idx;
+        this.cssRules.splice(pos, 0, { cssText: s });
+        __domMutations++;
+        return pos;
+    }
+    deleteRule(idx) { this.cssRules.splice(idx, 1); __domMutations++; }
+};
+
+var __shadowRootsById = {};
 var ShadowRoot = class ShadowRoot extends DocumentFragment {
     constructor(host, init) {
         super();
@@ -903,9 +1147,10 @@ var ShadowRoot = class ShadowRoot extends DocumentFragment {
         this.slotAssignment = init.slotAssignment === "manual" ? "manual" : "named";
         this.ownerDocument = doc;
         this.adoptedStyleSheets = [];
+        __shadowRootsById[this._id] = this;
     }
     get innerHTML() { return __sc(this); }
-    set innerHTML(v) { this.childNodes = []; if (v) this.appendChild(__markupText(String(v))); }
+    set innerHTML(v) { this.childNodes = []; if (v) this.appendChild(__markupText(String(v))); __domMutations++; }
     get activeElement() { var a = doc.activeElement; return a && this.contains(a) ? a : null; }
     getElementById(id) { function w(n) { for (var i = 0; i < n.childNodes.length; i++) { var c = n.childNodes[i]; if (c.nodeType === 1 && c.id === id) return c; var f = w(c); if (f) return f; } return null; } return w(this); }
     querySelector(s) { return _qs(this, s, false); }
@@ -915,6 +1160,7 @@ Element.prototype.attachShadow = function (init) {
     if (!init || (init.mode !== "open" && init.mode !== "closed")) throw new TypeError("Failed to execute 'attachShadow' on 'Element': The provided value is not a valid enum value of type ShadowRootMode.");
     if (this._shadowRoot) throw new DOMException("Failed to execute 'attachShadow' on 'Element': Shadow root cannot be created on a host which already hosts a shadow tree.", "NotSupportedError");
     this._shadowRoot = new ShadowRoot(this, init);
+    __domMutations++;
     return this._shadowRoot;
 };
 Object.defineProperty(Element.prototype, "shadowRoot", {
@@ -1335,6 +1581,38 @@ function __reflectLater() {
     __reflectAttr([HTMLLabelElement, HTMLOutputElement], "htmlFor", "for");
     __reflectAttr([HTMLFormElement], "method", "method", "", "get"); __reflectAttr([HTMLFormElement], "enctype", "enctype", "", "application/x-www-form-urlencoded");
     __reflectAttr([HTMLFormElement], "noValidate", "novalidate", "bool");
+    __reflectAttr([HTMLButtonElement, HTMLInputElement], "formNoValidate", "formnovalidate", "bool");
+    __reflectAttr([HTMLButtonElement, HTMLInputElement], "formAction", "formaction");
+    __reflectAttr([HTMLButtonElement, HTMLInputElement], "formMethod", "formmethod");
+    __reflectAttr([HTMLButtonElement, HTMLInputElement], "formEnctype", "formenctype");
+    __reflectAttr([HTMLButtonElement, HTMLInputElement], "formTarget", "formtarget");
+    [HTMLButtonElement, HTMLInputElement, HTMLSelectElement, HTMLTextAreaElement, HTMLFieldSetElement, HTMLLabelElement, HTMLOutputElement, HTMLObjectElement].forEach(function (C) {
+        Object.defineProperty(C.prototype, "form", {
+            configurable: true,
+            get: function () {
+                var fid = this.getAttribute("form");
+                if (fid) {
+                    var root = this.getRootNode ? this.getRootNode() : doc;
+                    var f = root && root.getElementById ? root.getElementById(fid) : null;
+                    return f && f.tagName === "FORM" ? f : null;
+                }
+                return this.closest ? this.closest("form") : null;
+            }
+        });
+    });
+    [HTMLInputElement, HTMLSelectElement, HTMLTextAreaElement, HTMLButtonElement].forEach(function (C) {
+        C.prototype.checkValidity = function () {
+            if (this.disabled) return true;
+            if (this.required) {
+                var t = (this.type || "").toLowerCase();
+                if (this.tagName === "INPUT" && (t === "checkbox" || t === "radio")) return !!this.checked;
+                if (!String(this.value || "")) return false;
+            }
+            return true;
+        };
+        C.prototype.reportValidity = function () { return this.checkValidity(); };
+        C.prototype.setCustomValidity = function (msg) { this._validationMessage = String(msg || ""); };
+    });
     __reflectAttr([HTMLTableCellElement], "colSpan", "colspan", "int", 1); __reflectAttr([HTMLTableCellElement], "rowSpan", "rowspan", "int", 1);
     __reflectAttr([HTMLTableCellElement], "headers", "headers"); __reflectAttr([HTMLTableCellElement], "scope", "scope");
     __reflectAttr([HTMLMediaElement], "autoplay", "autoplay", "bool"); __reflectAttr([HTMLMediaElement], "loop", "loop", "bool");
@@ -1381,10 +1659,16 @@ var DOMException = class DOMException extends Error {
 };
 
 var Event = class Event {
-    constructor(type,opts) { opts=opts||{}; this.type=type; this.bubbles=!!opts.bubbles; this.cancelable=!!opts.cancelable; this.target=null; this.currentTarget=null; this.defaultPrevented=false; this._stopped=false; }
-    preventDefault() { this.defaultPrevented=true; }
+    constructor(type,opts) { opts=opts||{}; this.type=type; this.bubbles=!!opts.bubbles; this.cancelable=!!opts.cancelable; this.composed=!!opts.composed; this.target=null; this.currentTarget=null; this.defaultPrevented=false; this._stopped=false; this._immStopped=false; }
+    preventDefault() { if (this.cancelable !== false) this.defaultPrevented=true; }
     stopPropagation() { this._stopped=true; }
-    stopImmediatePropagation() { this._stopped=true; }
+    stopImmediatePropagation() { this._stopped=true; this._immStopped=true; }
+    composedPath() {
+        var path = [], n = this.target;
+        while (n) { path.push(n); n = n.parentNode || n.host || null; }
+        if (path.length && path[path.length - 1] === doc) path.push(window);
+        return path;
+    }
 };
 var CustomEvent = class CustomEvent extends Event {
     constructor(type,opts) { super(type,opts); this.detail=opts?opts.detail:null; }
@@ -2763,8 +3047,24 @@ var URL = class URL {
     }
     static canParse(url, base) { try { new URL(url, base); return true; } catch (e) { return false; } }
     static parse(url, base) { try { return new URL(url, base); } catch (e) { return null; } }
-    static createObjectURL() { return "blob:null"; }
-    static revokeObjectURL() {}
+    static createObjectURL(blob) {
+        if (!blob || !(blob instanceof Blob)) {
+            throw new TypeError("Failed to execute 'createObjectURL' on 'URL': Overload resolution failed.");
+        }
+        var bytes = blob._bytes || new Uint8Array(0);
+        if (bytes.length > 0) {
+            if (typeof __zippHostBytes === "undefined" || __zippHostBytes.length < bytes.length) {
+                __zippHostBytes = new Uint8Array(Math.max(bytes.length, (typeof __zippHostBytes !== "undefined" ? __zippHostBytes.length : 0) * 2));
+            }
+            __zippHostBytes.set(bytes, 0);
+        }
+        return __zippHostCall("blob_create", String(bytes.length), String(blob.type || ""), String((typeof loc !== "undefined" && loc.origin) || "null"));
+    }
+    static revokeObjectURL(url) {
+        if (typeof url === "string" && url.indexOf("blob:") === 0) {
+            try { __zippHostCall("blob_revoke", url); } catch (e) {}
+        }
+    }
     _set(part, value) {
         this._p = JSON.parse(__zippHostCall("url_set", this._p.href, part, String(value)));
         if (this._sp) this._sp._load(this._p.search);
@@ -3088,12 +3388,56 @@ var Response = class Response {
     text() { return this.arrayBuffer().then(function (ab) { return new TextDecoder().decode(new Uint8Array(ab)); }); }
     json() { return this.text().then(JSON.parse); }
     bytes() { return this.arrayBuffer().then(function (ab) { return new Uint8Array(ab); }); }
-    blob() { var type = this.headers.get("content-type") || ""; return this.arrayBuffer().then(function (ab) { return new Blob([new TextDecoder().decode(new Uint8Array(ab))], { type: type }); }); }
+    blob() { var type = this.headers.get("content-type") || ""; return this.arrayBuffer().then(function (ab) { return new Blob([new Uint8Array(ab)], { type: type }); }); }
     clone() { return new Response(this._body, { status: this.status, statusText: this.statusText, headers: this.headers }); }
     static json(data, init) { init = init || {}; var r = new Response(JSON.stringify(data), init); r.headers.set("content-type", "application/json"); return r; }
     static error() { var r = new Response(null, { status: 0 }); r.type = "error"; return r; }
 };
 function __asResponse(r) { Object.setPrototypeOf(r, Response.prototype); return r; }
+
+// Request class (Fetch API) — required by Three.js FileLoader/GLTFLoader/RGBELoader.
+var Request = class Request {
+    constructor(input, init) {
+        init = init || {};
+        if (input instanceof Request) {
+            this.url = input.url;
+            this.method = (init.method || input.method || "GET").toUpperCase();
+            this.headers = new Headers(init.headers !== undefined ? (init.headers instanceof Headers ? init.headers._headers : init.headers) : input.headers._headers);
+            this.body = init.body !== undefined ? init.body : input.body;
+            this.credentials = init.credentials || input.credentials || "same-origin";
+            this.mode = init.mode || input.mode || "cors";
+            this.cache = init.cache || input.cache || "default";
+            this.redirect = init.redirect || input.redirect || "follow";
+            this.referrer = init.referrer !== undefined ? init.referrer : input.referrer;
+            this.referrerPolicy = init.referrerPolicy || input.referrerPolicy || "";
+            this.integrity = init.integrity || input.integrity || "";
+            this.keepalive = init.keepalive !== undefined ? !!init.keepalive : input.keepalive;
+            this.signal = init.signal || input.signal || null;
+        } else {
+            var rawUrl = input && input.href ? input.href : String(input);
+            this.url = __zippAbsoluteUrl(rawUrl);
+            this.method = (init.method || "GET").toUpperCase();
+            this.headers = new Headers(init.headers instanceof Headers ? init.headers._headers : init.headers);
+            this.body = init.body !== undefined ? init.body : null;
+            this.credentials = init.credentials || "same-origin";
+            this.mode = init.mode || "cors";
+            this.cache = init.cache || "default";
+            this.redirect = init.redirect || "follow";
+            this.referrer = init.referrer || "about:client";
+            this.referrerPolicy = init.referrerPolicy || "";
+            this.integrity = init.integrity || "";
+            this.keepalive = !!init.keepalive;
+            this.signal = init.signal || null;
+        }
+        this.bodyUsed = false;
+    }
+    clone() { return new Request(this); }
+    arrayBuffer() { return new Response(this.body).arrayBuffer(); }
+    text() { return new Response(this.body).text(); }
+    json() { return new Response(this.body).json(); }
+    bytes() { return new Response(this.body).bytes(); }
+    blob() { return new Response(this.body).blob(); }
+};
 
 // A header from what a page gives: a plain object in any case of name, or
 // Headers. Only the exact spelling "Content-Type" was found.
@@ -3127,18 +3471,93 @@ function __randomUUID() {
     return s;
 }
 
-// --- FormData class (basic) ---
-var FormData = function() { this._data = []; };
+// --- FormData class ---
+var FormData = function(form, submitter) {
+    this._data = [];
+    if (form && form.elements) {
+        var els = form.elements;
+        for (var i = 0; i < els.length; i++) {
+            var el = els[i];
+            if (!el.name || el.disabled) continue;
+            var tag = el.tagName;
+            if (tag === "INPUT") {
+                var t = (el.type || "text").toLowerCase();
+                if (t === "submit" || t === "button" || t === "reset" || t === "image" || t === "file") continue;
+                if ((t === "checkbox" || t === "radio") && !el.checked) continue;
+                this._data.push([el.name, String(el.value || "")]);
+            } else if (tag === "TEXTAREA") {
+                this._data.push([el.name, String(el.value || "")]);
+            } else if (tag === "SELECT") {
+                var opts = el.selectedOptions || [];
+                for (var j = 0; j < opts.length; j++) this._data.push([el.name, String(opts[j].value || "")]);
+            }
+        }
+        if (submitter && submitter.name && !submitter.disabled) {
+            this._data.push([submitter.name, String(submitter.value || "")]);
+        }
+    }
+};
 FormData.prototype.append = function(name, value) { this._data.push([name, value]); };
 FormData.prototype.get = function(name) { for (var i = 0; i < this._data.length; i++) if (this._data[i][0] === name) return this._data[i][1]; return null; };
 FormData.prototype.has = function(name) { return this.get(name) !== null; };
 FormData.prototype.delete = function(name) { this._data = this._data.filter(function(e) { return e[0] !== name; }); };
 FormData.prototype.forEach = function(fn) { for (var i = 0; i < this._data.length; i++) fn(this._data[i][1], this._data[i][0]); };
 
-// --- Blob class (basic) ---
-var Blob = function(parts, options) { this._parts = parts || []; this.type = (options && options.type) || ""; this.size = 0; for (var i = 0; i < this._parts.length; i++) this.size += String(this._parts[i]).length; };
-Blob.prototype.text = function() { return Promise.resolve(this._parts.join("")); };
-Blob.prototype.arrayBuffer = function() { return Promise.resolve(this._parts.join("")); };
+// --- Binary-safe Blob class ---
+function __blobPartToBytes(p) {
+    if (p == null) return new Uint8Array(0);
+    if (p instanceof Blob) return p._bytes || new Uint8Array(0);
+    if (p instanceof ArrayBuffer) return new Uint8Array(p);
+    if (ArrayBuffer.isView(p)) return new Uint8Array(p.buffer, p.byteOffset, p.byteLength);
+    var enc = new TextEncoder().encode(String(p));
+    return enc instanceof Uint8Array ? enc : new Uint8Array(enc);
+}
+var Blob = function(parts, options) {
+    this._parts = parts || [];
+    this.type = (options && options.type) ? String(options.type).toLowerCase() : "";
+    var chunks = [];
+    var total = 0;
+    for (var i = 0; i < this._parts.length; i++) {
+        var b = __blobPartToBytes(this._parts[i]);
+        chunks.push(b);
+        total += b.byteLength;
+    }
+    var out = new Uint8Array(total);
+    var off = 0;
+    for (var j = 0; j < chunks.length; j++) {
+        out.set(chunks[j], off);
+        off += chunks[j].byteLength;
+    }
+    this._bytes = out;
+    this.size = total;
+};
+Blob.prototype.arrayBuffer = function() { return Promise.resolve(this._bytes.slice(0).buffer); };
+Blob.prototype.bytes = function() { return Promise.resolve(this._bytes.slice(0)); };
+Blob.prototype.text = function() { return Promise.resolve(new TextDecoder().decode(this._bytes)); };
+Blob.prototype.slice = function(start, end, contentType) {
+    var len = this._bytes.byteLength;
+    var s = start === undefined ? 0 : (start < 0 ? Math.max(len + start, 0) : Math.min(start, len));
+    var e = end === undefined ? len : (end < 0 ? Math.max(len + end, 0) : Math.min(end, len));
+    var sliced = e > s ? this._bytes.slice(s, e) : new Uint8Array(0);
+    return new Blob([sliced], { type: contentType === undefined ? "" : String(contentType) });
+};
+Blob.prototype.stream = function() {
+    var bytes = this._bytes;
+    return {
+        getReader: function() {
+            var done = false;
+            return {
+                read: function() {
+                    if (done) return Promise.resolve({ value: undefined, done: true });
+                    done = true;
+                    return Promise.resolve({ value: bytes.slice(0), done: false });
+                },
+                cancel: function() { done = true; return Promise.resolve(); },
+                releaseLock: function() {}
+            };
+        }
+    };
+};
 
 // --- File: a Blob with a name. One picked in a file dialog (`_path`) reads
 // its bytes from disk when asked: see `__zippChosenFile`.
@@ -3394,16 +3813,34 @@ var window = {
     },
     isSecureContext:true,
     structuredClone:function(v){return JSON.parse(JSON.stringify(v));},
-    fetch:function(url, opts) {
+    fetch:function(input, opts) {
         opts = opts || {};
-        var method = (opts.method || "GET").toUpperCase();
-        var body = opts.body || null;
-        var headers = opts.headers || {};
+        var isReq = input instanceof Request;
+        var url = isReq ? input.url : (input && input.href ? input.href : String(input));
+        var method = String(opts.method || (isReq ? input.method : "GET")).toUpperCase();
+        var body = opts.body !== undefined ? opts.body : (isReq ? input.body : null);
+        var headers = opts.headers !== undefined ? opts.headers : (isReq ? input.headers : {});
         // As fetch has it: what a string body is, unless the page says.
         var contentType = __headerNamed(headers, "content-type") || "text/plain;charset=UTF-8";
-        var credentials = opts.credentials === "include" ? "include" : "";
+        var creds = opts.credentials || (isReq ? input.credentials : "");
+        var credentials = creds === "include" ? "include" : "";
         return new Promise(function(resolve, reject) {
             try {
+                // Fast binary path for blob: and data: URLs (e.g. Three.js GLB/HDR
+                // assets extracted from .softn bundles or in-memory Blobs).
+                if (method === "GET" && (url.indexOf("blob:") === 0 || url.indexOf("data:") === 0)) {
+                    var info = JSON.parse(__zippHostCall("http_bytes", url, credentials));
+                    if (__zippHostBytes.length < info.len) {
+                        __zippHostBytes = new Uint8Array(Math.max(info.len, __zippHostBytes.length * 2));
+                    }
+                    __zippHostCall("take_bytes");
+                    var rawBytes = __zippHostBytes.slice(0, info.len);
+                    var bHeaders = new Headers(info.contentType ? { "content-type": info.contentType, "content-length": String(info.len) } : { "content-length": String(info.len) });
+                    var resp = new Response(rawBytes, { status: info.status, statusText: info.ok ? "OK" : "Error", headers: bHeaders });
+                    resp.url = url;
+                    resolve(resp);
+                    return;
+                }
                 var r;
                 __zippCredentials = credentials;
                 if (method === "POST") {
@@ -3416,17 +3853,31 @@ var window = {
                     r = http.get(String(url));
                 }
                 var responseBody = r.body;
+                var respHeaders = new Headers(r.contentType ? { "content-type": r.contentType } : {});
+                var respType = r.contentType || "";
                 resolve(__asResponse({
                     ok: r.ok,
                     status: r.status,
                     statusText: r.ok ? "OK" : "Error",
                     url: String(url),
-                    headers: { get: function(name) { return null; }, has: function(name) { return false; }, forEach: function() {} },
+                    headers: respHeaders,
                     text: function() { return Promise.resolve(responseBody); },
                     json: function() { return Promise.resolve(JSON.parse(responseBody)); },
-                    // A Blob that remembers where it came from, so that
-                    // `createImageBitmap(blob)` can decode the image.
-                    blob: function() { var b = new Blob([responseBody]); b._url = __zippAbsoluteUrl(String(url)); return Promise.resolve(b); },
+                    // Preserve raw binary bytes for images, GLBs, HDRs, and Wasm.
+                    blob: function() {
+                        return new Promise(function(res, rej) {
+                            try {
+                                var ab = __zippFetchBytes(String(url), credentials);
+                                var b = new Blob([new Uint8Array(ab)], { type: respType });
+                                b._url = __zippAbsoluteUrl(String(url));
+                                res(b);
+                            } catch (e) {
+                                var fb = new Blob([responseBody], { type: respType });
+                                fb._url = __zippAbsoluteUrl(String(url));
+                                res(fb);
+                            }
+                        });
+                    },
                     // The body as bytes, fetched again as such: the text above
                     // went through UTF-8 and cannot give them back. What
                     // `WebAssembly.instantiateStreaming(fetch(url))` reads.
@@ -3434,6 +3885,9 @@ var window = {
                         return new Promise(function(res, rej) {
                             try { res(__zippFetchBytes(String(url), credentials)); } catch (e) { rej(e); }
                         });
+                    },
+                    bytes: function() {
+                        return this.arrayBuffer().then(function(ab) { return new Uint8Array(ab); });
                     },
                     clone: function() { return this; },
                     redirected: false,
@@ -3447,7 +3901,7 @@ var window = {
     XMLHttpRequest:XMLHttpRequest,
     WeakRef:WeakRef, FinalizationRegistry:FinalizationRegistry,
     Proxy:Proxy, Reflect:Reflect,
-    Headers:Headers, FormData:FormData, Blob:Blob, File:File, Response:Response
+    Headers:Headers, FormData:FormData, Blob:Blob, File:File, Response:Response, Request:Request, CSSStyleSheet:CSSStyleSheet
 };
 window.self=window; window.top=window; window.parent=window;
 window.origin = loc.origin;
@@ -3474,7 +3928,7 @@ window.URL = URL;
 })();
 window.window = window; window.self = window; window.top = window; window.parent = window; window.frames = window;
 // The DOM's interfaces, on the window as in a browser (`window.HTMLElement`).
-var __domInterfaces = { EventTarget: EventTarget, Document: Document, HTMLDocument: Document, AbortSignal: AbortSignal,
+var __domInterfaces = { EventTarget: EventTarget, Document: Document, HTMLDocument: Document, DOMParser: DOMParser, XMLSerializer: XMLSerializer, AbortSignal: AbortSignal,
     AbortController: AbortController, BroadcastChannel: BroadcastChannel, CustomElementRegistry: CustomElementRegistry,
     customElements: customElements, SVGElement: SVGElement, ShadowRoot: ShadowRoot, ElementInternals: ElementInternals,
     CustomStateSet: CustomStateSet, FontFace: FontFace, FontFaceSet: FontFaceSet, CSS: CSS, PerformanceObserver: PerformanceObserver, HTMLElement: HTMLElement, HTMLAnchorElement: HTMLAnchorElement, HTMLAreaElement: HTMLAreaElement, HTMLMediaElement: HTMLMediaElement, HTMLAudioElement: HTMLAudioElement, HTMLVideoElement: HTMLVideoElement, HTMLBRElement: HTMLBRElement, HTMLBaseElement: HTMLBaseElement, HTMLBodyElement: HTMLBodyElement, HTMLButtonElement: HTMLButtonElement, HTMLCanvasElement: HTMLCanvasElement, HTMLDListElement: HTMLDListElement, HTMLDataElement: HTMLDataElement, HTMLDataListElement: HTMLDataListElement, HTMLDetailsElement: HTMLDetailsElement, HTMLDivElement: HTMLDivElement, HTMLEmbedElement: HTMLEmbedElement, HTMLFieldSetElement: HTMLFieldSetElement, HTMLHRElement: HTMLHRElement, HTMLHeadElement: HTMLHeadElement, HTMLHeadingElement: HTMLHeadingElement, HTMLHtmlElement: HTMLHtmlElement, HTMLIFrameElement: HTMLIFrameElement, HTMLImageElement: HTMLImageElement, HTMLInputElement: HTMLInputElement, HTMLLIElement: HTMLLIElement, HTMLLabelElement: HTMLLabelElement, HTMLLegendElement: HTMLLegendElement, HTMLLinkElement: HTMLLinkElement, HTMLMapElement: HTMLMapElement, HTMLMenuElement: HTMLMenuElement, HTMLMetaElement: HTMLMetaElement, HTMLMeterElement: HTMLMeterElement, HTMLModElement: HTMLModElement, HTMLOListElement: HTMLOListElement, HTMLObjectElement: HTMLObjectElement, HTMLOptGroupElement: HTMLOptGroupElement, HTMLOptionElement: HTMLOptionElement, HTMLOutputElement: HTMLOutputElement, HTMLParagraphElement: HTMLParagraphElement, HTMLPictureElement: HTMLPictureElement, HTMLPreElement: HTMLPreElement, HTMLProgressElement: HTMLProgressElement, HTMLQuoteElement: HTMLQuoteElement, HTMLScriptElement: HTMLScriptElement, HTMLSelectElement: HTMLSelectElement, HTMLSlotElement: HTMLSlotElement, HTMLSourceElement: HTMLSourceElement, HTMLSpanElement: HTMLSpanElement, HTMLStyleElement: HTMLStyleElement, HTMLTableCaptionElement: HTMLTableCaptionElement, HTMLTableCellElement: HTMLTableCellElement, HTMLTableColElement: HTMLTableColElement, HTMLTableElement: HTMLTableElement, HTMLTableRowElement: HTMLTableRowElement, HTMLTableSectionElement: HTMLTableSectionElement, HTMLTemplateElement: HTMLTemplateElement, HTMLTextAreaElement: HTMLTextAreaElement, HTMLTimeElement: HTMLTimeElement, HTMLTitleElement: HTMLTitleElement, HTMLTrackElement: HTMLTrackElement, HTMLUListElement: HTMLUListElement, HTMLUnknownElement: HTMLUnknownElement, HTMLDialogElement: HTMLDialogElement, HTMLFormElement: HTMLFormElement };
@@ -3501,6 +3955,38 @@ var screen = window.screen;
 var globalThis = window;
 var fetch = window.fetch;
 var location = loc;
+
+// Tag compiled WebAssembly.Modules with a host blob URL so `worker.postMessage`
+// can structured-clone compiled Wasm modules across Worker threads.
+if (typeof WebAssembly === "object" && typeof WebAssembly.compile === "function") {
+    var __origWasmCompile = WebAssembly.compile;
+    var __origWasmCompileStreaming = WebAssembly.compileStreaming;
+    var __storeWasmBytes = function (src) {
+        try {
+            var u8 = src instanceof Uint8Array ? src : (src instanceof ArrayBuffer ? new Uint8Array(src) : (ArrayBuffer.isView(src) ? new Uint8Array(src.buffer, src.byteOffset, src.byteLength) : null));
+            if (!u8 || !u8.byteLength) return "";
+            if (__zippHostBytes.length < u8.byteLength) {
+                __zippHostBytes = new Uint8Array(Math.max(u8.byteLength, __zippHostBytes.length * 2));
+            }
+            __zippHostBytes.set(u8, 0);
+            return __zippHostCall("blob_create", String(u8.byteLength), "application/wasm", String((loc && loc.origin) || "null"));
+        } catch (e) { return ""; }
+    };
+    WebAssembly.compile = function (bytes) {
+        var url = __storeWasmBytes(bytes);
+        return __origWasmCompile.call(WebAssembly, bytes).then(function (mod) {
+            if (url) { try { Object.defineProperty(mod, "__zippWasmBlobUrl", { value: url, configurable: true }); } catch (e) {} }
+            return mod;
+        });
+    };
+    if (typeof __origWasmCompileStreaming === "function") {
+        WebAssembly.compileStreaming = function (source) {
+            return Promise.resolve(source).then(function (resp) {
+                return resp.arrayBuffer().then(function (ab) { return WebAssembly.compile(ab); });
+            });
+        };
+    }
+}
 
 // Re-export `window`'s API surface as bare globals.
 //
@@ -3604,11 +4090,19 @@ var __fl_doc_ref = doc;
 // project cards' `--project-accent` colour among them.
 function __styleText(style) {
     var t = "";
+    if (!style) return t;
+    var imp = style._imp;
     for (var p in style) {
         if (typeof style[p] !== "string" || style[p] === "" || p === "cssText" || p.indexOf("_") === 0) continue;
-        t += p.replace(/[A-Z]/g, function (m) { return "-" + m.toLowerCase(); }) + ":" + style[p] + ";";
+        var prop = p === "cssFloat" ? "float" : (p.indexOf("--") === 0 ? p : p.replace(/[A-Z]/g, function (m) { return "-" + m.toLowerCase(); }));
+        t += prop + ":" + style[p] + (imp && imp[p] ? " !important" : "") + ";";
     }
     return t;
+}
+function __elementStyleAttr(node) {
+    var obj = node && node.style ? __styleText(node.style) : "";
+    if (obj) return obj;
+    return node && node.attributes && node.attributes.style ? String(node.attributes.style) : "";
 }
 
 var __svgTagCase = {
@@ -3652,26 +4146,128 @@ function __serializeSvgChild(cn) {
         var mapped=__svgAttrCase[al]||ak;
         ca+=" "+mapped+"=\""+__ea(cn.attributes[ak])+"\"";
     }
-    var cst=(cn.attributes&&cn.attributes.style?String(cn.attributes.style).replace(/;?\s*$/,";"):"")+(cn.style?__styleText(cn.style):"");
+    var cst=__elementStyleAttr(cn);
     if(cst!==""&&cst!==";") ca+=" style=\""+__ea(cst)+"\"";
     var inner="";
     for(var i=0;i<cn.childNodes.length;i++) inner+=__serializeSvgChild(cn.childNodes[i]);
     return inner==="" ? "<"+ct+ca+"/>" : "<"+ct+ca+">"+inner+"</"+ct+">";
 }
 
-function __serializeNode(node) {
+// Scope CSS rules inside a ShadowRoot to `[data-zsr="<id>"]` so styles
+// match `:host`, `:root`, `html`, `body`, and shadow descendants without
+// leaking out onto the embedding page or browser chrome.
+function __scopeShadowSelector(sel, scope) {
+    sel = sel.trim();
+    if (!sel) return sel;
+    if (sel.indexOf(":host(") === 0) {
+        var depth = 0, end = -1;
+        for (var i = 5; i < sel.length; i++) {
+            if (sel.charAt(i) === "(") depth++;
+            else if (sel.charAt(i) === ")") { depth--; if (depth === 0) { end = i; break; } }
+        }
+        if (end > 5) {
+            return scope + sel.slice(6, end).trim() + sel.slice(end + 1);
+        }
+    }
+    if (/^:host(?=$|[\s.:[#>,+~])/.test(sel)) {
+        return sel.replace(/^:host/, scope);
+    }
+    if (sel === ":root" || sel === "html" || sel === "body") return scope;
+    if (/^(?:html|body|:root)(?=[\s.:[#>,+~])/.test(sel)) {
+        return sel.replace(/^(?:html|body|:root)/, scope);
+    }
+    return scope + " " + sel;
+}
+function __splitTopLevelCommas(str) {
+    var parts = [], cur = "", depth = 0, sq = 0, q = "";
+    for (var i = 0; i < str.length; i++) {
+        var ch = str.charAt(i);
+        if (q) { cur += ch; if (ch === "\\" && i + 1 < str.length) cur += str.charAt(++i); else if (ch === q) q = ""; continue; }
+        if (ch === '"' || ch === "'") { q = ch; cur += ch; continue; }
+        if (ch === "(") depth++; else if (ch === ")" && depth > 0) depth--;
+        else if (ch === "[") sq++; else if (ch === "]" && sq > 0) sq--;
+        else if (ch === "," && depth === 0 && sq === 0) { parts.push(cur); cur = ""; continue; }
+        cur += ch;
+    }
+    if (cur.trim()) parts.push(cur);
+    return parts;
+}
+function __scopeShadowCss(css, scope) {
+    if (!css || !scope) return css || "";
+    var out = "", i = 0, n = css.length;
+    while (i < n) {
+        // Preserve whitespace
+        if (/\s/.test(css.charAt(i))) { out += css.charAt(i++); continue; }
+        // Skip comments
+        if (css.charAt(i) === "/" && css.charAt(i + 1) === "*") {
+            var ce = css.indexOf("*/", i + 2);
+            if (ce < 0) break;
+            i = ce + 2;
+            continue;
+        }
+        // Read prelude up to `{` or `;`
+        var start = i, q = "", paren = 0;
+        while (i < n) {
+            var c = css.charAt(i);
+            if (q) { if (c === "\\" && i + 1 < n) i++; else if (c === q) q = ""; i++; continue; }
+            if (c === "/" && css.charAt(i + 1) === "*") { var ce2 = css.indexOf("*/", i + 2); i = ce2 < 0 ? n : ce2 + 2; continue; }
+            if (c === '"' || c === "'") { q = c; i++; continue; }
+            if (c === "(") paren++; else if (c === ")" && paren > 0) paren--;
+            if (paren === 0 && (c === "{" || c === ";")) break;
+            i++;
+        }
+        var prelude = css.slice(start, i).trim();
+        if (i >= n) { out += prelude; break; }
+        if (css.charAt(i) === ";") { out += prelude + ";"; i++; continue; }
+        // Find matching `}` for block
+        var bStart = i + 1, depth = 1;
+        i++;
+        q = "";
+        while (i < n && depth > 0) {
+            var bc = css.charAt(i);
+            if (q) { if (bc === "\\" && i + 1 < n) i++; else if (bc === q) q = ""; i++; continue; }
+            if (bc === "/" && css.charAt(i + 1) === "*") { var ce3 = css.indexOf("*/", i + 2); i = ce3 < 0 ? n : ce3 + 2; continue; }
+            if (bc === '"' || bc === "'") { q = bc; i++; continue; }
+            if (bc === "{") depth++;
+            else if (bc === "}") depth--;
+            i++;
+        }
+        var inner = css.slice(bStart, i - 1);
+        if (prelude.charAt(0) === "@") {
+            var at = prelude.toLowerCase();
+            if (/^@(?:media|supports|layer|container|document)\b/.test(at)) {
+                out += prelude + "{" + __scopeShadowCss(inner, scope) + "}";
+            } else {
+                out += prelude + "{" + inner + "}";
+            }
+        } else {
+            var sels = __splitTopLevelCommas(prelude);
+            var scoped = [];
+            for (var s = 0; s < sels.length; s++) scoped.push(__scopeShadowSelector(sels[s], scope));
+            out += scoped.join(",") + "{" + inner + "}";
+        }
+    }
+    return out;
+}
+
+function __renderChildren(node) {
+    return node && node._shadowRoot ? node._shadowRoot.childNodes : (node ? node.childNodes : []);
+}
+
+function __serializeNode(node, scopeId) {
     if(node.nodeType===3) {
         // Markup set through innerHTML goes out as markup. Otherwise <style>
         // and <script> are raw text, where escaping would turn `a > b` into
         // `a &gt; b`; everywhere else unescaped text re-parses as markup.
         if(node._html) return node.data||"";
         var ptag=node.parentNode&&node.parentNode.tagName?node.parentNode.tagName.toLowerCase():"";
-        return ptag==="style"||ptag==="script"?(node.data||""):__eh(node.data||"");
+        if(ptag==="style") return scopeId ? __scopeShadowCss(node.data||"", "[data-zsr=\""+scopeId+"\"]") : (node.data||"");
+        return ptag==="script"?(node.data||""):__eh(node.data||"");
     }
     if(node.nodeType===8) return "";
     if(node.nodeType!==1) {
         var h="";
-        for(var i=0;i<node.childNodes.length;i++) h+=__serializeNode(node.childNodes[i]);
+        for(var i=0;i<node.childNodes.length;i++) h+=__serializeNode(node.childNodes[i], scopeId);
         return h;
     }
     var tag=(node.tagName||node.nodeName||"div").toLowerCase();
@@ -3686,34 +4282,41 @@ function __serializeNode(node) {
     if(fieldValue&&tag==="input") r+=" value=\""+__ea(node._value)+"\"";
     // One style attribute: the author's text, then the object's declarations,
     // which come later so a value JS changed wins.
-    var st=(node.attributes&&node.attributes.style?String(node.attributes.style).replace(/;?\s*$/,";"):"")+(node.style?__styleText(node.style):"");
+    var st=__elementStyleAttr(node);
     if(st!==""&&st!==";") r+=" style=\""+__ea(st)+"\"";
     __keepNode(node);
     r+=" data-flid=\""+node._id+"\"";
+    if(node._shadowRoot) r+=" data-zsr=\""+node._shadowRoot._id+"\"";
     r+=">";
     // A select shows its chosen option's label, written in as its text.
     if(tag==="select") r+=__eh(__selectLabel(node));
     // Serialize SVG elements recursively (including <text>, <g>, <defs>,
     // gradients, and clip paths) with proper XML camelCase tag/attribute names
-    // for Rust-side usvg rendering.
+    // for Rust-side usvg rendering. Preserve responsive `width="100%"` +
+    // `viewBox` aspect ratios instead of forcing a 24px height.
     if(tag==="svg") {
-        var sw=node.getAttribute("width");
-        var sh=node.getAttribute("height");
+        var rawW=node.getAttribute("width");
+        var rawH=node.getAttribute("height");
         var vb=node.getAttribute("viewBox")||node.getAttribute("viewbox");
-        if(!sw&&!sh&&vb) {
+        var vbW=null, vbH=null;
+        if(vb) {
             var vbp=String(vb).trim().split(/[\s,]+/);
-            if(vbp.length===4) { sw=vbp[2]; sh=vbp[3]; }
+            if(vbp.length===4) { vbW=vbp[2]; vbH=vbp[3]; }
         }
-        if(!sw) sw="24";
-        if(!sh) sh="24";
-        if(!vb) vb="0 0 "+sw+" "+sh;
+        var isPctW=rawW!==null&&String(rawW).indexOf("%")>=0;
+        var isPctH=rawH!==null&&String(rawH).indexOf("%")>=0;
+        // Concrete XML dimensions for usvg (using viewBox when width/height is
+        // absent or percentage so usvg keeps the true aspect ratio).
+        var xmlW=(rawW&&!isPctW)?rawW:(vbW||"24");
+        var xmlH=(rawH&&!isPctH)?rawH:(vbH||"24");
+        if(!vb) vb="0 0 "+xmlW+" "+xmlH;
         var svgChildren="";
         for(var i=0;i<node.childNodes.length;i++) svgChildren+=__serializeSvgChild(node.childNodes[i]);
         var svgAttrs="";
         if(node.id) svgAttrs+=" id=\""+__ea(node.id)+"\"";
         if(node.className) svgAttrs+=" class=\""+__ea(node.className)+"\"";
         svgAttrs+=" xmlns=\"http://www.w3.org/2000/svg\"";
-        svgAttrs+=" width=\""+__ea(sw)+"\" height=\""+__ea(sh)+"\" viewBox=\""+__ea(vb)+"\"";
+        svgAttrs+=" width=\""+__ea(xmlW)+"\" height=\""+__ea(xmlH)+"\" viewBox=\""+__ea(vb)+"\"";
         var hasFill=false;
         for(var ak in node.attributes) {
             var al=ak.toLowerCase();
@@ -3724,10 +4327,23 @@ function __serializeNode(node) {
         }
         if(!hasFill&&node.getAttribute("stroke")!==null) svgAttrs+=" fill=\"none\"";
         svgAttrs+=" data-flid=\""+node._id+"\"";
-        var swCss=/^\d+(\.\d+)?$/.test(String(sw))?(sw+"px"):String(sw);
-        var shCss=/^\d+(\.\d+)?$/.test(String(sh))?(sh+"px"):String(sh);
-        var svgStyle="width:"+swCss+";height:"+shCss+";display:inline-block;flex-shrink:0;"+(st&&st!==";"?st:"");
-        return "<svg"+svgAttrs+" style=\""+__ea(svgStyle)+"\">"+svgChildren+"</svg>";
+        // Only put width/height into inline style when explicitly declared on
+        // the element as HTML attributes (never clobbering CSS class sizing or
+        // inventing a 24px height on a responsive `width="100%"` chart).
+        var svgStylePrefix="";
+        if(rawW!==null) {
+            var swCss=/^\d+(\.\d+)?$/.test(String(rawW))?(rawW+"px"):String(rawW);
+            svgStylePrefix+="width:"+swCss+";";
+        }
+        if(rawH!==null) {
+            var shCss=/^\d+(\.\d+)?$/.test(String(rawH))?(rawH+"px"):String(rawH);
+            svgStylePrefix+="height:"+shCss+";";
+        } else if(isPctW&&vbW&&vbH) {
+            svgStylePrefix+="height:auto;aspect-ratio:"+vbW+"/"+vbH+";";
+        }
+        var svgStyle=svgStylePrefix+(st&&st!==";"?st:"");
+        if(svgStyle) svgAttrs+=" style=\""+__ea(svgStyle)+"\"";
+        return "<svg"+svgAttrs+">"+svgChildren+"</svg>";
     }
     // Skip SVG child elements (they're serialized inline above)
     if(node.namespaceURI && node.namespaceURI.indexOf("svg")>=0) return "";
@@ -3737,7 +4353,20 @@ function __serializeNode(node) {
     if(v.indexOf(tag)>=0) return r;
     // The parser drops one newline straight after <textarea>: keep a leading one.
     if(fieldValue&&tag==="textarea") return r+(node._value.charAt(0)==="\n"?"\n":"")+__eh(node._value)+"</textarea>";
-    for(var i=0;i<node.childNodes.length;i++) r+=__serializeNode(node.childNodes[i]);
+    if(node._shadowRoot) {
+        var sr=node._shadowRoot;
+        var childScope=sr._id;
+        var sheets=sr.adoptedStyleSheets;
+        if(sheets&&sheets.length) {
+            for(var si=0;si<sheets.length;si++) {
+                var cssText=(sheets[si]&&sheets[si]._text)||"";
+                if(cssText) r+="<style>"+__scopeShadowCss(cssText, "[data-zsr=\""+childScope+"\"]")+"</style>";
+            }
+        }
+        for(var j=0;j<sr.childNodes.length;j++) r+=__serializeNode(sr.childNodes[j], childScope);
+    } else {
+        for(var i=0;i<node.childNodes.length;i++) r+=__serializeNode(node.childNodes[i], scopeId);
+    }
     r+="</"+tag+">";
     return r;
 }
@@ -3793,7 +4422,7 @@ function __renderWhole() {
 function __tagOf(node) { return (node.tagName||node.nodeName||"div").toLowerCase(); }
 
 function __drawnWhole(node, tag) {
-    return tag === "svg" || tag === "select" || (tag === "textarea" && node._value !== undefined);
+    return tag === "svg" || tag === "select" || tag === "style" || (tag === "textarea" && node._value !== undefined);
 }
 
 // The attributes as __serializeNode writes them, as [name, value] pairs.
@@ -3808,10 +4437,11 @@ function __attrPairs(node, tag) {
         out.push([k, String(node.attributes[k])]);
     }
     if (fieldValue && tag==="input") out.push(["value", String(node._value)]);
-    var st=(node.attributes&&node.attributes.style?String(node.attributes.style).replace(/;?\s*$/,";"):"")+(node.style?__styleText(node.style):"");
+    var st=__elementStyleAttr(node);
     if (st!==""&&st!==";") out.push(["style", st]);
     __keepNode(node);
     out.push(["data-flid", String(node._id)]);
+    if (node._shadowRoot) out.push(["data-zsr", String(node._shadowRoot._id)]);
     return out;
 }
 function __attrSig(pairs) {
@@ -3819,11 +4449,21 @@ function __attrSig(pairs) {
     for (var i = 0; i < pairs.length; i++) s += pairs[i][0] + "\u0001" + pairs[i][1] + "\u0002";
     return s;
 }
-// The children: elements by number, text by what it says.
+// The children (shadow root children when attached, else light DOM): elements by number, text by what it says.
 function __kidsSig(node) {
     var s = "";
-    for (var i = 0; i < node.childNodes.length; i++) {
-        var c = node.childNodes[i];
+    if (node._shadowRoot) {
+        var sr = node._shadowRoot;
+        s += "\u0004" + sr._id;
+        if (sr.adoptedStyleSheets && sr.adoptedStyleSheets.length) {
+            for (var si = 0; si < sr.adoptedStyleSheets.length; si++) {
+                s += "\u0005" + ((sr.adoptedStyleSheets[si] && sr.adoptedStyleSheets[si]._text) || "");
+            }
+        }
+    }
+    var kids = __renderChildren(node);
+    for (var i = 0; i < kids.length; i++) {
+        var c = kids[i];
         if (c.nodeType === 1) s += "\u0001" + c._id;
         else if (c.nodeType === 3) s += (c._html ? "\u0003" : "\u0002") + (c.data || "");
     }
@@ -3831,38 +4471,51 @@ function __kidsSig(node) {
 }
 
 // Remember an element, and what is in it, as drawn now.
-function __remember(node) {
+function __remember(node, scopeId) {
     var tag = __tagOf(node);
-    if (__drawnWhole(node, tag)) { node._rf = __serializeNode(node); return; }
+    if (__drawnWhole(node, tag)) { node._rf = __serializeNode(node, scopeId); return; }
     node._ra = __attrSig(__attrPairs(node, tag));
     node._rk = __kidsSig(node);
-    for (var i = 0; i < node.childNodes.length; i++) {
-        if (node.childNodes[i].nodeType === 1) __remember(node.childNodes[i]);
+    var childScope = node._shadowRoot ? node._shadowRoot._id : scopeId;
+    var kids = __renderChildren(node);
+    for (var i = 0; i < kids.length; i++) {
+        if (kids[i].nodeType === 1) __remember(kids[i], childScope);
     }
 }
 
 // Its children drawn again, from their markup.
-function __redrawKids(node, ops) {
+function __redrawKids(node, ops, scopeId) {
     var h = "";
-    for (var i = 0; i < node.childNodes.length; i++) h += __serializeNode(node.childNodes[i]);
+    var childScope = node._shadowRoot ? node._shadowRoot._id : scopeId;
+    if (node._shadowRoot && node._shadowRoot.adoptedStyleSheets && node._shadowRoot.adoptedStyleSheets.length) {
+        var sheets = node._shadowRoot.adoptedStyleSheets;
+        for (var si = 0; si < sheets.length; si++) {
+            var cssText = (sheets[si] && sheets[si]._text) || "";
+            if (cssText) h += "<style>" + __scopeShadowCss(cssText, "[data-zsr=\"" + childScope + "\"]") + "</style>";
+        }
+    }
+    var kids = __renderChildren(node);
+    for (var i = 0; i < kids.length; i++) h += __serializeNode(kids[i], childScope);
     ops.push(["k", node._id, h]);
     node._rk = __kidsSig(node);
-    for (var j = 0; j < node.childNodes.length; j++) {
-        if (node.childNodes[j].nodeType === 1) __remember(node.childNodes[j]);
+    for (var j = 0; j < kids.length; j++) {
+        if (kids[j].nodeType === 1) __remember(kids[j], childScope);
     }
 }
 
 // Bring a drawn element up to date with patches; false when it is drawn
 // whole and changed, for its parent to draw its children again.
-function __patchNode(node, ops) {
+function __patchNode(node, ops, scopeId) {
     var tag = __tagOf(node);
-    if (__drawnWhole(node, tag)) return node._rf === __serializeNode(node);
+    if (__drawnWhole(node, tag)) return node._rf === __serializeNode(node, scopeId);
     var pairs = __attrPairs(node, tag), a = __attrSig(pairs);
     if (a !== node._ra) { ops.push(["a", node._id, pairs]); node._ra = a; }
-    if (__kidsSig(node) !== node._rk) { __redrawKids(node, ops); return true; }
-    for (var i = 0; i < node.childNodes.length; i++) {
-        var c = node.childNodes[i];
-        if (c.nodeType === 1 && !__patchNode(c, ops)) { __redrawKids(node, ops); return true; }
+    if (__kidsSig(node) !== node._rk) { __redrawKids(node, ops, scopeId); return true; }
+    var childScope = node._shadowRoot ? node._shadowRoot._id : scopeId;
+    var kids = __renderChildren(node);
+    for (var i = 0; i < kids.length; i++) {
+        var c = kids[i];
+        if (c.nodeType === 1 && !__patchNode(c, ops, childScope)) { __redrawKids(node, ops, scopeId); return true; }
     }
     return true;
 }
@@ -3881,9 +4534,11 @@ function __zippRenderPatch() {
     if (__htmlAttrs() !== __drawnHtmlAttrs) return __renderWhole();
     if (__attrSig(__attrPairs(body, "body")) !== body._ra || __kidsSig(body) !== body._rk) return __renderWhole();
     var ops = [];
-    for (var i = 0; i < body.childNodes.length; i++) {
-        var c = body.childNodes[i];
-        if (c.nodeType === 1 && !__patchNode(c, ops)) return __renderWhole();
+    var kids = __renderChildren(body);
+    var bodyScope = body._shadowRoot ? body._shadowRoot._id : 0;
+    for (var i = 0; i < kids.length; i++) {
+        var c = kids[i];
+        if (c.nodeType === 1 && !__patchNode(c, ops, bodyScope)) return __renderWhole();
     }
     if (!ops.length) return null;
     if (ops.length > 400) return __renderWhole();
@@ -3893,12 +4548,20 @@ function __zippRenderPatch() {
 // Return a JSON string mapping JS node IDs to their event types.
 // Format: { "nid": ["click","mousedown",...], ... }
 // Used by the Rust event bridge to know which nodes have handlers.
+// Listeners attached directly on a ShadowRoot are merged onto its host element's
+// flid so pointer/keyboard events inside Shadow DOM reach the ShadowRoot.
 function __getEventMap() {
     var map = {};
     for (var nid in __eventHandlers) {
-        var types = [];
-        for (var t in __eventHandlers[nid]) types.push(t);
-        if (types.length > 0) map[nid] = types;
+        var targetId = nid;
+        if (__shadowRootsById[nid] && __shadowRootsById[nid].host) {
+            targetId = String(__shadowRootsById[nid].host._id);
+        }
+        var types = map[targetId] || [];
+        for (var t in __eventHandlers[nid]) {
+            if (types.indexOf(t) < 0) types.push(t);
+        }
+        if (types.length > 0) map[targetId] = types;
     }
     return JSON.stringify(map);
 }

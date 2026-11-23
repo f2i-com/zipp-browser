@@ -360,6 +360,7 @@ fn main() {
     };
 
     zipp_shell::net::set_file_gate(page_may_read);
+    zipp_shell::net::set_blob_resolver(lookup_blob_bytes);
     let (raw_url, mobile, custom_viewport, kiosk, app, app_files) = match action {
         CliAction::Help => {
             print_usage();
@@ -886,6 +887,14 @@ fn load_fonts() -> FontContext {
 // ---------------------------------------------------------------------------
 
 fn fetch(url: &str) -> Result<String, String> {
+    if url.starts_with("blob:") {
+        let (_, bytes) = lookup_blob(url).ok_or_else(|| format!("blob URL not found: {url}"))?;
+        return Ok(String::from_utf8_lossy(&bytes).into_owned());
+    }
+    if url.starts_with("data:") {
+        let (_, bytes) = decode_data_url(url).ok_or_else(|| format!("invalid data URL: {url}"))?;
+        return Ok(String::from_utf8_lossy(&bytes).into_owned());
+    }
     // `file://` — load from disk. Needed to render a local page at all, and it
     // is what makes a local CSS test corpus possible: comparing against another
     // browser on hand-written test cases is far more precise than only ever
@@ -976,7 +985,7 @@ var http = (function () {
             credentials
         );
         var r = JSON.parse(raw);
-        return { status: r.status, ok: r.ok, body: r.body };
+        return { status: r.status, ok: r.ok, body: r.body, contentType: r.contentType || "" };
     }
     return {
         get: function (url) { return request("GET", url, "", ""); },
@@ -1131,12 +1140,23 @@ function __getHtmlClass() {
 }
 
 function __zippDispatchEvent(handlerNid, targetNid, type, details) {
+    var host = __nodesById[handlerNid] || null;
+    var target = __nodesById[targetNid] || host || null;
+    var result = 0;
+    // Listeners attached directly on a host's ShadowRoot fire before the host itself.
+    if (host && host._shadowRoot) {
+        var srByType = __eventHandlers[host._shadowRoot._id];
+        var srHandlers = srByType && srByType[type];
+        if (srHandlers && srHandlers.length > 0) {
+            result = __zippRunListeners(srHandlers, type, target, host._shadowRoot, 3, details);
+            if (result & 2) return result;
+        }
+    }
     var byType = __eventHandlers[handlerNid];
-    if (!byType) return 0;
+    if (!byType) return result;
     var handlers = byType[type];
-    if (!handlers || handlers.length === 0) return 0;
-    var target = __nodesById[targetNid] || __nodesById[handlerNid] || null;
-    return __zippRunListeners(handlers, type, target, __nodesById[handlerNid] || null, 2, details);
+    if (!handlers || handlers.length === 0) return result;
+    return result | __zippRunListeners(handlers, type, target, host, 2, details);
 }
 
 // The document's listeners (and the window's, which the shim keeps there),
@@ -1182,7 +1202,8 @@ function __zippRunListeners(handlers, type, target, currentTarget, phase, detail
         },
         composedPath: function () {
             var path = [], n = target;
-            while (n) { path.push(n); n = n.parentNode; }
+            while (n) { path.push(n); n = n.parentNode || n.host || null; }
+            if (path.length && path[path.length - 1] === document && typeof window !== "undefined") path.push(window);
             return path;
         }
     };
@@ -1516,25 +1537,132 @@ fn from_chrome(url: &str) -> bool {
         && url::Url::parse(url).is_ok_and(|u| u.query_pairs().any(|(k, v)| k == "__zipp_chrome" && v == token))
 }
 
-/// GET a URL for page script, as bytes: http(s) through the shared client,
-/// `file:` from disk (a page opened from disk fetches its neighbours; see
-/// `page_may_read`).
+/// In-memory `blob:` URL store shared across the main page thread, Web Workers,
+/// WebGL texture decoding, and `zipp-shell`'s `NetProvider`.
+type BlobMap = HashMap<String, (String, Vec<u8>)>;
+static BLOB_STORE: std::sync::LazyLock<std::sync::Mutex<BlobMap>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+static NEXT_BLOB_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub(crate) fn store_blob(origin: &str, mime: &str, bytes: Vec<u8>) -> String {
+    let id = NEXT_BLOB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let base = if origin.is_empty() || origin == "null" { "null" } else { origin.trim_end_matches('/') };
+    let url = format!("blob:{base}/zipp-{id:016x}");
+    BLOB_STORE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(url.clone(), (mime.to_string(), bytes));
+    url
+}
+
+pub(crate) fn lookup_blob(url: &str) -> Option<(String, Vec<u8>)> {
+    BLOB_STORE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(url)
+        .cloned()
+}
+
+pub(crate) fn lookup_blob_bytes(url: &str) -> Option<Vec<u8>> {
+    lookup_blob(url).map(|(_, bytes)| bytes)
+}
+
+pub(crate) fn revoke_blob(url: &str) {
+    BLOB_STORE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(url);
+}
+
+/// Decode a `data:[<mediatype>][;base64],<data>` URI into `(mime_type, bytes)`.
+fn decode_data_url(url: &str) -> Option<(String, Vec<u8>)> {
+    use base64::Engine as _;
+    let rest = url.strip_prefix("data:")?;
+    let (meta, payload) = rest.split_once(',')?;
+    let mut is_base64 = false;
+    let mut mime = String::new();
+    for part in meta.split(';') {
+        let p = part.trim();
+        if p.eq_ignore_ascii_case("base64") {
+            is_base64 = true;
+        } else if mime.is_empty() && !p.is_empty() && !p.contains('=') {
+            mime = p.to_string();
+        }
+    }
+    if mime.is_empty() {
+        mime = "text/plain;charset=US-ASCII".to_string();
+    }
+    let bytes = if is_base64 {
+        let cleaned: String = payload.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+        let decoded = urlencoding::decode(&cleaned).unwrap_or(std::borrow::Cow::Borrowed(&cleaned));
+        base64::engine::general_purpose::STANDARD
+            .decode(decoded.as_bytes())
+            .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(decoded.as_bytes()))
+            .ok()?
+    } else {
+        urlencoding::decode_binary(payload.as_bytes()).into_owned()
+    };
+    Some((mime, bytes))
+}
+
+/// Guess a basic Content-Type for local `file:` fetches (Wasm, JS, JSON, images, glTF).
+fn guess_mime_from_url(url: &str) -> &'static str {
+    let path = url.split(['?', '#']).next().unwrap_or(url).to_ascii_lowercase();
+    if path.ends_with(".wasm") { "application/wasm" }
+    else if path.ends_with(".js") || path.ends_with(".mjs") { "text/javascript" }
+    else if path.ends_with(".json") { "application/json" }
+    else if path.ends_with(".css") { "text/css" }
+    else if path.ends_with(".html") || path.ends_with(".htm") { "text/html" }
+    else if path.ends_with(".svg") { "image/svg+xml" }
+    else if path.ends_with(".png") { "image/png" }
+    else if path.ends_with(".jpg") || path.ends_with(".jpeg") { "image/jpeg" }
+    else if path.ends_with(".webp") { "image/webp" }
+    else if path.ends_with(".glb") { "model/gltf-binary" }
+    else if path.ends_with(".gltf") { "model/gltf+json" }
+    else if path.ends_with(".hdr") { "image/vnd.radiance" }
+    else { "application/octet-stream" }
+}
+
+/// GET a URL for page script, as bytes: `blob:`, `data:`, `file:`, or http(s).
 fn fetch_bytes_for_page(url: &str) -> Result<(u16, Vec<u8>), String> {
+    let (status, _, bytes) = fetch_bytes_with_mime(url)?;
+    Ok((status, bytes))
+}
+
+fn fetch_bytes_with_mime(url: &str) -> Result<(u16, String, Vec<u8>), String> {
+    if url.starts_with("blob:") {
+        return match lookup_blob(url) {
+            Some((mime, bytes)) => Ok((200, mime, bytes)),
+            None => Err(format!("TypeError: Failed to fetch: blob URL not found: {url}")),
+        };
+    }
+    if url.starts_with("data:") {
+        return match decode_data_url(url) {
+            Some((mime, bytes)) => Ok((200, mime, bytes)),
+            None => Err(format!("TypeError: Failed to fetch: invalid data URL: {url}")),
+        };
+    }
     if let Ok(parsed) = url::Url::parse(url)
         && parsed.scheme() == "file" {
             let path = parsed.to_file_path().map_err(|_| format!("Error: GET {url}: not a file path"))?;
             if !page_may_read(&path) {
-                return Ok((403, Vec::new()));
+                return Ok((403, String::new(), Vec::new()));
             }
             return match std::fs::read(&path) {
-                Ok(bytes) => Ok((200, bytes)),
-                Err(_) => Ok((404, Vec::new())),
+                Ok(bytes) => Ok((200, guess_mime_from_url(url).to_string(), bytes)),
+                Err(_) => Ok((404, String::new(), Vec::new())),
             };
         }
     let resp = client_for_page(url, false).get(url).send().map_err(|e| format!("Error: GET {url}: {e}"))?;
     let status = resp.status().as_u16();
+    let mime = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
     let bytes = resp.bytes().map_err(|e| format!("Error: reading {url}: {e}"))?;
-    Ok((status, bytes.to_vec()))
+    Ok((status, mime, bytes.to_vec()))
 }
 
 /// The origin of the page asking, when it is on the web: what the same-origin
@@ -1673,16 +1801,57 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
             PENDING_BYTES.with(|p| *p.borrow_mut() = bytes);
             Ok(len.to_string())
         }
+        // Store a Blob's raw bytes from `__zippHostBytes` (or inline text) into
+        // `BLOB_STORE` and return its `blob:` URL.
+        "blob_create" => {
+            let mode = args.first().map(String::as_str).unwrap_or("bytes");
+            let mime = args.get(1).map(String::as_str).unwrap_or("");
+            let origin = args.get(2).map(String::as_str).unwrap_or("null");
+            let bytes = if mode == "text" {
+                args.get(3).cloned().unwrap_or_default().into_bytes()
+            } else {
+                let len: usize = mode.parse().unwrap_or(0);
+                if len == 0 {
+                    Vec::new()
+                } else {
+                    let (addr, count, kind) = ctx.typed_array_region("__zippHostBytes")?;
+                    if kind != 1 || len > count {
+                        return Err("RangeError: blob_create buffer mismatch".into());
+                    }
+                    // SAFETY: engine pinned `__zippHostBytes` (`count` u8s at `addr`).
+                    unsafe { std::slice::from_raw_parts(addr as *const u8, len).to_vec() }
+                }
+            };
+            Ok(store_blob(origin, mime, bytes))
+        }
+        "blob_revoke" => {
+            revoke_blob(args.first().map(String::as_str).unwrap_or_default());
+            Ok(String::new())
+        }
+        "blob_read" => {
+            let url = args.first().map(String::as_str).unwrap_or_default();
+            let Some((mime, bytes)) = lookup_blob(url) else {
+                return Err(format!("TypeError: blob URL not found: {url}"));
+            };
+            let len = bytes.len();
+            PENDING_BYTES.with(|p| *p.borrow_mut() = bytes);
+            Ok(format!("{{\"len\":{len},\"type\":{}}}", json_quote(&mime)))
+        }
+        // `new DOMParser().parseFromString(html, "text/html")`: real html5ever parse.
+        "parse_html" => {
+            let html = args.first().map(String::as_str).unwrap_or_default();
+            Ok(seed::parse_html_json(html).unwrap_or_else(|| "[[],[],[],[]]".to_string()))
+        }
         // `fetch(url).arrayBuffer()`: fetch the body as bytes and keep it for
-        // `take_bytes`; report its status and length, so the shim can make the
-        // scratch array big enough first.
+        // `take_bytes`; report its status, contentType and length, so the shim
+        // can make the scratch array big enough first.
         "http_bytes" => {
             let url = resolve_page_url(args.first().map(String::as_str).unwrap_or_default());
             let credentials = args.get(1).is_some_and(|c| c == "include");
             let origin = web_origin(&page_url()).map(|o| o.ascii_serialization());
             let foreign = origin.filter(|_| url.starts_with("http") && !same_origin(&url));
-            let (status, bytes) = match &foreign {
-                None => fetch_bytes_for_page(&url)?,
+            let (status, mime, bytes) = match &foreign {
+                None => fetch_bytes_with_mime(&url)?,
                 Some(origin) => {
                     let resp = client_for_page(&url, credentials)
                         .get(&url)
@@ -1693,14 +1862,21 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
                         return Err(format!("TypeError: Failed to fetch: {url} does not allow {origin} to read it"));
                     }
                     let status = resp.status().as_u16();
-                    (status, resp.bytes().map_err(|e| format!("Error: reading {url}: {e}"))?.to_vec())
+                    let mime = resp
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    (status, mime, resp.bytes().map_err(|e| format!("Error: reading {url}: {e}"))?.to_vec())
                 }
             };
             let len = bytes.len();
             PENDING_BYTES.with(|p| *p.borrow_mut() = bytes);
             Ok(format!(
-                "{{\"status\":{status},\"ok\":{},\"len\":{len}}}",
-                (200..300).contains(&status)
+                "{{\"status\":{status},\"ok\":{},\"len\":{len},\"contentType\":{}}}",
+                (200..300).contains(&status),
+                json_quote(&mime)
             ))
         }
         // Copy the pending bytes into `__zippHostBytes`.
@@ -1838,11 +2014,12 @@ fn browser_host_call(kind: &str, args: &[String]) -> Result<String, String> {
             // disk reads its neighbours.
             let resolved = resolve_page_url(url);
             let url = resolved.as_str();
-            if method == "GET" && url.starts_with("file:") {
-                let (status, bytes) = fetch_bytes_for_page(url)?;
+            if method == "GET" && (url.starts_with("file:") || url.starts_with("blob:") || url.starts_with("data:")) {
+                let (status, mime, bytes) = fetch_bytes_with_mime(url)?;
                 return Ok(format!(
-                    "{{\"status\":{status},\"ok\":{},\"body\":{}}}",
-                    status == 200,
+                    "{{\"status\":{status},\"ok\":{},\"contentType\":{},\"body\":{}}}",
+                    (200..300).contains(&status),
+                    json_quote(&mime),
                     json_quote(&String::from_utf8_lossy(&bytes))
                 ));
             }
@@ -1882,9 +2059,16 @@ fn browser_host_call(kind: &str, args: &[String]) -> Result<String, String> {
             }
             let status = resp.status().as_u16();
             let ok = resp.status().is_success();
+            let mime = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
             let body = resp.text().map_err(|e| format!("Error: reading {url}: {e}"))?;
             Ok(format!(
-                "{{\"status\":{status},\"ok\":{ok},\"body\":{}}}",
+                "{{\"status\":{status},\"ok\":{ok},\"contentType\":{},\"body\":{}}}",
+                json_quote(&mime),
                 json_quote(&body)
             ))
         }
@@ -2241,6 +2425,9 @@ fn render_rgba(url: &str, rt: &tokio::runtime::Runtime, net_provider: &Arc<zipp_
 fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
     use zipp_dom::traits_src::shell::{ColorScheme, Viewport};
 
+    worker::allow_on_this_thread();
+    worker::new_page();
+    let shot_page = worker::current_page();
     eprintln!("[SHOT] {url} -> {out_path} ({width}x{height})");
     let (mut final_html, event_map, mut js_state) = prepare_page(url, (width, height));
 
@@ -2415,6 +2602,45 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
     // time anyone looks at it, so settling is the honest comparison point.
     doc.as_mut().resolve(0.0);
     doc.as_mut().resolve(ANIMATION_SETTLE_SECS);
+    // Pump the live document loop so async mount effects, dynamic imports,
+    // Web Workers (e.g. SoftN container/archive workers), and initial WebGL
+    // frames all settle before clicks or capture.
+    {
+        use zipp_dom::Document;
+        let wait_secs: u64 = std::env::var("ZIPP_SHOT_WAIT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        let t_w = std::time::Instant::now();
+        let max_wait = std::time::Duration::from_secs(wait_secs);
+        let mut quiet = 0u32;
+        while t_w.elapsed() < max_wait {
+            let next_timer = doc.run_tasks();
+            let anim = doc.animation_frame();
+            let net_busy = doc.poll(None) || !net_provider.is_empty();
+            doc.as_mut().resolve(ANIMATION_SETTLE_SECS * 1.5);
+            if worker::has_active() || net_busy {
+                quiet = 0;
+            } else if next_timer.is_some() || anim {
+                quiet += 1;
+                if quiet >= 8 {
+                    break;
+                }
+            } else {
+                quiet += 1;
+                if quiet >= 3 {
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        for _ in 0..3 {
+            let _ = doc.run_tasks();
+            let _ = doc.animation_frame();
+            let _ = doc.poll(None);
+            doc.as_mut().resolve(ANIMATION_SETTLE_SECS * 2.0);
+        }
+    }
     let layout_ms = t_layout.elapsed().as_millis();
 
     // `ZIPP_RESIZE=w,h[;w,h...]` lays the page out at the requested size first,
@@ -2500,6 +2726,21 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
                     // the next hit-test runs against settled geometry.
                     doc.as_mut().resolve(ANIMATION_SETTLE_SECS * (2 + i * 2) as f64);
                     doc.as_mut().resolve(ANIMATION_SETTLE_SECS * (3 + i * 2) as f64);
+                }
+                // Pump post-click async work (e.g. dynamic ESM imports, GLB/HDR
+                // model loads, and WebGL animation frames) before painting.
+                let t_click = std::time::Instant::now();
+                let click_budget = std::time::Duration::from_secs(5);
+                let mut frames_drawn = 0u32;
+                while t_click.elapsed() < click_budget && frames_drawn < 12 {
+                    let _ = doc.run_tasks();
+                    let animating = doc.animation_frame();
+                    let _ = doc.poll(None);
+                    doc.as_mut().resolve(ANIMATION_SETTLE_SECS * (2 + total * 2) as f64);
+                    if animating {
+                        frames_drawn += 1;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(80));
                 }
                 // Advance PAST the settle time: nodes inserted by the click
                 // start their entrance animations at "now", so resolving at the
@@ -2595,6 +2836,8 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
     eprintln!(
         "[PERF] Render: parse={parse_ms}ms net-wait={net_ms}ms layout={layout_ms}ms paint={paint_ms}ms"
     );
+
+    worker::terminate_page(shot_page);
 
     match painter.pixmap.save_png(out_path) {
         Ok(()) => {
@@ -2892,6 +3135,17 @@ var __zippEsmDebug=true;
     let init_ms = t_init.elapsed().as_millis();
     let t_settle = std::time::Instant::now();
     event_bridge::run_page_tasks(&mut state, 600, 2, std::time::Duration::from_secs(3));
+    // Give any worker started during init a brief moment for an immediate reply
+    // without blocking interactive window startup.
+    if worker::has_active() {
+        let brief = std::time::Duration::from_millis(300);
+        let t_w = std::time::Instant::now();
+        while t_w.elapsed() < brief {
+            if event_bridge::run_page_tasks(&mut state, 100, 1, std::time::Duration::from_millis(100)) == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
     // Settled: from here on the page's timers keep real time.
     let _ = state.call_global("__zippEndSettle", &[]);
     // A page drawing with WebGL shows its first frame from the start: present

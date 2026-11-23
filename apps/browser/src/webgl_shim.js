@@ -956,18 +956,38 @@ var __zippWebGL = (function () {
   Element.prototype.decode = function () { return Promise.resolve(); };
   // An ImageBitmap stands for its image's URL, as `src`; uploads from it
   // (`texImage2D`, `copyExternalImageToTexture`) fetch and decode on the host.
-  function ImageBitmap(src, size) { this.src = src; this.width = size[0]; this.height = size[1]; }
-  ImageBitmap.prototype.close = function () {};
+  function ImageBitmap(src, size, ownedBlob) {
+    this.src = src;
+    this.width = size[0];
+    this.height = size[1];
+    this._ownedBlob = !!ownedBlob;
+  }
+  ImageBitmap.prototype.close = function () {
+    if (this._ownedBlob && this.src) {
+      var u = this.src;
+      this._ownedBlob = false;
+      // Delay revocation so queued WebGL texImage2DUrl batches still decode it.
+      setTimeout(function () { try { URL.revokeObjectURL(u); } catch (e) {} }, 10000);
+    }
+  };
   createImageBitmap = function (source) {
     if (source instanceof ImageBitmap) return Promise.resolve(source);
     if (source && source.tagName === "IMG") {
-      return Promise.resolve(new ImageBitmap(__zippAbsoluteUrl(source.getAttribute("src") || ""), imageSize(source)));
+      return Promise.resolve(new ImageBitmap(__zippAbsoluteUrl(source.getAttribute("src") || ""), imageSize(source), false));
     }
-    // A Blob from `fetch(url).then(r => r.blob())` remembers its URL.
-    if (source && source._url) {
+    // A Blob from `fetch(url).then(r => r.blob())` remembers its URL; an
+    // in-memory Blob (e.g. an embedded PNG/JPEG/WebP inside a Three.js GLB)
+    // is registered in the host blob store so Rust's image decoder can read it.
+    if (source && (source._url || (typeof Blob === "function" && source instanceof Blob) || source._bytes)) {
+      var url = source._url;
+      var owned = false;
+      if (!url) {
+        url = URL.createObjectURL(source instanceof Blob ? source : new Blob([source._bytes || new Uint8Array(0)]));
+        owned = true;
+      }
       var info = null;
-      try { info = JSON.parse(__zippHostCall("image_info", source._url)); } catch (e) {}
-      return Promise.resolve(new ImageBitmap(source._url, info && info.width > 0 ? [info.width, info.height] : [0, 0]));
+      try { info = JSON.parse(__zippHostCall("image_info", url)); } catch (e) {}
+      return Promise.resolve(new ImageBitmap(url, info && info.width > 0 ? [info.width, info.height] : [0, 0], owned));
     }
     return Promise.reject(new TypeError("createImageBitmap: unsupported source"));
   };

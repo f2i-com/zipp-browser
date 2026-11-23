@@ -75,6 +75,10 @@ impl Document for HtmlDocument {
     }
 
     fn animation_frame(&mut self) -> bool {
+        if std::mem::take(&mut self.layout_stale) {
+            let now = self.inner.animation_time;
+            self.inner.resolve(now);
+        }
         let Some(handler) = self.event_handler.as_mut() else {
             return false;
         };
@@ -84,6 +88,10 @@ impl Document for HtmlDocument {
     }
 
     fn run_tasks(&mut self) -> Option<std::time::Instant> {
+        if std::mem::take(&mut self.layout_stale) {
+            let now = self.inner.animation_time;
+            self.inner.resolve(now);
+        }
         let handler = self.event_handler.as_mut()?;
         let next = handler.run_tasks(&mut self.inner);
         self.apply_pending_rerender();

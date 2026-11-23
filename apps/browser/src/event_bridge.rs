@@ -41,11 +41,38 @@ use zipp_dom::{BaseDocument, Document, EventHandler, LocalName};
 /// batches, so an `await` continuation ran after every timer that was due
 /// rather than before the next one -- out of order, and late enough that an
 /// IndexedDB transaction would commit under it.
+/// Deliver any messages that worker threads have posted back to this page.
+pub(crate) fn deliver_worker_messages(state: &mut ScriptState) -> usize {
+    let messages = crate::worker::take_messages();
+    let count = messages.len();
+    for (id, message) in messages {
+        let (kind, payload) = match message {
+            crate::worker::FromWorker::Message(data) => ("message", data),
+            crate::worker::FromWorker::Error(err) => ("error", err),
+        };
+        let args = [
+            JsValue::Number(f64::from(id)),
+            JsValue::String(kind.into()),
+            JsValue::String(payload),
+        ];
+        if let Err(e) = state.call_global("__zippWorkerDeliver", &args) {
+            eprintln!("[EVENT] worker message delivery failed: {e}");
+        }
+        state.run_microtasks();
+    }
+    count
+}
+
 pub(crate) fn run_page_tasks(state: &mut ScriptState, max_tasks: usize, mut frames: u32, budget: std::time::Duration) -> usize {
     let start = Instant::now();
     state.run_microtasks();
     let mut ran = 0;
     while ran < max_tasks && start.elapsed() < budget {
+        let delivered = deliver_worker_messages(state);
+        if delivered > 0 {
+            ran += delivered;
+            continue;
+        }
         match state.call_global("__zippRunTask", &[JsValue::Bool(frames > 0)]) {
             Ok(JsValue::Number(1.0)) => ran += 1,
             Ok(JsValue::Number(2.0)) => frames = frames.saturating_sub(1),
@@ -1147,18 +1174,9 @@ pub(crate) fn layout_rect(nid: &str) -> String {
         let Some(node) = doc.get_node(id).filter(|n| laid_out(n)) else {
             return String::new();
         };
-        // `absolute_position` takes off the node's own scroll too, which moves
-        // its content, not the box.
-        let at = node.absolute_position(0.0, 0.0);
+        let (x, y, w, h) = node.transformed_border_rect();
         let scroll = doc.viewport_scroll();
-        let size = node.final_layout.size;
-        format!(
-            "[{},{},{},{}]",
-            f64::from(at.x) + node.scroll_offset.x - scroll.x,
-            f64::from(at.y) + node.scroll_offset.y - scroll.y,
-            size.width,
-            size.height
-        )
+        format!("[{},{},{},{}]", x - scroll.x, y - scroll.y, w, h)
     })
 }
 

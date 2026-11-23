@@ -725,12 +725,17 @@ impl Gpu {
                 let dest = a(2).ok_or("no destination")?;
                 let texture = obj(dest.get("texture")).and_then(|t| self.textures.get(&t)).ok_or("no such texture")?;
                 let (_, raw) = crate::fetch_bytes_for_page(&url)?;
-                let mut rgba = image::load_from_memory(&raw).map_err(|e| e.to_string())?.to_rgba8();
+                let (w, h, mut data) = crate::viewers::decode_image_rgba(&raw, &url)?;
                 if a(3).and_then(Json::as_bool).unwrap_or(false) {
-                    image::imageops::flip_vertical_in_place(&mut rgba);
+                    let row = w as usize * 4;
+                    for y in 0..(h as usize / 2) {
+                        let top = y * row;
+                        let bot = (h as usize - 1 - y) * row;
+                        for x in 0..row {
+                            data.swap(top + x, bot + x);
+                        }
+                    }
                 }
-                let (w, h) = rgba.dimensions();
-                let mut data = rgba.into_raw();
                 if matches!(texture.format(), wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb) {
                     for px in data.chunks_exact_mut(4) {
                         px.swap(0, 2);

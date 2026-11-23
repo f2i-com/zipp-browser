@@ -141,6 +141,32 @@ pub(crate) fn collect_layout_children(
                     outer_html.replace("<svg", "<svg xmlns=\"http://www.w3.org/2000/svg\"");
             }
 
+            // Inject document SVG presentation CSS rules (e.g. `.softn-mark-ground { fill: var(--ink-3); }`)
+            // with `var(--...)` and `currentColor` resolved against this `<svg>`'s Stylo computed styles.
+            let svg_css = doc.combined_svg_css();
+            if !svg_css.is_empty() && (outer_html.contains("class=\"") || outer_html.contains("id=\"")) {
+                let resolved_css = if let Some(styles) = doc.get_node(container_node_id).and_then(|n| n.primary_styles()) {
+                    let mut css = crate::node::resolve_css_vars_in_attr(&svg_css, &styles, 0);
+                    if css.contains("currentColor") {
+                        use style_traits::values::ToCss;
+                        let color = styles.clone_color().to_css_string();
+                        css = css.replace("currentColor", &color);
+                    }
+                    css
+                } else {
+                    svg_css
+                };
+                if let Some(gt) = outer_html.find('>') {
+                    let mut injected = String::with_capacity(outer_html.len() + resolved_css.len() + 15);
+                    injected.push_str(&outer_html[..=gt]);
+                    injected.push_str("<style>");
+                    injected.push_str(&resolved_css);
+                    injected.push_str("</style>");
+                    injected.push_str(&outer_html[gt + 1..]);
+                    outer_html = injected;
+                }
+            }
+
             // Remove contruction damage from subtree
             doc.iter_subtree_mut(container_node_id, |id: usize, doc: &mut BaseDocument| {
                 doc.nodes[id].remove_damage(CONSTRUCT_BOX | CONSTRUCT_DESCENDENT | CONSTRUCT_FC);

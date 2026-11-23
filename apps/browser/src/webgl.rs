@@ -684,10 +684,8 @@ impl Context {
     /// An image's pixels from its URL, as RGBA8 with the unpack flags applied.
     fn decode_image(&self, url: &str) -> Result<(i32, i32, Vec<u8>), String> {
         let (_, raw) = crate::fetch_bytes_for_page(url).map_err(|e| e.to_string())?;
-        let img = image::load_from_memory(&raw).map_err(|e| format!("texture {url}: {e}"))?;
-        let rgba = img.to_rgba8();
-        let (w, h) = (rgba.width() as i32, rgba.height() as i32);
-        let mut rgba = rgba.into_raw();
+        let (w, h, mut rgba) = crate::viewers::decode_image_rgba(&raw, url)?;
+        let (w, h) = (w as i32, h as i32);
         if self.flip_y {
             flip_rows(&mut rgba, w as usize * 4, h as usize);
         }

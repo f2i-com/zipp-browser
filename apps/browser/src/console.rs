@@ -13,7 +13,7 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fmt::Write;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -85,6 +85,17 @@ pub(crate) fn push(level: Level, text: impl Into<String>) {
         "" => text.into(),
         label => format!("[{label}] {}", text.into()),
     };
+    static DEBUG_CONSOLE: OnceLock<bool> = OnceLock::new();
+    if *DEBUG_CONSOLE.get_or_init(|| std::env::var_os("ZIPP_DEBUG_CONSOLE").is_some()) {
+        let tag = match level {
+            Level::Error => "ERR",
+            Level::Warn => "WARN",
+            Level::Log => "LOG",
+            Level::Input => "IN",
+            Level::Result => "OUT",
+        };
+        eprintln!("[CONSOLE:{tag}] {text}");
+    }
     let mut log = LOG.lock().unwrap();
     match level {
         Level::Error => log.errors += 1,

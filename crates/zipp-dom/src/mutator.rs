@@ -793,7 +793,9 @@ impl<'doc> DocumentMutator<'doc> {
             .stylist
             .force_stylesheet_origins_dirty(OriginSet::all());
 
+        drop(guard);
         self.doc.nodes_to_stylesheet.remove(&node_id);
+        self.doc.set_svg_css_for_node(node_id, String::new());
     }
 
     fn load_image(&mut self, target_id: usize) {

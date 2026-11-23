@@ -72,7 +72,17 @@ pub fn resolve_2d_transform(
             .transform
             .to_transform_3d_matrix(Some(&reference_box))
             .ok()
-            .filter(|(_t, has_3d)| !has_3d)
+            .filter(|(t, has_3d)| {
+                !has_3d
+                    || (t.m13 == 0.0
+                        && t.m23 == 0.0
+                        && (t.m33 - 1.0).abs() < 1e-6
+                        && t.m43 == 0.0
+                        && t.m14 == 0.0
+                        && t.m24 == 0.0
+                        && t.m34 == 0.0
+                        && (t.m44 - 1.0).abs() < 1e-6)
+            })
             .map(|(t, _has_3d)| {
                 // See: https://drafts.csswg.org/css-transforms-2/#two-dimensional-subset
                 // And https://docs.rs/kurbo/latest/kurbo/struct.Affine.html#method.new

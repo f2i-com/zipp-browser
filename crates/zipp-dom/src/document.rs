@@ -338,6 +338,8 @@ pub struct BaseDocument {
     pub(crate) nodes_to_id: HashMap<String, usize>,
     /// Map of `<style>` and `<link>` node IDs to their associated stylesheet.
     pub(crate) nodes_to_stylesheet: BTreeMap<usize, DocumentStyleSheet>,
+    /// Extracted SVG presentation CSS rules (`fill`, `stroke`, etc.) per stylesheet node.
+    pub(crate) svg_css_by_node: BTreeMap<usize, String>,
     /// User-agent stylesheets, keyed by the raw CSS string.
     pub(crate) ua_stylesheets: HashMap<String, DocumentStyleSheet>,
     /// Map from form control node IDs to their associated form node IDs.
@@ -510,6 +512,7 @@ impl BaseDocument {
             url: base_url,
             ua_stylesheets: HashMap::new(),
             nodes_to_stylesheet: BTreeMap::new(),
+            svg_css_by_node: BTreeMap::new(),
             font_ctx,
             #[cfg(feature = "parallel-construct")]
             thread_font_contexts: ThreadLocal::new(),
@@ -1062,8 +1065,44 @@ impl BaseDocument {
     /// Re-parse and update the stylesheet for a `<style>` node.
     pub fn upsert_stylesheet_for_node(&mut self, node_id: usize) {
         let raw_styles = self.nodes[node_id].text_content();
+        let svg_css = crate::util::extract_svg_css_rules(&raw_styles);
+        self.set_svg_css_for_node(node_id, svg_css);
         let sheet = self.make_stylesheet(raw_styles, Origin::Author);
         self.add_stylesheet_for_node(sheet, node_id);
+    }
+
+    pub(crate) fn set_svg_css_for_node(&mut self, node_id: usize, svg_css: String) {
+        let changed = if svg_css.is_empty() {
+            self.svg_css_by_node.remove(&node_id).is_some()
+        } else {
+            self.svg_css_by_node.insert(node_id, svg_css.clone()).as_deref() != Some(svg_css.as_str())
+        };
+        if changed {
+            // Re-construct existing inline `<svg>` nodes so they pick up the updated CSS rules.
+            let svg_ids: Vec<usize> = self
+                .nodes
+                .iter()
+                .filter_map(|(id, node)| {
+                    node.element_data()
+                        .filter(|el| el.name.local.as_ref() == "svg")
+                        .map(|_| id)
+                })
+                .collect();
+            for id in svg_ids {
+                self.nodes[id].insert_damage(crate::layout::damage::CONSTRUCT_BOX);
+            }
+        }
+    }
+
+    pub(crate) fn combined_svg_css(&self) -> String {
+        if self.svg_css_by_node.is_empty() {
+            return String::new();
+        }
+        let mut combined = String::new();
+        for css in self.svg_css_by_node.values() {
+            combined.push_str(css);
+        }
+        combined
     }
 
     /// Register a stylesheet and associate it with a node, maintaining document order.
@@ -1168,8 +1207,9 @@ impl BaseDocument {
         };
 
         match resource {
-            Resource::Css(css) => {
+            Resource::Css(css, svg_css) => {
                 let node_id = res.node_id.unwrap();
+                self.set_svg_css_for_node(node_id, svg_css);
                 self.add_stylesheet_for_node(css, node_id);
             }
             Resource::Image(_kind, width, height, image_data) => {

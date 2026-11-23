@@ -1242,6 +1242,72 @@ impl Node {
             .unwrap_or(crate::util::Point { x, y })
     }
 
+    /// Computes the Document-relative axis-aligned bounding box of this node's
+    /// border box after applying CSS 2D transforms (`transform`, `translate`,
+    /// `scale`, `rotate`, `transform-origin`) along the layout ancestor chain.
+    ///
+    /// Matches the paint-time transform composition in `zipp-renderer` so
+    /// `Element.getBoundingClientRect()` sees transformed/panned/scaled containers.
+    pub fn transformed_border_rect(&self) -> (f64, f64, f64, f64) {
+        let mut chain = Vec::new();
+        let mut cur = Some(self.id);
+        while let Some(id) = cur {
+            chain.push(id);
+            cur = self.with(id).layout_parent.get();
+        }
+        chain.reverse();
+
+        let mut ancestor_transform = kurbo::Affine::IDENTITY;
+        let mut pos_x = 0.0_f64;
+        let mut pos_y = 0.0_f64;
+        let last_idx = chain.len().saturating_sub(1);
+
+        for (idx, id) in chain.into_iter().enumerate() {
+            let n = self.with(id);
+            let box_x = pos_x + f64::from(n.final_layout.location.x);
+            let box_y = pos_y + f64::from(n.final_layout.location.y);
+            let node_local = kurbo::Affine::translate((box_x, box_y));
+            let mut transform = ancestor_transform * node_local;
+
+            let style_transform = n.primary_styles().and_then(|styles| {
+                let reference_box = euclid::Rect::new(
+                    euclid::Point2D::new(
+                        style::values::computed::CSSPixelLength::new(0.0),
+                        style::values::computed::CSSPixelLength::new(0.0),
+                    ),
+                    euclid::Size2D::new(
+                        style::values::computed::CSSPixelLength::new(n.final_layout.size.width),
+                        style::values::computed::CSSPixelLength::new(n.final_layout.size.height),
+                    ),
+                );
+                crate::resolve_2d_transform(styles.get_box(), reference_box, 1.0)
+            });
+            if let Some(t) = style_transform {
+                transform *= t;
+                ancestor_transform = transform * node_local.inverse();
+            }
+
+            if idx == last_idx {
+                let w = f64::from(n.final_layout.size.width);
+                let h = f64::from(n.final_layout.size.height);
+                let corners = [
+                    transform * kurbo::Point::new(0.0, 0.0),
+                    transform * kurbo::Point::new(w, 0.0),
+                    transform * kurbo::Point::new(0.0, h),
+                    transform * kurbo::Point::new(w, h),
+                ];
+                let min_x = corners.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
+                let min_y = corners.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
+                let max_x = corners.iter().map(|p| p.x).fold(f64::NEG_INFINITY, f64::max);
+                let max_y = corners.iter().map(|p| p.y).fold(f64::NEG_INFINITY, f64::max);
+                return (min_x, min_y, (max_x - min_x).max(0.0), (max_y - min_y).max(0.0));
+            }
+            pos_x = box_x - n.scroll_offset.x;
+            pos_y = box_y - n.scroll_offset.y;
+        }
+        (0.0, 0.0, 0.0, 0.0)
+    }
+
     /// Creates a synthetic click event
     pub fn synthetic_click_event(&self, mods: Modifiers) -> DomEventData {
         DomEventData::Click(self.synthetic_click_event_data(mods))
@@ -1274,9 +1340,9 @@ impl Node {
 }
 
 /// Resolve CSS custom property references (`var(--name)` / `var(--name, fallback)`)
-/// inside serialized SVG/element attributes using Stylo's computed custom properties,
-/// so `usvg` receives concrete colors and lengths instead of unparsed `var(...)`.
-fn resolve_css_vars_in_attr(input: &str, styles: &ComputedValues, depth: usize) -> String {
+/// inside serialized SVG/element attributes or injected SVG `<style>` rules using
+/// Stylo's computed custom properties, so `usvg` receives concrete colors and lengths.
+pub(crate) fn resolve_css_vars_in_attr(input: &str, styles: &ComputedValues, depth: usize) -> String {
     if depth >= 8 || !input.contains("var(") {
         return input.to_string();
     }
@@ -1470,5 +1536,41 @@ mod test {
             document.get_node(el).unwrap().outer_html(),
             "<text>SoftN Mobile &amp; Desktop &lt;1&gt;</text>"
         );
+    }
+
+    #[test]
+    fn transformed_border_rect_applies_ancestor_2d_transform_and_flex_shrink_zero_keeps_width() {
+        use crate::html_parser::HtmlDocument;
+        use crate::traits_src::shell::Viewport;
+
+        let html = r#"<!doctype html><html><body style="margin:0">
+            <div style="display:flex;width:200px">
+                <div id="keep" style="flex-shrink:0;width:80px;height:20px;margin-left:-10px"></div>
+            </div>
+            <div style="position:relative;width:100px;height:100px;transform-origin:0 0;transform:translate(50px, 25px) scale(2)">
+                <div id="child" style="position:absolute;left:10px;top:5px;width:20px;height:15px"></div>
+            </div>
+        </body></html>"#;
+        let mut doc = HtmlDocument::from_html(
+            html,
+            DocumentConfig {
+                viewport: Some(Viewport::new(800, 600, 1.0, Default::default())),
+                ..Default::default()
+            },
+        );
+        doc.resolve(0.0);
+
+        let keep_id = doc.query_selector("#keep").unwrap().unwrap();
+        let (_, _, keep_w, _) = doc.get_node(keep_id).unwrap().transformed_border_rect();
+        assert!((keep_w - 80.0).abs() < 0.5, "flex-shrink:0 item collapsed to {keep_w}");
+
+        let child_id = doc.query_selector("#child").unwrap().unwrap();
+        let (x, y, w, h) = doc.get_node(child_id).unwrap().transformed_border_rect();
+        // Parent is at (0, 20), translated by (+50, +25) and scaled by 2 around (0, 0).
+        // Child at (10, 5) size (20, 15) maps to (50 + 20, 20 + 25 + 10) = (70, 55), size (40, 30).
+        assert!((x - 70.0).abs() < 0.5, "expected x≈70, got {x}");
+        assert!((y - 55.0).abs() < 0.5, "expected y≈55, got {y}");
+        assert!((w - 40.0).abs() < 0.5, "expected w≈40, got {w}");
+        assert!((h - 30.0).abs() < 0.5, "expected h≈30, got {h}");
     }
 }

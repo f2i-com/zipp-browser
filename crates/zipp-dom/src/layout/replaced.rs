@@ -51,10 +51,13 @@ pub fn replaced_measure_function(
         Size::ZERO
     };
 
-    // Use aspect_ratio from style, fall back to inherent aspect ratio
+    // Use aspect_ratio from style, fall back to inherent aspect ratio when both
+    // dimensions are positive (avoids 0.0 / 0.0 = NaN on pending images / canvases).
     let s_aspect_ratio = style.aspect_ratio;
-    let aspect_ratio = s_aspect_ratio.unwrap_or_else(|| inherent_size.width / inherent_size.height);
-    let inv_aspect_ratio = 1.0 / aspect_ratio;
+    let inherent_ratio = (inherent_size.width > 0.0 && inherent_size.height > 0.0)
+        .then(|| inherent_size.width / inherent_size.height);
+    let aspect_ratio = s_aspect_ratio.or(inherent_ratio);
+    let inv_aspect_ratio = aspect_ratio.map(|r| 1.0 / r);
 
     // See https://www.w3.org/TR/css-sizing-3/#replaced-percentage-min-contribution
     let basis_for_max_and_preferred = Size {
@@ -74,19 +77,21 @@ pub fn replaced_measure_function(
     let style_size = style
         .size
         .maybe_resolve(basis_for_max_and_preferred, resolve_calc_value)
-        .maybe_apply_aspect_ratio(Some(aspect_ratio))
+        .maybe_apply_aspect_ratio(aspect_ratio)
         .maybe_sub(box_sizing_adjustment);
     let min_size = style
         .min_size
         .maybe_resolve(parent_size, resolve_calc_value)
         .maybe_sub(box_sizing_adjustment);
-    // The space available caps the width only. Available HEIGHT is no limit on a
-    // replaced element -- an image overflows a short box -- and treating it as
-    // one shrank every absolutely positioned image or SVG whose containing block
-    // was 0px tall (all its content out of flow): the height clamp, carried
-    // across by the aspect ratio, made it 0x0.
+    // The space available caps auto-width replaced elements only (and never to
+    // 0px during a zero-width probe); an explicit `width` overflows unless
+    // `max-width` caps it. Available HEIGHT is never a limit on a replaced element.
     let available_width = taffy::Size {
-        width: available_space.width.into_option(),
+        width: if style.size.width.is_auto() {
+            available_space.width.into_option().filter(|&w| w > 0.0)
+        } else {
+            None
+        },
         height: None,
     };
     let max_size = style
@@ -101,28 +106,34 @@ pub fn replaced_measure_function(
     let unclamped_size = 'size: {
         if known_dimensions.width.is_some() | known_dimensions.height.is_some() {
             let content_box_known_dimensions = known_dimensions.maybe_sub(pb_sum);
-            break 'size content_box_known_dimensions
-                .maybe_apply_aspect_ratio(Some(aspect_ratio))
-                .map(|s| s.unwrap());
+            let resolved = content_box_known_dimensions.maybe_apply_aspect_ratio(aspect_ratio);
+            break 'size Size {
+                width: resolved.width.unwrap_or(inherent_size.width),
+                height: resolved.height.unwrap_or(inherent_size.height),
+            };
         }
 
         if style_size.width.is_some() | style_size.height.is_some() {
-            break 'size style_size
-                .maybe_apply_aspect_ratio(Some(aspect_ratio))
-                .map(|s| s.unwrap());
+            let resolved = style_size.maybe_apply_aspect_ratio(aspect_ratio);
+            break 'size Size {
+                width: resolved.width.unwrap_or(inherent_size.width),
+                height: resolved.height.unwrap_or(inherent_size.height),
+            };
         }
 
         if attr_size.width.is_some() | attr_size.height.is_some() {
-            break 'size attr_size
-                .maybe_apply_aspect_ratio(Some(aspect_ratio))
-                .map(|s| s.unwrap());
+            let resolved = attr_size.maybe_apply_aspect_ratio(aspect_ratio);
+            break 'size Size {
+                width: resolved.width.unwrap_or(inherent_size.width),
+                height: resolved.height.unwrap_or(inherent_size.height),
+            };
         }
 
         inherent_size
     };
 
     // Floor size at zero
-    let size = unclamped_size.map(|s| s.max(0.0));
+    let size = unclamped_size.map(|s| if s.is_finite() { s.max(0.0) } else { 0.0 });
 
     // Violations
     let width_violation = if size.width < min_size.width.unwrap_or(0.0) {
@@ -151,7 +162,10 @@ pub fn replaced_measure_function(
             let max_width = max_size.width.unwrap();
             Size {
                 width: max_width,
-                height: (max_width * inv_aspect_ratio).maybe_max(min_size.height),
+                height: match inv_aspect_ratio {
+                    Some(inv) => (max_width * inv).maybe_max(min_size.height),
+                    None => size.height,
+                },
             }
         }
         // w < min-width
@@ -159,14 +173,20 @@ pub fn replaced_measure_function(
             let min_width = min_size.width.unwrap();
             Size {
                 width: min_width,
-                height: (min_width * inv_aspect_ratio).maybe_min(max_size.height),
+                height: match inv_aspect_ratio {
+                    Some(inv) => (min_width * inv).maybe_min(max_size.height),
+                    None => size.height,
+                },
             }
         }
         // h > max-height
         (Violation::None, Violation::Max) => {
             let max_height = max_size.height.unwrap();
             Size {
-                width: (max_height * aspect_ratio).maybe_max(min_size.width),
+                width: match aspect_ratio {
+                    Some(ar) => (max_height * ar).maybe_max(min_size.width),
+                    None => size.width,
+                },
                 height: max_height,
             }
         }
@@ -174,7 +194,10 @@ pub fn replaced_measure_function(
         (Violation::None, Violation::Min) => {
             let min_height = min_size.height.unwrap();
             Size {
-                width: (min_height * aspect_ratio).maybe_min(max_size.width),
+                width: match aspect_ratio {
+                    Some(ar) => (min_height * ar).maybe_min(max_size.width),
+                    None => size.width,
+                },
                 height: min_height,
             }
         }
@@ -182,32 +205,42 @@ pub fn replaced_measure_function(
         (Violation::Max, Violation::Max) => {
             let max_width = max_size.width.unwrap();
             let max_height = max_size.height.unwrap();
-            if max_width / size.width <= max_height / size.height {
-                Size {
-                    width: max_width,
-                    height: (max_width * inv_aspect_ratio).maybe_max(min_size.height),
+            match (aspect_ratio, inv_aspect_ratio) {
+                (Some(ar), Some(inv)) => {
+                    if max_width / size.width <= max_height / size.height {
+                        Size {
+                            width: max_width,
+                            height: (max_width * inv).maybe_max(min_size.height),
+                        }
+                    } else {
+                        Size {
+                            width: (max_height * ar).maybe_max(min_size.width),
+                            height: max_height,
+                        }
+                    }
                 }
-            } else {
-                Size {
-                    width: (max_height * aspect_ratio).maybe_max(min_size.width),
-                    height: max_height,
-                }
+                _ => Size { width: max_width, height: max_height },
             }
         }
         // (w < min-width) and (h < min-height)
         (Violation::Min, Violation::Min) => {
             let min_width = min_size.width.unwrap();
             let min_height = min_size.height.unwrap();
-            if min_width / size.width <= min_height / size.height {
-                Size {
-                    width: (min_height * aspect_ratio).maybe_min(max_size.width),
-                    height: min_height,
+            match (aspect_ratio, inv_aspect_ratio) {
+                (Some(ar), Some(inv)) => {
+                    if min_width / size.width <= min_height / size.height {
+                        Size {
+                            width: (min_height * ar).maybe_min(max_size.width),
+                            height: min_height,
+                        }
+                    } else {
+                        Size {
+                            width: min_width,
+                            height: (min_width * inv).maybe_min(max_size.height),
+                        }
+                    }
                 }
-            } else {
-                Size {
-                    width: min_width,
-                    height: (min_width * inv_aspect_ratio).maybe_min(max_size.height),
-                }
+                _ => Size { width: min_width, height: min_height },
             }
         }
         // (w < min-width) and (h > max-height)

@@ -197,6 +197,95 @@ A("IndexedDB: a transaction ends when nothing more is asked of it", async functi
     try { s.put(3, "c"); return false; } catch (e) { return e.name === "TransactionInactiveError"; }
 });
 
+// CSSStyleDeclaration, Shadow DOM, DOMParser, Forms, Request & binary Blob
+T("CSSStyleDeclaration: cssText, !important, url(data:...) and setProperty", function() {
+    var d = document.createElement("div");
+    d.style.cssText = "all: initial !important; display: block !important; background-image: url(\"data:image/svg+xml;utf8,<svg/>\"); --accent: #38bdf8;";
+    var ok = d.style.all === "initial"
+        && d.style.getPropertyPriority("all") === "important"
+        && d.style.display === "block"
+        && d.style.getPropertyValue("background-image").indexOf("data:image/svg+xml;utf8") >= 0
+        && d.style.getPropertyValue("--accent") === "#38bdf8"
+        && d.hasAttribute("style")
+        && d.getAttribute("style").indexOf("all:initial !important;") >= 0;
+    d.style.setProperty("width", "100%", "important");
+    var ok2 = d.style.width === "100%" && d.style.getPropertyPriority("width") === "important";
+    var removed = d.style.removeProperty("display");
+    var clone = d.cloneNode(false);
+    return ok && ok2 && removed === "block" && d.style.display === "" && clone.style.width === "100%" && clone.style.getPropertyPriority("width") === "important";
+});
+T("ShadowRoot, CSSStyleSheet and scoped CSS serialization", function() {
+    var host = document.createElement("div");
+    var sr = host.attachShadow({ mode: "open" });
+    var sheet = new CSSStyleSheet();
+    sheet.replaceSync(":host { display: block; } :host(.dark) .card { color: #fff; } body { margin: 0; } @media (max-width: 600px) { .card { padding: 8px; } }");
+    sr.adoptedStyleSheets = [sheet];
+    var card = document.createElement("div");
+    card.className = "card";
+    card.textContent = "Inside";
+    sr.appendChild(card);
+    var html = __serializeNode(host);
+    var scope = '[data-zsr="' + sr._id + '"]';
+    return host.shadowRoot === sr
+        && html.indexOf('data-zsr="' + sr._id + '"') >= 0
+        && html.indexOf(scope + "{ display: block; }") >= 0
+        && html.indexOf(scope + ".dark .card{ color: #fff; }") >= 0
+        && html.indexOf("@media (max-width: 600px){") >= 0
+        && html.indexOf(scope + " .card{ padding: 8px; }") >= 0
+        && html.indexOf("Inside") >= 0;
+});
+T("DOMParser and XMLSerializer round-trip HTML documents", function() {
+    var parsed = new DOMParser().parseFromString("<!doctype html><html lang='en'><head><title>App</title></head><body><div id='root'><p class='msg'>Hello</p></div><noscript>Off</noscript></body></html>", "text/html");
+    var xml = new XMLSerializer().serializeToString(parsed.querySelector(".msg"));
+    return parsed.title === "App"
+        && parsed.documentElement.getAttribute("lang") === "en"
+        && parsed.querySelector("#root .msg").textContent === "Hello"
+        && parsed.querySelector("noscript") !== null
+        && xml.indexOf("<p") === 0 && xml.indexOf("Hello") >= 0;
+});
+T("Forms: control.form, checkValidity, FormData and composedPath across ShadowRoot", function() {
+    var host = document.createElement("section");
+    document.body.appendChild(host);
+    var sr = host.attachShadow({ mode: "open" });
+    var form = document.createElement("form");
+    var inp = document.createElement("input");
+    inp.name = "farm"; inp.required = true; inp.value = "";
+    var btn = document.createElement("button");
+    btn.type = "submit"; btn.name = "act"; btn.value = "go";
+    form.appendChild(inp); form.appendChild(btn); sr.appendChild(form);
+    var invalidEmpty = !form.checkValidity() && btn.form === form && inp.form === form;
+    inp.value = "Green Acres";
+    var validFilled = form.checkValidity();
+    var fd = new FormData(form, btn);
+    var path = [];
+    sr.addEventListener("click", function(e) { path = e.composedPath(); });
+    var order = [];
+    btn.addEventListener("click", function() { order.push("bubble"); });
+    btn.addEventListener("click", function() { order.push("capture"); }, { capture: true, once: true });
+    btn.click();
+    btn.click();
+    document.body.removeChild(host);
+    return invalidEmpty && validFilled && fd.get("farm") === "Green Acres" && fd.get("act") === "go"
+        && path.indexOf(btn) >= 0 && path.indexOf(sr) >= 0 && path.indexOf(host) >= 0
+        && order.join(",") === "capture,bubble,bubble";
+});
+A("Request and binary Blob preserve raw bytes and blob: URLs", async function() {
+    var src = new Uint8Array([0x67, 0x6c, 0x54, 0x46, 0x00, 0xff, 0x80, 0x01]);
+    var blob = new Blob([src], { type: "model/gltf-binary" });
+    var slice = blob.slice(0, 4, "application/octet-stream");
+    var ab = await blob.arrayBuffer();
+    var sab = await slice.arrayBuffer();
+    var url = URL.createObjectURL(blob);
+    var req = new Request(url, { method: "GET", headers: { "X-Test": "1" } });
+    var resp = await fetch(req);
+    var fetched = new Uint8Array(await resp.arrayBuffer());
+    URL.revokeObjectURL(url);
+    var view = new Uint8Array(ab);
+    return blob.size === 8 && view[4] === 0 && view[5] === 255 && new Uint8Array(sab).length === 4
+        && req.url === url && req.headers.get("x-test") === "1"
+        && resp.ok && fetched.length === 8 && fetched[5] === 255 && fetched[6] === 128;
+});
+
 env.log("info", "");
 env.log("info", "=== JS TEST RESULTS: " + _p + "/" + (_p + _f) + " passed ===");
 if (_f > 0) { env.log("warn", _f + " failures:"); for (var i = 0; i < _e.length; i++) env.log("warn", "  " + _e[i]); }

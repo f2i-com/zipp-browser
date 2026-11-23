@@ -50,8 +50,47 @@ var URL = function (url, base) {
 };
 URL.prototype.toString = function () { return this.href; };
 URL.prototype.toJSON = function () { return this.href; };
-URL.createObjectURL = function () { return "blob:zipp-worker"; };
-URL.revokeObjectURL = function () {};
+URL.createObjectURL = function (blob) {
+  var bytes = blob && blob._bytes ? blob._bytes : new Uint8Array(0);
+  if (bytes.length > 0) {
+    if (__zippHostBytes.length < bytes.length) __zippHostBytes = new Uint8Array(Math.max(bytes.length, __zippHostBytes.length * 2));
+    __zippHostBytes.set(bytes, 0);
+  }
+  return __zippHostCall("blob_create", String(bytes.length), String((blob && blob.type) || ""), String((location && location.origin) || "null"));
+};
+URL.revokeObjectURL = function (url) {
+  if (typeof url === "string" && url.indexOf("blob:") === 0) {
+    try { __zippHostCall("blob_revoke", url); } catch (e) {}
+  }
+};
+
+function __blobPartToBytes(p) {
+  if (p == null) return new Uint8Array(0);
+  if (p instanceof Blob) return p._bytes || new Uint8Array(0);
+  if (p instanceof ArrayBuffer) return new Uint8Array(p);
+  if (ArrayBuffer.isView(p)) return new Uint8Array(p.buffer, p.byteOffset, p.byteLength);
+  var enc = new TextEncoder().encode(String(p));
+  return enc instanceof Uint8Array ? enc : new Uint8Array(enc);
+}
+var Blob = function (parts, options) {
+  this._parts = parts || [];
+  this.type = (options && options.type) ? String(options.type).toLowerCase() : "";
+  var chunks = [], total = 0;
+  for (var i = 0; i < this._parts.length; i++) { var b = __blobPartToBytes(this._parts[i]); chunks.push(b); total += b.byteLength; }
+  var out = new Uint8Array(total), off = 0;
+  for (var j = 0; j < chunks.length; j++) { out.set(chunks[j], off); off += chunks[j].byteLength; }
+  this._bytes = out;
+  this.size = total;
+};
+Blob.prototype.arrayBuffer = function () { return Promise.resolve(this._bytes.slice(0).buffer); };
+Blob.prototype.bytes = function () { return Promise.resolve(this._bytes.slice(0)); };
+Blob.prototype.text = function () { return Promise.resolve(new TextDecoder().decode(this._bytes)); };
+Blob.prototype.slice = function (start, end, type) {
+  var len = this._bytes.byteLength;
+  var s = start === undefined ? 0 : (start < 0 ? Math.max(len + start, 0) : Math.min(start, len));
+  var e = end === undefined ? len : (end < 0 ? Math.max(len + end, 0) : Math.min(end, len));
+  return new Blob([e > s ? this._bytes.slice(s, e) : new Uint8Array(0)], { type: type === undefined ? "" : String(type) });
+};
 
 var location = new URL('__WORKER_URL__');
 location.toString = function () { return this.href; };
@@ -165,7 +204,7 @@ Headers.prototype.get = function (k) { k = String(k).toLowerCase(); return k in 
 Headers.prototype.has = function (k) { return String(k).toLowerCase() in this._h; };
 Headers.prototype.set = function (k, v) { this._h[String(k).toLowerCase()] = String(v); };
 Headers.prototype.forEach = function (fn, that) { for (var k in this._h) fn.call(that, this._h[k], k, this); };
-function Response(bytes, status, url) {
+function Response(bytes, status, url, contentType) {
   this.status = status;
   this.ok = status >= 200 && status < 300;
   this.statusText = this.ok ? "OK" : "Error";
@@ -174,29 +213,41 @@ function Response(bytes, status, url) {
   this.type = "basic";
   this.bodyUsed = false;
   this._bytes = bytes;
-  var type = /\.wasm(\?|#|$)/.test(url) ? "application/wasm" : /\.m?js(\?|#|$)/.test(url) ? "text/javascript" : /\.json(\?|#|$)/.test(url) ? "application/json" : "";
+  var type = contentType || (/\.wasm(\?|#|$)/.test(url) ? "application/wasm" : /\.m?js(\?|#|$)/.test(url) ? "text/javascript" : /\.json(\?|#|$)/.test(url) ? "application/json" : "");
   this.headers = new Headers(type ? { "content-type": type } : {});
 }
 Response.prototype.arrayBuffer = function () { return Promise.resolve(this._bytes.slice(0).buffer); };
+Response.prototype.bytes = function () { return Promise.resolve(this._bytes.slice(0)); };
 Response.prototype.text = function () { return Promise.resolve(new TextDecoder().decode(this._bytes)); };
 Response.prototype.json = function () { return this.text().then(JSON.parse); };
-Response.prototype.blob = function () { return Promise.resolve({ size: this._bytes.length, type: "", _bytes: this._bytes, arrayBuffer: Response.prototype.arrayBuffer.bind(this) }); };
-Response.prototype.clone = function () { return new Response(this._bytes, this.status, this.url); };
+Response.prototype.blob = function () { return Promise.resolve(new Blob([this._bytes], { type: this.headers.get("content-type") || "" })); };
+Response.prototype.clone = function () { return new Response(this._bytes, this.status, this.url, this.headers.get("content-type") || ""); };
+var Request = function (input, init) {
+  init = init || {};
+  var raw = input && input.url ? input.url : (input && input.href ? input.href : String(input));
+  this.url = __zippAbsoluteUrl(raw);
+  this.method = String(init.method || (input && input.method) || "GET").toUpperCase();
+  this.headers = new Headers(init.headers || (input && input.headers && input.headers._h) || {});
+  this.body = init.body !== undefined ? init.body : (input && input.body !== undefined ? input.body : null);
+  this.credentials = init.credentials || (input && input.credentials) || "same-origin";
+};
+Request.prototype.clone = function () { return new Request(this); };
 var fetch = function (input, init) {
-  var url = new URL(input && input.url ? input.url : String(input && input.href ? input.href : input), location.href).href;
-  var method = String((init && init.method) || "GET").toUpperCase();
+  var rawUrl = input && input.url ? input.url : String(input && input.href ? input.href : input);
+  var url = (rawUrl.indexOf("blob:") === 0 || rawUrl.indexOf("data:") === 0) ? rawUrl : new URL(rawUrl, location.href).href;
+  var method = String((init && init.method) || (input && input.method) || "GET").toUpperCase();
   return new Promise(function (resolve, reject) {
     try {
       if (method !== "GET") {
         var body = init && init.body != null ? String(init.body) : "";
         var r = JSON.parse(__zippHostCall("http", method, url, body, (init && init.headers && (init.headers["Content-Type"] || init.headers["content-type"])) || ""));
-        resolve(new Response(new TextEncoder().encode(r.body), r.status, url));
+        resolve(new Response(new TextEncoder().encode(r.body), r.status, url, r.contentType || ""));
         return;
       }
       var info = JSON.parse(__zippHostCall("http_bytes", url));
       if (__zippHostBytes.length < info.len) __zippHostBytes = new Uint8Array(Math.max(info.len, __zippHostBytes.length * 2));
       __zippHostCall("take_bytes");
-      resolve(new Response(__zippHostBytes.slice(0, info.len), info.status, url));
+      resolve(new Response(__zippHostBytes.slice(0, info.len), info.status, url, info.contentType || ""));
     } catch (e) {
       reject(new TypeError("Failed to fetch " + url + ": " + ((e && e.message) || e)));
     }
@@ -253,7 +304,7 @@ function __zippWorkerReportError(e) {
  ["performance", performance], ["crypto", crypto], ["btoa", btoa], ["atob", atob],
  ["structuredClone", structuredClone], ["queueMicrotask", queueMicrotask], ["AbortController", AbortController],
  ["setTimeout", setTimeout], ["setInterval", setInterval], ["clearTimeout", clearTimeout],
- ["clearInterval", clearInterval], ["Headers", Headers], ["Response", Response], ["fetch", fetch],
+ ["clearInterval", clearInterval], ["Headers", Headers], ["Response", Response], ["Request", Request], ["Blob", Blob], ["fetch", fetch],
  ["importScripts", importScripts], ["addEventListener", addEventListener],
  ["removeEventListener", removeEventListener], ["postMessage", postMessage], ["close", close],
  ["console", console], ["self", self]].forEach(function (pair) {

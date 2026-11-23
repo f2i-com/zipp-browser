@@ -363,11 +363,16 @@ impl<'dom> DocumentPainter<'dom> {
             height: (size.height as f64 - scaled_pb.top - scaled_pb.bottom) * self.scale,
         };
 
-        // Don't render things that are out of view
-        let scaled_y = (box_position.y - self.initial_y) * self.scale;
-        let scaled_content_height = content_size.height.max(size.height) as f64 * self.scale;
-        if scaled_y > self.height as f64 || scaled_y + scaled_content_height < 0.0 {
-            return;
+        // Don't render things that are out of view (only valid when neither an
+        // ancestor nor this element applies a CSS transform, since a transform
+        // like `translate(-50%, -50%)` or `translateY(...)` can move an element
+        // whose layout position is off-screen right back into the viewport).
+        if ancestor_transform == Affine::IDENTITY && !zipp_dom::has_2d_transform(styles.get_box()) {
+            let scaled_y = (box_position.y - self.initial_y) * self.scale;
+            let scaled_content_height = content_size.height.max(size.height) as f64 * self.scale;
+            if scaled_y > self.height as f64 || scaled_y + scaled_content_height < 0.0 {
+                return;
+            }
         }
 
         // Optimise zero-area (/very small area) clips by not rendering at all

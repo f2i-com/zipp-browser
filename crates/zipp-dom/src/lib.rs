@@ -84,7 +84,7 @@ mod url;
 // Public module re-exports
 // -----------------------------------------------
 
-pub use stylo_to_kurbo::resolve_2d_transform;
+pub use stylo_to_kurbo::{has_2d_transform, resolve_2d_transform};
 
 pub mod net;
 pub mod util;

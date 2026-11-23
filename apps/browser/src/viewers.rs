@@ -329,16 +329,56 @@ fn filename_from_url(url: &str) -> String {
     if decoded.is_empty() { "download".to_string() } else { decoded }
 }
 
+/// Decode raster or SVG image bytes into straight-alpha RGBA8 `(width, height, rgba)`.
+pub(crate) fn decode_image_rgba(raw: &[u8], url: &str) -> Result<(u32, u32, Vec<u8>), String> {
+    if let Ok(img) = image::load_from_memory(raw) {
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        return Ok((w, h, rgba.into_raw()));
+    }
+    #[cfg(feature = "svg")]
+    if let Some(pixmap) = zipp_renderer::rasterize_svg(raw) {
+        let (w, h) = (pixmap.width(), pixmap.height());
+        let src = pixmap.data();
+        let mut out = vec![0u8; src.len()];
+        for (o, s) in out.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+            match s[3] {
+                0 => {}
+                255 => o.copy_from_slice(s),
+                a => {
+                    let a32 = u32::from(a);
+                    o[0] = ((u32::from(s[0]) * 255 + a32 / 2) / a32).min(255) as u8;
+                    o[1] = ((u32::from(s[1]) * 255 + a32 / 2) / a32).min(255) as u8;
+                    o[2] = ((u32::from(s[2]) * 255 + a32 / 2) / a32).min(255) as u8;
+                    o[3] = a;
+                }
+            }
+        }
+        return Ok((w, h, out));
+    }
+    Err(format!("image {url}: unsupported or corrupt image format"))
+}
+
 /// `__zippHostCall("image_info", url)`: an image's size, for `naturalWidth`.
 pub(crate) fn image_info(url: &str) -> Result<String, String> {
     let (status, raw) = crate::fetch_bytes_for_page(url)?;
     if !(200..300).contains(&status) {
         return Ok("{\"width\":0,\"height\":0}".into());
     }
-    let size = image::ImageReader::new(std::io::Cursor::new(raw))
+    let size = image::ImageReader::new(std::io::Cursor::new(&raw))
         .with_guessed_format()
         .ok()
         .and_then(|r| r.into_dimensions().ok())
+        .or_else(|| {
+            #[cfg(feature = "svg")]
+            {
+                zipp_renderer::svg_size(&raw)
+            }
+            #[cfg(not(feature = "svg"))]
+            {
+                None
+            }
+        })
         .unwrap_or((0, 0));
     Ok(format!("{{\"width\":{},\"height\":{}}}", size.0, size.1))
 }

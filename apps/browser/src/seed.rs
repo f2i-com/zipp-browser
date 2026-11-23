@@ -211,9 +211,19 @@ impl TreeSink for Sink {
 /// The page's body as the shim's seed (see the module docs), or `None` when
 /// the page has no body.
 pub(crate) fn body_json(html: &str) -> Option<String> {
+    parse_html_json_inner(html, false)
+}
+
+/// Full HTML5 document parse for `DOMParser.prototype.parseFromString(html, "text/html")`,
+/// preserving `#root` children and `<noscript>` elements.
+pub(crate) fn parse_html_json(html: &str) -> Option<String> {
+    parse_html_json_inner(html, true)
+}
+
+fn parse_html_json_inner(html: &str, keep_all: bool) -> Option<String> {
     let sink = Sink { nodes: RefCell::new(vec![Node { kind: Kind::Document, parent: None, children: Vec::new() }]) };
     let opts = ParseOpts {
-        tree_builder: TreeBuilderOpts { scripting_enabled: true, drop_doctype: true, ..Default::default() },
+        tree_builder: TreeBuilderOpts { scripting_enabled: !keep_all, drop_doctype: true, ..Default::default() },
         ..Default::default()
     };
     let nodes = html5ever::parse_document(sink, opts).one(html).nodes.into_inner();
@@ -226,10 +236,10 @@ pub(crate) fn body_json(html: &str) -> Option<String> {
         write_attrs(&mut out, attrs);
     }
     out.push(',');
-    write_children(&mut out, &nodes, body);
+    write_children(&mut out, &nodes, body, keep_all);
     out.push(',');
     match nodes[html_el].children.iter().find(|&&c| is(c, &local_name!("head"))) {
-        Some(&head) => write_children(&mut out, &nodes, head),
+        Some(&head) => write_children(&mut out, &nodes, head, keep_all),
         None => out.push_str("[]"),
     }
     out.push(',');
@@ -240,7 +250,7 @@ pub(crate) fn body_json(html: &str) -> Option<String> {
     Some(out)
 }
 
-fn write_children(out: &mut String, nodes: &[Node], id: usize) {
+fn write_children(out: &mut String, nodes: &[Node], id: usize, keep_all: bool) {
     out.push('[');
     let mut first = true;
     for &child in &nodes[id].children {
@@ -248,7 +258,7 @@ fn write_children(out: &mut String, nodes: &[Node], id: usize) {
         if !first {
             out.push(',');
         }
-        if write_node(out, nodes, child) {
+        if write_node(out, nodes, child, keep_all) {
             first = false;
         } else {
             out.truncate(start);
@@ -258,14 +268,14 @@ fn write_children(out: &mut String, nodes: &[Node], id: usize) {
 }
 
 /// One node, or false (and nothing usable written) when it is left out.
-fn write_node(out: &mut String, nodes: &[Node], id: usize) -> bool {
+fn write_node(out: &mut String, nodes: &[Node], id: usize, keep_all: bool) -> bool {
     match &nodes[id].kind {
         Kind::Text(text) => {
             write_str(out, text);
             true
         }
         Kind::Element { name, attrs, template } => {
-            if name.ns == ns!(html) && name.local == local_name!("noscript") {
+            if !keep_all && name.ns == ns!(html) && name.local == local_name!("noscript") {
                 return false;
             }
             out.push('[');
@@ -273,11 +283,11 @@ fn write_node(out: &mut String, nodes: &[Node], id: usize) -> bool {
             out.push(',');
             write_attrs(out, attrs);
             out.push(',');
-            let is_root = attrs.iter().any(|a| a.name.local == local_name!("id") && &*a.value == "root");
+            let is_root = !keep_all && attrs.iter().any(|a| a.name.local == local_name!("id") && &*a.value == "root");
             if is_root {
                 out.push_str("[]");
             } else {
-                write_children(out, nodes, template.unwrap_or(id));
+                write_children(out, nodes, template.unwrap_or(id), keep_all);
             }
             if name.ns == ns!(svg) {
                 out.push_str(",\"s\"");
@@ -351,5 +361,16 @@ mod tests {
     #[test]
     fn a_page_without_markup_still_has_a_body() {
         assert_eq!(body_json("").as_deref(), Some("[[],[],[],[]]"));
+    }
+
+    #[test]
+    fn parse_html_json_preserves_root_children_and_noscript() {
+        let json = super::parse_html_json(
+            "<!doctype html><html><head><title>T</title></head><body><div id=root><p>ok</p></div><noscript>fb</noscript></body></html>",
+        )
+        .unwrap();
+        assert!(json.contains("[\"div\",[\"id\",\"root\"],[[\"p\",[],[\"ok\"]]]]"), "{json}");
+        assert!(json.contains("[\"noscript\",[],[\"fb\"]]"), "{json}");
+        assert!(json.contains("[\"title\",[],[\"T\"]]"), "{json}");
     }
 }

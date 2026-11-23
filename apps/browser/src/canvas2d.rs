@@ -381,18 +381,29 @@ fn image(url: &str) -> Result<Arc<Pixmap>, String> {
         return Ok(found);
     }
     let (_, raw) = crate::fetch_bytes_for_page(url)?;
-    let rgba = image::load_from_memory(&raw).map_err(|e| format!("image {url}: {e}"))?.to_rgba8();
-    let (w, h) = (rgba.width(), rgba.height());
-    let mut data = rgba.into_raw();
-    for px in data.chunks_exact_mut(4) {
-        let a = px[3] as u32;
-        for c in &mut px[..3] {
-            *c = ((*c as u32 * a + 127) / 255) as u8;
+    let pixmap = if let Ok(img) = image::load_from_memory(&raw) {
+        let rgba = img.to_rgba8();
+        let (w, h) = (rgba.width(), rgba.height());
+        let mut data = rgba.into_raw();
+        for px in data.chunks_exact_mut(4) {
+            let a = px[3] as u32;
+            for c in &mut px[..3] {
+                *c = ((*c as u32 * a + 127) / 255) as u8;
+            }
         }
-    }
-    let pixmap = Arc::new(
-        Pixmap::from_vec(data, IntSize::from_wh(w.max(1), h.max(1)).ok_or("empty image")?).ok_or("bad image")?,
-    );
+        Arc::new(
+            Pixmap::from_vec(data, IntSize::from_wh(w.max(1), h.max(1)).ok_or("empty image")?).ok_or("bad image")?,
+        )
+    } else {
+        #[cfg(feature = "svg")]
+        if let Some(svg_pixmap) = zipp_renderer::rasterize_svg(&raw) {
+            Arc::new(svg_pixmap)
+        } else {
+            return Err(format!("image {url}: unsupported image format"));
+        }
+        #[cfg(not(feature = "svg"))]
+        return Err(format!("image {url}: unsupported image format"));
+    };
     IMAGES.with(|i| i.borrow_mut().insert(url.to_string(), pixmap.clone()));
     Ok(pixmap)
 }
