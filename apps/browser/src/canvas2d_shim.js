@@ -159,6 +159,7 @@ var CanvasRenderingContext2D, CanvasGradient, CanvasPattern, Path2D, ImageData;
         } else {
           v = String(v); sent = v;
         }
+        if (this._s[name] === v) return;
         this._s[name] = v;
         if (!LOCAL[name]) this._cmd(["set", name, sent]);
       },
@@ -186,21 +187,21 @@ var CanvasRenderingContext2D, CanvasGradient, CanvasPattern, Path2D, ImageData;
 
   // Transforms
   P.setTransform = function (a, b, c, d, e, f) {
-    if (a && typeof a === "object") { var m = a; a = m.a === undefined ? 1 : m.a; b = m.b || 0; c = m.c || 0; d = m.d === undefined ? 1 : m.d; e = m.e || 0; f = m.f || 0; }
+    if (a && typeof a === "object") { var m = a; a = m.a === undefined ? 1 : +m.a; b = +m.b || 0; c = +m.c || 0; d = m.d === undefined ? 1 : +m.d; e = +m.e || 0; f = +m.f || 0; }
     else if (a === undefined) { a = 1; b = 0; c = 0; d = 1; e = 0; f = 0; }
-    var n = [a, b, c, d, e, f].map(Number);
-    if (!n.every(isFinite)) return;
-    this._s.m = n;
-    this._cmd(["setTransform"].concat(n));
+    else { a = +a; b = +b; c = +c; d = +d; e = +e; f = +f; }
+    if (!isFinite(a) || !isFinite(b) || !isFinite(c) || !isFinite(d) || !isFinite(e) || !isFinite(f)) return;
+    this._s.m = [a, b, c, d, e, f];
+    this._cmd(["setTransform", a, b, c, d, e, f]);
   };
   P.resetTransform = function () { this.setTransform(1, 0, 0, 1, 0, 0); };
   P.transform = function (a, b, c, d, e, f) {
-    var n = [a, b, c, d, e, f].map(Number);
-    if (!n.every(isFinite)) return;
+    a = +a; b = +b; c = +c; d = +d; e = +e; f = +f;
+    if (!isFinite(a) || !isFinite(b) || !isFinite(c) || !isFinite(d) || !isFinite(e) || !isFinite(f)) return;
     var m = this._s.m;
     this._s.m = [m[0] * a + m[2] * b, m[1] * a + m[3] * b, m[0] * c + m[2] * d, m[1] * c + m[3] * d,
       m[0] * e + m[2] * f + m[4], m[1] * e + m[3] * f + m[5]];
-    this._cmd(["transform"].concat(n));
+    this._cmd(["transform", a, b, c, d, e, f]);
   };
   P.translate = function (x, y) { this.transform(1, 0, 0, 1, x, y); };
   P.scale = function (x, y) { this.transform(x, 0, 0, y, 0, 0); };
@@ -212,14 +213,48 @@ var CanvasRenderingContext2D, CanvasGradient, CanvasPattern, Path2D, ImageData;
       isIdentity: m[0] === 1 && m[1] === 0 && m[2] === 0 && m[3] === 1 && m[4] === 0 && m[5] === 0 };
   };
 
-  // Paths
+  // Paths (direct fast paths avoid per-vertex arguments/slice/closure allocations)
   P.beginPath = function () { this._cmd(["beginPath"]); };
-  Object.keys(PATH).forEach(function (name) {
-    P[name] = function () {
-      var c = PATH[name].apply(null, arguments);
-      if (c.slice(1).every(function (v) { return typeof v !== "number" || isFinite(v); })) this._cmd(c);
-    };
-  });
+  P.closePath = function () { this._cmd(["closePath"]); };
+  P.moveTo = function (x, y) { x = +x; y = +y; if (isFinite(x) && isFinite(y)) this._cmd(["moveTo", x, y]); };
+  P.lineTo = function (x, y) { x = +x; y = +y; if (isFinite(x) && isFinite(y)) this._cmd(["lineTo", x, y]); };
+  P.quadraticCurveTo = function (cx, cy, x, y) {
+    cx = +cx; cy = +cy; x = +x; y = +y;
+    if (isFinite(cx) && isFinite(cy) && isFinite(x) && isFinite(y)) this._cmd(["quadraticCurveTo", cx, cy, x, y]);
+  };
+  P.bezierCurveTo = function (c1x, c1y, c2x, c2y, x, y) {
+    c1x = +c1x; c1y = +c1y; c2x = +c2x; c2y = +c2y; x = +x; y = +y;
+    if (isFinite(c1x) && isFinite(c1y) && isFinite(c2x) && isFinite(c2y) && isFinite(x) && isFinite(y)) {
+      this._cmd(["bezierCurveTo", c1x, c1y, c2x, c2y, x, y]);
+    }
+  };
+  P.arc = function (x, y, r, a0, a1, ccw) {
+    x = +x; y = +y; r = +r; a0 = +a0; a1 = +a1;
+    if (r < 0) throw new DOMException("The radius provided is negative.", "IndexSizeError");
+    if (isFinite(x) && isFinite(y) && isFinite(r) && isFinite(a0) && isFinite(a1)) {
+      this._cmd(["arc", x, y, r, a0, a1, !!ccw]);
+    }
+  };
+  P.arcTo = function (x1, y1, x2, y2, r) {
+    x1 = +x1; y1 = +y1; x2 = +x2; y2 = +y2; r = +r;
+    if (isFinite(x1) && isFinite(y1) && isFinite(x2) && isFinite(y2) && isFinite(r)) {
+      this._cmd(["arcTo", x1, y1, x2, y2, r]);
+    }
+  };
+  P.ellipse = function (x, y, rx, ry, rot, a0, a1, ccw) {
+    x = +x; y = +y; rx = +rx; ry = +ry; rot = +rot; a0 = +a0; a1 = +a1;
+    if (isFinite(x) && isFinite(y) && isFinite(rx) && isFinite(ry) && isFinite(rot) && isFinite(a0) && isFinite(a1)) {
+      this._cmd(["ellipse", x, y, rx, ry, rot, a0, a1, !!ccw]);
+    }
+  };
+  P.rect = function (x, y, w, h) {
+    x = +x; y = +y; w = +w; h = +h;
+    if (isFinite(x) && isFinite(y) && isFinite(w) && isFinite(h)) this._cmd(["rect", x, y, w, h]);
+  };
+  P.roundRect = function (x, y, w, h, r) {
+    x = +x; y = +y; w = +w; h = +h;
+    if (isFinite(x) && isFinite(y) && isFinite(w) && isFinite(h)) this._cmd(["roundRect", x, y, w, h, radii(r)]);
+  };
   function pathAndRule(a, b) {
     return a instanceof Path2D ? [a._cmds, b === "evenodd" ? "evenodd" : "nonzero"] : [null, a === "evenodd" ? "evenodd" : "nonzero"];
   }
@@ -246,11 +281,23 @@ var CanvasRenderingContext2D, CanvasGradient, CanvasPattern, Path2D, ImageData;
   };
   P.getLineDash = function () { return this._s.dash.slice(); };
 
-  // Text
+  // Text (measureText cached per font+text to avoid mid-frame synchronous batch flushes)
+  var measureCache = Object.create(null);
+  var measureCacheSize = 0;
   P.fillText = function (text, x, y, max) { this._draw(["fillText", String(text), +x, +y, max === undefined ? null : +max]); };
   P.strokeText = function (text, x, y, max) { this._draw(["strokeText", String(text), +x, +y, max === undefined ? null : +max]); };
   P.measureText = function (text) {
-    var m = this._ask(["measureText", String(text)]) || { width: 0 };
+    var s = String(text);
+    var key = this._s.font + "\0" + s;
+    var hit = measureCache[key];
+    if (hit !== undefined) return hit;
+    var m = this._ask(["measureText", s]) || { width: 0 };
+    if (measureCacheSize >= 512) {
+      measureCache = Object.create(null);
+      measureCacheSize = 0;
+    }
+    measureCache[key] = m;
+    measureCacheSize++;
     return m;
   };
 

@@ -21,6 +21,7 @@
 //! Glyph outlines are extracted from OpenType fonts via [`skrifa`] and converted
 //! to tiny-skia paths through the [`GlyphOutlinePen`] adapter.
 
+use std::collections::HashMap;
 #[cfg(feature = "window-renderer")]
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -36,6 +37,69 @@ use peniko::{
 use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Transform};
 
 use skrifa::MetadataProvider;
+
+/// Cache key for pre-blurred CSS box-shadow pixmaps (position-independent).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct ShadowCacheKey {
+    w: u32,
+    h: u32,
+    radius_q: u32,
+    sigma_q: u32,
+    r: u8,
+    g: u8,
+    b: u8,
+}
+
+/// Cached pre-blurred box-shadow pixmap and its downscale factor (`1`, `2`, or `4`).
+#[derive(Clone)]
+struct CachedShadow {
+    pixmap: Arc<Pixmap>,
+    ds: u32,
+    pad_px: i32,
+}
+
+/// Reusable full-framebuffer clip mask that tracks its non-zero row span so
+/// recycling only clears the touched rows instead of reallocating megabytes.
+struct PooledMask {
+    mask: tiny_skia::Mask,
+    dirty_rows: (usize, usize),
+}
+
+/// Cache key for pre-rasterized anti-aliased glyph alpha masks.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct GlyphCacheKey {
+    font_hash: u64,
+    font_index: u32,
+    glyph_id: u32,
+    size_q: u16,
+}
+
+/// Tightly-cropped 1-byte-per-pixel anti-aliased coverage mask for a glyph.
+struct CachedGlyph {
+    ox: i32,
+    oy: i32,
+    w: u32,
+    h: u32,
+    alpha: Vec<u8>,
+}
+
+/// Fast fingerprint for a font byte slice (length + pointer + first/mid/last words).
+#[inline]
+fn font_bytes_fingerprint(bytes: &[u8]) -> u64 {
+    let len = bytes.len() as u64;
+    let mut h = len.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    if len >= 8 {
+        let a = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        let mid = (bytes.len() / 2) & !7;
+        let b = u64::from_le_bytes(bytes[mid..mid + 8].try_into().unwrap());
+        let end = bytes.len() - 8;
+        let c = u64::from_le_bytes(bytes[end..end + 8].try_into().unwrap());
+        h ^= a.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        h = h.rotate_left(27) ^ b.wrapping_mul(0x94D0_49BB_1331_11EB);
+        h = h.rotate_left(31) ^ c;
+    }
+    h
+}
 
 // ============================================================================
 // Color and paint helpers
@@ -372,41 +436,71 @@ impl ClipRegion {
         }
     }
 
-    /// Rasterize this clip region into a 1-bit [`tiny_skia::Mask`].
-    ///
-    /// Returns `None` for simple rectangular clips (which are handled via
-    /// coordinate tests instead) or if mask allocation fails.
-    fn to_mask(&self, width: u32, height: u32) -> Option<tiny_skia::Mask> {
+    /// Rasterize this clip region into an existing zeroed `mask`, returning the
+    /// inclusive-exclusive row range `(y0, y1)` that may contain non-zero bytes.
+    fn rasterize_into(&self, mask: &mut tiny_skia::Mask) -> Option<(usize, usize)> {
+        let width = mask.width();
+        let height = mask.height();
+        let bbox = self.bounding_box();
+        let by0 = (bbox.y0.floor() as i32 - 1).clamp(0, height as i32) as usize;
+        let by1 = (bbox.y1.ceil() as i32 + 1).clamp(0, height as i32) as usize;
+        if by1 <= by0 {
+            return Some((0, 0));
+        }
         match self {
             ClipRegion::Rect(r) => {
-                let clip_path = shape_to_path(r)?;
-                let mut mask = tiny_skia::Mask::new(width, height)?;
-                mask.fill_path(&clip_path, FillRule::EvenOdd, true, Transform::identity());
-                Some(mask)
+                let x0 = (r.x0.round() as i32).clamp(0, width as i32) as usize;
+                let y0 = (r.y0.round() as i32).clamp(0, height as i32) as usize;
+                let x1 = (r.x1.round() as i32).clamp(0, width as i32) as usize;
+                let y1 = (r.y1.round() as i32).clamp(0, height as i32) as usize;
+                if x1 > x0 && y1 > y0 {
+                    let stride = width as usize;
+                    let data = mask.data_mut();
+                    for y in y0..y1 {
+                        let base = y * stride;
+                        data[base + x0..base + x1].fill(255);
+                    }
+                    Some((y0, y1))
+                } else {
+                    Some((0, 0))
+                }
             }
             ClipRegion::RoundedPath { path, .. } => {
                 let clip_path = shape_to_path(path)?;
-                let mut mask = tiny_skia::Mask::new(width, height)?;
-                // Anti-aliased fill produces smooth clip edges on rounded corners
-                mask.fill_path(
-                    &clip_path,
-                    FillRule::EvenOdd,
-                    true, // anti-alias
-                    Transform::identity(),
-                );
-                Some(mask)
+                mask.fill_path(&clip_path, FillRule::EvenOdd, true, Transform::identity());
+                Some((by0, by1))
             }
-            // Seed with the intersected bounding box, then cut each curved side
-            // out of it.
             ClipRegion::Intersection(a, b) => {
-                let mut mask = tiny_skia::Mask::new(width, height)?;
-                let seed = shape_to_path(&self.bounding_box())?;
-                mask.fill_path(&seed, FillRule::EvenOdd, true, Transform::identity());
-                a.intersect_into(&mut mask);
-                b.intersect_into(&mut mask);
-                Some(mask)
+                // Seed with the intersected bounding box via direct row fill, then
+                // cut each curved side out of it.
+                let x0 = (bbox.x0.floor() as i32).clamp(0, width as i32) as usize;
+                let y0 = (bbox.y0.floor() as i32).clamp(0, height as i32) as usize;
+                let x1 = (bbox.x1.ceil() as i32).clamp(0, width as i32) as usize;
+                let y1 = (bbox.y1.ceil() as i32).clamp(0, height as i32) as usize;
+                if x1 <= x0 || y1 <= y0 {
+                    return Some((0, 0));
+                }
+                let stride = width as usize;
+                {
+                    let data = mask.data_mut();
+                    for y in y0..y1 {
+                        let base = y * stride;
+                        data[base + x0..base + x1].fill(255);
+                    }
+                }
+                a.intersect_into(mask);
+                b.intersect_into(mask);
+                Some((y0, y1))
             }
         }
+    }
+
+    /// Rasterize this clip region into a fresh [`tiny_skia::Mask`].
+    #[allow(dead_code)]
+    fn to_mask(&self, width: u32, height: u32) -> Option<tiny_skia::Mask> {
+        let mut mask = tiny_skia::Mask::new(width, height)?;
+        self.rasterize_into(&mut mask)?;
+        Some(mask)
     }
 
     /// Cut this region out of `mask`. Rectangles are already covered by the
@@ -552,6 +646,8 @@ struct LayerEntry {
     saved_clip: Option<ClipRegion>,
     /// The previous clip's rasterized mask, restored with it.
     saved_mask: Option<Arc<tiny_skia::Mask>>,
+    /// The non-zero row span of `saved_mask` (for fast pool recycling).
+    saved_mask_rows: (usize, usize),
     /// If this is an opacity layer (alpha < 1.0), what the surface looked like
     /// before the layer drew anything, plus the alpha.
     opacity: Option<OpacityGroup>,
@@ -654,6 +750,17 @@ pub struct TinySkiaPainter {
     /// site can hold it while `&mut self.pixmap` is borrowed without copying a
     /// full-framebuffer mask.
     clip_mask: Option<Arc<tiny_skia::Mask>>,
+    clip_mask_rows: (usize, usize),
+    mask_pool: Vec<PooledMask>,
+
+    /// Cache of pre-blurred CSS box-shadow pixmaps keyed by quantized geometry
+    /// and RGB color (position-independent across scrolls and repaints).
+    shadow_cache: HashMap<ShadowCacheKey, CachedShadow>,
+    shadow_cache_bytes: usize,
+
+    /// Cache of pre-rasterized glyph alpha coverage masks keyed by font, glyph ID,
+    /// and quantized pixel size.
+    glyph_cache: HashMap<GlyphCacheKey, Arc<CachedGlyph>>,
 }
 
 impl TinySkiaPainter {
@@ -665,8 +772,108 @@ impl TinySkiaPainter {
             blur_stack: Vec::new(),
             active_clip: None,
             clip_mask: None,
+            clip_mask_rows: (0, 0),
+            mask_pool: Vec::new(),
             dirty: None,
+            shadow_cache: HashMap::new(),
+            shadow_cache_bytes: 0,
+            glyph_cache: HashMap::new(),
         }
+    }
+
+    fn recycle_mask(&mut self, mask_opt: Option<Arc<tiny_skia::Mask>>, dirty_rows: (usize, usize)) {
+        if let Some(arc) = mask_opt {
+            if self.mask_pool.len() < 4 {
+                if let Ok(mask) = Arc::try_unwrap(arc) {
+                    if mask.width() == self.pixmap.width() && mask.height() == self.pixmap.height() {
+                        self.mask_pool.push(PooledMask { mask, dirty_rows });
+                    }
+                }
+            }
+        }
+    }
+
+    fn take_zeroed_mask(&mut self, width: u32, height: u32) -> Option<tiny_skia::Mask> {
+        while let Some(mut pooled) = self.mask_pool.pop() {
+            if pooled.mask.width() == width && pooled.mask.height() == height {
+                let (y0, y1) = pooled.dirty_rows;
+                let y0 = y0.min(height as usize);
+                let y1 = y1.min(height as usize);
+                if y1 > y0 {
+                    let stride = width as usize;
+                    pooled.mask.data_mut()[y0 * stride..y1 * stride].fill(0);
+                }
+                return Some(pooled.mask);
+            }
+        }
+        tiny_skia::Mask::new(width, height)
+    }
+
+    /// Prepare for a partial-damage repaint: preserves every pixel outside `(x0, y0, x1, y1)`,
+    /// clears only the damage rectangle, and installs it as the root clip so all draw
+    /// operations outside the damage region are culled in O(1).
+    pub fn reset_damage(&mut self, x0: f64, y0: f64, x1: f64, y1: f64) {
+        self.reset_damage_inner(x0, y0, x1, y1, true);
+    }
+
+    /// Partial-damage repaint that keeps existing framebuffer pixels intact inside
+    /// `(x0, y0, x1, y1)` as well (for opaque `<canvas>` + overlay repaints where the
+    /// canvas overwrites its own pixels and background layers are skipped).
+    pub fn reset_damage_preserve(&mut self, x0: f64, y0: f64, x1: f64, y1: f64) {
+        self.reset_damage_inner(x0, y0, x1, y1, false);
+    }
+
+    fn reset_damage_inner(&mut self, x0: f64, y0: f64, x1: f64, y1: f64, clear_damage: bool) {
+        let w = self.pixmap.width() as i32;
+        let h = self.pixmap.height() as i32;
+        let ix0 = (x0.floor() as i32).clamp(0, w);
+        let iy0 = (y0.floor() as i32).clamp(0, h);
+        let ix1 = (x1.ceil() as i32).clamp(0, w);
+        let iy1 = (y1.ceil() as i32).clamp(0, h);
+        let clamped = Rect::new(ix0 as f64, iy0 as f64, ix1 as f64, iy1 as f64);
+
+        if clear_damage && ix1 > ix0 && iy1 > iy0 {
+            let stride = (w as usize) * 4;
+            let lo = (ix0 as usize) * 4;
+            let hi = (ix1 as usize) * 4;
+            let data = self.pixmap.data_mut();
+            for y in iy0 as usize..iy1 as usize {
+                let row = y * stride;
+                data[row + lo..row + hi].fill(255);
+            }
+        }
+        let prev_mask = self.clip_mask.take();
+        let prev_rows = self.clip_mask_rows;
+        self.recycle_mask(prev_mask, prev_rows);
+        self.clip_mask_rows = (0, 0);
+        self.layer_stack.clear();
+        self.blur_stack.clear();
+        self.active_clip = Some(ClipRegion::Rect(clamped));
+        self.dirty = None;
+    }
+
+    /// Whether a device-space bounding box is completely outside the framebuffer
+    /// or outside the currently active clip region's bounding box.
+    #[inline]
+    fn is_culled(&self, bounds: Rect) -> bool {
+        if !bounds.x0.is_finite()
+            || !bounds.y0.is_finite()
+            || !bounds.x1.is_finite()
+            || !bounds.y1.is_finite()
+            || bounds.x1 <= 0.0
+            || bounds.y1 <= 0.0
+            || bounds.x0 >= self.pixmap.width() as f64
+            || bounds.y0 >= self.pixmap.height() as f64
+        {
+            return true;
+        }
+        if let Some(ref clip) = self.active_clip {
+            let cb = clip.bounding_box();
+            if bounds.x1 <= cb.x0 || bounds.y1 <= cb.y0 || bounds.x0 >= cb.x1 || bounds.y0 >= cb.y1 {
+                return true;
+            }
+        }
+        false
     }
 
     /// Union `bounds` (device space) into the current group's dirty region,
@@ -749,6 +956,9 @@ impl TinySkiaPainter {
     pub fn resize(&mut self, width: u32, height: u32) {
         if width > 0 && height > 0 {
             self.pixmap = Pixmap::new(width, height).unwrap();
+            self.mask_pool.clear();
+            self.clip_mask = None;
+            self.clip_mask_rows = (0, 0);
         }
     }
 
@@ -792,28 +1002,32 @@ impl TinySkiaPainter {
         }
         if self.clip_mask.is_none() {
             let (w, h) = (self.pixmap.width(), self.pixmap.height());
-            // Re-borrow: `to_mask` needs `&self.active_clip` while `self` is &mut.
-            self.clip_mask = self
-                .active_clip
-                .as_ref()
-                .and_then(|c| c.to_mask(w, h))
-                .map(Arc::new);
+            if let Some(mut mask) = self.take_zeroed_mask(w, h) {
+                let rows = self
+                    .active_clip
+                    .as_ref()
+                    .and_then(|c| c.rasterize_into(&mut mask));
+                if let Some(r) = rows {
+                    self.clip_mask = Some(Arc::new(mask));
+                    self.clip_mask_rows = r;
+                } else {
+                    self.mask_pool.push(PooledMask { mask, dirty_rows: (0, 0) });
+                }
+            }
         }
         self.clip_mask.clone()
     }
 
     /// Make `new_clip` active, INTERSECTED with whatever is already active, and
-    /// return the previous (clip, mask) so `pop_layer` can restore them.
-    ///
-    /// Intersecting rather than replacing is what makes nested clips correct: a
-    /// clipped box inside a rounded `overflow:hidden` ancestor must be confined
-    /// to both, or it paints over its parent's corners.
+    /// return the previous `(clip, mask, mask_rows)` so `pop_layer` can restore them.
     fn push_clip(
         &mut self,
         new_clip: ClipRegion,
-    ) -> (Option<ClipRegion>, Option<Arc<tiny_skia::Mask>>) {
+    ) -> (Option<ClipRegion>, Option<Arc<tiny_skia::Mask>>, (usize, usize)) {
         let old_clip = self.active_clip.take();
         let old_mask = self.clip_mask.take();
+        let old_rows = self.clip_mask_rows;
+        self.clip_mask_rows = (0, 0);
         let combined = match old_clip.clone() {
             Some(existing) => ClipRegion::intersect(existing, new_clip),
             None => new_clip,
@@ -821,7 +1035,7 @@ impl TinySkiaPainter {
         // Left unrasterized: `clip_mask_for` builds it on first genuine need.
         self.clip_mask = None;
         self.active_clip = Some(combined);
-        (old_clip, old_mask)
+        (old_clip, old_mask, old_rows)
     }
 }
 
@@ -1039,6 +1253,10 @@ impl BlurLayer for TinySkiaPainter {
         // panel, whose own background is deliberately near-transparent because
         // the blur is meant to supply the substance, just looks see-through.
         let (x0, y0, x1, y1) = rect;
+        let elem_bounds = Rect::new(x0 as f64, y0 as f64, x1 as f64, y1 as f64);
+        if self.is_culled(elem_bounds) {
+            return;
+        }
         // Pad by the radius so the blur has real pixels to pull from at the
         // edges rather than smearing the clamped border inward.
         let pad = radius_px.ceil() as i32 + 1;
@@ -1070,21 +1288,16 @@ impl BlurLayer for TinySkiaPainter {
         );
         let Some(keep) = keep else { return };
         let Some(cropped) = region.clone_rect(keep) else { return };
-        // Recorded before the write, and without consulting the clip, which
-        // this ignores.
-        self.mark_dirty_device(Rect::new(
-            x0.floor() as f64,
-            y0.floor() as f64,
-            x1.ceil() as f64,
-            y1.ceil() as f64,
-        ));
+        // Recorded before the write, respecting the active clip when present.
+        self.mark_dirty(elem_bounds);
+        let mask = self.clip_mask_for(elem_bounds);
         self.pixmap.draw_pixmap(
             x0.floor() as i32,
             y0.floor() as i32,
             cropped.as_ref(),
             &tiny_skia::PixmapPaint::default(),
             tiny_skia::Transform::identity(),
-            None,
+            mask.as_deref(),
         );
     }
 
@@ -1139,15 +1352,14 @@ impl BlurLayer for TinySkiaPainter {
 impl PaintScene for TinySkiaPainter {
     /// Clear the framebuffer to white and reset the clip stack.
     fn reset(&mut self) {
-        // Frame counter for debugging (not currently displayed)
-        static FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let _frame_number = FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
         self.pixmap.fill(tiny_skia::Color::WHITE);
+        let prev_mask = self.clip_mask.take();
+        let prev_rows = self.clip_mask_rows;
+        self.recycle_mask(prev_mask, prev_rows);
+        self.clip_mask_rows = (0, 0);
         self.layer_stack.clear();
         self.blur_stack.clear();
         self.active_clip = None;
-        self.clip_mask = None;
         self.dirty = None;
     }
 
@@ -1165,7 +1377,7 @@ impl PaintScene for TinySkiaPainter {
         clip: &impl Shape,
     ) {
         let shape = transform_clip_shape(transform, clip);
-        let (old_clip, old_mask) = self.push_clip(shape);
+        let (old_clip, old_mask, old_rows) = self.push_clip(shape);
 
         let opacity =
             (alpha < 1.0).then(|| OpacityGroup::new(alpha, self.pixmap.height() as usize));
@@ -1173,6 +1385,7 @@ impl PaintScene for TinySkiaPainter {
         self.layer_stack.push(LayerEntry {
             saved_clip: old_clip,
             saved_mask: old_mask,
+            saved_mask_rows: old_rows,
             opacity,
             saved_dirty: self.dirty.take(),
             blur_depth: self.blur_stack.len(),
@@ -1182,10 +1395,11 @@ impl PaintScene for TinySkiaPainter {
     /// Push a clip-only layer (no blend mode, full opacity).
     fn push_clip_layer(&mut self, transform: Affine, clip: &impl Shape) {
         let shape = transform_clip_shape(transform, clip);
-        let (old_clip, old_mask) = self.push_clip(shape);
+        let (old_clip, old_mask, old_rows) = self.push_clip(shape);
         self.layer_stack.push(LayerEntry {
             saved_clip: old_clip,
             saved_mask: old_mask,
+            saved_mask_rows: old_rows,
             opacity: None,
             saved_dirty: self.dirty.take(),
             blur_depth: self.blur_stack.len(),
@@ -1199,8 +1413,12 @@ impl PaintScene for TinySkiaPainter {
     /// layer actually painted, and no further.
     fn pop_layer(&mut self) {
         if let Some(entry) = self.layer_stack.pop() {
+            let cur_mask = self.clip_mask.take();
+            let cur_rows = self.clip_mask_rows;
+            self.recycle_mask(cur_mask, cur_rows);
             self.active_clip = entry.saved_clip;
             self.clip_mask = entry.saved_mask;
+            self.clip_mask_rows = entry.saved_mask_rows;
 
             // What this layer painted, measured in isolation; then folded back
             // into the enclosing group, which is equally changed by it.
@@ -1274,6 +1492,118 @@ impl PaintScene for TinySkiaPainter {
                 self.fill_with_image(img, transform, shape);
             }
             _ => {
+                let bounds = device_bounds(shape, transform);
+                if self.is_culled(bounds) {
+                    return;
+                }
+
+                // Fast path for solid axis-aligned rectangles when there is no curved clip:
+                // skips path tessellation, tiny-skia scanline setup, and clip-mask allocation.
+                if let anyrender::PaintRef::Solid(color) = paint_ref {
+                    let (r, g, b, a) = color_to_rgba(color);
+                    if a == 0 {
+                        return;
+                    }
+                    let coeffs = transform.as_coeffs();
+                    let axis_aligned = coeffs[1].abs() < 1e-5 && coeffs[2].abs() < 1e-5;
+                    let rect_clip_ok = match &self.active_clip {
+                        None | Some(ClipRegion::Rect(_)) => true,
+                        Some(_) => false,
+                    };
+                    if axis_aligned
+                        && rect_clip_ok
+                        && shape.as_rect().is_some()
+                        && bounds.width() >= 2.0
+                        && bounds.height() >= 2.0
+                    {
+                        self.mark_dirty(bounds);
+                        let (fw, fh) = (self.pixmap.width() as i32, self.pixmap.height() as i32);
+                        let mut x0 = (bounds.x0.round() as i32).clamp(0, fw);
+                        let mut y0 = (bounds.y0.round() as i32).clamp(0, fh);
+                        let mut x1 = (bounds.x1.round() as i32).clamp(0, fw);
+                        let mut y1 = (bounds.y1.round() as i32).clamp(0, fh);
+                        if let Some(ClipRegion::Rect(cb)) = &self.active_clip {
+                            x0 = x0.max(cb.x0.ceil() as i32);
+                            y0 = y0.max(cb.y0.ceil() as i32);
+                            x1 = x1.min(cb.x1.floor() as i32);
+                            y1 = y1.min(cb.y1.floor() as i32);
+                        }
+                        if x1 > x0 && y1 > y0 {
+                            let stride = (fw as usize) * 4;
+                            let data = self.pixmap.data_mut();
+                            if a == 255 {
+                                let px = [r, g, b, 255u8];
+                                for y in y0 as usize..y1 as usize {
+                                    let row = &mut data[y * stride + (x0 as usize) * 4
+                                        ..y * stride + (x1 as usize) * 4];
+                                    for dst in row.chunks_exact_mut(4) {
+                                        dst.copy_from_slice(&px);
+                                    }
+                                }
+                            } else {
+                                let sa = a as u32;
+                                let sr = (r as u32 * sa + 127) / 255;
+                                let sg = (g as u32 * sa + 127) / 255;
+                                let sb = (b as u32 * sa + 127) / 255;
+                                let inv = 255 - sa;
+                                for y in y0 as usize..y1 as usize {
+                                    let row = &mut data[y * stride + (x0 as usize) * 4
+                                        ..y * stride + (x1 as usize) * 4];
+                                    for dst in row.chunks_exact_mut(4) {
+                                        dst[0] = (sr + (dst[0] as u32 * inv + 127) / 255).min(255) as u8;
+                                        dst[1] = (sg + (dst[1] as u32 * inv + 127) / 255).min(255) as u8;
+                                        dst[2] = (sb + (dst[2] as u32 * inv + 127) / 255).min(255) as u8;
+                                        dst[3] = (sa + (dst[3] as u32 * inv + 127) / 255).min(255) as u8;
+                                    }
+                                }
+                            }
+                        }
+                        return;
+                    }
+                }
+
+                // Clamp axis-aligned gradient rectangle fills to the visible framebuffer &
+                // active clip so full-screen/tall-page radial gradients never evaluate their
+                // shader on off-screen or off-damage pixels.
+                if matches!(paint_ref, anyrender::PaintRef::Gradient(_)) && shape.as_rect().is_some() {
+                    let coeffs = transform.as_coeffs();
+                    if coeffs[1].abs() < 1e-5 && coeffs[2].abs() < 1e-5 {
+                        let mut vis = bounds.intersect(Rect::new(
+                            0.0,
+                            0.0,
+                            self.pixmap.width() as f64,
+                            self.pixmap.height() as f64,
+                        ));
+                        if let Some(ref clip) = self.active_clip {
+                            vis = vis.intersect(clip.bounding_box());
+                        }
+                        if vis.width() <= 0.0 || vis.height() <= 0.0 {
+                            return;
+                        }
+                        if let Some(path) = shape_to_path(&vis) {
+                            let ts = affine_to_transform(transform);
+                            let shader_ts = brush_space(brush_transform).post_concat(ts);
+                            let paint = make_brush_paint(&paint_ref, shader_ts);
+                            self.mark_dirty(vis);
+                            let mask = self.clip_mask_for(vis);
+                            let rule = match style {
+                                Fill::NonZero => FillRule::Winding,
+                                Fill::EvenOdd => FillRule::EvenOdd,
+                            };
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                self.pixmap.fill_path(
+                                    &path,
+                                    &paint,
+                                    rule,
+                                    Transform::identity(),
+                                    mask.as_deref(),
+                                );
+                            }));
+                            return;
+                        }
+                    }
+                }
+
                 if let Some(path) = shape_to_path(shape) {
                     let ts = affine_to_transform(transform);
                     // A gradient's geometry is expressed in BRUSH space, which
@@ -1283,18 +1613,6 @@ impl PaintScene for TinySkiaPainter {
                     // radial gradients with a ~1px radius at the origin — they
                     // rendered as nothing at all.
                     let paint = make_brush_paint(&paint_ref, brush_space(brush_transform));
-                    let bounds = device_bounds(shape, transform);
-                    if !bounds.x0.is_finite()
-                        || !bounds.y0.is_finite()
-                        || !bounds.x1.is_finite()
-                        || !bounds.y1.is_finite()
-                        || bounds.x1 <= 0.0
-                        || bounds.y1 <= 0.0
-                        || bounds.x0 >= self.pixmap.width() as f64
-                        || bounds.y0 >= self.pixmap.height() as f64
-                    {
-                        return;
-                    }
                     self.mark_dirty(bounds);
                     let mask = self.clip_mask_for(bounds);
                     // The fill rule was ignored -- everything filled as nonzero --
@@ -1335,6 +1653,10 @@ impl PaintScene for TinySkiaPainter {
         brush_transform: Option<Affine>,
         shape: &impl Shape,
     ) {
+        let bounds = device_bounds(shape, transform).inflate(style.width, style.width);
+        if self.is_culled(bounds) {
+            return;
+        }
         let paint_ref = brush.into();
         if let Some(path) = shape_to_path(shape) {
             // The stroke's own caps, join and dashes. These were fixed at round
@@ -1367,18 +1689,6 @@ impl PaintScene for TinySkiaPainter {
             };
             let ts = affine_to_transform(transform);
             let paint = make_brush_paint(&paint_ref, brush_space(brush_transform));
-            let bounds = device_bounds(shape, transform).inflate(style.width, style.width);
-            if !bounds.x0.is_finite()
-                || !bounds.y0.is_finite()
-                || !bounds.x1.is_finite()
-                || !bounds.y1.is_finite()
-                || bounds.x1 <= 0.0
-                || bounds.y1 <= 0.0
-                || bounds.x0 >= self.pixmap.width() as f64
-                || bounds.y0 >= self.pixmap.height() as f64
-            {
-                return;
-            }
             self.mark_dirty(bounds);
             let mask = self.clip_mask_for(bounds);
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1401,8 +1711,8 @@ impl PaintScene for TinySkiaPainter {
         }
     }
 
-    /// Draw a sequence of font glyphs by extracting outlines from the font via
-    /// skrifa and converting them to tiny-skia paths.
+    /// Draw a sequence of font glyphs using a cached anti-aliased alpha-mask fast path
+    /// (falling back to skrifa outline extraction for variable fonts or rotated/skewed text).
     fn draw_glyphs<'a, 's: 'a>(
         &'s mut self,
         font: &'a FontData,
@@ -1417,42 +1727,15 @@ impl PaintScene for TinySkiaPainter {
         glyphs: impl Iterator<Item = Glyph>,
     ) {
         let (r, g, b, a) = extract_rgba(&brush.into());
-        let paint = make_paint(r, g, b, a);
-
-        // Parse the font binary to access glyph outlines
-        let font_bytes: &[u8] = font.data.as_ref();
-        let Ok(font_ref) = skrifa::FontRef::from_index(font_bytes, font.index) else {
+        if a == 0 {
             return;
-        };
+        }
 
-        // Build variation coordinates for variable fonts
-        let variation_coords: Vec<skrifa::instance::NormalizedCoord> = normalized_coords
-            .iter()
-            .map(|&c| skrifa::instance::NormalizedCoord::from_bits(c))
-            .collect();
-        let size = skrifa::instance::Size::new(font_size);
-        let location = skrifa::instance::LocationRef::new(&variation_coords);
-
-        let outlines = font_ref.outline_glyphs();
-        let skia_transform = affine_to_transform(transform);
-
-        // Read units-per-em for potential manual scaling (not used when skrifa's
-        // DrawSettings handles scaling via Size, but kept for diagnostics).
-        use read_fonts::TableProvider;
-        let _upem = font_ref
-            .head()
-            .map(|h| h.units_per_em() as f32)
-            .unwrap_or(1000.0);
-
-        // Collect the run so its extent can be measured before drawing. The
-        // clip mask is then requested ONCE for the whole run — it is a
-        // full-framebuffer allocation, so per-glyph would be ruinous — and only
-        // when the run actually reaches outside the clip.
-        //
-        // Text used to pass `None` here, making it the one primitive that
-        // ignored clipping: a 1x1 `overflow:hidden` sr-only box printed its
-        // "Skip to content" across the page.
         let glyphs: Vec<Glyph> = glyphs.collect();
+        if glyphs.is_empty() {
+            return;
+        }
+
         let run_bounds = {
             let (mut x0, mut y0, mut x1, mut y1) = (
                 f64::INFINITY,
@@ -1460,15 +1743,13 @@ impl PaintScene for TinySkiaPainter {
                 f64::NEG_INFINITY,
                 f64::NEG_INFINITY,
             );
-            for g in &glyphs {
-                x0 = x0.min(g.x as f64);
-                y0 = y0.min(g.y as f64);
-                x1 = x1.max(g.x as f64);
-                y1 = y1.max(g.y as f64);
+            for gl in &glyphs {
+                x0 = x0.min(gl.x as f64);
+                y0 = y0.min(gl.y as f64);
+                x1 = x1.max(gl.x as f64);
+                y1 = y1.max(gl.y as f64);
             }
             if x0.is_finite() {
-                // Pad by the em size: glyph origins are baseline-left, so the
-                // run extends above, below and past the last origin.
                 let pad = font_size as f64;
                 device_bounds(
                     &Rect::new(x0 - pad, y0 - pad, x1 + pad, y1 + pad),
@@ -1478,31 +1759,234 @@ impl PaintScene for TinySkiaPainter {
                 Rect::new(0.0, 0.0, 0.0, 0.0)
             }
         };
-        // Twice the em size for the dirty region: `run_bounds` is a good enough
-        // guess for "does this run cross the clip", but a group composite needs
-        // a bound it can never fall outside, and an accent or a swash can reach
-        // past one em from the baseline.
+
+        // Viewport & active-clip culling BEFORE font parsing or glyph rasterization.
+        if self.is_culled(run_bounds.inflate(font_size as f64, font_size as f64)) {
+            return;
+        }
+
+        let font_bytes: &[u8] = font.data.as_ref();
         self.mark_dirty(run_bounds.inflate(font_size as f64, font_size as f64));
         let clip_mask = self.clip_mask_for(run_bounds);
+        let clip_bbox = self.active_clip.as_ref().map(|c| c.bounding_box());
+
+        // Fast cached alpha-coverage path for non-variable, axis-aligned uniform-scale text.
+        let coeffs = transform.as_coeffs();
+        let can_cache = normalized_coords.is_empty()
+            && coeffs[1].abs() < 1e-4
+            && coeffs[2].abs() < 1e-4
+            && coeffs[0] > 0.0
+            && (coeffs[0] - coeffs[3]).abs() < 1e-3
+            && (font_size * coeffs[0] as f32) <= 256.0;
+
+        if can_cache {
+            let scale = coeffs[0] as f32;
+            let tx = coeffs[4] as f32;
+            let ty = coeffs[5] as f32;
+            let dev_size = (font_size * scale).max(1.0);
+            let size_q = (dev_size * 4.0).round().clamp(1.0, u16::MAX as f32) as u16;
+            let font_hash = font_bytes_fingerprint(font_bytes);
+
+            // Lazily parse the FontRef only if at least one glyph misses the cache.
+            let mut parsed_font: Option<skrifa::FontRef<'_>> = None;
+
+            let fw = self.pixmap.width() as i32;
+            let fh = self.pixmap.height() as i32;
+            let (clip_x0, clip_y0, clip_x1, clip_y1) = if let Some(ref cb) = clip_bbox {
+                (
+                    (cb.x0.floor() as i32).clamp(0, fw),
+                    (cb.y0.floor() as i32).clamp(0, fh),
+                    (cb.x1.ceil() as i32).clamp(0, fw),
+                    (cb.y1.ceil() as i32).clamp(0, fh),
+                )
+            } else {
+                (0, 0, fw, fh)
+            };
+
+            let mask_data = clip_mask.as_deref().map(|m| m.data());
+            let fb_w = fw as usize;
+            let fb_stride = fb_w * 4;
+
+            for glyph in glyphs {
+                let key = GlyphCacheKey {
+                    font_hash,
+                    font_index: font.index,
+                    glyph_id: glyph.id,
+                    size_q,
+                };
+                let cached = if let Some(hit) = self.glyph_cache.get(&key) {
+                    Arc::clone(hit)
+                } else {
+                    if parsed_font.is_none() {
+                        parsed_font = skrifa::FontRef::from_index(font_bytes, font.index).ok();
+                    }
+                    let Some(ref fref) = parsed_font else {
+                        return;
+                    };
+                    let outlines = fref.outline_glyphs();
+                    let entry = if let Some(outline) = outlines.get(skrifa::GlyphId::new(glyph.id))
+                    {
+                        let mut pb = PathBuilder::new();
+                        let mut pen = GlyphOutlinePen {
+                            builder: &mut pb,
+                            scale: 1.0,
+                            glyph_x: 0.0,
+                            glyph_y: 0.0,
+                        };
+                        let settings = skrifa::outline::DrawSettings::unhinted(
+                            skrifa::instance::Size::new(dev_size),
+                            skrifa::instance::LocationRef::default(),
+                        );
+                        if outline.draw(settings, &mut pen).is_ok() {
+                            if let Some(path) = pb.finish() {
+                                let b = path.bounds();
+                                let ox = b.left().floor() as i32 - 1;
+                                let oy = b.top().floor() as i32 - 1;
+                                let gw = (b.right().ceil() as i32 + 1 - ox).max(1) as u32;
+                                let gh = (b.bottom().ceil() as i32 + 1 - oy).max(1) as u32;
+                                if gw <= 512 && gh <= 512 {
+                                    if let Some(mut pm) = Pixmap::new(gw, gh) {
+                                        pm.fill_path(
+                                            &path,
+                                            &make_paint(255, 255, 255, 255),
+                                            FillRule::Winding,
+                                            Transform::from_translate(-ox as f32, -oy as f32),
+                                            None,
+                                        );
+                                        let alpha: Vec<u8> =
+                                            pm.data().chunks_exact(4).map(|p| p[3]).collect();
+                                        Arc::new(CachedGlyph {
+                                            ox,
+                                            oy,
+                                            w: gw,
+                                            h: gh,
+                                            alpha,
+                                        })
+                                    } else {
+                                        Arc::new(CachedGlyph { ox: 0, oy: 0, w: 0, h: 0, alpha: Vec::new() })
+                                    }
+                                } else {
+                                    Arc::new(CachedGlyph { ox: 0, oy: 0, w: 0, h: 0, alpha: Vec::new() })
+                                }
+                            } else {
+                                Arc::new(CachedGlyph { ox: 0, oy: 0, w: 0, h: 0, alpha: Vec::new() })
+                            }
+                        } else {
+                            Arc::new(CachedGlyph { ox: 0, oy: 0, w: 0, h: 0, alpha: Vec::new() })
+                        }
+                    } else {
+                        Arc::new(CachedGlyph { ox: 0, oy: 0, w: 0, h: 0, alpha: Vec::new() })
+                    };
+                    if self.glyph_cache.len() >= 4096 {
+                        self.glyph_cache.clear();
+                    }
+                    self.glyph_cache.insert(key, Arc::clone(&entry));
+                    entry
+                };
+
+                if cached.w == 0 || cached.h == 0 {
+                    continue;
+                }
+                let gx = (glyph.x * scale + tx).round() as i32 + cached.ox;
+                let gy = (glyph.y * scale + ty).round() as i32 + cached.oy;
+                let gw = cached.w as i32;
+                let gh = cached.h as i32;
+
+                let dx0 = gx.max(clip_x0);
+                let dy0 = gy.max(clip_y0);
+                let dx1 = (gx + gw).min(clip_x1);
+                let dy1 = (gy + gh).min(clip_y1);
+                if dx0 >= dx1 || dy0 >= dy1 {
+                    continue;
+                }
+
+                let dst_buf = self.pixmap.data_mut();
+                let r32 = r as u32;
+                let g32 = g as u32;
+                let b32 = b as u32;
+                let a32 = a as u32;
+                let src_w = cached.w as usize;
+
+                for py in dy0..dy1 {
+                    let sy = (py - gy) as usize;
+                    let src_row = sy * src_w;
+                    let dst_row = (py as usize) * fb_stride;
+                    let mask_row = (py as usize) * fb_w;
+                    for px in dx0..dx1 {
+                        let sx = (px - gx) as usize;
+                        // SAFETY: sy < cached.h, sx < cached.w, py < fh, px < fw
+                        unsafe {
+                            let mut cov = *cached.alpha.get_unchecked(src_row + sx) as u32;
+                            if cov == 0 {
+                                continue;
+                            }
+                            if let Some(mdata) = mask_data {
+                                let mi = mask_row + (px as usize);
+                                let mc = *mdata.get_unchecked(mi) as u32;
+                                if mc == 0 {
+                                    continue;
+                                }
+                                if mc < 255 {
+                                    cov = (cov * mc + 127) / 255;
+                                    if cov == 0 {
+                                        continue;
+                                    }
+                                }
+                            }
+                            let eff_a = if a32 == 255 { cov } else { (cov * a32 + 127) / 255 };
+                            if eff_a == 0 {
+                                continue;
+                            }
+                            let di = dst_row + (px as usize) * 4;
+                            let d = dst_buf.get_unchecked_mut(di..di + 4);
+                            if eff_a == 255 {
+                                d[0] = r;
+                                d[1] = g;
+                                d[2] = b;
+                                d[3] = 255;
+                            } else {
+                                let sr = (r32 * eff_a + 127) / 255;
+                                let sg = (g32 * eff_a + 127) / 255;
+                                let sb = (b32 * eff_a + 127) / 255;
+                                let inv = 255 - eff_a;
+                                d[0] = (sr + (d[0] as u32 * inv + 127) / 255).min(255) as u8;
+                                d[1] = (sg + (d[1] as u32 * inv + 127) / 255).min(255) as u8;
+                                d[2] = (sb + (d[2] as u32 * inv + 127) / 255).min(255) as u8;
+                                d[3] = (eff_a + (d[3] as u32 * inv + 127) / 255).min(255) as u8;
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // Fallback path for variable fonts or non-uniform / rotated transforms.
+        let paint = make_paint(r, g, b, a);
+        let Ok(font_ref) = skrifa::FontRef::from_index(font_bytes, font.index) else {
+            return;
+        };
+        let variation_coords: Vec<skrifa::instance::NormalizedCoord> = normalized_coords
+            .iter()
+            .map(|&c| skrifa::instance::NormalizedCoord::from_bits(c))
+            .collect();
+        let size = skrifa::instance::Size::new(font_size);
+        let location = skrifa::instance::LocationRef::new(&variation_coords);
+        let outlines = font_ref.outline_glyphs();
+        let skia_transform = affine_to_transform(transform);
 
         for glyph in glyphs {
             let glyph_id = skrifa::GlyphId::new(glyph.id);
-
             let Some(outline) = outlines.get(glyph_id) else {
                 continue;
             };
-
             let mut path_builder = PathBuilder::new();
-
-            // GlyphOutlinePen with scale=1.0 because skrifa's DrawSettings
-            // already handles the units-to-pixels conversion via `size`.
             let mut pen = GlyphOutlinePen {
                 builder: &mut path_builder,
                 scale: 1.0,
                 glyph_x: glyph.x,
                 glyph_y: glyph.y,
             };
-
             let settings = skrifa::outline::DrawSettings::unhinted(size, location);
             if outline.draw(settings, &mut pen).is_ok() {
                 if let Some(path) = path_builder.finish() {
@@ -1529,7 +2013,13 @@ impl PaintScene for TinySkiaPainter {
     fn draw_image(&mut self, image: peniko::ImageBrushRef, transform: Affine) {
         let image_width = image.image.width;
         let image_height = image.image.height;
+        if image_width == 0 || image_height == 0 {
+            return;
+        }
         let source_pixels: &[u8] = image.image.data.as_ref();
+        if source_pixels.len() < (image_width as usize) * (image_height as usize) * 4 {
+            return;
+        }
 
         // Extract scale and translation from the transform matrix
         let coeffs = transform.as_coeffs();
@@ -1544,104 +2034,137 @@ impl PaintScene for TinySkiaPainter {
 
         let framebuffer_width = self.pixmap.width() as i32;
         let framebuffer_height = self.pixmap.height() as i32;
+        let dest_x_i = dest_x as i32;
+        let dest_y_i = dest_y as i32;
+        let dest_w_i = dest_width as i32;
+        let dest_h_i = dest_height as i32;
 
-        // Ratio to map from destination pixels back to source pixels
-        let sample_ratio_x = image_width as f32 / dest_width;
-        let sample_ratio_y = image_height as f32 / dest_height;
-
-        self.mark_dirty(Rect::new(
+        let bounds = Rect::new(
             dest_x as f64,
             dest_y as f64,
             (dest_x + dest_width) as f64,
             (dest_y + dest_height) as f64,
-        ));
+        );
+        if self.is_culled(bounds) {
+            return;
+        }
 
-        // Prepare clip mask. For rounded containers (e.g. avatar circles), the
-        // clip region is rasterized into a 1-bit mask. Each destination pixel is
-        // tested against this mask and skipped if outside the clip.
-        // Pre-compute from &self.active_clip before taking &mut via data_mut().
-        let clip_mask = self
-            .active_clip
-            .as_ref()
-            .and_then(|c| c.to_mask(framebuffer_width as u32, framebuffer_height as u32));
+        self.mark_dirty(bounds);
+
+        // Memoized clip mask: returns None when the image sits completely inside
+        // a rectangular clip, avoiding a full-framebuffer mask allocation per draw.
+        let clip_mask = self.clip_mask_for(bounds);
         let clip_bbox = self.active_clip.as_ref().map(|c| c.bounding_box());
 
+        let (mut min_px_x, mut min_px_y, mut max_px_x, mut max_px_y) = (
+            dest_x_i.max(0),
+            dest_y_i.max(0),
+            (dest_x_i + dest_w_i).min(framebuffer_width),
+            (dest_y_i + dest_h_i).min(framebuffer_height),
+        );
+        if let Some(ref bbox) = clip_bbox {
+            min_px_x = min_px_x.max(bbox.x0.ceil() as i32);
+            min_px_y = min_px_y.max(bbox.y0.ceil() as i32);
+            max_px_x = max_px_x.min(bbox.x1.floor() as i32);
+            max_px_y = max_px_y.min(bbox.y1.floor() as i32);
+        }
+        if min_px_x >= max_px_x || min_px_y >= max_px_y {
+            return;
+        }
+
+        let sample_ratio_x = image_width as f32 / dest_width;
+        let sample_ratio_y = image_height as f32 / dest_height;
+        let max_src_col = image_width - 1;
+        let max_src_row = image_height - 1;
+        let src_row_stride = (image_width as usize) * 4;
+        let fb_w = framebuffer_width as usize;
+        let fb_row_stride = fb_w * 4;
+
+        // Precompute source X byte offsets once for all rows (eliminates per-pixel float math)
+        let span_cols = (max_px_x - min_px_x) as usize;
+        let mut src_x_bytes = Vec::with_capacity(span_cols);
+        for px in min_px_x..max_px_x {
+            let col = (px - dest_x_i) as f32;
+            let src_col = ((col * sample_ratio_x) as u32).min(max_src_col) as usize;
+            src_x_bytes.push(src_col * 4);
+        }
+
         let framebuffer = self.pixmap.data_mut();
+        let mask_data = clip_mask.as_deref().map(|m| m.data());
 
-        // Iterate over every pixel in the destination rectangle
-        for row in 0..(dest_height as i32) {
-            let pixel_y = dest_y as i32 + row;
-            if pixel_y < 0 || pixel_y >= framebuffer_height {
-                continue;
-            }
+        for py in min_px_y..max_px_y {
+            let row = (py - dest_y_i) as f32;
+            let src_row = ((row * sample_ratio_y) as u32).min(max_src_row) as usize;
+            let src_row_base = src_row * src_row_stride;
+            let dst_row_base = (py as usize) * fb_row_stride + (min_px_x as usize) * 4;
 
-            for col in 0..(dest_width as i32) {
-                let pixel_x = dest_x as i32 + col;
-                if pixel_x < 0 || pixel_x >= framebuffer_width {
-                    continue;
-                }
-
-                // Clip test: prefer the rasterized mask for accurate rounded
-                // clipping; fall back to bounding-box rejection otherwise.
-                if let Some(ref mask) = clip_mask {
-                    let mask_index = (pixel_y as u32) * (framebuffer_width as u32) + (pixel_x as u32);
-                    if (mask_index as usize) < mask.data().len()
-                        && mask.data()[mask_index as usize] == 0
-                    {
+            if let Some(mdata) = mask_data {
+                let mask_row_base = (py as usize) * fb_w + (min_px_x as usize);
+                for (i, &sx) in src_x_bytes.iter().enumerate() {
+                    let mi = mask_row_base + i;
+                    if mi < mdata.len() && mdata[mi] == 0 {
                         continue;
                     }
-                } else if let Some(ref bbox) = clip_bbox {
-                    if (pixel_x as f64) < bbox.x0
-                        || (pixel_x as f64) > bbox.x1
-                        || (pixel_y as f64) < bbox.y0
-                        || (pixel_y as f64) > bbox.y1
-                    {
-                        continue;
+                    let si = src_row_base + sx;
+                    let di = dst_row_base + i * 4;
+                    // SAFETY: src_row <= max_src_row, sx <= max_src_col*4, py < fb_h, min_px_x+i < fb_w
+                    unsafe {
+                        let sa = *source_pixels.get_unchecked(si + 3);
+                        if sa == 0 {
+                            continue;
+                        }
+                        if sa == 255 {
+                            framebuffer
+                                .get_unchecked_mut(di..di + 4)
+                                .copy_from_slice(source_pixels.get_unchecked(si..si + 4));
+                        } else {
+                            let sr = *source_pixels.get_unchecked(si);
+                            let sg = *source_pixels.get_unchecked(si + 1);
+                            let sb = *source_pixels.get_unchecked(si + 2);
+                            blend_pixel(
+                                framebuffer.get_unchecked_mut(di..di + 4),
+                                sr,
+                                sg,
+                                sb,
+                                sa,
+                            );
+                        }
                     }
                 }
-
-                // Map destination pixel back to the nearest source pixel
-                let src_col = ((col as f32 * sample_ratio_x) as u32).min(image_width - 1);
-                let src_row = ((row as f32 * sample_ratio_y) as u32).min(image_height - 1);
-
-                let source_index = ((src_row * image_width + src_col) * 4) as usize;
-                if source_index + 3 >= source_pixels.len() {
-                    continue;
-                }
-
-                let dest_index = ((pixel_y * framebuffer_width + pixel_x) * 4) as usize;
-                if dest_index + 3 >= framebuffer.len() {
-                    continue;
-                }
-
-                // SAFETY: bounds verified above (source_index+3 < len, dest_index+3 < len)
-                unsafe {
-                    let sr = *source_pixels.get_unchecked(source_index);
-                    let sg = *source_pixels.get_unchecked(source_index + 1);
-                    let sb = *source_pixels.get_unchecked(source_index + 2);
-                    let sa = *source_pixels.get_unchecked(source_index + 3);
-                    blend_pixel(
-                        framebuffer.get_unchecked_mut(dest_index..dest_index + 4),
-                        sr, sg, sb, sa,
-                    );
+            } else {
+                for (i, &sx) in src_x_bytes.iter().enumerate() {
+                    let si = src_row_base + sx;
+                    let di = dst_row_base + i * 4;
+                    // SAFETY: src_row <= max_src_row, sx <= max_src_col*4, py < fb_h, min_px_x+i < fb_w
+                    unsafe {
+                        let sa = *source_pixels.get_unchecked(si + 3);
+                        if sa == 0 {
+                            continue;
+                        }
+                        if sa == 255 {
+                            framebuffer
+                                .get_unchecked_mut(di..di + 4)
+                                .copy_from_slice(source_pixels.get_unchecked(si..si + 4));
+                        } else {
+                            let sr = *source_pixels.get_unchecked(si);
+                            let sg = *source_pixels.get_unchecked(si + 1);
+                            let sb = *source_pixels.get_unchecked(si + 2);
+                            blend_pixel(
+                                framebuffer.get_unchecked_mut(di..di + 4),
+                                sr,
+                                sg,
+                                sb,
+                                sa,
+                            );
+                        }
+                    }
                 }
             }
         }
     }
 
     /// Draw a box shadow: the (rounded) box filled with the shadow colour and
-    /// blurred by the CSS blur radius.
-    ///
-    /// This used to fill a hard-edged rectangle at a fixed 30% of the shadow's
-    /// alpha, inflated by the element's BORDER RADIUS while ignoring the blur
-    /// entirely. That made every shadow the wrong colour, and made a blur-only
-    /// shadow (`0 0 30px`, by far the most common form) invisible: with no
-    /// blur and no spread the flat rect coincides exactly with the border box,
-    /// which the caller's `shadow_clip` annulus punches out.
-    ///
-    /// `radius` is the box's corner radius and `std_dev` the CSS blur radius,
-    /// both in device pixels. CSS specifies the shadow to ramp across a band
-    /// the width of the blur radius, which is a Gaussian of half that sigma.
+    /// blurred by the CSS blur radius, using a position-independent blur cache.
     fn draw_box_shadow(
         &mut self,
         transform: Affine,
@@ -1659,9 +2182,6 @@ impl PaintScene for TinySkiaPainter {
         // Three box passes reach ~3 sigma; past that the tail is rounding noise.
         let pad = (sigma * 3.0).ceil() as i32 + 1;
 
-        // The scratch surface is axis-aligned in device space, so the shape's
-        // bounds have to be taken after the transform.
-        let shape = kurbo::RoundedRect::from_rect(rect, radius.max(0.0));
         let dev = transform.transform_rect_bbox(rect);
         let x0 = dev.x0.floor() as i32 - pad;
         let y0 = dev.y0.floor() as i32 - pad;
@@ -1673,23 +2193,129 @@ impl PaintScene for TinySkiaPainter {
             return;
         }
 
-        // Cull shadows that fall entirely outside the surface before allocating
-        // and blurring a scratch pixmap for them. A long page has far more
-        // shadowed cards off screen than on, and each one otherwise costs a full
-        // allocation plus three box-blur passes to produce nothing visible.
-        let sw = self.pixmap.width() as i32;
-        let sh = self.pixmap.height() as i32;
-        if x0 >= sw || y0 >= sh || x0 + w <= 0 || y0 + h <= 0 {
+        let bounds = Rect::new(x0 as f64, y0 as f64, (x0 + w) as f64, (y0 + h) as f64);
+        if self.is_culled(bounds) {
             return;
         }
 
+        let coeffs = transform.as_coeffs();
+        let axis_aligned = coeffs[1].abs() < 1e-4 && coeffs[2].abs() < 1e-4;
+        if axis_aligned {
+            let rw = dev.width().round().max(1.0) as u32;
+            let rh = dev.height().round().max(1.0) as u32;
+            let sx = coeffs[0].abs().max(1e-3);
+            let radius_px = (radius.max(0.0) * sx).min((rw.min(rh) as f64) * 0.5);
+            let key = ShadowCacheKey {
+                w: rw,
+                h: rh,
+                radius_q: (radius_px * 2.0).round() as u32,
+                sigma_q: (sigma * 4.0).round() as u32,
+                r,
+                g,
+                b,
+            };
+            let entry = if let Some(cached) = self.shadow_cache.get(&key) {
+                cached.clone()
+            } else {
+                // Downscale large Gaussian blurs (2x for sigma >= 3, 4x for sigma >= 10):
+                // visually indistinguishable with bilinear upscaling, up to 16x faster
+                // on cold frames and 16x smaller in cache so full pages never thrash.
+                let ds: u32 = if sigma >= 10.0 && rw >= 32 && rh >= 32 {
+                    4
+                } else if sigma >= 3.0 && rw >= 16 && rh >= 16 {
+                    2
+                } else {
+                    1
+                };
+                let pad_ds = ((pad as u32) + ds - 1) / ds;
+                let rw_ds = (rw + ds - 1) / ds;
+                let rh_ds = (rh + ds - 1) / ds;
+                let cw = (rw_ds + pad_ds * 2).max(1);
+                let ch = (rh_ds + pad_ds * 2).max(1);
+                let shape = kurbo::RoundedRect::from_rect(
+                    Rect::from_origin_size(
+                        (pad_ds as f64, pad_ds as f64),
+                        (rw as f64 / ds as f64, rh as f64 / ds as f64),
+                    ),
+                    radius_px / ds as f64,
+                );
+                let (Some(mut layer), Some(path)) = (Pixmap::new(cw, ch), shape_to_path(&shape))
+                else {
+                    return;
+                };
+                layer.fill_path(
+                    &path,
+                    &make_paint(r, g, b, 255),
+                    FillRule::Winding,
+                    Transform::identity(),
+                    None,
+                );
+                box_blur(&mut layer, sigma / ds as f32);
+                let cached = CachedShadow {
+                    pixmap: Arc::new(layer),
+                    ds,
+                    pad_px: (pad_ds * ds) as i32,
+                };
+                let bytes = (cw as usize) * (ch as usize) * 4;
+                if self.shadow_cache.len() >= 128
+                    || self.shadow_cache_bytes.saturating_add(bytes) > 32 * 1024 * 1024
+                {
+                    self.shadow_cache.clear();
+                    self.shadow_cache_bytes = 0;
+                }
+                self.shadow_cache_bytes += bytes;
+                self.shadow_cache.insert(key, cached.clone());
+                cached
+            };
+
+            let draw_x0 = dev.x0.floor() as i32 - entry.pad_px;
+            let draw_y0 = dev.y0.floor() as i32 - entry.pad_px;
+            let draw_bounds = Rect::new(
+                draw_x0 as f64,
+                draw_y0 as f64,
+                (draw_x0 + (entry.pixmap.width() * entry.ds) as i32) as f64,
+                (draw_y0 + (entry.pixmap.height() * entry.ds) as i32) as f64,
+            );
+            self.mark_dirty(draw_bounds);
+            let mask = self.clip_mask_for(draw_bounds);
+            let paint = tiny_skia::PixmapPaint {
+                opacity: a as f32 / 255.0,
+                quality: if entry.ds > 1 {
+                    tiny_skia::FilterQuality::Bilinear
+                } else {
+                    tiny_skia::FilterQuality::Nearest
+                },
+                ..Default::default()
+            };
+            if entry.ds > 1 {
+                let ts = Transform::from_scale(entry.ds as f32, entry.ds as f32)
+                    .post_translate(draw_x0 as f32, draw_y0 as f32);
+                self.pixmap.draw_pixmap(
+                    0,
+                    0,
+                    entry.pixmap.as_ref().as_ref(),
+                    &paint,
+                    ts,
+                    mask.as_deref(),
+                );
+            } else {
+                self.pixmap.draw_pixmap(
+                    draw_x0,
+                    draw_y0,
+                    entry.pixmap.as_ref().as_ref(),
+                    &paint,
+                    Transform::identity(),
+                    mask.as_deref(),
+                );
+            }
+            return;
+        }
+
+        let shape = kurbo::RoundedRect::from_rect(rect, radius.max(0.0));
         let (Some(mut layer), Some(path)) = (Pixmap::new(w as u32, h as u32), shape_to_path(&shape))
         else {
             return;
         };
-
-        // Filled opaque and composited at the shadow's alpha afterwards, so the
-        // blur ramp is not multiplied by that alpha twice.
         layer.fill_path(
             &path,
             &make_paint(r, g, b, 255),
@@ -1697,10 +2323,8 @@ impl PaintScene for TinySkiaPainter {
             affine_to_transform(transform).post_translate(-x0 as f32, -y0 as f32),
             None,
         );
-
         box_blur(&mut layer, sigma);
 
-        let bounds = Rect::new(x0 as f64, y0 as f64, (x0 + w) as f64, (y0 + h) as f64);
         self.mark_dirty(bounds);
         let mask = self.clip_mask_for(bounds);
         let paint = tiny_skia::PixmapPaint {

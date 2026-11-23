@@ -46,4 +46,23 @@ pub fn paint_scene(
     generator.paint_scene(scene);
 }
 
+/// Partial-scene repaint starting from `target_nodes` (such as updated opaque `<canvas>`
+/// elements): skips all painting prior to the first target node while preserving ancestor
+/// clips/scroll offsets, then paints the target nodes and any subsequent overlays normally.
+pub fn paint_scene_from_nodes(
+    scene: &mut (impl PaintScene + crate::tinyskia::BlurLayer),
+    dom: &BaseDocument,
+    scale: f64,
+    width: u32,
+    height: u32,
+    x_offset: u32,
+    y_offset: u32,
+    target_nodes: &[usize],
+) {
+    let mut generator =
+        DocumentPainter::new(dom, scale, width, height, x_offset as f64, y_offset as f64);
+    generator.set_skip_until_nodes(target_nodes);
+    generator.paint_scene(scene);
+}
+
 const SELECTION_COLOR: Color = Color::from_rgb8(180, 213, 255);

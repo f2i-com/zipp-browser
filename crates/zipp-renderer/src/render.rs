@@ -9,7 +9,8 @@ mod box_shadow;
 mod form_controls;
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 
 use super::kurbo_css::{CssBox, Edge};
 use crate::SELECTION_COLOR;
@@ -63,6 +64,11 @@ pub struct DocumentPainter<'dom> {
     /// Cached root background color (resolved from <html> or <body> once at
     /// construction time to avoid DOM traversal on every frame).
     pub(crate) cached_bg_color: Option<Color>,
+    /// Optional partial-repaint filter: `(target_nodes, ancestor_nodes)`.
+    /// Elements strictly prior to the first target node skip drawing while
+    /// ancestors still push clips and scroll offsets.
+    pub(crate) skip_targets: Option<(HashSet<usize>, HashSet<usize>)>,
+    pub(crate) skip_reached: Cell<bool>,
 }
 
 impl<'dom> DocumentPainter<'dom> {
@@ -147,7 +153,29 @@ impl<'dom> DocumentPainter<'dom> {
             layer_manager,
             selection_ranges,
             cached_bg_color,
+            skip_targets: None,
+            skip_reached: Cell::new(false),
         }
+    }
+
+    pub fn set_skip_until_nodes(&mut self, targets: &[usize]) {
+        if targets.is_empty() {
+            return;
+        }
+        let mut target_set = HashSet::with_capacity(targets.len());
+        let mut ancestor_set = HashSet::new();
+        for &tid in targets {
+            target_set.insert(tid);
+            let mut cur = self.dom.as_ref().get_node(tid).and_then(|n| n.parent);
+            while let Some(pid) = cur {
+                if !ancestor_set.insert(pid) {
+                    break;
+                }
+                cur = self.dom.as_ref().get_node(pid).and_then(|n| n.parent);
+            }
+        }
+        self.skip_targets = Some((target_set, ancestor_set));
+        self.skip_reached.set(false);
     }
 
     #[inline]
@@ -174,12 +202,14 @@ impl<'dom> DocumentPainter<'dom> {
         let bg_height = (self.height as f32).max(root_element.final_layout.size.height);
 
         // Paint the background using the cached color (computed once in new()).
-        if let Some(bg_color) = self.cached_bg_color {
-            let rect = Rect::from_origin_size(
-                (self.initial_x * self.scale, self.initial_y * self.scale),
-                (bg_width as f64, bg_height as f64),
-            );
-            scene.fill(Fill::NonZero, Affine::IDENTITY, bg_color, None, &rect);
+        if self.skip_targets.is_none() {
+            if let Some(bg_color) = self.cached_bg_color {
+                let rect = Rect::from_origin_size(
+                    (self.initial_x * self.scale, self.initial_y * self.scale),
+                    (bg_width as f64, bg_height as f64),
+                );
+                scene.fill(Fill::NonZero, Affine::IDENTITY, bg_color, None, &rect);
+            }
         }
 
         // When critical resources are still loading, show the background
@@ -232,6 +262,19 @@ impl<'dom> DocumentPainter<'dom> {
         location: Point,
         ancestor_transform: Affine,
     ) {
+        let mut ancestor_passthrough = false;
+        if let Some((ref targets, ref ancestors)) = self.skip_targets {
+            if !self.skip_reached.get() {
+                if targets.contains(&node_id) {
+                    self.skip_reached.set(true);
+                } else if ancestors.contains(&node_id) {
+                    ancestor_passthrough = true;
+                } else {
+                    return;
+                }
+            }
+        }
+
         let node = &self.dom.as_ref().tree()[node_id];
 
         // Early return if the element is hidden
@@ -330,6 +373,30 @@ impl<'dom> DocumentPainter<'dom> {
         // Optimise zero-area (/very small area) clips by not rendering at all
         let clip_area = content_box_size.width * content_box_size.height;
         if should_clip && clip_area < 0.01 {
+            return;
+        }
+
+        if ancestor_passthrough {
+            let mut cx = self.element_cx(node, layout, box_position, ancestor_transform);
+            let clip = if is_text_input {
+                &cx.frame.content_box_path()
+            } else {
+                &cx.frame.padding_box_path()
+            };
+            self.layer_manager.maybe_with_layer(
+                scene,
+                should_clip,
+                1.0,
+                cx.transform,
+                clip,
+                |scene| {
+                    cx.pos = Point {
+                        x: cx.pos.x - node.scroll_offset.x,
+                        y: cx.pos.y - node.scroll_offset.y,
+                    };
+                    cx.draw_children(scene);
+                },
+            );
             return;
         }
 

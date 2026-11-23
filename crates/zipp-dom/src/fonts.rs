@@ -73,6 +73,19 @@ pub fn embedded_face(family: &str, bold: bool, italic: bool) -> &'static [u8] {
     FACES.iter().filter(|(g, _)| *g == generic).nth(style).map_or(FACES[0].1, |(_, bytes)| bytes)
 }
 
+/// Load all embedded Liberation font faces into a `usvg` font database so inline
+/// SVG `<text>` elements always resolve clean sans-serif / serif / monospace
+/// glyphs even on headless or mobile platforms without desktop system fonts.
+#[cfg(feature = "svg")]
+pub(crate) fn load_embedded_into_fontdb(db: &mut usvg::fontdb::Database) {
+    for &(_, data) in FACES {
+        db.load_font_data(data.to_vec());
+    }
+    db.set_sans_serif_family("Liberation Sans");
+    db.set_serif_family("Liberation Serif");
+    db.set_monospace_family("Liberation Mono");
+}
+
 /// Register the embedded faces and wire them into the CSS generic families.
 ///
 /// The generics are APPENDED, not replaced: where the platform has real fonts
