@@ -8,9 +8,10 @@ rust-version.workspace = true
 publish = false
 
 [features]
-default = ["svg"]
+default = ["svg", "window-renderer"]
 tracing = ["dep:tracing"]
 svg = ["dep:anyrender_svg", "dep:usvg", "zipp-dom/svg"]
+window-renderer = ["dep:softbuffer", "dep:raw-window-handle"]
 
 [dependencies]
 # In-repo
@@ -37,9 +38,9 @@ linebender_resource_handle = { workspace = true }
 
 # TinySkia software renderer (merged from anyrender_tinyskia)
 tiny-skia = { workspace = true }
-softbuffer = { workspace = true }
+softbuffer = { workspace = true, optional = true }
 read-fonts = { workspace = true }
-raw-window-handle = { workspace = true }
+raw-window-handle = { workspace = true, optional = true }
 
 # SVG (optional)
 usvg = { workspace = true, optional = true }

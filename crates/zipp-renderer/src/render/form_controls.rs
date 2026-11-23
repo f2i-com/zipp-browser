@@ -28,6 +28,21 @@ impl ElementCx<'_> {
             return;
         }
         let (cx, cy) = (frame.x1 - 13.0 * s, frame.center().y);
+        // Mask the right arrow gutter with the select's own background color so
+        // long option labels (when author CSS sets small padding-right) never
+        // collide visually with the dropdown chevron.
+        let bg = background
+            .background_color
+            .resolve_to_absolute(&self.style.clone_color())
+            .as_srgb_color();
+        if bg.components[3] > 0.05 {
+            let gutter = self.frame.padding_box;
+            let mask_x0 = (frame.x1 - 24.0 * s).max(gutter.x0);
+            if gutter.x1 > mask_x0 && gutter.y1 > gutter.y0 {
+                let mask_rect = kurbo::Rect::new(mask_x0, gutter.y0, gutter.x1, gutter.y1);
+                scene.fill(Fill::NonZero, self.transform, bg, None, &mask_rect);
+            }
+        }
         let (w, h) = (4.0 * s, 2.4 * s);
         let mut path = BezPath::new();
         path.move_to((cx - w, cy - h));
@@ -83,6 +98,10 @@ fn draw_checkbox(
     accent_color: Color,
     scale: f64,
 ) {
+    let c = accent_color.to_rgba8();
+    let lum = 0.2126 * (c.r as f32 / 255.0)
+        + 0.7152 * (c.g as f32 / 255.0)
+        + 0.0722 * (c.b as f32 / 255.0);
     if checked {
         scene.fill(Fill::NonZero, transform, accent_color, None, &frame);
         //Tick code derived from masonry
@@ -103,10 +122,23 @@ fn draw_checkbox(
             dash_offset: 0.0,
         };
 
-        scene.stroke(&style, transform, Color::WHITE, None, &path);
+        let tick_color = if lum > 0.7 {
+            Color::from_rgba8(15, 23, 42, 255)
+        } else {
+            Color::WHITE
+        };
+        scene.stroke(&style, transform, tick_color, None, &path);
     } else {
-        scene.fill(Fill::NonZero, transform, Color::WHITE, None, &frame);
-        scene.stroke(&Stroke::default(), transform, accent_color, None, &frame);
+        let (bg, border) = if lum > 0.55 {
+            (
+                Color::from_rgba8(15, 23, 42, 210),
+                Color::from_rgba8(148, 163, 184, 200),
+            )
+        } else {
+            (Color::WHITE, accent_color)
+        };
+        scene.fill(Fill::NonZero, transform, bg, None, &frame);
+        scene.stroke(&Stroke::new(scale.max(1.0)), transform, border, None, &frame);
     }
 }
 

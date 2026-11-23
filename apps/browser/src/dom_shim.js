@@ -3640,11 +3640,16 @@ function __serializeNode(node) {
         }
         var vb=node.getAttribute("viewBox")||("0 0 "+sw+" "+sh);
         var fill=node.getAttribute("fill")||"none";
-        var stroke=node.getAttribute("stroke")||"currentColor";
-        var sw2=node.getAttribute("stroke-width")||"2";
-        var slc=node.getAttribute("stroke-linecap")||"round";
-        var slj=node.getAttribute("stroke-linejoin")||"round";
-        return "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\""+sw+"\" height=\""+sh+"\" viewBox=\""+vb+"\" fill=\""+fill+"\" stroke=\""+stroke+"\" stroke-width=\""+sw2+"\" stroke-linecap=\""+slc+"\" stroke-linejoin=\""+slj+"\" style=\"width:"+sw+"px;height:"+sh+"px;display:inline-block;flex-shrink:0\">"+svgChildren+"</svg>";
+        var svgAttrs=" xmlns=\"http://www.w3.org/2000/svg\" width=\""+sw+"\" height=\""+sh+"\" viewBox=\""+vb+"\" fill=\""+fill+"\"";
+        var stroke=node.getAttribute("stroke");
+        if(stroke!==null&&stroke!==undefined) svgAttrs+=" stroke=\""+__ea(stroke)+"\"";
+        var sw2=node.getAttribute("stroke-width");
+        if(sw2!==null&&sw2!==undefined) svgAttrs+=" stroke-width=\""+__ea(sw2)+"\"";
+        var slc=node.getAttribute("stroke-linecap");
+        if(slc!==null&&slc!==undefined) svgAttrs+=" stroke-linecap=\""+__ea(slc)+"\"";
+        var slj=node.getAttribute("stroke-linejoin");
+        if(slj!==null&&slj!==undefined) svgAttrs+=" stroke-linejoin=\""+__ea(slj)+"\"";
+        return "<svg"+svgAttrs+" style=\"width:"+sw+"px;height:"+sh+"px;display:inline-block;flex-shrink:0\">"+svgChildren+"</svg>";
     }
     // Skip SVG child elements (they're serialized inline above)
     if(node.namespaceURI && node.namespaceURI.indexOf("svg")>=0) return "";

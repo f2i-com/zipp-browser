@@ -593,6 +593,21 @@ pub fn to_taffy_style(style: &stylo::ComputedValues) -> taffy::Style<Atom> {
     let padding = style.get_padding();
     let border = style.get_border();
 
+    let raw_overflow_y = style.clone_overflow_y();
+    let taffy_overflow_y = if matches!(raw_overflow_y, stylo::Overflow::Hidden)
+        && matches!(pos.height, stylo::Size::Auto)
+        && matches!(pos.max_height, stylo::MaxSize::None)
+    {
+        // Taffy treats `Overflow::Hidden` as a scroll container with automatic
+        // minimum size 0, which collapses auto-height `overflow-hidden` cards
+        // inside CSS Grid tracks to 0px. Mapping auto-height `overflow-y: hidden`
+        // to `Clip` preserves intrinsic height in layout while paint still clips
+        // using Stylo's `overflow_y`.
+        taffy::Overflow::Clip
+    } else {
+        self::overflow(raw_overflow_y)
+    };
+
     taffy::Style {
         dummy: core::marker::PhantomData,
         display: self::display(display),
@@ -608,7 +623,7 @@ pub fn to_taffy_style(style: &stylo::ComputedValues) -> taffy::Style<Atom> {
         position: self::position(style.clone_position()),
         overflow: taffy::Point {
             x: self::overflow(style.clone_overflow_x()),
-            y: self::overflow(style.clone_overflow_y()),
+            y: taffy_overflow_y,
         },
         direction: self::direction(style.clone_direction()),
         scrollbar_width: 0.0,

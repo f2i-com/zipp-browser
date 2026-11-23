@@ -447,9 +447,9 @@ impl<'dom> DocumentPainter<'dom> {
                         cx.draw_canvas(scene);
                         cx.draw_sub_document(scene);
                         cx.draw_input(scene);
-                        cx.draw_select_arrow(scene);
                         cx.draw_text_input_text(scene, content_position);
                         cx.draw_inline_layout(scene, content_position);
+                        cx.draw_select_arrow(scene);
                         cx.draw_marker(scene, content_position);
                         cx.draw_children(scene);
                     },
@@ -1121,6 +1121,39 @@ impl ElementCx<'_> {
         let border = style.get_border();
         let current_color = style.clone_color();
 
+        // Fast path: uniform 4-sided dashed or dotted border — stroke the closed
+        // rounded border centerline directly with a real dash pattern so rounded
+        // corners curve smoothly without clip-mask corner wedges.
+        if matches!(border.border_top_style, BorderStyle::Dashed | BorderStyle::Dotted)
+            && border.border_top_style == border.border_right_style
+            && border.border_top_style == border.border_bottom_style
+            && border.border_top_style == border.border_left_style
+        {
+            let bw = &self.frame.border_width;
+            let w = bw.y0;
+            if w > 0.0
+                && (bw.x1 - w).abs() < 1e-3
+                && (bw.y1 - w).abs() < 1e-3
+                && (bw.x0 - w).abs() < 1e-3
+            {
+                let c_top = border.border_top_color.resolve_to_absolute(&current_color).as_srgb_color();
+                let c_right = border.border_right_color.resolve_to_absolute(&current_color).as_srgb_color();
+                let c_bottom = border.border_bottom_color.resolve_to_absolute(&current_color).as_srgb_color();
+                let c_left = border.border_left_color.resolve_to_absolute(&current_color).as_srgb_color();
+                if c_top.components[3] > 0.0 && c_top == c_right && c_top == c_bottom && c_top == c_left {
+                    let centerline = self.frame.border_centerline_path();
+                    let (dash, gap, cap) = match border.border_top_style {
+                        BorderStyle::Dotted => (w, w * 1.5, kurbo::Cap::Round),
+                        _ => (w * 3.0, w * 2.0, kurbo::Cap::Butt),
+                    };
+                    let mut stroke = Stroke::new(w).with_caps(cap);
+                    stroke.dash_pattern = [dash, gap].as_slice().into();
+                    scene.stroke(&stroke, self.transform, c_top, None, &centerline);
+                    return;
+                }
+            }
+        }
+
         let mut borders: [(Color, Option<BezPath>); 4] = [
             (Color::TRANSPARENT, None),
             (Color::TRANSPARENT, None),
@@ -1375,7 +1408,8 @@ impl ElementCx<'_> {
             offset += period;
         }
 
-        let clip = self.frame.border_edge_shape(edge);
+        let mut clip = self.frame.border_edge_shape(edge);
+        clip.close_path();
         scene.push_layer(peniko::Mix::Normal, 1.0, self.transform, &clip);
         scene.fill(Fill::NonZero, self.transform, color, None, &pattern);
         scene.pop_layer();

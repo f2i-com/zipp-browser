@@ -161,6 +161,28 @@ impl CssBox {
         path
     }
 
+    /// Construct a closed bezpath along the centerline of the border (halfway
+    /// between the outer border box and the inner padding box), suitable for
+    /// stroking uniform dashed/dotted borders cleanly around rounded corners.
+    pub fn border_centerline_path(&self) -> BezPath {
+        let half_insets = Insets {
+            x0: self.border_width.x0 * 0.5,
+            y0: self.border_width.y0 * 0.5,
+            x1: self.border_width.x1 * 0.5,
+            y1: self.border_width.y1 * 0.5,
+        };
+        let half_box = Self::new(
+            self.border_box,
+            half_insets,
+            Insets::ZERO,
+            0.0,
+            self.border_radii,
+        );
+        let mut path = half_box.padding_box_path();
+        path.close_path();
+        path
+    }
+
     /// Construct a bezpath drawing the frame padding
     pub fn padding_box_path(&self) -> BezPath {
         let mut path = BezPath::new();

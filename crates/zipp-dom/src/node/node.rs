@@ -823,11 +823,23 @@ impl Node {
     }
 
     pub fn write_outer_html(&self, writer: &mut String) {
+        self.write_outer_html_with_context(writer, None, None);
+    }
+
+    fn write_outer_html_with_context(
+        &self,
+        writer: &mut String,
+        inherited_color: Option<&str>,
+        inherited_styles: Option<&ComputedValues>,
+    ) {
         let has_children = !self.children.is_empty();
-        let current_color = self
-            .primary_styles()
-            .map(|style| style.clone_color())
-            .map(|color| color.to_css_string());
+        let own_styles = self.primary_styles();
+        let own_color = own_styles
+            .as_deref()
+            .map(|style| style.clone_color().to_css_string());
+        let effective_color = own_color.as_deref().or(inherited_color);
+        let effective_styles: Option<&ComputedValues> =
+            own_styles.as_deref().map(|s| &**s).or(inherited_styles);
 
         match &self.data {
             NodeData::Document => {}
@@ -845,14 +857,22 @@ impl Node {
                     writer.push(' ');
                     writer.push_str(&attr.name.local);
                     writer.push_str("=\"");
-                    #[allow(clippy::unnecessary_unwrap)] // Convert to if-let chain once stabilised
-                    if current_color.is_some() && attr.value.contains("currentColor") {
-                        let value = attr
-                            .value
-                            .replace("currentColor", current_color.as_ref().unwrap());
-                        encode_quoted_attribute_to_string(&value, writer);
+                    let mut resolved: Option<String> = None;
+                    if let Some(styles) = effective_styles {
+                        if attr.value.contains("var(") {
+                            resolved = Some(resolve_css_vars_in_attr(&attr.value, styles, 0));
+                        }
+                    }
+                    let val_ref = resolved.as_deref().unwrap_or(&attr.value);
+                    if let Some(color) = effective_color {
+                        if val_ref.contains("currentColor") {
+                            let replaced = val_ref.replace("currentColor", color);
+                            encode_quoted_attribute_to_string(&replaced, writer);
+                        } else {
+                            encode_quoted_attribute_to_string(val_ref, writer);
+                        }
                     } else {
-                        encode_quoted_attribute_to_string(&attr.value, writer);
+                        encode_quoted_attribute_to_string(val_ref, writer);
                     }
                     writer.push('"');
                 }
@@ -863,7 +883,11 @@ impl Node {
 
                 if has_children {
                     for &child_id in &self.children {
-                        self.tree()[child_id].write_outer_html(writer);
+                        self.tree()[child_id].write_outer_html_with_context(
+                            writer,
+                            effective_color,
+                            effective_styles,
+                        );
                     }
 
                     writer.push_str("</");
@@ -1246,6 +1270,76 @@ impl Node {
             buttons: Default::default(),
             details: Default::default(),
         }
+    }
+}
+
+/// Resolve CSS custom property references (`var(--name)` / `var(--name, fallback)`)
+/// inside serialized SVG/element attributes using Stylo's computed custom properties,
+/// so `usvg` receives concrete colors and lengths instead of unparsed `var(...)`.
+fn resolve_css_vars_in_attr(input: &str, styles: &ComputedValues, depth: usize) -> String {
+    if depth >= 8 || !input.contains("var(") {
+        return input.to_string();
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(idx) = rest.find("var(") {
+        out.push_str(&rest[..idx]);
+        let after = &rest[idx + 4..];
+        let mut paren_depth = 1usize;
+        let mut end = None;
+        for (i, ch) in after.char_indices() {
+            match ch {
+                '(' => paren_depth += 1,
+                ')' => {
+                    paren_depth -= 1;
+                    if paren_depth == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end_idx) = end else {
+            out.push_str(&rest[idx..]);
+            return out;
+        };
+        let inner = after[..end_idx].trim();
+        let (var_name, fallback) = match inner.find(',') {
+            Some(comma) => (inner[..comma].trim(), Some(inner[comma + 1..].trim())),
+            None => (inner, None),
+        };
+        let resolved = lookup_css_custom_property(styles, var_name).or_else(|| {
+            fallback.map(|fb| resolve_css_vars_in_attr(fb, styles, depth + 1))
+        });
+        match resolved {
+            Some(val) => {
+                if val.contains("var(") {
+                    out.push_str(&resolve_css_vars_in_attr(&val, styles, depth + 1));
+                } else {
+                    out.push_str(&val);
+                }
+            }
+            None => out.push_str(&rest[idx..idx + 4 + end_idx + 1]),
+        }
+        rest = &after[end_idx + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn lookup_css_custom_property(styles: &ComputedValues, name: &str) -> Option<String> {
+    if !name.starts_with("--") {
+        return None;
+    }
+    let id = style::properties::PropertyId::parse_enabled_for_all_content(name).ok()?;
+    let declaration = id.as_shorthand().err()?;
+    let val = styles.computed_value_to_string(declaration);
+    let trimmed = val.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 

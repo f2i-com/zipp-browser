@@ -21,10 +21,13 @@
 //! Glyph outlines are extracted from OpenType fonts via [`skrifa`] and converted
 //! to tiny-skia paths through the [`GlyphOutlinePen`] adapter.
 
+#[cfg(feature = "window-renderer")]
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use anyrender::{Glyph, NormalizedCoord, PaintScene, WindowHandle, WindowRenderer};
+use anyrender::{Glyph, NormalizedCoord, PaintScene};
+#[cfg(feature = "window-renderer")]
+use anyrender::{WindowHandle, WindowRenderer};
 use kurbo::{Affine, Rect, Shape, Stroke};
 use peniko::{
     color::{AlphaColor, Srgb},
@@ -749,6 +752,24 @@ impl TinySkiaPainter {
         }
     }
 
+    /// Raw premultiplied RGBA8 framebuffer bytes (4 bytes per pixel, row-major).
+    #[inline]
+    pub fn rgba_data(&self) -> &[u8] {
+        self.pixmap.data()
+    }
+
+    /// Current framebuffer width in physical pixels.
+    #[inline]
+    pub fn width(&self) -> u32 {
+        self.pixmap.width()
+    }
+
+    /// Current framebuffer height in physical pixels.
+    #[inline]
+    pub fn height(&self) -> u32 {
+        self.pixmap.height()
+    }
+
     /// Build a clip mask from the active clip region, sized to the current pixmap.
     /// The clip mask to pass to a draw whose device-space bounds are `bounds`.
     ///
@@ -1263,6 +1284,17 @@ impl PaintScene for TinySkiaPainter {
                     // rendered as nothing at all.
                     let paint = make_brush_paint(&paint_ref, brush_space(brush_transform));
                     let bounds = device_bounds(shape, transform);
+                    if !bounds.x0.is_finite()
+                        || !bounds.y0.is_finite()
+                        || !bounds.x1.is_finite()
+                        || !bounds.y1.is_finite()
+                        || bounds.x1 <= 0.0
+                        || bounds.y1 <= 0.0
+                        || bounds.x0 >= self.pixmap.width() as f64
+                        || bounds.y0 >= self.pixmap.height() as f64
+                    {
+                        return;
+                    }
                     self.mark_dirty(bounds);
                     let mask = self.clip_mask_for(bounds);
                     // The fill rule was ignored -- everything filled as nonzero --
@@ -1272,8 +1304,23 @@ impl PaintScene for TinySkiaPainter {
                         Fill::NonZero => FillRule::Winding,
                         Fill::EvenOdd => FillRule::EvenOdd,
                     };
-                    self.pixmap
-                        .fill_path(&path, &paint, rule, ts, mask.as_deref());
+                    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        self.pixmap
+                            .fill_path(&path, &paint, rule, ts, mask.as_deref());
+                    }));
+                    if res.is_err() {
+                        let mut fallback_paint = paint.clone();
+                        fallback_paint.anti_alias = false;
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            self.pixmap.fill_path(
+                                &path,
+                                &fallback_paint,
+                                rule,
+                                ts,
+                                mask.as_deref(),
+                            );
+                        }));
+                    }
                 }
             }
         }
@@ -1321,10 +1368,36 @@ impl PaintScene for TinySkiaPainter {
             let ts = affine_to_transform(transform);
             let paint = make_brush_paint(&paint_ref, brush_space(brush_transform));
             let bounds = device_bounds(shape, transform).inflate(style.width, style.width);
+            if !bounds.x0.is_finite()
+                || !bounds.y0.is_finite()
+                || !bounds.x1.is_finite()
+                || !bounds.y1.is_finite()
+                || bounds.x1 <= 0.0
+                || bounds.y1 <= 0.0
+                || bounds.x0 >= self.pixmap.width() as f64
+                || bounds.y0 >= self.pixmap.height() as f64
+            {
+                return;
+            }
             self.mark_dirty(bounds);
             let mask = self.clip_mask_for(bounds);
-            self.pixmap
-                .stroke_path(&path, &paint, &stroke, ts, mask.as_deref());
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.pixmap
+                    .stroke_path(&path, &paint, &stroke, ts, mask.as_deref());
+            }));
+            if res.is_err() {
+                let mut fallback_paint = paint.clone();
+                fallback_paint.anti_alias = false;
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.pixmap.stroke_path(
+                        &path,
+                        &fallback_paint,
+                        &stroke,
+                        ts,
+                        mask.as_deref(),
+                    );
+                }));
+            }
         }
     }
 
@@ -1861,6 +1934,10 @@ impl skrifa::outline::OutlinePen for GlyphOutlinePen<'_> {
 // TinySkiaWindowRenderer -- softbuffer presentation (works without GPU / on RDP)
 // ============================================================================
 
+#[cfg(feature = "window-renderer")]
+mod window_renderer {
+use super::*;
+
 /// How the picture goes onto the screen: the quarter turns clockwise it is
 /// turned by (a panel mounted on its side, as a GPD Win Max's is), and the
 /// size of the screen's buffers then -- the picture's turned, or wider where
@@ -2008,3 +2085,7 @@ impl WindowRenderer for TinySkiaWindowRenderer {
         let _ = buffer.present();
     }
 }
+}
+
+#[cfg(feature = "window-renderer")]
+pub use window_renderer::{TinySkiaWindowRenderer, set_screen_transform};
