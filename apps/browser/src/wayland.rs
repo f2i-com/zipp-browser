@@ -1350,10 +1350,10 @@ impl Dispatch<WlSurface, ()> for State {
         let id = surface.id();
         match request {
             wl_surface::Request::Attach { buffer, .. } => {
-                if let Some(s) = state.surfaces.get_mut(&id) {
-                    if let Some(Some(prev)) = s.buffer.replace(buffer) {
-                        prev.release();
-                    }
+                if let Some(s) = state.surfaces.get_mut(&id)
+                    && let Some(Some(prev)) = s.buffer.replace(buffer)
+                {
+                    prev.release();
                 }
             }
             wl_surface::Request::Frame { callback } => {
