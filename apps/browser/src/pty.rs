@@ -102,7 +102,7 @@ impl Options {
                 uid: v["jail"]["uid"].as_u64().unwrap_or(0) as u32,
                 gid: v["jail"]["gid"].as_u64().unwrap_or(0) as u32,
             }),
-            user: v["user"].as_u64().filter(|&n| n > 0 && n <= u32::MAX as u64).map(|n| n as u32),
+            user: v["user"].as_u64().filter(|n| (1..=u32::MAX as u64).contains(n)).map(|n| n as u32),
         })
     }
 }

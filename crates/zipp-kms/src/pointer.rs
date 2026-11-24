@@ -155,11 +155,11 @@ impl Pointer {
         #[allow(deprecated)]
         if self.hardware.is_some() {
             let _ = card.set_cursor2::<DumbBuffer>(crtc, None, (0, 0));
-        } else if let Some(drawn) = state.drawn.take() {
-            if let Some(map) = state.maps.get(&u32::from(drawn.fb)) {
-                map.put(drawn.at, state.rotation, &drawn.under);
-                let _ = card.dirty_framebuffer(drawn.fb, &[rect(drawn.at, state.rotation)]);
-            }
+        } else if let Some(drawn) = state.drawn.take()
+            && let Some(map) = state.maps.get(&u32::from(drawn.fb))
+        {
+            map.put(drawn.at, state.rotation, &drawn.under);
+            let _ = card.dirty_framebuffer(drawn.fb, &[rect(drawn.at, state.rotation)]);
         }
     }
 

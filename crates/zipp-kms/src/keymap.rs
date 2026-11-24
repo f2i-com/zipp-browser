@@ -39,7 +39,9 @@ pub(crate) fn map(code: u16) -> Mapped {
     use KeyLocation::{Left, Numpad, Right, Standard};
     use NamedKey as N;
 
-    let (key, location, chars, named): (Option<KeyCode>, KeyLocation, Option<(char, char)>, Option<NamedKey>) =
+    type KeyMapping = (Option<KeyCode>, KeyLocation, Option<(char, char)>, Option<NamedKey>);
+
+    let (key, location, chars, named): KeyMapping =
         match code {
             1 => (Some(C::Escape), Standard, None, Some(N::Escape)),
             2..=11 => {

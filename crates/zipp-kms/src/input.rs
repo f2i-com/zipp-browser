@@ -355,7 +355,7 @@ impl Input {
                     button: ButtonSource::Mouse(button),
                 });
             }
-            (EV_KEY, code) if code < BTN_MISC || code >= KEY_OK => self.key(device_id, code, event.value, out),
+            (EV_KEY, code) if !(BTN_MISC..KEY_OK).contains(&code) => self.key(device_id, code, event.value, out),
             (EV_REL, REL_X) => device.rel.0 += event.value,
             (EV_REL, REL_Y) => device.rel.1 += event.value,
             (EV_REL, REL_WHEEL) => device.wheel.1 += event.value,

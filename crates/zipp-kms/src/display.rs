@@ -361,7 +361,7 @@ fn set_mode(card: &Card, crtc: crtc::Handle, connector: connector::Handle, mode:
 /// where the driver pads rows.
 fn drawn_width(scanout: &DumbBuffer, width: u32) -> u32 {
     let pitch = drm::buffer::Buffer::pitch(scanout);
-    if pitch % 4 == 0 && pitch / 4 > width { pitch / 4 } else { width }
+    if pitch.is_multiple_of(4) && pitch / 4 > width { pitch / 4 } else { width }
 }
 
 /// A 60 Hz mode of this size, for a virtual screen that takes any (real

@@ -58,9 +58,11 @@ static WAKE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new
 /// The screen's turn now, and the panel's own (quarter turns clockwise).
 static ROTATION_NOW: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 static ROTATION_PANEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+type RotationCallback = Box<dyn Fn(u8, (u32, u32)) + Send + Sync>;
+
 /// Told of each turn: the quarter turns, and the size of the buffers the
 /// panel scans out (what a renderer turns its picture onto).
-static ON_ROTATION: std::sync::OnceLock<Box<dyn Fn(u8, (u32, u32)) + Send + Sync>> = std::sync::OnceLock::new();
+static ON_ROTATION: std::sync::OnceLock<RotationCallback> = std::sync::OnceLock::new();
 
 /// Turn the screen: `Some(0..=3)` quarter turns clockwise, or `None` for the
 /// panel's own (as the kernel knows the panel is mounted). Applied by the
@@ -309,22 +311,23 @@ impl EventLoop {
         let stats = std::env::var_os("ZIPP_KMS_STATS").is_some();
         let (mut frames, mut counted_since) = (0u32, Instant::now());
         loop {
-            if let Some(id) = target.window.get() {
-                if flip_due.is_none() && shared.redraw.swap(false, Ordering::AcqRel) {
-                    if stats {
-                        frames += 1;
-                        if counted_since.elapsed() >= Duration::from_secs(1) {
-                            eprintln!("[kms] {frames} frames in {:.2} s", counted_since.elapsed().as_secs_f64());
-                            (frames, counted_since) = (0, Instant::now());
-                        }
+            if let Some(id) = target.window.get()
+                && flip_due.is_none()
+                && shared.redraw.swap(false, Ordering::AcqRel)
+            {
+                if stats {
+                    frames += 1;
+                    if counted_since.elapsed() >= Duration::from_secs(1) {
+                        eprintln!("[kms] {frames} frames in {:.2} s", counted_since.elapsed().as_secs_f64());
+                        (frames, counted_since) = (0, Instant::now());
                     }
-                    app.window_event(target, id, WindowEvent::RedrawRequested);
-                    flip_due = Some(Instant::now() + FLIP_TIMEOUT);
-                    // A drawn pointer goes on the new frame at once: the flip
-                    // is queued, the CRTC already names its framebuffer, and
-                    // the pointer's update is committed after it.
-                    shared.display.frame_presented();
                 }
+                app.window_event(target, id, WindowEvent::RedrawRequested);
+                flip_due = Some(Instant::now() + FLIP_TIMEOUT);
+                // A drawn pointer goes on the new frame at once: the flip
+                // is queued, the CRTC already names its framebuffer, and
+                // the pointer's update is committed after it.
+                shared.display.frame_presented();
             }
             app.about_to_wait(target);
             if target.exit.get() {
@@ -375,12 +378,11 @@ impl EventLoop {
             // The previous frame reached the screen: its flip completed, or the
             // wait for one ran out (some drivers never report it).
             let was_pending = flip_due.is_some();
-            if fds[0].revents & libc::POLLIN != 0 {
-                if let Ok(drm_events) = shared.display.card.receive_events() {
-                    if drm_events.into_iter().any(|e| matches!(e, DrmEvent::PageFlip(_))) {
-                        flip_due = None;
-                    }
-                }
+            if fds[0].revents & libc::POLLIN != 0
+                && let Ok(drm_events) = shared.display.card.receive_events()
+                && drm_events.into_iter().any(|e| matches!(e, DrmEvent::PageFlip(_)))
+            {
+                flip_due = None;
             }
             if flip_due.is_some_and(|due| Instant::now() >= due) {
                 flip_due = None;

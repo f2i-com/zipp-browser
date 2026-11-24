@@ -70,7 +70,7 @@ mod linux {
                         eprintln!("[smoke] present failed at frame {f}: {e}");
                     }
                     self.frames += 1;
-                    if self.frames % 60 == 0 {
+                    if self.frames.is_multiple_of(60) {
                         let fps = self.frames as f64 / self.started.elapsed().as_secs_f64();
                         eprintln!("[smoke] {} frames, {fps:.1} fps", self.frames);
                     }
