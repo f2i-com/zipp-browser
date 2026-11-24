@@ -216,6 +216,33 @@ pub extern "system" fn Java_com_softn_android_SoftnNative_nativeScroll(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_softn_android_SoftnNative_nativeScroll2D(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    delta_x: jfloat,
+    delta_y: jfloat,
+) -> jboolean {
+    if handle == 0 {
+        return JNI_FALSE;
+    }
+    let moved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let h = unsafe { &*(handle as *const EngineHandle) };
+        if let Ok(mut eng) = h.engine.lock() {
+            eng.on_scroll_2d(delta_x, delta_y)
+        } else {
+            false
+        }
+    }))
+    .unwrap_or(false);
+    if moved {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_softn_android_SoftnNative_nativePointerDown(
     _env: JNIEnv,
     _class: JClass,

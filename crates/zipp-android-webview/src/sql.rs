@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::limits::Limit;
@@ -28,6 +28,7 @@ pub struct SqlStorage {
     pub db_dir: PathBuf,
     pub kv_path: PathBuf,
     pub databases: Vec<DatabaseConfig>,
+    kv_conn: Arc<Mutex<Connection>>,
 }
 
 impl SqlStorage {
@@ -36,20 +37,25 @@ impl SqlStorage {
         fs::create_dir_all(&db_dir)
             .map_err(|e| format!("Failed to create app database directory: {e}"))?;
         let kv_path = app_data_dir.join("softn_kv.sqlite");
+        let conn = Self::open_kv_connection(&kv_path)?;
         let storage = Self {
             db_dir,
             kv_path,
             databases,
+            kv_conn: Arc::new(Mutex::new(conn)),
         };
-        storage.init_kv()?;
         Ok(storage)
     }
 
-    fn init_kv(&self) -> Result<(), String> {
-        let conn = Connection::open(&self.kv_path)
+    fn open_kv_connection(kv_path: &Path) -> Result<Connection, String> {
+        let conn = Connection::open(kv_path)
             .map_err(|e| format!("Failed to open KV SQLite: {e}"))?;
+        let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA temp_store=MEMORY;
+             PRAGMA cache_size=-2000;
              CREATE TABLE IF NOT EXISTS local_storage (
                  k TEXT PRIMARY KEY,
                  v TEXT NOT NULL
@@ -60,15 +66,15 @@ impl SqlStorage {
              );",
         )
         .map_err(|e| format!("Failed to initialize KV tables: {e}"))?;
-        Ok(())
+        Ok(conn)
     }
 
     pub fn load_local_storage(&self) -> HashMap<String, String> {
         let mut map = HashMap::new();
-        let Ok(conn) = Connection::open(&self.kv_path) else {
+        let Ok(conn) = self.kv_conn.lock() else {
             return map;
         };
-        let Ok(mut stmt) = conn.prepare("SELECT k, v FROM local_storage") else {
+        let Ok(mut stmt) = conn.prepare_cached("SELECT k, v FROM local_storage") else {
             return map;
         };
         let Ok(rows) = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) else {
@@ -81,33 +87,53 @@ impl SqlStorage {
     }
 
     pub fn set_local_storage(&self, key: &str, value: &str) {
-        if let Ok(conn) = Connection::open(&self.kv_path) {
-            let _ = conn.execute(
+        if let Ok(conn) = self.kv_conn.lock() {
+            if let Ok(mut stmt) = conn.prepare_cached(
                 "INSERT INTO local_storage (k, v) VALUES (?1, ?2)
                  ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-                params![key, value],
-            );
+            ) {
+                let _ = stmt.execute(params![key, value]);
+            }
+        }
+    }
+
+    pub fn replace_local_storage(&self, entries: &[(String, String)]) {
+        if let Ok(mut conn) = self.kv_conn.lock() {
+            if let Ok(tx) = conn.transaction() {
+                let _ = tx.execute("DELETE FROM local_storage", []);
+                if let Ok(mut stmt) = tx.prepare_cached(
+                    "INSERT INTO local_storage (k, v) VALUES (?1, ?2)
+                     ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                ) {
+                    for (k, v) in entries {
+                        let _ = stmt.execute(params![k, v]);
+                    }
+                }
+                let _ = tx.commit();
+            }
         }
     }
 
     pub fn remove_local_storage(&self, key: &str) {
-        if let Ok(conn) = Connection::open(&self.kv_path) {
-            let _ = conn.execute("DELETE FROM local_storage WHERE k = ?1", params![key]);
+        if let Ok(conn) = self.kv_conn.lock() {
+            if let Ok(mut stmt) = conn.prepare_cached("DELETE FROM local_storage WHERE k = ?1") {
+                let _ = stmt.execute(params![key]);
+            }
         }
     }
 
     pub fn clear_local_storage(&self) {
-        if let Ok(conn) = Connection::open(&self.kv_path) {
+        if let Ok(conn) = self.kv_conn.lock() {
             let _ = conn.execute("DELETE FROM local_storage", []);
         }
     }
 
     pub fn load_xdb_collections(&self) -> HashMap<String, Value> {
         let mut map = HashMap::new();
-        let Ok(conn) = Connection::open(&self.kv_path) else {
+        let Ok(conn) = self.kv_conn.lock() else {
             return map;
         };
-        let Ok(mut stmt) = conn.prepare("SELECT collection, records_json FROM xdb_collections") else {
+        let Ok(mut stmt) = conn.prepare_cached("SELECT collection, records_json FROM xdb_collections") else {
             return map;
         };
         let Ok(rows) = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) else {
@@ -122,12 +148,13 @@ impl SqlStorage {
     }
 
     pub fn save_xdb_collection(&self, collection: &str, records_json: &str) {
-        if let Ok(conn) = Connection::open(&self.kv_path) {
-            let _ = conn.execute(
+        if let Ok(conn) = self.kv_conn.lock() {
+            if let Ok(mut stmt) = conn.prepare_cached(
                 "INSERT INTO xdb_collections (collection, records_json) VALUES (?1, ?2)
                  ON CONFLICT(collection) DO UPDATE SET records_json = excluded.records_json",
-                params![collection, records_json],
-            );
+            ) {
+                let _ = stmt.execute(params![collection, records_json]);
+            }
         }
     }
 
@@ -217,7 +244,13 @@ impl SqlStorage {
                 .map_err(|e| format!("Failed to open in-memory SQLite DB: {e}"))?,
         };
         let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
-        let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;");
+        let _ = conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA foreign_keys=ON;
+             PRAGMA temp_store=MEMORY;
+             PRAGMA cache_size=-4000;",
+        );
         let _ = conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, 16 * 1024 * 1024);
         let _ = conn.set_limit(Limit::SQLITE_LIMIT_SQL_LENGTH, 1024 * 1024);
         let _ = conn.set_limit(Limit::SQLITE_LIMIT_LIKE_PATTERN_LENGTH, 512);
@@ -574,7 +607,7 @@ fn json_to_sql_value(v: &Value) -> SqlValue {
 }
 
 fn decode_hex(hex: &str) -> Option<Vec<u8>> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(hex.len() / 2);

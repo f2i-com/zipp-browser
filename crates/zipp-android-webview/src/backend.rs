@@ -945,6 +945,12 @@ impl LocalContainerBackend {
         rx.recv().unwrap_or_else(|_| json!({ "ok": false }))
     }
 
+    /// Returns `true` when this app runs a persistent Rust Axum backend that may emit
+    /// asynchronous timers or WebSocket frames between user interactions.
+    pub fn is_rust_backend(&self) -> bool {
+        self.kind == BackendKind::Rust
+    }
+
     /// Poll pending async timers in a Rust worker and drain all queued WebSocket frames.
     pub fn poll_rust_timers(&self) -> Vec<Value> {
         if self.kind != BackendKind::Rust {
@@ -1123,7 +1129,7 @@ fn encode_hex_bytes(bytes: &[u8]) -> String {
 }
 
 fn decode_hex_bytes(hex: &str) -> Option<Vec<u8>> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(hex.len() / 2);

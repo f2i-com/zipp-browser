@@ -205,9 +205,11 @@ init();
         }
         let bytes = std::fs::read(&fk_path).unwrap();
         let dir = temp_dir("mobile_fieldkit");
-        let mut host_info = HostDeviceInfo::default();
-        host_info.os_version = "Android 16 (API 36)".into();
-        host_info.model = "Google sdk_gphone64_x86_64".into();
+        let host_info = HostDeviceInfo {
+            os_version: "Android 16 (API 36)".into(),
+            model: "Google sdk_gphone64_x86_64".into(),
+            ..Default::default()
+        };
         let mut eng = SoftnMobileEngine::load_bundle(
             &bytes,
             &dir,
@@ -729,5 +731,117 @@ echo json_encode(['error' => 'not found']);
         assert_eq!(cc["ok"], true);
         let csd: serde_json::Value = serde_json::from_str(&eng.clear_site_data()).unwrap();
         assert_eq!(csd["ok"], true);
+    }
+
+    #[test]
+    fn supports_2d_scroll_idle_timer_reporting_and_batched_storage() {
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default();
+            zw.start_file("manifest.json", opts).unwrap();
+            zw.write_all(
+                br#"{
+                "name": "Scroll & Idle Test",
+                "version": "1.0.0",
+                "main": "index.html"
+            }"#,
+            )
+            .unwrap();
+            zw.start_file("index.html", opts).unwrap();
+            zw.write_all(
+                br#"<!doctype html>
+<html>
+<head>
+  <style>
+    body { margin: 0; padding: 0; }
+    #wide { width: 1200px; height: 2400px; background: #1e293b; }
+    #btn { width: 180px; height: 48px; }
+  </style>
+</head>
+<body>
+  <div id="wide">
+    <button id="btn">Count: 0</button>
+    <input id="note" type="text" placeholder="Note..." />
+  </div>
+  <script>
+    var count = 0;
+    var btn = document.getElementById("btn");
+    btn.addEventListener("click", function () {
+      count++;
+      btn.textContent = "Count: " + count;
+      localStorage.setItem("k1", "v" + count);
+      localStorage.setItem("k2", "saved-" + count);
+    });
+  </script>
+</body>
+</html>"#,
+            )
+            .unwrap();
+            zw.finish().unwrap();
+        }
+
+        let dir = temp_dir("scroll_idle");
+        let mut eng = SoftnMobileEngine::load_bundle(
+            &buf,
+            &dir,
+            400,
+            800,
+            1.0,
+            HostDeviceInfo::default(),
+        )
+        .expect("load scroll_idle bundle");
+
+        // No canvas and no timers scheduled -> idle next_timer_ms == -1, has_canvas == false
+        assert!(!eng.has_canvas(), "Static DOM should report has_canvas=false");
+        let idle_tick = eng.tick();
+        assert!(!idle_tick.has_canvas);
+        assert!(!idle_tick.wants_raf);
+        assert_eq!(idle_tick.next_timer_ms, -1, "Idle app should report next_timer_ms=-1");
+
+        // Rapid taps should update state and persist localStorage via persistent KV connection
+        let tap1 = eng.on_tap(60.0, 24.0);
+        assert!(tap1.dirty);
+        assert!(!tap1.has_canvas);
+        assert!(eng.current_rendered_html().contains("Count: 1"));
+        assert_eq!(eng.storage.load_local_storage().get("k2").map(String::as_str), Some("saved-1"));
+
+        // Tapping and typing into an uncontrolled <input> must mark DOM mutated & re-render value
+        let tap_input = eng.on_tap(250.0, 24.0);
+        assert!(tap_input.wants_ime, "Expected input tap to open IME");
+        let typed = eng.on_text_input("Turbine OK");
+        assert!(typed.dirty, "Typing into uncontrolled input must re-render");
+        assert!(
+            eng.current_rendered_html().contains("Turbine OK"),
+            "Rendered HTML missing typed input value: {}",
+            eng.current_rendered_html()
+        );
+
+        // 2D scrolling works on both Y and X axes and updates viewport cleanly
+        assert!(eng.on_scroll_2d(0.0, 120.0), "Expected vertical scroll to move");
+        assert!(eng.on_scroll_2d(150.0, 0.0), "Expected horizontal scroll to move");
+        assert!(eng.on_scroll_2d(-150.0, -120.0), "Expected scrolling back to origin to move");
+
+        // Measure 15 taps + 50 scroll steps to verify responsive layout/scroll pipeline
+        let t0 = std::time::Instant::now();
+        for _ in 0..15 {
+            let _ = eng.on_tap(60.0, 24.0);
+        }
+        let tap_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        assert!(eng.current_rendered_html().contains("Count: 16"));
+
+        let s0 = std::time::Instant::now();
+        for i in 0..50 {
+            let dy = if i < 25 { 24.0 } else { -24.0 };
+            let _ = eng.on_scroll_2d(0.0, dy);
+        }
+        let scroll_ms = s0.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "[perf] 15 interactive taps+DOM-syncs={:.1}ms ({:.2}ms/tap), 50 scrolls={:.2}ms ({:.3}ms/scroll)",
+            tap_ms,
+            tap_ms / 15.0,
+            scroll_ms,
+            scroll_ms / 50.0
+        );
     }
 }

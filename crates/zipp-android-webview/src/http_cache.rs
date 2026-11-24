@@ -117,18 +117,27 @@ impl MobileCookieJar {
         }
     }
 
-    fn insert_cookie(&self, url: &Url, raw: &str, from_http: bool) {
+    /// Insert a single parsed cookie into `list`. Returns `true` if the set of persistent
+    /// (non-session) cookies changed and therefore needs to be flushed to disk.
+    fn insert_cookie_locked(
+        list: &mut Vec<StoredCookie>,
+        url: &Url,
+        raw: &str,
+        from_http: bool,
+    ) -> bool {
         let Some(host) = url.host_str().map(|h| h.to_ascii_lowercase()) else {
-            return;
+            return false;
         };
         let mut parts = raw.split(';');
-        let Some(nv) = parts.next() else { return };
+        let Some(nv) = parts.next() else {
+            return false;
+        };
         let Some((name, value)) = nv.split_once('=') else {
-            return;
+            return false;
         };
         let name = name.trim().to_string();
         if name.is_empty() {
-            return;
+            return false;
         }
         let value = value.trim().to_string();
 
@@ -185,12 +194,18 @@ impl MobileCookieJar {
         }
 
         if !from_http && http_only {
-            return;
+            return false;
         }
 
-        let mut list = self.cookies.lock().unwrap_or_else(|e| e.into_inner());
         let now = unix_now();
-        list.retain(|c| c.expires_at.map_or(true, |exp| exp > now));
+        let mut persistent_changed = false;
+        list.retain(|c| {
+            let keep = c.expires_at.is_none_or(|exp| exp > now);
+            if !keep && c.expires_at.is_some() {
+                persistent_changed = true;
+            }
+            keep
+        });
 
         if !from_http
             && list.iter().any(|c| {
@@ -200,11 +215,20 @@ impl MobileCookieJar {
                     && matches_domain(&host, &c.domain, c.host_only)
             })
         {
-            return;
+            return persistent_changed;
         }
 
-        list.retain(|c| !(c.name == name && c.domain == domain && c.path == path));
+        list.retain(|c| {
+            let same = c.name == name && c.domain == domain && c.path == path;
+            if same && c.expires_at.is_some() {
+                persistent_changed = true;
+            }
+            !same
+        });
         if !expired_now {
+            if expires_at.is_some() {
+                persistent_changed = true;
+            }
             list.push(StoredCookie {
                 name,
                 value,
@@ -216,17 +240,28 @@ impl MobileCookieJar {
                 expires_at,
             });
         }
-        self.save_locked(&list);
+        persistent_changed
     }
 
     pub fn set_from_response(&self, url: &Url, set_cookie_headers: &[String]) {
+        if set_cookie_headers.is_empty() {
+            return;
+        }
+        let mut list = self.cookies.lock().unwrap_or_else(|e| e.into_inner());
+        let mut needs_save = false;
         for hdr in set_cookie_headers {
-            self.insert_cookie(url, hdr, true);
+            needs_save |= Self::insert_cookie_locked(&mut list, url, hdr, true);
+        }
+        if needs_save {
+            self.save_locked(&list);
         }
     }
 
     pub fn set_document_cookie(&self, url: &Url, raw: &str) {
-        self.insert_cookie(url, raw, false);
+        let mut list = self.cookies.lock().unwrap_or_else(|e| e.into_inner());
+        if Self::insert_cookie_locked(&mut list, url, raw, false) {
+            self.save_locked(&list);
+        }
     }
 
     pub fn document_cookie(&self, url: &Url) -> String {
@@ -252,7 +287,7 @@ impl MobileCookieJar {
         let list = self.cookies.lock().unwrap_or_else(|e| e.into_inner());
         list.iter()
             .filter(|c| {
-                c.expires_at.map_or(true, |exp| exp > now)
+                c.expires_at.is_none_or(|exp| exp > now)
                     && (include_http_only || !c.http_only)
                     && (!c.secure || is_secure)
                     && matches_domain(&host, &c.domain, c.host_only)
@@ -678,7 +713,7 @@ impl MobileHttpCache {
             let _ = std::fs::rename(&tmp, &path);
         }
         let n = self.writes.fetch_add(1, Ordering::Relaxed) + 1;
-        if n % 32 == 0 {
+        if n.is_multiple_of(32) {
             trim_disk(&self.dir, MAX_DISK_BYTES);
         }
     }

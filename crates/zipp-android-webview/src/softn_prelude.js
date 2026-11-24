@@ -1006,6 +1006,7 @@ var softn = {};
     var nextVal = opts[idx].value !== undefined && opts[idx].value !== null ? String(opts[idx].value) : "";
     node.value = nextVal;
     if (node.attributes) node.attributes.value = nextVal;
+    if (typeof __domMutations === "number") __domMutations++;
     if (typeof node.dispatchEvent === "function") {
       node.dispatchEvent(new Event("input", { bubbles: true }));
       node.dispatchEvent(new Event("change", { bubbles: true }));
@@ -1097,6 +1098,7 @@ var softn = {};
     }
     node.value = String(newValue);
     if (node.attributes) node.attributes.value = String(newValue);
+    if (typeof __domMutations === "number") __domMutations++;
     var cur = node;
     while (cur) {
       if (cur._id !== undefined) {
@@ -1113,6 +1115,11 @@ var softn = {};
     var node = __nodesById[flid];
     if (!node) return false;
     node.checked = !node.checked;
+    if (node.attributes) {
+      if (node.checked) node.attributes.checked = "checked";
+      else delete node.attributes.checked;
+    }
+    if (typeof __domMutations === "number") __domMutations++;
     var cur = node;
     while (cur) {
       if (cur._id !== undefined) {

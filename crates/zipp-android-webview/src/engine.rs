@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use anyrender::PaintScene;
 use linebender_resource_handle::Blob;
@@ -156,6 +156,9 @@ function __zippHasPendingRaf() {
         typeof __zippCanvasContexts !== "undefined" &&
         __zippCanvasContexts.length > 0
     );
+}
+function __zippHasAnyRaf() {
+    return typeof __rafQueue !== "undefined" && __rafQueue.length > 0;
 }
 function __getHtmlClassOnly() {
     try { return String((doc.documentElement && doc.documentElement.className) || ""); }
@@ -364,6 +367,8 @@ pub struct SelectPickerRequest {
 pub struct InteractionResult {
     pub dirty: bool,
     pub wants_raf: bool,
+    pub has_canvas: bool,
+    pub next_timer_ms: i64,
     pub ime_changed: bool,
     pub wants_ime: bool,
     pub input_text: String,
@@ -381,7 +386,8 @@ struct LayoutCache {
     boxes: HashMap<u32, [f32; 6]>,
     rects: HashMap<u32, [f32; 4]>,
     order: Vec<u32>,
-    styles: HashMap<u32, HashMap<String, String>>,
+    styles: HashMap<u32, Box<[Option<String>; CACHED_STYLE_PROPS.len()]>>,
+    scroll_x: f64,
     scroll_y: f64,
 }
 
@@ -402,20 +408,32 @@ const CACHED_STYLE_PROPS: &[&str] = &[
     "font-size",
 ];
 
+fn style_prop_index(prop: &str) -> Option<usize> {
+    let trimmed = prop.trim();
+    CACHED_STYLE_PROPS
+        .iter()
+        .position(|&p| p.eq_ignore_ascii_case(trimmed))
+}
+
 impl LayoutCache {
     fn update_from_doc(
         &mut self,
         doc: &BaseDocument,
         flid_to_dom: &HashMap<u32, usize>,
+        scroll_x: f64,
         scroll_y: f64,
     ) {
         self.boxes.clear();
         self.rects.clear();
         self.order.clear();
         self.styles.clear();
+        self.scroll_x = scroll_x;
         self.scroll_y = scroll_y;
         let mut pairs: Vec<(usize, u32)> = flid_to_dom.iter().map(|(&f, &n)| (n, f)).collect();
         pairs.sort_unstable_by_key(|&(node_id, _)| node_id);
+        self.boxes.reserve(pairs.len());
+        self.rects.reserve(pairs.len());
+        self.order.reserve(pairs.len());
         for (node_id, flid) in pairs {
             let Some(node) = doc.get_node(node_id) else {
                 continue;
@@ -435,17 +453,44 @@ impl LayoutCache {
             self.rects.insert(flid, [tx as f32, ty as f32, tw as f32, th as f32]);
             self.order.push(flid);
             if node.primary_styles().is_some() {
-                let mut smap = HashMap::new();
-                for &prop in CACHED_STYLE_PROPS {
+                let mut slots: [Option<String>; CACHED_STYLE_PROPS.len()] = Default::default();
+                let mut any = false;
+                for (idx, &prop) in CACHED_STYLE_PROPS.iter().enumerate() {
                     if let Some(val) = node.computed_style_value(prop) {
                         if !val.is_empty() {
-                            smap.insert(prop.to_string(), val);
+                            slots[idx] = Some(val);
+                            any = true;
                         }
                     }
                 }
-                if !smap.is_empty() {
-                    self.styles.insert(flid, smap);
+                if any {
+                    self.styles.insert(flid, Box::new(slots));
                 }
+            }
+        }
+    }
+
+    /// O(1) update when only the root viewport scroll offset changed.
+    fn set_viewport_scroll(&mut self, scroll_x: f64, scroll_y: f64) {
+        self.scroll_x = scroll_x;
+        self.scroll_y = scroll_y;
+    }
+
+    /// Fast rect-only refresh for nested container scrolls (never recomputes box sizes or CSS strings).
+    fn update_rects_from_doc(
+        &mut self,
+        doc: &BaseDocument,
+        flid_to_dom: &HashMap<u32, usize>,
+        scroll_x: f64,
+        scroll_y: f64,
+    ) {
+        self.scroll_x = scroll_x;
+        self.scroll_y = scroll_y;
+        for (&flid, &node_id) in flid_to_dom {
+            if let Some(node) = doc.get_node(node_id) {
+                let (tx, ty, tw, th) = node.transformed_border_rect();
+                self.rects
+                    .insert(flid, [tx as f32, ty as f32, tw as f32, th as f32]);
             }
         }
     }
@@ -467,29 +512,38 @@ impl LayoutCache {
         let Some(r) = self.rects.get(&flid) else {
             return String::new();
         };
-        format!("[{},{},{},{}]", r[0], f64::from(r[1]) - self.scroll_y, r[2], r[3])
+        format!(
+            "[{},{},{},{}]",
+            f64::from(r[0]) - self.scroll_x,
+            f64::from(r[1]) - self.scroll_y,
+            r[2],
+            r[3]
+        )
     }
 
     fn format_style(&self, flid_str: &str, prop: &str) -> String {
         let Ok(flid) = flid_str.parse::<u32>() else {
             return String::new();
         };
-        let key = prop.trim().to_ascii_lowercase();
+        let Some(idx) = style_prop_index(prop) else {
+            return String::new();
+        };
         self.styles
             .get(&flid)
-            .and_then(|m| m.get(&key))
-            .cloned()
-            .unwrap_or_default()
+            .and_then(|slots| slots[idx].as_deref())
+            .unwrap_or("")
+            .to_string()
     }
 
     fn hit(&self, x_str: &str, y_str: &str) -> String {
         let (Ok(x), Ok(y)) = (x_str.parse::<f32>(), y_str.parse::<f32>()) else {
             return String::new();
         };
+        let doc_x = x + self.scroll_x as f32;
         let doc_y = y + self.scroll_y as f32;
         for &flid in self.order.iter().rev() {
             if let Some(&[rx, ry, rw, rh]) = self.rects.get(&flid) {
-                if rw > 0.0 && rh > 0.0 && x >= rx && x <= rx + rw && doc_y >= ry && doc_y <= ry + rh {
+                if rw > 0.0 && rh > 0.0 && doc_x >= rx && doc_x <= rx + rw && doc_y >= ry && doc_y <= ry + rh {
                     return flid.to_string();
                 }
             }
@@ -594,12 +648,14 @@ pub struct SoftnMobileEngine {
     width: u32,
     height: u32,
     scale: f32,
+    scroll_x: f64,
     scroll_y: f64,
     focused_flid: Option<u32>,
     active_canvas_flid: Option<u32>,
     last_pointer_phys: (f32, f32),
     flid_to_dom: HashMap<u32, usize>,
     dom_to_flid: HashMap<usize, u32>,
+    canvas_flids: Vec<u32>,
     layout_cache: Arc<Mutex<LayoutCache>>,
     pending_calls: Arc<Mutex<Vec<PendingDeviceRequest>>>,
     pub logs: Arc<Mutex<Vec<String>>>,
@@ -708,12 +764,14 @@ impl SoftnMobileEngine {
                 width,
                 height,
                 scale,
+                None,
             ),
             painter: TinySkiaPainter::new(width.max(1), height.max(1)),
             head_css,
             width: width.max(1),
             height: height.max(1),
             scale: scale.max(1.0),
+            scroll_x: 0.0,
             scroll_y: 0.0,
             focused_flid: None,
             active_canvas_flid: None,
@@ -723,6 +781,7 @@ impl SoftnMobileEngine {
             ),
             flid_to_dom: HashMap::new(),
             dom_to_flid: HashMap::new(),
+            canvas_flids: Vec::new(),
             layout_cache,
             pending_calls,
             logs,
@@ -762,7 +821,7 @@ impl SoftnMobileEngine {
         self.doc.as_mut().set_viewport(viewport);
         self.doc.as_mut().resolve(0.0);
         if let Ok(mut lc) = self.layout_cache.lock() {
-            lc.update_from_doc(self.doc.as_ref(), &self.flid_to_dom, self.scroll_y);
+            lc.update_from_doc(self.doc.as_ref(), &self.flid_to_dom, self.scroll_x, self.scroll_y);
         }
         self.layout_dirty = false;
         self.full_repaint = true;
@@ -791,8 +850,11 @@ impl SoftnMobileEngine {
             return false;
         }
         if self.layout_dirty {
-            self.doc.as_mut().poll(None);
+            self.doc.poll(None);
             self.doc.as_mut().resolve(0.0);
+            if self.doc.poll(None) {
+                self.doc.as_mut().resolve(0.0);
+            }
             self.layout_dirty = false;
             self.full_repaint = true;
         }
@@ -918,7 +980,7 @@ impl SoftnMobileEngine {
                 }
             }
             let at = node.absolute_position(0.0, 0.0);
-            let lx = (at.x + node.scroll_offset.x as f32) as f64;
+            let lx = (at.x + node.scroll_offset.x as f32) as f64 - self.scroll_x;
             let ly = (at.y + node.scroll_offset.y as f32) as f64 - self.scroll_y;
             let lw = node.final_layout.size.width as f64;
             let lh = node.final_layout.size.height as f64;
@@ -958,10 +1020,61 @@ impl SoftnMobileEngine {
         matches!(st.call_global("__zippHasPendingRaf", &[]), Ok(JsValue::Bool(true)))
     }
 
+    fn has_any_raf_queued(&mut self) -> bool {
+        let Some(ref mut st) = self.js_state else {
+            return false;
+        };
+        matches!(st.call_global("__zippHasAnyRaf", &[]), Ok(JsValue::Bool(true)))
+    }
+
+    pub fn has_canvas(&self) -> bool {
+        !self.canvas_flids.is_empty()
+    }
+
+    /// Milliseconds until the next scheduled JS or Rust backend timer is due (`-1` when idle).
+    pub fn next_timer_ms(&mut self) -> i64 {
+        let mut js_next: i64 = -1;
+        if let Some(ref mut st) = self.js_state {
+            if let Ok(JsValue::Number(n)) = st.call_global("__zippNextTimer", &[]) {
+                if n.is_finite() && n >= 0.0 {
+                    js_next = (n.ceil() as i64).min(60_000);
+                }
+            }
+        }
+        if self.backend.as_ref().is_some_and(|b| b.is_rust_backend()) {
+            return if js_next < 0 { 120 } else { js_next.min(120) };
+        }
+        js_next
+    }
+
+    fn build_interaction_result(
+        &mut self,
+        ime_changed: bool,
+        wants_ime: bool,
+        input_text: String,
+        input_type: String,
+        select_picker: Option<SelectPickerRequest>,
+    ) -> InteractionResult {
+        let wants_raf = self.has_pending_raf();
+        let next_timer_ms = if wants_raf { 0 } else { self.next_timer_ms() };
+        InteractionResult {
+            dirty: self.dirty,
+            wants_raf,
+            has_canvas: self.has_canvas(),
+            next_timer_ms,
+            ime_changed,
+            wants_ime,
+            input_text,
+            input_type,
+            pending_calls: self.drain_pending_calls(),
+            select_picker,
+        }
+    }
+
     /// Handle a tap at physical pixel coordinates `(x, y)` on Android.
     pub fn on_tap(&mut self, phys_x: f32, phys_y: f32) -> InteractionResult {
         self.renew_frontend_budget();
-        let logical_x = phys_x / self.scale;
+        let logical_x = phys_x / self.scale + self.scroll_x as f32;
         let logical_y = phys_y / self.scale + self.scroll_y as f32;
 
         let mut wants_ime = false;
@@ -1037,7 +1150,11 @@ impl SoftnMobileEngine {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    input_type = itype.to_string();
+                    input_type = if tag == "textarea" {
+                        "textarea".to_string()
+                    } else {
+                        itype.to_string()
+                    };
                 } else {
                     self.focused_flid = None;
                     if tag == "input" && itype == "checkbox" {
@@ -1110,36 +1227,35 @@ impl SoftnMobileEngine {
                                 }
                             }
                             drain_js(st);
-                            // Also step rAF once after tab/UI clicks so any newly mounted <canvas> paints immediately!
-                            let _ = st.call_global("__zippStepRaf", &[]);
-                            drain_js(st);
                         });
                     }
-                    self.sync_dom_from_vm();
-                    // If the click mounted a brand-new <canvas>, LayoutCache now has its real container size;
-                    // run one more rAF frame so the new canvas draws immediately on the same tap!
-                    if let Some(ref mut st) = self.js_state {
-                        stacker::maybe_grow(512 * 1024, 16 * 1024 * 1024, || {
-                            let _ = st.call_global("__zippStepRaf", &[]);
-                            drain_js(st);
-                        });
+                    // Step rAF once only if a callback or active canvas exists before syncing DOM.
+                    if self.has_canvas() || self.has_any_raf_queued() {
+                        if let Some(ref mut st) = self.js_state {
+                            stacker::maybe_grow(512 * 1024, 16 * 1024 * 1024, || {
+                                let _ = st.call_global("__zippStepRaf", &[]);
+                                drain_js(st);
+                            });
+                        }
                     }
+                    let prev_canvases = self.canvas_flids.clone();
                     self.sync_dom_from_vm();
+                    // Only run a second rAF + DOM sync if the click mounted a brand-new <canvas>
+                    // (now that LayoutCache has its real container size, render Frame 1 immediately).
+                    if !self.canvas_flids.is_empty() && self.canvas_flids != prev_canvases {
+                        if let Some(ref mut st) = self.js_state {
+                            stacker::maybe_grow(512 * 1024, 16 * 1024 * 1024, || {
+                                let _ = st.call_global("__zippStepRaf", &[]);
+                                drain_js(st);
+                            });
+                        }
+                        self.sync_dom_from_vm();
+                    }
                 }
             }
         }
 
-        let wants_raf = self.has_pending_raf();
-        InteractionResult {
-            dirty: self.dirty,
-            wants_raf,
-            ime_changed: true,
-            wants_ime,
-            input_text,
-            input_type,
-            pending_calls: self.drain_pending_calls(),
-            select_picker,
-        }
+        self.build_interaction_result(true, wants_ime, input_text, input_type, select_picker)
     }
 
     /// Select an option on a `<select>` element chosen from Android's native picker dialog.
@@ -1151,26 +1267,23 @@ impl SoftnMobileEngine {
                 &[JsValue::Number(f64::from(flid)), JsValue::Number(f64::from(index))],
             );
             drain_js(st);
-            let _ = st.call_global("__zippStepRaf", &[]);
-            drain_js(st);
         }
+        if self.has_canvas() || self.has_any_raf_queued() {
+            if let Some(ref mut st) = self.js_state {
+                let _ = st.call_global("__zippStepRaf", &[]);
+                drain_js(st);
+            }
+        }
+        let prev_canvases = self.canvas_flids.clone();
         self.sync_dom_from_vm();
-        if let Some(ref mut st) = self.js_state {
-            let _ = st.call_global("__zippStepRaf", &[]);
-            drain_js(st);
+        if !self.canvas_flids.is_empty() && self.canvas_flids != prev_canvases {
+            if let Some(ref mut st) = self.js_state {
+                let _ = st.call_global("__zippStepRaf", &[]);
+                drain_js(st);
+            }
+            self.sync_dom_from_vm();
         }
-        self.sync_dom_from_vm();
-        let wants_raf = self.has_pending_raf();
-        InteractionResult {
-            dirty: self.dirty,
-            wants_raf,
-            ime_changed: false,
-            wants_ime: false,
-            input_text: String::new(),
-            input_type: "text".to_string(),
-            pending_calls: self.drain_pending_calls(),
-            select_picker: None,
-        }
+        self.build_interaction_result(false, false, String::new(), "text".to_string(), None)
     }
 
     /// Begin a touch pointer sequence. Returns `true` if the touch landed on an interactive
@@ -1179,7 +1292,10 @@ impl SoftnMobileEngine {
     pub fn on_pointer_down(&mut self, phys_x: f32, phys_y: f32) -> bool {
         self.active_canvas_flid = None;
         self.last_pointer_phys = (phys_x, phys_y);
-        let logical_x = phys_x / self.scale;
+        if self.canvas_flids.is_empty() {
+            return false;
+        }
+        let logical_x = phys_x / self.scale + self.scroll_x as f32;
         let logical_y = phys_y / self.scale + self.scroll_y as f32;
         let Some(hit) = self.doc.as_ref().hit(logical_x, logical_y) else {
             return false;
@@ -1247,17 +1363,7 @@ impl SoftnMobileEngine {
             }
             self.sync_dom_from_vm();
         }
-        let wants_raf = self.has_pending_raf();
-        InteractionResult {
-            dirty: self.dirty,
-            wants_raf,
-            ime_changed: false,
-            wants_ime: false,
-            input_text: String::new(),
-            input_type: "text".to_string(),
-            pending_calls: self.drain_pending_calls(),
-            select_picker: None,
-        }
+        self.build_interaction_result(false, false, String::new(), "text".to_string(), None)
     }
 
     /// Finish a `<canvas>` touch drag (triggers click-picking on short taps inside 3D view).
@@ -1285,24 +1391,23 @@ impl SoftnMobileEngine {
             }
             self.sync_dom_from_vm();
         }
-        let wants_raf = self.has_pending_raf();
-        InteractionResult {
-            dirty: self.dirty,
-            wants_raf,
-            ime_changed: false,
-            wants_ime: false,
-            input_text: String::new(),
-            input_type: "text".to_string(),
-            pending_calls: self.drain_pending_calls(),
-            select_picker: None,
-        }
+        self.build_interaction_result(false, false, String::new(), "text".to_string(), None)
     }
 
     /// Scroll vertically by `delta_phys_y` physical pixels (positive = scroll down).
-    /// Supports both nested `overflow-y: auto|scroll` containers (such as flex app shells)
-    /// and root document viewport scrolling via `zipp-dom`'s bubbling `scroll_by`.
     pub fn on_scroll(&mut self, delta_phys_y: f32) -> bool {
-        let delta_logical = (delta_phys_y / self.scale) as f64;
+        self.on_scroll_2d(0.0, delta_phys_y)
+    }
+
+    /// Scroll horizontally and/or vertically by `(delta_phys_x, delta_phys_y)` physical pixels
+    /// (positive = scroll right / down). Supports both nested `overflow: auto|scroll` containers
+    /// (such as wide data grids, tab strips, and flex app shells) and root viewport scrolling.
+    pub fn on_scroll_2d(&mut self, delta_phys_x: f32, delta_phys_y: f32) -> bool {
+        if delta_phys_x.abs() < 0.01 && delta_phys_y.abs() < 0.01 {
+            return false;
+        }
+        let delta_logical_x = (delta_phys_x / self.scale) as f64;
+        let delta_logical_y = (delta_phys_y / self.scale) as f64;
         let (px, py) = self.last_pointer_phys;
         let lx = if px > 0.0 {
             px / self.scale
@@ -1317,18 +1422,36 @@ impl SoftnMobileEngine {
         let anchor_id = self
             .doc
             .as_ref()
-            .hit(lx, ly + self.scroll_y as f32)
+            .hit(lx + self.scroll_x as f32, ly + self.scroll_y as f32)
             .map(|h| h.node_id);
-        let changed = self
-            .doc
-            .as_mut()
-            .scroll_by(anchor_id, 0.0, -delta_logical, &mut |_| {});
+        let prev_vp = self.doc.as_ref().viewport_scroll();
+        let changed = self.doc.as_mut().scroll_by(
+            anchor_id,
+            -delta_logical_x,
+            -delta_logical_y,
+            &mut |_| {},
+        );
         if !changed {
             return false;
         }
-        self.scroll_y = self.doc.as_ref().viewport_scroll().y;
+        let new_vp = self.doc.as_ref().viewport_scroll();
+        let vp_changed =
+            (new_vp.x - prev_vp.x).abs() > 1e-6 || (new_vp.y - prev_vp.y).abs() > 1e-6;
+        self.scroll_x = new_vp.x;
+        self.scroll_y = new_vp.y;
         if let Ok(mut lc) = self.layout_cache.lock() {
-            lc.update_from_doc(self.doc.as_ref(), &self.flid_to_dom, self.scroll_y);
+            if vp_changed {
+                // O(1) fast path: viewport scroll only shifts client coordinates.
+                lc.set_viewport_scroll(self.scroll_x, self.scroll_y);
+            } else {
+                // Nested overflow container scrolled: refresh rects only (skip CSS style serialization).
+                lc.update_rects_from_doc(
+                    self.doc.as_ref(),
+                    &self.flid_to_dom,
+                    self.scroll_x,
+                    self.scroll_y,
+                );
+            }
         }
         self.full_repaint = true;
         self.dirty = true;
@@ -1351,17 +1474,14 @@ impl SoftnMobileEngine {
             }
             self.sync_dom_from_vm();
         }
-        let wants_raf = self.has_pending_raf();
-        InteractionResult {
-            dirty: self.dirty,
-            wants_raf,
-            ime_changed: false,
-            wants_ime: self.focused_flid.is_some(),
-            input_text: full_text.to_string(),
-            input_type: "text".to_string(),
-            pending_calls: self.drain_pending_calls(),
-            select_picker: None,
-        }
+        let wants_ime = self.focused_flid.is_some();
+        self.build_interaction_result(
+            false,
+            wants_ime,
+            full_text.to_string(),
+            "text".to_string(),
+            None,
+        )
     }
 
     /// Submit focused form on IME Done/Enter key.
@@ -1378,17 +1498,7 @@ impl SoftnMobileEngine {
             self.focused_flid = None;
             self.sync_dom_from_vm();
         }
-        let wants_raf = self.has_pending_raf();
-        InteractionResult {
-            dirty: self.dirty,
-            wants_raf,
-            ime_changed: true,
-            wants_ime: false,
-            input_text: String::new(),
-            input_type: "text".to_string(),
-            pending_calls: self.drain_pending_calls(),
-            select_picker: None,
-        }
+        self.build_interaction_result(true, false, String::new(), "text".to_string(), None)
     }
 
     /// Resolve an asynchronous native Android hardware call back into the live `zipp-vm` Promise.
@@ -1411,17 +1521,8 @@ impl SoftnMobileEngine {
             drain_js(st);
         }
         self.sync_dom_from_vm();
-        let wants_raf = self.has_pending_raf();
-        InteractionResult {
-            dirty: self.dirty,
-            wants_raf,
-            ime_changed: false,
-            wants_ime: self.focused_flid.is_some(),
-            input_text: String::new(),
-            input_type: "text".to_string(),
-            pending_calls: self.drain_pending_calls(),
-            select_picker: None,
-        }
+        let wants_ime = self.focused_flid.is_some();
+        self.build_interaction_result(false, wants_ime, String::new(), "text".to_string(), None)
     }
 
     pub fn tick(&mut self) -> InteractionResult {
@@ -1470,17 +1571,8 @@ impl SoftnMobileEngine {
                 self.dirty = true;
             }
         }
-        let wants_raf = self.has_pending_raf();
-        InteractionResult {
-            dirty: self.dirty,
-            wants_raf,
-            ime_changed: false,
-            wants_ime: self.focused_flid.is_some(),
-            input_text: String::new(),
-            input_type: "text".to_string(),
-            pending_calls: self.drain_pending_calls(),
-            select_picker: None,
-        }
+        let wants_ime = self.focused_flid.is_some();
+        self.build_interaction_result(false, wants_ime, String::new(), "text".to_string(), None)
     }
 
     pub fn drain_pending_calls(&self) -> Vec<PendingDeviceRequest> {
@@ -1497,6 +1589,7 @@ impl SoftnMobileEngine {
             "version": self.bundle.version,
             "capabilities": self.bundle.declared_capabilities(),
             "hasBackend": self.backend.is_some(),
+            "hasCanvas": self.has_canvas(),
             "backendRuntime": self.bundle.manifest.backend.as_ref().map(|b| b.runtime.as_str()),
             "databases": self.bundle.manifest.databases.as_ref().map(|d| d.len()).unwrap_or(0),
         })
@@ -1568,7 +1661,7 @@ impl SoftnMobileEngine {
         while y < h {
             let mut x = 16.0f32;
             while x < w {
-                if let Some(hit) = doc.hit(x, y + self.scroll_y as f32) {
+                if let Some(hit) = doc.hit(x + self.scroll_x as f32, y + self.scroll_y as f32) {
                     let chain = doc.node_chain(hit.node_id);
                     if chain.iter().any(|id| self.dom_to_flid.get(id) == Some(&flid)) {
                         return Some((x * self.scale, y * self.scale));
@@ -1647,7 +1740,7 @@ impl SoftnMobileEngine {
             }
             return;
         }
-        self.last_synced_html = full_html.clone();
+        self.last_synced_html = full_html;
         // Preserve per-element nested container scroll offsets across DOM rebuilds
         let saved_scrolls: Vec<(u32, zipp_dom::Point<f64>)> = self
             .flid_to_dom
@@ -1661,26 +1754,41 @@ impl SoftnMobileEngine {
                 }
             })
             .collect();
+        // Reuse the existing FontContext (embedded Liberation TTFs + any loaded @font-face),
+        // NetProvider, and HtmlParserProvider across DOM rebuilds instead of re-parsing 12 TTFs.
+        let reused_config = self
+            .doc
+            .as_ref()
+            .clone_config_for_navigation(format!("{VIRTUAL_ORIGIN}/"));
         let mut doc = build_html_document(
-            &full_html,
+            &self.last_synced_html,
             &self.bundle,
             &self.http_cache,
             &self.cookies,
             self.width,
             self.height,
             self.scale,
+            Some(reused_config),
         );
-        let max_scroll = {
+        let (max_scroll_x, max_scroll_y) = {
             let l = doc.as_ref().root_element().final_layout;
+            let content_w = l.size.width.max(l.content_size.width) as f64;
             let content_h = l.size.height.max(l.content_size.height) as f64;
+            let view_w = (self.width as f64) / (self.scale as f64);
             let view_h = (self.height as f64) / (self.scale as f64);
-            (content_h - view_h).max(0.0)
+            ((content_w - view_w).max(0.0), (content_h - view_h).max(0.0))
         };
-        self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
-        doc.as_mut()
-            .set_viewport_scroll(zipp_dom::Point { x: 0.0, y: self.scroll_y });
+        self.scroll_x = self.scroll_x.clamp(0.0, max_scroll_x);
+        self.scroll_y = self.scroll_y.clamp(0.0, max_scroll_y);
+        doc.as_mut().set_viewport_scroll(zipp_dom::Point {
+            x: self.scroll_x,
+            y: self.scroll_y,
+        });
 
-        self.flid_to_dom = build_flid_map(doc.as_ref());
+        let (flid_to_dom, mut canvas_flids) = build_flid_and_canvas_maps(doc.as_ref());
+        canvas_flids.sort_unstable();
+        self.flid_to_dom = flid_to_dom;
+        self.canvas_flids = canvas_flids;
         self.dom_to_flid = self
             .flid_to_dom
             .iter()
@@ -1699,14 +1807,14 @@ impl SoftnMobileEngine {
             }
         }
         if let Ok(mut lc) = self.layout_cache.lock() {
-            lc.update_from_doc(doc.as_ref(), &self.flid_to_dom, self.scroll_y);
+            lc.update_from_doc(doc.as_ref(), &self.flid_to_dom, self.scroll_x, self.scroll_y);
         }
         // Flush any newly presented canvas frames into SHOWN, then attach every canvas's
         // latest rendered picture directly onto its new DOM node.
         let _ = canvas::take_frames();
         let _ = show_canvas_frames(doc.as_mut(), &self.flid_to_dom, canvas::shown_frames());
         self.doc = doc;
-        // build_html_document already polled and resolved layout twice; no need to re-resolve in render_rgba
+        // build_html_document already polled and resolved layout; no need to re-resolve in render_rgba
         self.layout_dirty = false;
         self.full_repaint = true;
         self.dirty_canvas_nodes.clear();
@@ -1758,6 +1866,8 @@ fn drain_js(st: &mut ScriptState) {
     });
 }
 
+static EMBEDDED_FONT_CTX: LazyLock<FontContext> = LazyLock::new(load_embedded_fonts);
+
 fn load_embedded_fonts() -> FontContext {
     let mut font_ctx = FontContext::default();
     zipp_dom::register_embedded_fonts(&mut font_ctx.collection);
@@ -1767,6 +1877,7 @@ fn load_embedded_fonts() -> FontContext {
     font_ctx
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_html_document(
     html: &str,
     bundle: &Arc<SoftnBundle>,
@@ -1775,21 +1886,24 @@ fn build_html_document(
     width: u32,
     height: u32,
     scale: f32,
+    reused_config: Option<DocumentConfig>,
 ) -> HtmlDocument {
     stacker::maybe_grow(512 * 1024, 16 * 1024 * 1024, || {
-        let font_ctx = load_embedded_fonts();
-        let net_provider = Arc::new(VfsNetProvider {
-            bundle: Arc::clone(bundle),
-            http_cache: Arc::clone(http_cache),
-            cookies: Arc::clone(cookies),
+        let config = reused_config.unwrap_or_else(|| {
+            let font_ctx = EMBEDDED_FONT_CTX.clone();
+            let net_provider = Arc::new(VfsNetProvider {
+                bundle: Arc::clone(bundle),
+                http_cache: Arc::clone(http_cache),
+                cookies: Arc::clone(cookies),
+            });
+            DocumentConfig {
+                font_ctx: Some(font_ctx),
+                base_url: Some(format!("{VIRTUAL_ORIGIN}/")),
+                net_provider: Some(net_provider),
+                html_parser_provider: Some(Arc::new(HtmlProvider)),
+                ..Default::default()
+            }
         });
-        let config = DocumentConfig {
-            font_ctx: Some(font_ctx),
-            base_url: Some(format!("{VIRTUAL_ORIGIN}/")),
-            net_provider: Some(net_provider),
-            html_parser_provider: Some(Arc::new(HtmlProvider)),
-            ..Default::default()
-        };
         let mut doc = HtmlDocument::from_html(html, config);
         let color_scheme = match bundle.manifest.theme.as_deref() {
             Some("light") => ColorScheme::Light,
@@ -1801,11 +1915,14 @@ fn build_html_document(
             scale.max(1.0),
             color_scheme,
         ));
-        // Drain synchronous VfsNetProvider image/stylesheet loads and resolve layout
-        doc.as_mut().poll(None);
+        // Drain synchronous VfsNetProvider image/stylesheet loads and resolve layout once;
+        // only re-resolve if style resolution triggered additional synchronous resources
+        // (such as CSS background images or @font-face declarations).
+        doc.poll(None);
         doc.as_mut().resolve(0.0);
-        doc.as_mut().poll(None);
-        doc.as_mut().resolve(0.0);
+        if doc.poll(None) {
+            doc.as_mut().resolve(0.0);
+        }
         doc
     })
 }
@@ -1821,11 +1938,12 @@ fn compose_document_html(head_css: &str, body_html: &str, html_attrs: &str) -> S
     )
 }
 
-fn build_flid_map(doc: &BaseDocument) -> HashMap<u32, usize> {
+fn build_flid_and_canvas_maps(doc: &BaseDocument) -> (HashMap<u32, usize>, Vec<u32>) {
     let mut map = HashMap::new();
+    let mut canvases = Vec::new();
     let flid_attr = LocalName::from("data-flid");
-    walk_flid(doc, 0, &flid_attr, &mut map);
-    map
+    walk_flid(doc, 0, &flid_attr, &mut map, &mut canvases);
+    (map, canvases)
 }
 
 fn walk_flid(
@@ -1833,15 +1951,22 @@ fn walk_flid(
     node_id: usize,
     flid_attr: &LocalName,
     map: &mut HashMap<u32, usize>,
+    canvases: &mut Vec<u32>,
 ) {
     if let Some(node) = doc.get_node(node_id) {
         if let Some(val) = node.attr(flid_attr.clone()) {
             if let Ok(flid) = val.parse::<u32>() {
                 map.insert(flid, node_id);
+                if node
+                    .element_data()
+                    .is_some_and(|e| e.name.local.as_ref() == "canvas")
+                {
+                    canvases.push(flid);
+                }
             }
         }
         for &kid in &node.children {
-            walk_flid(doc, kid, flid_attr, map);
+            walk_flid(doc, kid, flid_attr, map, canvases);
         }
     }
 }
@@ -2095,12 +2220,11 @@ fn boot_frontend_vm(
                 match store_kind {
                     "local" => {
                         if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(data) {
-                            storage_hc.clear_local_storage();
-                            for (k, v) in map {
-                                if let Some(s) = v.as_str() {
-                                    storage_hc.set_local_storage(&k, s);
-                                }
-                            }
+                            let entries: Vec<(String, String)> = map
+                                .into_iter()
+                                .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
+                                .collect();
+                            storage_hc.replace_local_storage(&entries);
                         }
                         Ok(String::new())
                     }
@@ -2395,9 +2519,18 @@ fn url_set(href: &str, part: &str, value: &str) -> Result<String, String> {
         "host" => q::set_host(&mut u, value),
         "hostname" => q::set_hostname(&mut u, value),
         "port" => q::set_port(&mut u, value),
-        "pathname" => Ok(q::set_pathname(&mut u, value)),
-        "search" => Ok(q::set_search(&mut u, value)),
-        "hash" => Ok(q::set_hash(&mut u, value)),
+        "pathname" => {
+            q::set_pathname(&mut u, value);
+            Ok(())
+        }
+        "search" => {
+            q::set_search(&mut u, value);
+            Ok(())
+        }
+        "hash" => {
+            q::set_hash(&mut u, value);
+            Ok(())
+        }
         _ => return Err(format!("unknown URL part {part:?}")),
     };
     Ok(url_parts_json(&u))
