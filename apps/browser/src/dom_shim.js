@@ -4359,6 +4359,31 @@ function __randomUUID() {
     }
     return s;
 }
+function __subtleDigest(algorithm, data) {
+    return new Promise(function (resolve, reject) {
+        try {
+            var alg = typeof algorithm === "string" ? algorithm : (algorithm && typeof algorithm.name === "string" ? algorithm.name : "");
+            if (!alg) { reject(new DOMException("digest: missing algorithm", "NotSupportedError")); return; }
+            var u8;
+            if (data instanceof Uint8Array) u8 = data;
+            else if (data instanceof ArrayBuffer) u8 = new Uint8Array(data);
+            else if (ArrayBuffer.isView(data)) u8 = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+            else { reject(new TypeError("digest: data must be an ArrayBuffer or ArrayBufferView")); return; }
+            if (u8.byteLength > 0) {
+                if (typeof __zippHostBytes === "undefined" || __zippHostBytes.length < u8.byteLength) {
+                    __zippHostBytes = new Uint8Array(Math.max(u8.byteLength, (typeof __zippHostBytes !== "undefined" ? __zippHostBytes.length : 0) * 2));
+                }
+                __zippHostBytes.set(u8, 0);
+            }
+            var hex = __zippHostCall("crypto_digest", alg, String(u8.byteLength));
+            var out = new Uint8Array(hex.length >> 1);
+            for (var i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+            resolve(out.buffer);
+        } catch (e) {
+            reject(e);
+        }
+    });
+}
 
 // --- FormData class ---
 var FormData = function(form, submitter) {
@@ -4709,7 +4734,10 @@ var window = {
     cancelIdleCallback:function(id){ clearTimeout(id); },
     crypto:{
         getRandomValues:__randomFill,
-        randomUUID:__randomUUID
+        randomUUID:__randomUUID,
+        subtle:{
+            digest:__subtleDigest
+        }
     },
     isSecureContext:true,
     structuredClone:function(v){return JSON.parse(JSON.stringify(v));},

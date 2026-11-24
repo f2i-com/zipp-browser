@@ -42,9 +42,9 @@ use zipp_dom::{BaseDocument, Document, EventHandler, LocalName};
 /// batches, so an `await` continuation ran after every timer that was due
 /// rather than before the next one -- out of order, and late enough that an
 /// IndexedDB transaction would commit under it.
-/// Deliver any messages that worker threads have posted back to this page.
+/// Deliver any messages that worker threads have posted back to the active document scope.
 pub(crate) fn deliver_worker_messages(state: &mut ScriptState) -> usize {
-    let messages = crate::worker::take_messages();
+    let messages = crate::worker::take_messages_for(crate::async_fetch::current_scope());
     let count = messages.len();
     for (id, message) in messages {
         let (kind, payload) = match message {
@@ -983,11 +983,14 @@ impl JsEventBridge {
 }
 
 impl Drop for JsEventBridge {
-    /// The page is going, and its workers with it.
+    /// The page (or iframe) is going, and its workers/canvas cache with it.
     fn drop(&mut self) {
         self.video_players.clear();
         crate::async_fetch::drop_scope(self.fetch_scope);
-        if !self.is_subdocument {
+        if self.is_subdocument {
+            crate::worker::terminate_scope(self.fetch_scope);
+            crate::canvas::forget_scope(self.fetch_scope);
+        } else {
             let _ = take_pending_video_ops();
             crate::worker::terminate_page(self.page);
         }
@@ -995,18 +998,24 @@ impl Drop for JsEventBridge {
 }
 
 impl EventHandler for JsEventBridge {
-    /// A frame for a page with a WebGL context: its `requestAnimationFrame`
-    /// callbacks, then each context's drawing read back into its canvas. Pages
-    /// without one are not driven: their animation frames run while they
-    /// settle and after events, as before.
+    /// A frame for a page with pending `requestAnimationFrame` callbacks or
+    /// live WebGL contexts. Pages with neither return `false` immediately so
+    /// idle pages spend zero CPU.
     fn animation_frame(&mut self, doc: &mut BaseDocument) -> bool {
         let _layout = LayoutScope::enter(doc, &self.flid_to_dom, &self.page_url, self.fetch_scope);
         let Some(state) = self.js_state.as_mut() else {
             return false;
         };
-        match state.call_global("__zippWebGLContexts", &[]) {
-            Ok(JsValue::Number(n)) if n > 0.0 => {}
-            _ => return false,
+        let has_raf = matches!(
+            state.call_global("__zippHasAnimationFrame", &[]),
+            Ok(JsValue::Number(n)) if n > 0.0
+        );
+        let has_gl = matches!(
+            state.call_global("__zippWebGLContexts", &[]),
+            Ok(JsValue::Number(n)) if n > 0.0
+        );
+        if !has_raf && !has_gl {
+            return false;
         }
         let now = self.started.elapsed().as_secs_f64() * 1000.0;
         let flags = match state.call_global("__zippAnimationFrame", &[JsValue::Number(now)]) {
@@ -1019,7 +1028,7 @@ impl EventHandler for JsEventBridge {
         };
         state.run_microtasks();
         print_console(state);
-        if crate::apply_canvas_frames_with_map(doc, &self.flid_to_dom) {
+        if crate::apply_canvas_frames_with_map(doc, self.fetch_scope, &self.flid_to_dom) {
             doc.shell_provider.request_paint();
         }
         // The frame changed the DOM as well: lay the page out again.
@@ -1346,9 +1355,13 @@ impl EventHandler for JsEventBridge {
             .copied()
             .unwrap_or(0);
 
-        // Walk the bubble chain (target first, then ancestors). A scroll is
-        // the scrolled element's own: it does not bubble.
-        let chain = if scrolled { &chain[..chain.len().min(1)] } else { chain };
+        // Walk the bubble chain (target first, then ancestors). Non-bubbling
+        // events (`blur`, `focus`, `scroll`, `mouseenter`/`mouseleave`,
+        // `pointerenter`/`pointerleave`) stay on their target and must never
+        // propagate up to ancestors or `document`/`window` (in particular, an
+        // element losing focus must not trigger `window.addEventListener("blur", ...)`).
+        let bubbles = event.bubbles && !scrolled;
+        let chain = if bubbles { chain } else { &chain[..chain.len().min(1)] };
         for &node_id in chain {
             if let Some(types) = self.handler_map.get(&node_id)
                 && types.iter().any(|t| t == event_name) {
@@ -1423,9 +1436,9 @@ impl EventHandler for JsEventBridge {
 
         // Then the document's own listeners, and the window's (which the shim
         // keeps on the document): drag handlers that follow the pointer off
-        // their element listen there, as do a game's keys. Not for the toolbar,
-        // which is the browser's, not the page's.
-        if self.live_dom && !scrolled && !event_state.propagation_is_stopped() && !in_chrome(_doc, chain)
+        // their element listen there, as do a game's keys. Only for bubbling
+        // events and not for the browser toolbar.
+        if self.live_dom && bubbles && !event_state.propagation_is_stopped() && !in_chrome(_doc, chain)
             && let Some(state) = self.js_state.as_mut() {
                 let result = state.call_global(
                     "__zippDispatchToDocument",
@@ -1437,6 +1450,9 @@ impl EventHandler for JsEventBridge {
                 );
                 match result {
                     Ok(JsValue::Number(n)) if n as u32 & 1 != 0 => {
+                        if std::env::var_os("ZIPP_DEBUG_EVENTS").is_some() {
+                            eprintln!("[EVDBG-DOC] {event_name}: target_flid={target_flid} ret={n}");
+                        }
                         if n as u32 & 2 != 0 {
                             event_state.prevent_default();
                         }
@@ -1495,25 +1511,27 @@ impl EventHandler for JsEventBridge {
             self.run_due_work();
         }
         self.viewport_told = Some(size);
-        if !self.is_subdocument {
-            // What the page's workers sent: each message is a task of its own.
-            let messages = crate::worker::take_messages();
-            if !messages.is_empty() {
-                if let Some(state) = self.js_state.as_mut() {
-                    for (id, message) in messages {
-                        let (kind, payload) = match message {
-                            crate::worker::FromWorker::Message(data) => ("message", data),
-                            crate::worker::FromWorker::Error(error) => ("error", error),
-                        };
-                        let args = [JsValue::Number(f64::from(id)), JsValue::String(kind.into()), JsValue::String(payload)];
-                        if let Err(e) = state.call_global("__zippWorkerDeliver", &args) {
-                            eprintln!("[WORKER] delivering a {kind} failed: {e}");
-                        }
-                        state.run_microtasks();
+        // What this document's own workers sent (top-level page OR embedded
+        // iframe): scoped by `fetch_scope` so parents and iframes never steal
+        // each other's worker replies.
+        let messages = crate::worker::take_messages_for(self.fetch_scope);
+        if !messages.is_empty() {
+            if let Some(state) = self.js_state.as_mut() {
+                for (id, message) in messages {
+                    let (kind, payload) = match message {
+                        crate::worker::FromWorker::Message(data) => ("message", data),
+                        crate::worker::FromWorker::Error(error) => ("error", error),
+                    };
+                    let args = [JsValue::Number(f64::from(id)), JsValue::String(kind.into()), JsValue::String(payload)];
+                    if let Err(e) = state.call_global("__zippWorkerDeliver", &args) {
+                        eprintln!("[WORKER] delivering a {kind} failed: {e}");
                     }
+                    state.run_microtasks();
                 }
-                self.run_due_work();
             }
+            self.run_due_work();
+        }
+        if !self.is_subdocument {
             // What programs on the page's terminals printed, and their ends (pty.rs).
             #[cfg(target_os = "linux")]
             {
@@ -1553,7 +1571,7 @@ impl EventHandler for JsEventBridge {
                     for frame in frames {
                         crate::canvas::push_frame(frame);
                     }
-                    if crate::apply_canvas_frames_with_map(doc, &self.flid_to_dom) {
+                    if crate::apply_canvas_frames_with_map(doc, self.fetch_scope, &self.flid_to_dom) {
                         doc.shell_provider.request_paint();
                     }
                 }
@@ -1603,14 +1621,15 @@ impl EventHandler for JsEventBridge {
         if self.next_timer.is_some_and(|due| due <= now) {
             self.run_due_work();
         }
-        // What canvases drew in that work, shown now: no frame may come.
+        // What canvases (WebGL, WebGPU, or Canvas 2D) drew in that work,
+        // shown now: no animation frame may follow a timer/worker paint.
         if let Some(state) = self.js_state.as_mut()
             && matches!(state.call_global("__zippWebGLContexts", &[]), Ok(JsValue::Number(n)) if n > 0.0)
         {
             let _ = state.call_global("__zippPresentCanvases", &[]);
-            if crate::apply_canvas_frames_with_map(doc, &self.flid_to_dom) {
-                doc.shell_provider.request_paint();
-            }
+        }
+        if crate::apply_canvas_frames_with_map(doc, self.fetch_scope, &self.flid_to_dom) {
+            doc.shell_provider.request_paint();
         }
         self.apply_pending_video_ops(doc);
         self.apply_focus_request(doc);
@@ -1687,7 +1706,7 @@ impl EventHandler for JsEventBridge {
         // Its scroll containers are new nodes: find them again.
         self.scrollers = None;
         // The canvases are new nodes now: give them back the frames they showed.
-        crate::reapply_canvas_frames(doc);
+        crate::reapply_canvas_frames(doc, self.fetch_scope);
         let flid_map = build_flid_map(doc);
         let event_map_json = self
             .js_state

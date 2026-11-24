@@ -114,6 +114,13 @@ pub(crate) fn new_scope() -> u64 {
     scope
 }
 
+/// Peek at the fetch scope created by the most recent `run_zipp_js` on this thread
+/// without consuming it (used by `build_document` / `mount_iframe` before
+/// `JsEventBridge::new` takes ownership of the scope).
+pub(crate) fn peek_last_scope() -> u64 {
+    LAST_SCOPE.get()
+}
+
 /// Take the fetch scope created by the most recent `run_zipp_js` on this thread.
 pub(crate) fn take_last_scope() -> u64 {
     LAST_SCOPE.replace(0)

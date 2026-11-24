@@ -108,8 +108,11 @@ pub(crate) fn collect_layout_children(
     flush_pseudo_elements(doc, container_node_id);
 
     if let Some(el) = doc.nodes[container_node_id].data.downcast_element() {
-        // Handle text inputs
+        // Handle text inputs and iframes (iframes render their sub-document, not fallback children)
         let tag_name = el.name.local.as_ref();
+        if tag_name == "iframe" {
+            return;
+        }
         if matches!(tag_name, "input" | "textarea") {
             let type_attr: Option<&str> = doc.nodes[container_node_id]
                 .data
@@ -856,6 +859,7 @@ pub(crate) fn find_inline_layout_embedded_boxes(
                             || *tag_name == local_name!("video")
                             || *tag_name == local_name!("canvas")
                             || *tag_name == local_name!("svg")
+                            || *tag_name == local_name!("iframe")
                             || *tag_name == local_name!("input")
                             || *tag_name == local_name!("textarea")
                             || *tag_name == local_name!("button")
@@ -1054,6 +1058,7 @@ pub(crate) fn build_inline_layout_into(
                             || *tag_name == local_name!("video")
                             || *tag_name == local_name!("canvas")
                             || *tag_name == local_name!("svg")
+                            || *tag_name == local_name!("iframe")
                             || *tag_name == local_name!("input")
                             || *tag_name == local_name!("textarea")
                             || *tag_name == local_name!("button")

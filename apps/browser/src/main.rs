@@ -39,6 +39,7 @@ use zipp_renderer::tinyskia::TinySkiaWindowRenderer;
 use zipp_shell::{create_default_event_loop, ZippApp, ShellProxy, WindowConfig};
 
 mod async_fetch;
+mod crypto;
 mod esm;
 mod event_bridge;
 mod js_opt;
@@ -2188,6 +2189,22 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
             const HEX: &[u8; 16] = b"0123456789abcdef";
             Ok(bytes.iter().flat_map(|b| [HEX[(b >> 4) as usize] as char, HEX[(b & 15) as usize] as char]).collect())
         }
+        // `crypto.subtle.digest(algorithm, data)` (SHA-1, SHA-256, SHA-384, SHA-512).
+        "crypto_digest" => {
+            let alg = args.first().map(String::as_str).unwrap_or_default();
+            let len: usize = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(0);
+            if len == 0 {
+                crypto::digest_hex(alg, &[])
+            } else {
+                let (addr, count, kind) = ctx.typed_array_region("__zippHostBytes")?;
+                if kind != 1 || len > count {
+                    return Err("RangeError: crypto_digest buffer mismatch".into());
+                }
+                // SAFETY: engine pinned `__zippHostBytes` (`count` u8s at `addr`).
+                let slice = unsafe { std::slice::from_raw_parts(addr as *const u8, len) };
+                crypto::digest_hex(alg, slice)
+            }
+        }
         // Web Workers (worker.rs): start one, post to one, stop one.
         "worker_start" => {
             let url = args.first().map(String::as_str).unwrap_or_default();
@@ -2910,6 +2927,7 @@ fn render_page(
     clear_failed_iframes();
     devtools::new_page(url, html);
     let html = html.to_string();
+    let title_count_before = pending_window_title_count();
     let t_js = std::time::Instant::now();
     let (rendered, event_map_json, js_state) = if html.contains("<script") {
         match run_zipp_js(&html, url, viewport) {
@@ -2930,7 +2948,8 @@ fn render_page(
         .replace("class=\"no-js", "class=\"js")
         .replace("class=\"client-nojs", "class=\"client-js");
     let out = inline_images(&out, url);
-    let page_title = history::extract_html_title(&out);
+    let js_title = last_window_title_since(title_count_before);
+    let page_title = js_title.clone().or_else(|| history::extract_html_title(&out));
     history::record(url, page_title.as_deref());
     tabs::ensure_initialized(url);
     if let Some(ref title) = page_title {
@@ -2938,13 +2957,17 @@ fn render_page(
     } else {
         tabs::update_active_title(&tabs::default_title_for_url(url));
     }
-    let active_title = tabs::active_title();
-    let window_title = if zipp_shell::profile::is_incognito() {
-        format!("{active_title} — Zipp Browser (Incognito)")
-    } else {
-        format!("{active_title} — Zipp Browser")
-    };
-    push_window_request(WindowRequest::Title(window_title));
+    // Preserve `document.title = ...` set during initial script execution rather
+    // than clobbering it with the static `<title>` element.
+    if js_title.is_none() {
+        let active_title = tabs::active_title();
+        let window_title = if zipp_shell::profile::is_incognito() {
+            format!("{active_title} — Zipp Browser (Incognito)")
+        } else {
+            format!("{active_title} — Zipp Browser")
+        };
+        push_window_request(WindowRequest::Title(window_title));
+    }
     let out = wrap_with_toolbar(&out, url);
     let post_ms = t_post.elapsed().as_millis();
 
@@ -3070,6 +3093,30 @@ static WINDOW_REQUESTS: Mutex<Vec<WindowRequest>> = Mutex::new(Vec::new());
 
 fn push_window_request(request: WindowRequest) {
     WINDOW_REQUESTS.lock().unwrap_or_else(|e| e.into_inner()).push(request);
+}
+
+fn pending_window_title_count() -> usize {
+    WINDOW_REQUESTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|r| matches!(r, WindowRequest::Title(_)))
+        .count()
+}
+
+fn last_window_title_since(before: usize) -> Option<String> {
+    let reqs = WINDOW_REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut seen = 0usize;
+    let mut last = None;
+    for r in reqs.iter() {
+        if let WindowRequest::Title(t) = r {
+            seen += 1;
+            if seen > before {
+                last = Some(t.clone());
+            }
+        }
+    }
+    last
 }
 
 /// Carry out what the page asked of its window since last time.
@@ -3410,6 +3457,7 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
         let t_w = std::time::Instant::now();
         let max_wait = std::time::Duration::from_secs(wait_secs);
         let mut quiet = 0u32;
+        let mut anim_ticks = 0u32;
         while t_w.elapsed() < max_wait {
             let next_timer = doc.run_tasks();
             let anim = doc.animation_frame();
@@ -3417,7 +3465,14 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
             doc.as_mut().resolve(ANIMATION_SETTLE_SECS * 1.5);
             if worker::has_active() || net_busy {
                 quiet = 0;
-            } else if next_timer.is_some() || anim {
+            } else if anim {
+                // Allow finite rAF animations (e.g. 1.1s count-ups) to settle,
+                // while capping continuous loops (WebGL) at ~1.5s.
+                anim_ticks += 1;
+                if anim_ticks >= 30 {
+                    break;
+                }
+            } else if next_timer.is_some() {
                 quiet += 1;
                 if quiet >= 8 {
                     break;
@@ -4804,8 +4859,10 @@ fn mount_chrome(doc: &mut HtmlDocument) {
 fn build_document(final_html: &str, config: DocumentConfig) -> HtmlDocument {
     let mut doc = HtmlDocument::from_html(final_html, config);
     mount_chrome(&mut doc);
+    let scope = async_fetch::peek_last_scope();
     canvas::forget_shown();
-    apply_canvas_frames(&mut doc);
+    canvas::retain_scope(scope);
+    apply_canvas_frames_for(&mut doc, scope);
     doc
 }
 
@@ -5012,7 +5069,8 @@ fn build_iframe_document(
     };
 
     let mut sub_doc = HtmlDocument::from_html(&out, config);
-    apply_canvas_frames(&mut sub_doc);
+    let iframe_scope = async_fetch::peek_last_scope();
+    apply_canvas_frames_for(&mut sub_doc, iframe_scope);
 
     let emap_json = event_map_json.unwrap_or_else(|| "{}".to_string());
     let flid_map = event_bridge::build_flid_map(sub_doc.as_ref());
@@ -5130,22 +5188,23 @@ pub(crate) fn sync_iframes(doc: &mut BaseDocument, parent_url: &str, depth: u8) 
     mounted_any
 }
 
-/// Show the WebGL and WebGPU frames presented since the last call: each becomes the
-/// image of its canvas element (found by `data-flid`), which is painted, and
-/// sized when the canvas has no size of its own, like any image. True when
-/// there were any.
-pub(crate) fn apply_canvas_frames(doc: &mut BaseDocument) -> bool {
-    show_canvas_frames(doc, canvas::take_frames(), None)
+/// Show the WebGL, WebGPU, and Canvas 2D frames presented for `scope` since
+/// the last call: each becomes the image of its canvas element (found by
+/// `data-flid`), which is painted, and sized when the canvas has no size of
+/// its own, like any image. True when there were any.
+pub(crate) fn apply_canvas_frames_for(doc: &mut BaseDocument, scope: u64) -> bool {
+    show_canvas_frames(doc, canvas::take_frames_for(scope), None)
 }
 
-/// Faster variant using the event bridge's cached `flid -> node` map (O(1) per frame).
-pub(crate) fn apply_canvas_frames_with_map(doc: &mut BaseDocument, flids: &HashMap<u32, usize>) -> bool {
-    show_canvas_frames(doc, canvas::take_frames(), Some(flids))
+/// Faster variant using the event bridge's cached `flid -> node` map (O(1) per frame),
+/// scoped to `scope` so parent and iframe canvases never collide.
+pub(crate) fn apply_canvas_frames_with_map(doc: &mut BaseDocument, scope: u64, flids: &HashMap<u32, usize>) -> bool {
+    show_canvas_frames(doc, canvas::take_frames_for(scope), Some(flids))
 }
 
-/// After a re-render rebuilt the body: each canvas shows its frame again.
-pub(crate) fn reapply_canvas_frames(doc: &mut BaseDocument) {
-    show_canvas_frames(doc, canvas::shown_frames(), None);
+/// After a re-render rebuilt the body: each canvas in `scope` shows its frame again.
+pub(crate) fn reapply_canvas_frames(doc: &mut BaseDocument, scope: u64) {
+    show_canvas_frames(doc, canvas::shown_frames_for(scope), None);
 }
 
 fn show_canvas_frames(

@@ -1239,7 +1239,17 @@ impl BaseDocument {
 
     /// Whether the document has pending requests for "critical" resources (that should block rendering).
     pub fn has_pending_critical_resources(&self) -> bool {
-        !self.pending_critical_resources.is_empty()
+        if !self.pending_critical_resources.is_empty() {
+            return true;
+        }
+        for &id in &self.sub_document_nodes {
+            if let Some(sub) = self.nodes.get(id).and_then(|n| n.subdoc())
+                && sub.inner().has_pending_critical_resources()
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// Process a loaded resource and apply it to the document.

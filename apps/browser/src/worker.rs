@@ -42,6 +42,9 @@ struct Handle {
     from: Receiver<FromWorker>,
     /// The page that started it (`new_page`).
     page: u64,
+    /// Document scope (`async_fetch::current_scope()`) so top-level pages and
+    /// embedded `<iframe>` sub-documents never steal each other's worker replies.
+    scope: u64,
 }
 
 thread_local! {
@@ -129,7 +132,8 @@ pub(crate) fn start(url: &str, module: bool) -> Result<u32, String> {
             run(&url, module, to_rx, from_tx)
         })
         .map_err(|e| format!("Error: cannot start a worker: {e}"))?;
-    WORKERS.with(|w| w.borrow_mut().insert(id, Handle { to: to_tx, from: from_rx, page: PAGE.get() }));
+    let scope = crate::async_fetch::current_scope();
+    WORKERS.with(|w| w.borrow_mut().insert(id, Handle { to: to_tx, from: from_rx, page: PAGE.get(), scope }));
     Ok(id)
 }
 
@@ -164,16 +168,35 @@ pub(crate) fn terminate_page(page: u64) {
     }
 }
 
+/// Document `scope` (an iframe) is going: stop only its workers.
+pub(crate) fn terminate_scope(scope: u64) {
+    if scope == 0 {
+        return;
+    }
+    let gone: Vec<Handle> = WORKERS.with(|w| {
+        let mut w = w.borrow_mut();
+        let ids: Vec<u32> = w.iter().filter(|(_, h)| h.scope == scope).map(|(&id, _)| id).collect();
+        ids.into_iter().filter_map(|id| w.remove(&id)).collect()
+    });
+    for handle in gone {
+        let _ = handle.to.send(ToWorker::Terminate);
+    }
+}
+
 /// Whether this thread's page currently has any live worker threads.
 pub(crate) fn has_active() -> bool {
     WORKERS.with(|w| !w.borrow().is_empty())
 }
 
-/// What this thread's workers have sent since last asked.
-pub(crate) fn take_messages() -> Vec<(u32, FromWorker)> {
+/// What workers owned by `scope` (or unscoped workers when `scope == 0`) have
+/// sent since last asked.
+pub(crate) fn take_messages_for(scope: u64) -> Vec<(u32, FromWorker)> {
     WORKERS.with(|w| {
         let mut out = Vec::new();
         for (&id, handle) in w.borrow().iter() {
+            if scope != 0 && handle.scope != 0 && handle.scope != scope {
+                continue;
+            }
             while let Ok(message) = handle.from.try_recv() {
                 out.push((id, message));
             }

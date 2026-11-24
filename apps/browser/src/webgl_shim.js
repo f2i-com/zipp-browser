@@ -16,7 +16,7 @@
 // Page script, like the host (`ScriptState::call_global`), finds globals by
 // the program's top-level bindings, not by properties set on `globalThis`
 // later: hence the `var`s here, set from what the layer returns.
-var __zippAnimationFrame, __zippWebGLContexts, __zippPresentCanvases, createImageBitmap;
+var __zippAnimationFrame, __zippHasAnimationFrame, __zippWebGLContexts, __zippPresentCanvases, createImageBitmap;
 // Every canvas context that draws frames (WebGL here, WebGPU in
 // webgpu_shim.js): each has a `_present()` the frame calls at its end.
 var __zippCanvasContexts = [];
@@ -994,19 +994,22 @@ var __zippWebGL = (function () {
   window.createImageBitmap = createImageBitmap;
 
   // ---- Frames ---------------------------------------------------------------
-  // One animation frame, driven by the window while a WebGL context lives:
-  // the frame's callbacks, the work they queued, then each context's batch
-  // rendered and read back. Bit 1: another frame is wanted. Bit 2: the DOM
-  // changed, so the page needs laying out again.
+  // One animation frame, driven by the window whenever a page has queued
+  // `requestAnimationFrame` callbacks or live WebGL contexts: runs the frame's
+  // callbacks with a `performance.now()` timestamp (matching the HTML spec time
+  // origin), drains microtasks/queues, then presents each WebGL context.
+  // Bit 1: another frame is wanted. Bit 2: the DOM changed, so relayout/repaint.
   __zippAnimationFrame = function (now) {
     var mutations = __domMutations;
-    __zippRunAnimationFrame(now);
+    var ts = typeof performance !== "undefined" && typeof performance.now === "function" ? performance.now() : now;
+    __zippRunAnimationFrame(ts);
     __zippDrainQueues(8);
     for (var i = 0; i < __zippCanvasContexts.length; i++) {
       try { __zippCanvasContexts[i]._present(); } catch (e) { console.error("canvas: " + e); }
     }
-    return (__rafQueue.length > 0 && __zippCanvasContexts.length > 0 ? 1 : 0) | (__domMutations !== mutations ? 2 : 0);
+    return (__rafQueue.length > 0 ? 1 : 0) | (__domMutations !== mutations ? 2 : 0);
   };
+  __zippHasAnimationFrame = function () { return __rafQueue.length; };
   __zippWebGLContexts = function () { return __zippCanvasContexts.length; };
   // Show what canvases drew outside a frame (a timer, a worker's message).
   __zippPresentCanvases = function () {

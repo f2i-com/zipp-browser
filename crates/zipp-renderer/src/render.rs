@@ -530,7 +530,9 @@ impl<'dom> DocumentPainter<'dom> {
                         cx.draw_inline_layout(scene, content_position);
                         cx.draw_select_arrow(scene);
                         cx.draw_marker(scene, content_position);
-                        cx.draw_children(scene);
+                        if !is_sub_doc && cx.element.name.local != local_name!("iframe") {
+                            cx.draw_children(scene);
+                        }
                     },
                 );
             },

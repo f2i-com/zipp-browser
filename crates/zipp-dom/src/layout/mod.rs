@@ -174,6 +174,37 @@ impl BaseDocument {
                     }
                 }
 
+                if *element_data.name.local == *"iframe" {
+                    // CSS 2.2 §10.3.2 & §10.6.2: iframes are replaced elements with no
+                    // intrinsic aspect ratio and a 300x150 fallback concrete size when
+                    // neither CSS nor HTML `width`/`height` attributes specify a dimension.
+                    let parse_attr = |name| {
+                        element_data.attr(name).and_then(|val| {
+                            val.trim()
+                                .trim_end_matches("px")
+                                .parse::<f32>()
+                                .ok()
+                                .filter(|v| v.is_finite() && *v >= 0.0)
+                        })
+                    };
+                    let fallback = taffy::Size {
+                        width: parse_attr(local_name!("width")).unwrap_or(300.0),
+                        height: parse_attr(local_name!("height")).unwrap_or(150.0),
+                    };
+                    let known_dimensions = if in_block_container && node.style.size.width.is_auto() {
+                        taffy::Size { width: None, ..inputs.known_dimensions }
+                    } else {
+                        inputs.known_dimensions
+                    };
+                    let leaf_inputs = taffy::LayoutInput { known_dimensions, ..inputs };
+                    return compute_leaf_layout(
+                        leaf_inputs,
+                        &node.style,
+                        resolve_calc_value,
+                        |_known_size, _available_space| fallback,
+                    );
+                }
+
                 if *element_data.name.local == *"img"
                     || *element_data.name.local == *"video"
                     || *element_data.name.local == *"canvas"
