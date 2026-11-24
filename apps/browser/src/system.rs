@@ -475,6 +475,7 @@ fn space(path: &str) -> Option<(u64, u64)> {
     if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
         return None;
     }
+    #[allow(clippy::unnecessary_cast)]
     Some((s.f_blocks as u64 * s.f_frsize as u64, s.f_bavail as u64 * s.f_frsize as u64))
 }
 

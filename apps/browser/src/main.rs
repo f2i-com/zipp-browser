@@ -793,6 +793,7 @@ fn main() {
 
 /// What the browser's window runs on: the desktop's windowing system, or
 /// (`--kiosk`, Linux) the screen itself.
+#[allow(clippy::large_enum_variant)]
 enum Screen {
     Window(zipp_shell::EventLoop),
     #[cfg(target_os = "linux")]

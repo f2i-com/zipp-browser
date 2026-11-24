@@ -836,6 +836,7 @@ impl State {
     }
 
     /// A window's frame: its surface and subsurfaces, cut to its geometry.
+    #[allow(clippy::type_complexity)]
     fn compose(&self, root: &ObjectId) -> Option<(u32, u32, Vec<u8>, (i32, i32))> {
         let s = self.surfaces.get(root)?;
         let image = s.image.as_ref()?;
@@ -845,12 +846,12 @@ impl State {
         };
         let (gw, gh) = (gw.min(8192) as usize, gh.min(8192) as usize);
         let mut out = vec![0u8; gw * gh * 4];
-        self.draw(&mut out, gw, gh, root, -gx, -gy, 0);
+        self.draw(&mut out, (gw, gh), root, (-gx, -gy), 0);
         unpremultiply(&mut out);
         Some((gw as u32, gh as u32, out, (gx, gy)))
     }
 
-    fn draw(&self, out: &mut [u8], ow: usize, oh: usize, id: &ObjectId, x: i32, y: i32, depth: u32) {
+    fn draw(&self, out: &mut [u8], (ow, oh): (usize, usize), id: &ObjectId, (x, y): (i32, i32), depth: u32) {
         let Some(s) = self.surfaces.get(id) else {
             return;
         };
@@ -862,7 +863,7 @@ impl State {
         }
         for child in &s.children {
             if let Some(Role::Sub { x: cx, y: cy, .. }) = self.surfaces.get(child).map(|c| &c.role) {
-                self.draw(out, ow, oh, child, x + cx, y + cy, depth + 1);
+                self.draw(out, (ow, oh), child, (x + cx, y + cy), depth + 1);
             }
         }
     }

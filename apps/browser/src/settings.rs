@@ -97,6 +97,7 @@ pub fn start_page() -> String {
 }
 
 /// Whether media/audio is muted in settings (or via `ZIPP_MUTE_MEDIA`).
+#[allow(dead_code)]
 pub fn is_media_muted() -> bool {
     std::env::var_os("ZIPP_MUTE_MEDIA").is_some() || get().mute_media
 }
