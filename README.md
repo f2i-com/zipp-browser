@@ -88,7 +88,7 @@ Every [release](https://github.com/f2i-com/zipp-browser/releases) builds against
 
 ```powershell
 # Unzip and run — opens the New Tab page with portable ./data/ storage
-Expand-Archive .\zipp-browser-v0.1.2-windows-x86_64-portable.zip -DestinationPath .\zipp-browser
+Expand-Archive .\zipp-browser-v0.1.3-windows-x86_64-portable.zip -DestinationPath .\zipp-browser
 .\zipp-browser\zipp-browser.exe
 ```
 

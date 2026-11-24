@@ -1,7 +1,7 @@
 [package]
 name = "zipp-kms"
 description = "A winit event loop on Linux DRM/KMS and evdev: an application full screen with no display server"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
