@@ -13,7 +13,7 @@
 //! Files are decoded with symphonia: MP3, Ogg Vorbis, FLAC and WAV.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -21,6 +21,20 @@ use zipp_vm::embed::HostCtx;
 
 /// Frames per write to the device: about 10 ms.
 const PERIOD: usize = 480;
+/// Maximum buffered audio ahead of playback (2 seconds at 48 kHz stereo = 192,000 samples).
+const MAX_QUEUE_SAMPLES: usize = 48_000 * 2 * 2;
+
+static MUTED: AtomicBool = AtomicBool::new(false);
+
+/// Mute or unmute all Web Audio and `<audio>` output globally.
+pub fn set_muted(muted: bool) {
+    MUTED.store(muted, Ordering::Relaxed);
+}
+
+/// Whether Web Audio / `<audio>` output is muted (via settings or `ZIPP_MUTE_MEDIA`).
+pub fn is_muted() -> bool {
+    MUTED.load(Ordering::Relaxed) || std::env::var_os("ZIPP_MUTE_MEDIA").is_some()
+}
 
 struct Output {
     rate: u32,
@@ -49,6 +63,11 @@ pub(crate) fn host_call(ctx: &mut dyn HostCtx, args: &[String]) -> Result<String
             let bytes = page_bytes(ctx, num(1)?)?;
             let out = output();
             let mut queue = out.queue.lock().unwrap_or_else(|e| e.into_inner());
+            let incoming = bytes.len() / 4;
+            if queue.len() + incoming > MAX_QUEUE_SAMPLES {
+                let drop_n = ((queue.len() + incoming - MAX_QUEUE_SAMPLES).min(queue.len())) & !1;
+                queue.drain(..drop_n);
+            }
             queue.extend(bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])));
             Ok(String::new())
         }
@@ -120,6 +139,14 @@ fn output() -> Arc<Output> {
                 }
                 Err(e) => eprintln!("[AUDIO] no sound output ({e}): keeping time silently"),
             }
+            #[cfg(windows)]
+            match wasapi_out::start() {
+                Ok(out) => {
+                    eprintln!("[AUDIO] WASAPI playing at {} Hz", out.rate);
+                    return out;
+                }
+                Err(e) => eprintln!("[AUDIO] WASAPI unavailable ({e}): keeping time silently"),
+            }
             let out = Arc::new(Output { rate: 48_000, queue: Mutex::default(), played: AtomicU64::new(0) });
             let shared = out.clone();
             let _ = std::thread::Builder::new().name("audio".into()).spawn(move || silent(&shared));
@@ -130,9 +157,11 @@ fn output() -> Arc<Output> {
 
 /// Up to one period of what the page wrote, padded with silence.
 fn next_period(out: &Output, buf: &mut [f32]) {
+    let muted = is_muted();
     let mut queue = out.queue.lock().unwrap_or_else(|e| e.into_inner());
     for sample in buf.iter_mut() {
-        *sample = queue.pop_front().unwrap_or(0.0);
+        let s = queue.pop_front().unwrap_or(0.0);
+        *sample = if muted { 0.0 } else { s.clamp(-1.0, 1.0) };
     }
 }
 
@@ -312,6 +341,246 @@ mod alsa_out {
     }
 }
 
+/// Whether Windows currently has at least one active audio output endpoint.
+/// Used by `media.rs` so headless/RDP systems without speakers can still decode
+/// and render video frames with `MF_MEDIA_ENGINE_FORCEMUTE` instead of stalling
+/// inside Media Foundation's Streaming Audio Renderer.
+#[cfg(windows)]
+pub fn has_output_endpoint() -> bool {
+    wasapi_out::has_endpoint()
+}
+
+#[cfg(windows)]
+mod wasapi_out {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
+
+    use windows::Win32::Media::Audio::{
+        AUDCLNT_SHAREMODE_SHARED, DEVICE_STATE_ACTIVE, IAudioClient, IAudioRenderClient, IMMDevice,
+        IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEXTENSIBLE, eConsole, eMultimedia, eRender,
+    };
+    use windows::Win32::System::Com::{
+        CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize,
+    };
+    use windows::core::GUID;
+
+    use super::{Output, is_muted};
+
+    const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
+    const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
+    /// Standard Windows `KSDATAFORMAT_SUBTYPE_IEEE_FLOAT` (`00000003-0000-0010-8000-00aa00389b71`).
+    const SUBTYPE_IEEE_FLOAT: GUID = GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
+
+    unsafe fn pick_render_device(enumerator: &IMMDeviceEnumerator) -> Result<IMMDevice, String> {
+        if let Ok(dev) = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) } {
+            return Ok(dev);
+        }
+        if let Ok(dev) = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia) } {
+            return Ok(dev);
+        }
+        if let Ok(collection) = unsafe { enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) }
+            && let Ok(count) = unsafe { collection.GetCount() }
+            && count > 0
+            && let Ok(dev) = unsafe { collection.Item(0) }
+        {
+            return Ok(dev);
+        }
+        Err("No active Windows audio output endpoint found".to_string())
+    }
+
+    pub(super) fn has_endpoint() -> bool {
+        let com_ok = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+        let found = unsafe {
+            CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                .ok()
+                .and_then(|en| pick_render_device(&en).ok())
+                .is_some()
+        };
+        if com_ok {
+            unsafe { CoUninitialize() };
+        }
+        found
+    }
+
+    /// Spawn the Windows Core Audio (WASAPI) shared-mode render thread and wait
+    /// until the default speaker mix format (sample rate) is negotiated.
+    pub(super) fn start() -> Result<Arc<Output>, String> {
+        let (tx, rx) = mpsc::sync_channel::<Result<Arc<Output>, String>>(1);
+        std::thread::Builder::new()
+            .name("zipp-wasapi-audio".into())
+            .spawn(move || run_thread(tx))
+            .map_err(|e| e.to_string())?;
+        rx.recv().map_err(|_| "WASAPI thread exited during init".to_string())?
+    }
+
+    fn run_thread(ready: mpsc::SyncSender<Result<Arc<Output>, String>>) {
+        let com_ok = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+        match init_wasapi() {
+            Ok((client, render, buffer_frames, rate, channels, is_float, bits_per_sample)) => {
+                let out = Arc::new(Output {
+                    rate,
+                    queue: Mutex::default(),
+                    played: AtomicU64::new(0),
+                });
+                let _ = ready.send(Ok(out.clone()));
+                play_loop(&client, &render, buffer_frames, channels, is_float, bits_per_sample, &out);
+                let _ = unsafe { client.Stop() };
+            }
+            Err(e) => {
+                let _ = ready.send(Err(e));
+            }
+        }
+        if com_ok {
+            unsafe { CoUninitialize() };
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn init_wasapi() -> Result<(IAudioClient, IAudioRenderClient, u32, u32, usize, bool, u16), String> {
+        unsafe {
+            let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                .map_err(|e| format!("MMDeviceEnumerator: {e}"))?;
+            let device = pick_render_device(&enumerator)?;
+            let client: IAudioClient = device
+                .Activate(CLSCTX_ALL, None)
+                .map_err(|e| format!("Activate IAudioClient: {e}"))?;
+            let fmt_ptr = client.GetMixFormat().map_err(|e| format!("GetMixFormat: {e}"))?;
+            let fmt = *fmt_ptr;
+            let rate = fmt.nSamplesPerSec;
+            let channels = fmt.nChannels.max(1) as usize;
+            let bits = fmt.wBitsPerSample;
+            let is_float = if fmt.wFormatTag == WAVE_FORMAT_IEEE_FLOAT {
+                true
+            } else if fmt.wFormatTag == WAVE_FORMAT_EXTENSIBLE && fmt.cbSize >= 22 {
+                let ext = &*(fmt_ptr as *const WAVEFORMATEXTENSIBLE);
+                let sub = std::ptr::addr_of!(ext.SubFormat).read_unaligned();
+                sub == SUBTYPE_IEEE_FLOAT
+            } else {
+                false
+            };
+
+            // 60 ms shared-mode buffer (in 100-nanosecond units): low latency for
+            // games while tolerating main-thread GC/layout spikes cleanly.
+            let buffer_duration_hns: i64 = 600_000;
+            let init_res = client.Initialize(AUDCLNT_SHAREMODE_SHARED, 0, buffer_duration_hns, 0, fmt_ptr, None);
+            CoTaskMemFree(Some(fmt_ptr.cast()));
+            init_res.map_err(|e| format!("IAudioClient::Initialize: {e}"))?;
+
+            let buffer_frames = client.GetBufferSize().map_err(|e| format!("GetBufferSize: {e}"))?;
+            let render: IAudioRenderClient = client
+                .GetService()
+                .map_err(|e| format!("GetService IAudioRenderClient: {e}"))?;
+            client.Start().map_err(|e| format!("IAudioClient::Start: {e}"))?;
+
+            Ok((client, render, buffer_frames, rate, channels, is_float, bits))
+        }
+    }
+
+    fn play_loop(
+        client: &IAudioClient,
+        render: &IAudioRenderClient,
+        buffer_frames: u32,
+        channels: usize,
+        is_float: bool,
+        bits_per_sample: u16,
+        out: &Output,
+    ) {
+        let mut written: u64 = 0;
+        loop {
+            let padding = match unsafe { client.GetCurrentPadding() } {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("[AUDIO] WASAPI GetCurrentPadding failed ({e}): keeping time silently");
+                    return super::silent(out);
+                }
+            };
+            // Compute played frames BEFORE adding `avail` to `written`: `padding` is
+            // how many previously-written frames are still waiting in the ring buffer.
+            let played = written.saturating_sub(padding as u64).max(out.played.load(Ordering::Acquire));
+            out.played.store(played, Ordering::Release);
+            let avail = buffer_frames.saturating_sub(padding);
+            if avail > 0 {
+                match unsafe { render.GetBuffer(avail) } {
+                    Ok(ptr) => {
+                        let muted = is_muted();
+                        let mut queue = out.queue.lock().unwrap_or_else(|e| e.into_inner());
+                        let frames = avail as usize;
+                        if is_float && bits_per_sample == 32 {
+                            let dst = unsafe { std::slice::from_raw_parts_mut(ptr as *mut f32, frames * channels) };
+                            for f in 0..frames {
+                                let l = queue.pop_front().unwrap_or(0.0);
+                                let r = queue.pop_front().unwrap_or(0.0);
+                                let (l, r) = if muted { (0.0, 0.0) } else { (l.clamp(-1.0, 1.0), r.clamp(-1.0, 1.0)) };
+                                let base = f * channels;
+                                if channels == 1 {
+                                    dst[base] = (l + r) * 0.5;
+                                } else {
+                                    dst[base] = l;
+                                    dst[base + 1] = r;
+                                    for ch in 2..channels {
+                                        dst[base + ch] = 0.0;
+                                    }
+                                }
+                            }
+                        } else if bits_per_sample == 16 {
+                            let dst = unsafe { std::slice::from_raw_parts_mut(ptr as *mut i16, frames * channels) };
+                            for f in 0..frames {
+                                let l = queue.pop_front().unwrap_or(0.0);
+                                let r = queue.pop_front().unwrap_or(0.0);
+                                let (l, r) = if muted { (0.0, 0.0) } else { (l.clamp(-1.0, 1.0), r.clamp(-1.0, 1.0)) };
+                                let base = f * channels;
+                                if channels == 1 {
+                                    dst[base] = (((l + r) * 0.5) * 32767.0) as i16;
+                                } else {
+                                    dst[base] = (l * 32767.0) as i16;
+                                    dst[base + 1] = (r * 32767.0) as i16;
+                                    for ch in 2..channels {
+                                        dst[base + ch] = 0;
+                                    }
+                                }
+                            }
+                        } else if bits_per_sample == 32 {
+                            let dst = unsafe { std::slice::from_raw_parts_mut(ptr as *mut i32, frames * channels) };
+                            for f in 0..frames {
+                                let l = queue.pop_front().unwrap_or(0.0);
+                                let r = queue.pop_front().unwrap_or(0.0);
+                                let (l, r) = if muted { (0.0, 0.0) } else { (l.clamp(-1.0, 1.0), r.clamp(-1.0, 1.0)) };
+                                let base = f * channels;
+                                if channels == 1 {
+                                    dst[base] = (((l + r) * 0.5) * 2_147_483_647.0) as i32;
+                                } else {
+                                    dst[base] = (l * 2_147_483_647.0) as i32;
+                                    dst[base + 1] = (r * 2_147_483_647.0) as i32;
+                                    for ch in 2..channels {
+                                        dst[base + ch] = 0;
+                                    }
+                                }
+                            }
+                        } else {
+                            let bytes = frames * channels * (bits_per_sample as usize / 8).max(1);
+                            unsafe { std::ptr::write_bytes(ptr, 0, bytes) };
+                            let drain_n = (frames * 2).min(queue.len());
+                            queue.drain(..drain_n);
+                        }
+                        drop(queue);
+                        if let Err(e) = unsafe { render.ReleaseBuffer(avail, 0) } {
+                            eprintln!("[AUDIO] WASAPI ReleaseBuffer failed ({e}): keeping time silently");
+                            return super::silent(out);
+                        }
+                        written += avail as u64;
+                    }
+                    Err(e) => {
+                        eprintln!("[AUDIO] WASAPI GetBuffer failed ({e}): keeping time silently");
+                        return super::silent(out);
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
 /// A whole file, decoded to planar float samples.
 fn decode(bytes: Vec<u8>) -> Result<Decoded, String> {
     use symphonia::core::audio::SampleBuffer;
@@ -328,12 +597,26 @@ fn decode(bytes: Vec<u8>) -> Result<Decoded, String> {
         .format(&Hint::new(), source, &FormatOptions::default(), &MetadataOptions::default())
         .map_err(fail)?;
     let mut format = probed.format;
-    let track = format.default_track().ok_or("EncodingError: Unable to decode audio data: no audio track")?;
-    let track_id = track.id;
-    let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
-        .map_err(fail)?;
-    let mut rate = track.codec_params.sample_rate.unwrap_or(48_000);
+    // Pick the first decodable audio track (important for MP4 containers where
+    // track 0 is H.264 video and track 1 is AAC audio).
+    let codecs = symphonia::default::get_codecs();
+    let mut picked = None;
+    for t in format.tracks() {
+        if t.codec_params.sample_rate.is_some()
+            && let Ok(dec) = codecs.make(&t.codec_params, &DecoderOptions::default())
+        {
+            picked = Some((t.id, t.codec_params.sample_rate.unwrap_or(48_000), dec));
+            break;
+        }
+    }
+    let (track_id, mut rate, mut decoder) = match picked {
+        Some(p) => p,
+        None => {
+            let track = format.default_track().ok_or("EncodingError: Unable to decode audio data: no audio track")?;
+            let dec = codecs.make(&track.codec_params, &DecoderOptions::default()).map_err(fail)?;
+            (track.id, track.codec_params.sample_rate.unwrap_or(48_000), dec)
+        }
+    };
     let mut channels: Vec<Vec<f32>> = Vec::new();
     loop {
         let packet = match format.next_packet() {
@@ -368,4 +651,40 @@ fn decode(bytes: Vec<u8>) -> Result<Decoded, String> {
         return Err("EncodingError: Unable to decode audio data: no samples".into());
     }
     Ok(Decoded { rate, channels })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_pcm_wav_samples_accurately() {
+        // Synthesize a valid 16-bit PCM mono 44.1 kHz WAV (100 samples of a 440 Hz sine wave).
+        let sample_rate = 44_100u32;
+        let num_samples = 100u32;
+        let data_bytes = num_samples * 2;
+        let mut wav = Vec::with_capacity(44 + data_bytes as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        wav.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_bytes.to_le_bytes());
+        for i in 0..num_samples {
+            let s = (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sample_rate as f32).sin();
+            wav.extend_from_slice(&((s * 20_000.0) as i16).to_le_bytes());
+        }
+        let decoded = decode(wav).expect("decode synthetic WAV");
+        assert_eq!(decoded.rate, sample_rate);
+        assert_eq!(decoded.channels.len(), 1);
+        assert_eq!(decoded.channels[0].len(), num_samples as usize);
+        assert!(decoded.channels[0].iter().any(|&v| v.abs() > 0.3));
+    }
 }

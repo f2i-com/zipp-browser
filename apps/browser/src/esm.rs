@@ -131,10 +131,26 @@ impl ImportMap {
 ///
 /// It also notes an `await` outside any function: such a module's body has to
 /// become an async function, where a plain one would not compile.
+struct SetValueHoist {
+    stmt_start: u32,
+    stmt_end: u32,
+    recv_start: u32,
+    recv_end: u32,
+    arg0: (u32, u32),
+    arg1: (u32, u32),
+    arg2: (u32, u32),
+}
+
 #[derive(Default)]
 struct DynamicScan {
     dyn_imports: Vec<(u32, u32, u32, u32)>, // expr start/end, argument start/end
     meta_spans: Vec<(u32, u32)>,
+    /// Three.js `StructuredUniform.setValue`: `u.setValue(gl, value[u.id], textures)`
+    /// triggers a register-clobber bug in zipp-vm's JIT when the recursive method
+    /// call evaluates `value[u.id]` inline in the argument list while `u` is also
+    /// the receiver. Record the spans so we can hoist `value[u.id]` into a
+    /// block-scoped local cleanly.
+    set_value_hoists: Vec<SetValueHoist>,
     function_depth: u32,
     top_level_await: bool,
 }
@@ -169,6 +185,36 @@ impl<'a> Visit<'a> for DynamicScan {
             self.meta_spans.push((span.start, span.end));
         }
         oxc_ast_visit::walk::walk_meta_property(self, it);
+    }
+
+    fn visit_expression_statement(&mut self, it: &ox::ExpressionStatement<'a>) {
+        if let ox::Expression::CallExpression(call) = &it.expression
+            && call.arguments.len() == 3
+            && let ox::Expression::StaticMemberExpression(callee) = &call.callee
+            && callee.property.name == "setValue"
+            && let ox::Expression::Identifier(recv) = &callee.object
+            && let ox::Argument::ComputedMemberExpression(arg1) = &call.arguments[1]
+            && let ox::Expression::StaticMemberExpression(idx_mem) = &arg1.expression
+            && idx_mem.property.name == "id"
+            && let ox::Expression::Identifier(idx_obj) = &idx_mem.object
+            && idx_obj.name == recv.name
+        {
+            let stmt_span = it.span();
+            let recv_span = recv.span();
+            let a0 = call.arguments[0].span();
+            let a1 = call.arguments[1].span();
+            let a2 = call.arguments[2].span();
+            self.set_value_hoists.push(SetValueHoist {
+                stmt_start: stmt_span.start,
+                stmt_end: stmt_span.end,
+                recv_start: recv_span.start,
+                recv_end: recv_span.end,
+                arg0: (a0.start, a0.end),
+                arg1: (a1.start, a1.end),
+                arg2: (a2.start, a2.end),
+            });
+        }
+        oxc_ast_visit::walk::walk_expression_statement(self, it);
     }
 }
 
@@ -405,13 +451,33 @@ fn rewrite_module(
     for (start, end) in scan.meta_spans {
         edits.push(Edit { start, end, text: "__meta".into() });
     }
-
-    // Apply edits back-to-front so earlier offsets stay valid.
-    edits.sort_by_key(|e| std::cmp::Reverse(e.start));
-    let mut body = source.to_string();
-    for e in edits {
-        body.replace_range(e.start as usize..e.end as usize, &e.text);
+    for h in scan.set_value_hoists {
+        let recv = &source[h.recv_start as usize..h.recv_end as usize];
+        let arg0 = &source[h.arg0.0 as usize..h.arg0.1 as usize];
+        let arg1 = &source[h.arg1.0 as usize..h.arg1.1 as usize];
+        let arg2 = &source[h.arg2.0 as usize..h.arg2.1 as usize];
+        edits.push(Edit {
+            start: h.stmt_start,
+            end: h.stmt_end,
+            text: format!("{{let __zv={arg1};{recv}.setValue({arg0},__zv,{arg2});}}"),
+        });
     }
+
+    // Apply edits in a single O(N) forward pass instead of O(M * N) `replace_range`.
+    edits.sort_by_key(|e| (e.start, e.end));
+    let mut body = String::with_capacity(source.len() + edits.iter().map(|e| e.text.len()).sum::<usize>());
+    let mut cursor = 0usize;
+    for e in edits {
+        let start = e.start as usize;
+        let end = e.end as usize;
+        if start < cursor {
+            continue;
+        }
+        body.push_str(&source[cursor..start]);
+        body.push_str(&e.text);
+        cursor = end;
+    }
+    body.push_str(&source[cursor..]);
 
     Ok(Rewritten { body, deps, export_calls, top_level_await })
 }
@@ -497,6 +563,9 @@ fn collect_pattern_names<'a>(kind: &ox::BindingPattern<'a>, out: &mut Vec<String
     }
 }
 
+/// Maximum parallel HTTP fetches per dependency wave when linking an ES module graph.
+const MAX_PARALLEL_FETCHES: usize = 8;
+
 /// Fetch and link the whole graph reachable from `entries`.
 ///
 /// Dynamic-import targets with literal specifiers are pulled in too, so a
@@ -505,7 +574,7 @@ fn collect_pattern_names<'a>(kind: &ox::BindingPattern<'a>, out: &mut Vec<String
 /// so a chunk that is not linked up front could never be loaded at all.
 pub fn link_graph(
     entries: &[String],
-    fetch: &dyn Fn(&str) -> Result<String, String>,
+    fetch: &(dyn Fn(&str) -> Result<String, String> + Sync),
     resolve: &dyn Fn(&str, &str) -> String,
 ) -> Linked {
     link_more(entries, &HashSet::new(), true, fetch, resolve)
@@ -519,49 +588,93 @@ pub fn link_more(
     entries: &[String],
     linked: &HashSet<String>,
     run: bool,
-    fetch: &dyn Fn(&str) -> Result<String, String>,
+    fetch: &(dyn Fn(&str) -> Result<String, String> + Sync),
     resolve: &dyn Fn(&str, &str) -> String,
 ) -> Linked {
-    let mut queue: Vec<String> = entries.iter().filter(|e| !linked.contains(*e)).cloned().collect();
+    let mut wave: Vec<String> = entries.iter().filter(|e| !linked.contains(*e)).cloned().collect();
     let mut seen: HashSet<String> = entries.iter().chain(linked.iter()).cloned().collect();
     let mut modules: Vec<(String, Rewritten)> = Vec::new();
     let mut failures: Vec<(String, String)> = Vec::new();
+    let js_from = std::env::var("ZIPP_JS_FROM").ok();
+    let js_to = std::env::var("ZIPP_JS_TO").ok();
 
-    while let Some(url) = queue.pop() {
-        if !url_like(&url) {
-            failures.push((url.clone(), "a bare specifier, which no import map names".into()));
-            continue;
+    while !wave.is_empty() {
+        let mut to_fetch: Vec<String> = Vec::new();
+        for url in std::mem::take(&mut wave) {
+            if !url_like(&url) {
+                failures.push((url, "a bare specifier, which no import map names".into()));
+            } else {
+                to_fetch.push(url);
+            }
         }
-        let source = match fetch(&url) {
-            Ok(s) => s,
-            Err(e) => {
-                failures.push((url.clone(), format!("fetch failed: {e}")));
-                continue;
-            }
-        };
-        // Same `ZIPP_JS_FROM`/`ZIPP_JS_TO` rewrite the classic-script path has.
-        // A client-rendered app's behaviour lives entirely in these modules, so
-        // without it there is no way to instrument the code that actually runs.
-        let source = match (
-            std::env::var("ZIPP_JS_FROM").ok(),
-            std::env::var("ZIPP_JS_TO").ok(),
-        ) {
-            (Some(from), Some(to)) if source.contains(&from) => {
-                eprintln!("[ESM] substituted page source in {url}");
-                source.replace(&from, &to)
-            }
-            _ => source,
-        };
-        match rewrite_module(&url, &source, resolve) {
-            Ok(rw) => {
-                for d in &rw.deps {
-                    if seen.insert(d.clone()) {
-                        queue.push(d.clone());
-                    }
+        if to_fetch.is_empty() {
+            break;
+        }
+
+        // Fetch this BFS wave in parallel (capped at MAX_PARALLEL_FETCHES) so
+        // multi-module SoftN apps and Vite SPAs reuse keep-alive connections
+        // instead of stalling on 50+ sequential round-trips.
+        let fetched: Vec<(String, Result<String, String>)> = if to_fetch.len() <= 1 {
+            to_fetch.into_iter().map(|u| { let r = fetch(&u); (u, r) }).collect()
+        } else {
+            let workers = to_fetch.len().min(MAX_PARALLEL_FETCHES);
+            let next_idx = std::sync::atomic::AtomicUsize::new(0);
+            let results: Vec<std::sync::Mutex<Option<Result<String, String>>>> =
+                (0..to_fetch.len()).map(|_| std::sync::Mutex::new(None)).collect();
+            std::thread::scope(|s| {
+                for _ in 0..workers {
+                    s.spawn(|| {
+                        loop {
+                            let i = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if i >= to_fetch.len() {
+                                break;
+                            }
+                            let res = fetch(&to_fetch[i]);
+                            *results[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(res);
+                        }
+                    });
                 }
-                modules.push((url, rw));
+            });
+            to_fetch
+                .into_iter()
+                .zip(results)
+                .map(|(u, slot)| {
+                    let res = slot
+                        .into_inner()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .unwrap_or_else(|| Err("worker did not complete".into()));
+                    (u, res)
+                })
+                .collect()
+        };
+
+        for (url, res) in fetched {
+            let source = match res {
+                Ok(s) => s,
+                Err(e) => {
+                    failures.push((url, format!("fetch failed: {e}")));
+                    continue;
+                }
+            };
+            // Same `ZIPP_JS_FROM`/`ZIPP_JS_TO` rewrite the classic-script path has.
+            let source = match (&js_from, &js_to) {
+                (Some(from), Some(to)) if source.contains(from.as_str()) => {
+                    eprintln!("[ESM] substituted page source in {url}");
+                    source.replace(from.as_str(), to.as_str())
+                }
+                _ => source,
+            };
+            match rewrite_module(&url, &source, resolve) {
+                Ok(rw) => {
+                    for d in &rw.deps {
+                        if seen.insert(d.clone()) {
+                            wave.push(d.clone());
+                        }
+                    }
+                    modules.push((url, rw));
+                }
+                Err(e) => failures.push((url, format!("parse failed: {e}"))),
             }
-            Err(e) => failures.push((url.clone(), format!("parse failed: {e}"))),
         }
     }
 
@@ -836,6 +949,17 @@ mod tests {
     fn import_meta_is_replaced() {
         let r = rw("const u = import.meta.url;");
         assert!(r.body.contains("__meta.url"), "{}", r.body);
+    }
+
+    #[test]
+    fn hoists_threejs_structured_uniform_set_value_lookup() {
+        let src = "class S{setValue(e,t,n){let r=this.seq;for(let i=0,a=r.length;i!==a;++i){let a=r[i];a.setValue(e,t[a.id],n)}}}";
+        let r = rw(src);
+        assert!(
+            r.body.contains("{let __zv=t[a.id];a.setValue(e,__zv,n);}"),
+            "{}",
+            r.body
+        );
     }
 
     /// The whole point of parsing rather than pattern-matching: these words

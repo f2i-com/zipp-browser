@@ -16,8 +16,45 @@ use std::path::PathBuf;
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
-/// What a site may keep, each kind in its own folder.
-const KINDS: &[&str] = &["idb", "local"];
+/// What a site may keep, each kind in its own folder (`session` stays in memory
+/// for the lifetime of this browser process, per origin).
+const KINDS: &[&str] = &["idb", "local", "session"];
+
+static SESSION_STORE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+/// In-memory-only store for `localStorage` and `IndexedDB` when running in Incognito mode.
+static EPHEMERAL_STORE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+fn session_store() -> &'static Mutex<HashMap<String, String>> {
+    SESSION_STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn ephemeral_store() -> &'static Mutex<HashMap<String, String>> {
+    EPHEMERAL_STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn ephemeral_key(doc: &url::Url, kind: &str, name: &str) -> Result<String, String> {
+    if !KINDS.contains(&kind) {
+        return Err(format!("unknown storage kind {kind:?}"));
+    }
+    let origin = origin_key(doc).ok_or("SecurityError: this document cannot keep storage")?;
+    Ok(format!("{origin}::{kind}::{name}"))
+}
+
+fn origin_key(doc: &url::Url) -> Option<String> {
+    let name = match doc.scheme() {
+        scheme @ ("http" | "https") => {
+            let host: String = doc
+                .host_str()?
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+                .collect();
+            format!("{scheme}_{host}_{}", doc.port_or_known_default()?)
+        }
+        "file" => crate::app_storage_name().unwrap_or_else(|| "file".to_string()),
+        _ => return None,
+    };
+    Some(name)
+}
 
 struct Saver {
     /// Writes not yet on disk: a file's new content, or `None` to delete it.
@@ -56,21 +93,7 @@ fn saver() -> &'static Saver {
 /// `file` for pages opened from disk (which share one, as `localStorage`
 /// does in Chrome). Other documents -- `data:`, `about:` -- keep nothing.
 fn origin_dir(doc: &url::Url) -> Option<PathBuf> {
-    let name = match doc.scheme() {
-        scheme @ ("http" | "https") => {
-            let host: String = doc
-                .host_str()?
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
-                .collect();
-            format!("{scheme}_{host}_{}", doc.port_or_known_default()?)
-        }
-        // An app (`--app`) keeps its own: all that runs from disk under one
-        // name, one SoftN app read another's records.
-        "file" => crate::app_storage_name().unwrap_or_else(|| "file".to_string()),
-        _ => return None,
-    };
-    Some(zipp_shell::profile::dir()?.join("storage").join(name))
+    Some(zipp_shell::profile::dir()?.join("storage").join(origin_key(doc)?))
 }
 
 /// The file holding `name`: its UTF-8 bytes in hex, so that any name a page
@@ -94,6 +117,14 @@ fn file_for(doc: &url::Url, kind: &str, name: &str) -> Result<PathBuf, String> {
 
 /// `name`'s content, `None` if the site keeps nothing under it.
 pub fn read(doc: &url::Url, kind: &str, name: &str) -> Result<Option<String>, String> {
+    if kind == "session" {
+        let key = format!("{}::{name}", origin_key(doc).ok_or("SecurityError: this document cannot keep storage")?);
+        return Ok(lock(session_store()).get(&key).cloned());
+    }
+    if zipp_shell::profile::is_incognito() {
+        let key = ephemeral_key(doc, kind, name)?;
+        return Ok(lock(ephemeral_store()).get(&key).cloned());
+    }
     let path = file_for(doc, kind, name)?;
     let s = saver();
     let _disk = lock(&s.disk);
@@ -105,6 +136,24 @@ pub fn read(doc: &url::Url, kind: &str, name: &str) -> Result<Option<String>, St
 
 /// Keep `data` under `name`, or with `None` remove it.
 pub fn write(doc: &url::Url, kind: &str, name: &str, data: Option<String>) -> Result<(), String> {
+    if kind == "session" {
+        let key = format!("{}::{name}", origin_key(doc).ok_or("SecurityError: this document cannot keep storage")?);
+        let mut store = lock(session_store());
+        match data {
+            Some(v) => { store.insert(key, v); }
+            None => { store.remove(&key); }
+        }
+        return Ok(());
+    }
+    if zipp_shell::profile::is_incognito() {
+        let key = ephemeral_key(doc, kind, name)?;
+        let mut store = lock(ephemeral_store());
+        match data {
+            Some(v) => { store.insert(key, v); }
+            None => { store.remove(&key); }
+        }
+        return Ok(());
+    }
     let path = file_for(doc, kind, name)?;
     let s = saver();
     lock(&s.pending).insert(path, data);
@@ -114,6 +163,26 @@ pub fn write(doc: &url::Url, kind: &str, name: &str, data: Option<String>) -> Re
 
 /// The names the site keeps something under, as a JSON array.
 pub fn names(doc: &url::Url, kind: &str) -> Result<String, String> {
+    if kind == "session" {
+        let prefix = format!("{}::", origin_key(doc).ok_or("SecurityError: this document cannot keep storage")?);
+        let names: Vec<String> = lock(session_store())
+            .keys()
+            .filter_map(|k| k.strip_prefix(&prefix).map(str::to_string))
+            .collect();
+        return Ok(serde_json::to_string(&names).unwrap_or_else(|_| "[]".into()));
+    }
+    if zipp_shell::profile::is_incognito() {
+        if !KINDS.contains(&kind) {
+            return Err(format!("unknown storage kind {kind:?}"));
+        }
+        let origin = origin_key(doc).ok_or("SecurityError: this document cannot keep storage")?;
+        let prefix = format!("{origin}::{kind}::");
+        let names: Vec<String> = lock(ephemeral_store())
+            .keys()
+            .filter_map(|k| k.strip_prefix(&prefix).map(str::to_string))
+            .collect();
+        return Ok(serde_json::to_string(&names).unwrap_or_else(|_| "[]".into()));
+    }
     let dir = file_for(doc, kind, "")?.parent().map(PathBuf::from).unwrap_or_default();
     let s = saver();
     let _disk = lock(&s.disk);
@@ -143,8 +212,32 @@ pub fn names(doc: &url::Url, kind: &str) -> Result<String, String> {
     Ok(serde_json::to_string(&names).unwrap_or_else(|_| "[]".into()))
 }
 
+/// Clear every origin's `localStorage`, IndexedDB, and in-memory `sessionStorage`.
+pub fn clear_all() {
+    lock(session_store()).clear();
+    lock(ephemeral_store()).clear();
+    if zipp_shell::profile::is_incognito() {
+        return;
+    }
+    let s = saver();
+    let _disk = lock(&s.disk);
+    lock(&s.pending).clear();
+    if let Some(dir) = zipp_shell::profile::dir().map(|d| d.join("storage")) {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Clear in-memory `sessionStorage` only (e.g., for testing or starting a clean session).
+#[cfg(test)]
+pub fn clear_sessions() {
+    lock(session_store()).clear();
+}
+
 /// Write everything waiting, before the browser exits.
 pub fn flush() {
+    if zipp_shell::profile::is_incognito() {
+        return;
+    }
     let s = saver();
     let _disk = lock(&s.disk);
     let batch = std::mem::take(&mut *lock(&s.pending));

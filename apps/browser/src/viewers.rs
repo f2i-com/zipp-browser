@@ -48,18 +48,59 @@ pub(crate) fn fetch_document(url: &str, allow_download: bool) -> Result<String, 
     // (`/play/<name>`) only to a request that accepts HTML, and the rest of
     // its site's "there is no page here" to anything else -- which is what
     // every app opened in this browser showed.
-    let response = crate::http_client()
+    let cache = zipp_shell::cache::global();
+    let revalidate = match cache.lookup("doc", url) {
+        zipp_shell::cache::Lookup::Fresh(entry) => {
+            let mime = entry
+                .content_type
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            let mime = (!mime.is_empty()).then_some(mime);
+            return classify(url, entry.body.as_ref().clone(), mime, None, allow_download);
+        }
+        zipp_shell::cache::Lookup::Revalidate(entry) => Some(entry),
+        zipp_shell::cache::Lookup::Miss => None,
+    };
+
+    let mut req = crate::http_client()
         .get(url)
         .header(reqwest::header::ACCEPT, NAVIGATION_ACCEPT)
         .header("Sec-Fetch-Dest", "document")
         .header("Sec-Fetch-Mode", "navigate")
         .header("Sec-Fetch-Site", "none")
         .header("Sec-Fetch-User", "?1")
-        .header("Upgrade-Insecure-Requests", "1")
-        .send()
-        .map_err(|e| e.to_string())?;
+        .header("Upgrade-Insecure-Requests", "1");
+    if let Some(ref prev) = revalidate {
+        if let Some(ref etag) = prev.etag {
+            req = req.header(reqwest::header::IF_NONE_MATCH, etag.as_str());
+        }
+        if let Some(ref lm) = prev.last_modified {
+            req = req.header(reqwest::header::IF_MODIFIED_SINCE, lm.as_str());
+        }
+    }
+    let response = req.send().map_err(|e| e.to_string())?;
+    let status = response.status().as_u16();
+    if status == 304
+        && let Some(prev) = revalidate
+    {
+        let refreshed = cache.revalidate_304("doc", url, prev, response.headers());
+        let mime = refreshed
+            .content_type
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        let mime = (!mime.is_empty()).then_some(mime);
+        return classify(url, refreshed.body.as_ref().clone(), mime, None, allow_download);
+    }
+
+    let resp_headers = response.headers().clone();
     let header = |name: reqwest::header::HeaderName| {
-        response.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string)
+        resp_headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_string)
     };
     let mime = header(reqwest::header::CONTENT_TYPE)
         .map(|ct| ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase())
@@ -69,6 +110,7 @@ pub(crate) fn fetch_document(url: &str, allow_download: bool) -> Result<String, 
     // HTML and text go through `text()`, which honours the declared charset.
     if mime.as_deref().is_some_and(|m| is_html_mime(m) || is_text_mime(m)) {
         let text = response.text().map_err(|e| e.to_string())?;
+        cache.store("doc", url, status, &resp_headers, text.as_bytes().to_vec());
         return Ok(if mime.as_deref().is_some_and(is_html_mime) {
             text
         } else {
@@ -76,6 +118,7 @@ pub(crate) fn fetch_document(url: &str, allow_download: bool) -> Result<String, 
         });
     }
     let bytes = response.bytes().map_err(|e| e.to_string())?.to_vec();
+    cache.store("doc", url, status, &resp_headers, bytes.clone());
     classify(url, bytes, mime, disposition_name, allow_download)
 }
 

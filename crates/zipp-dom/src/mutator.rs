@@ -420,6 +420,10 @@ impl DocumentMutator<'_> {
 
     pub fn remove_and_drop_all_children(&mut self, node_id: usize) {
         let parent = &mut self.doc.nodes[node_id];
+        parent.insert_damage(ALL_DAMAGE);
+        parent.stacking_context = None;
+        parent.paint_children.borrow_mut().take();
+        let old_layout_children = parent.layout_children.borrow_mut().take();
         let parent_is_in_doc = parent.flags.is_in_document();
 
         // TODO: make this fine grained / conditional based on ElementSelectorFlags
@@ -432,6 +436,9 @@ impl DocumentMutator<'_> {
         }
 
         let children = mem::take(&mut parent.children);
+        if let Some(old_lc) = old_layout_children {
+            self.doc.free_anonymous_wrappers(old_lc);
+        }
         for child_id in children {
             self.process_removed_subtree(child_id);
             let _ = self.doc.drop_node_ignoring_parent(child_id);
@@ -657,6 +664,9 @@ impl<'doc> DocumentMutator<'doc> {
         self.doc.iter_subtree_mut(node_id, |node_id, doc| {
             let node = &mut doc.nodes[node_id];
             node.flags.set(NodeFlags::IS_IN_DOCUMENT, false);
+            node.stacking_context = None;
+            node.paint_children.borrow_mut().take();
+            node.layout_parent.set(None);
 
             // Clear hover state if this node was being hovered.
             // This prevents stale hover_node_id references.
@@ -665,10 +675,15 @@ impl<'doc> DocumentMutator<'doc> {
                 doc.hover_node_is_text = false;
             }
 
-            // Clear active state if this node was active
-            // This prevents stale active_node_id references.
+            // Clear focus/active/mousedown state if this node held them.
+            if doc.focus_node_id == Some(node_id) {
+                doc.focus_node_id = None;
+            }
             if doc.active_node_id == Some(node_id) {
                 doc.active_node_id = None;
+            }
+            if doc.mousedown_node_id == Some(node_id) {
+                doc.mousedown_node_id = None;
             }
 
             // Remove any snapshot for this node to prevent stale snapshot references
@@ -689,7 +704,9 @@ impl<'doc> DocumentMutator<'doc> {
             };
 
             match &element.special_data {
-                SpecialElementData::SubDocument(_) => {}
+                SpecialElementData::SubDocument(_) => {
+                    doc.sub_document_nodes.remove(&node_id);
+                }
                 SpecialElementData::Stylesheet(_) => self
                     .eager_op_queue
                     .push(SpecialOp::UnloadStylesheet(node_id)),

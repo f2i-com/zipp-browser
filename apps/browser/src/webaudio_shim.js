@@ -770,7 +770,7 @@
     m.offset = 0;
     load(this).catch(function () {});
   };
-  proto.canPlayType = function (type) { return /^audio\/(mpeg|mp3|ogg|wav|wave|x-wav|flac|x-flac)\b/.test(String(type)) ? "probably" : ""; };
+  proto.canPlayType = function (type) { return /^audio\/(mpeg|mp3|mp4|aac|x-m4a|m4a|ogg|wav|wave|x-wav|flac|x-flac)\b/i.test(String(type)) ? "probably" : ""; };
   Object.defineProperty(proto, "paused", { configurable: true, get: function () { return !media(this).want; } });
   Object.defineProperty(proto, "ended", { configurable: true, get: function () { return media(this).ended; } });
   Object.defineProperty(proto, "duration", {
@@ -809,6 +809,239 @@
     var all = document.querySelectorAll("audio[autoplay]");
     for (var i = 0; i < all.length; i++) all[i].play().catch(function () {});
   }, 0);
+
+  // ---- <video> ----------------------------------------------------------------
+  // Bridges HTMLVideoElement JS APIs (`play`, `pause`, `load`, `currentTime`,
+  // `duration`, `muted`, `volume`, `playbackRate`, `videoWidth`, `videoHeight`,
+  // `readyState`, `canPlayType`, and media lifecycle events) to the browser's
+  // native Media Foundation `<video>` player (`media.rs` + `event_bridge.rs`).
+  if (typeof HTMLVideoElement !== "undefined") {
+    var vproto = HTMLVideoElement.prototype;
+    function vhost() {
+      var args = ["video"];
+      for (var i = 0; i < arguments.length; i++) args.push(String(arguments[i]));
+      try { return __zippHostCall.apply(null, args); } catch (e) { return ""; }
+    }
+    function vstate(el) {
+      if (!el._vstate) {
+        el._vstate = {
+          paused: true,
+          ended: false,
+          muted: el.hasAttribute("muted"),
+          volume: 1,
+          playbackRate: 1,
+          readyState: 0,
+          currentTime: 0,
+          duration: NaN,
+          videoWidth: 0,
+          videoHeight: 0,
+          error: false,
+          firedMeta: false,
+          firedCanPlay: false,
+          firedEnded: false,
+          lastTime: -1,
+        };
+      }
+      return el._vstate;
+    }
+    function vrefresh(el) {
+      var s = vstate(el);
+      if (el._id === undefined) return s;
+      var raw = vhost("status", el._id);
+      if (raw) {
+        try {
+          var st = JSON.parse(raw);
+          if (st && st.hasPlayer) {
+            s.paused = !!st.paused;
+            s.ended = !!st.ended;
+            s.muted = !!st.muted;
+            if (typeof st.volume === "number") s.volume = st.volume;
+            if (typeof st.playbackRate === "number") s.playbackRate = st.playbackRate;
+            if (typeof st.readyState === "number") s.readyState = st.readyState;
+            if (typeof st.currentTime === "number") s.currentTime = st.currentTime;
+            if (typeof st.duration === "number" && st.duration > 0) s.duration = st.duration;
+            if (typeof st.videoWidth === "number") s.videoWidth = st.videoWidth;
+            if (typeof st.videoHeight === "number") s.videoHeight = st.videoHeight;
+            s.error = !!st.error;
+          }
+        } catch (e) {}
+      }
+      return s;
+    }
+    if (typeof HTMLMediaElement !== "undefined") {
+      HTMLMediaElement.HAVE_NOTHING = HTMLMediaElement.prototype.HAVE_NOTHING = 0;
+      HTMLMediaElement.HAVE_METADATA = HTMLMediaElement.prototype.HAVE_METADATA = 1;
+      HTMLMediaElement.HAVE_CURRENT_DATA = HTMLMediaElement.prototype.HAVE_CURRENT_DATA = 2;
+      HTMLMediaElement.HAVE_FUTURE_DATA = HTMLMediaElement.prototype.HAVE_FUTURE_DATA = 3;
+      HTMLMediaElement.HAVE_ENOUGH_DATA = HTMLMediaElement.prototype.HAVE_ENOUGH_DATA = 4;
+      HTMLMediaElement.NETWORK_EMPTY = HTMLMediaElement.prototype.NETWORK_EMPTY = 0;
+      HTMLMediaElement.NETWORK_IDLE = HTMLMediaElement.prototype.NETWORK_IDLE = 1;
+      HTMLMediaElement.NETWORK_LOADING = HTMLMediaElement.prototype.NETWORK_LOADING = 2;
+      HTMLMediaElement.NETWORK_NO_SOURCE = HTMLMediaElement.prototype.NETWORK_NO_SOURCE = 3;
+    }
+    Object.defineProperty(vproto, "src", {
+      configurable: true,
+      get: function () { return this.getAttribute("src") || ""; },
+      set: function (v) {
+        this.setAttribute("src", String(v));
+        var s = vstate(this);
+        s.firedMeta = false; s.firedCanPlay = false; s.firedEnded = false; s.duration = NaN; s.currentTime = 0;
+        if (this._id !== undefined) vhost("load", this._id);
+      },
+    });
+    vproto.play = function () {
+      var s = vstate(this);
+      s.paused = false;
+      s.ended = false;
+      s.firedEnded = false;
+      if (this._id !== undefined) vhost("play", this._id);
+      emit(this, "play");
+      return Promise.resolve();
+    };
+    vproto.pause = function () {
+      var s = vstate(this);
+      s.paused = true;
+      if (this._id !== undefined) vhost("pause", this._id);
+      emit(this, "pause");
+    };
+    vproto.load = function () {
+      var s = vstate(this);
+      s.firedMeta = false;
+      s.firedCanPlay = false;
+      s.firedEnded = false;
+      s.readyState = 0;
+      s.duration = NaN;
+      s.currentTime = 0;
+      if (this._id !== undefined) vhost("load", this._id);
+    };
+    vproto.canPlayType = function (type) {
+      var t = String(type || "").toLowerCase();
+      if (/^video\/(mp4|x-m4v|quicktime)\b/.test(t)) return "probably";
+      if (/^video\/(webm|ogg)\b/.test(t)) return "maybe";
+      if (/^audio\/(mpeg|mp3|mp4|aac|wav|ogg|flac)\b/.test(t)) return "probably";
+      return "";
+    };
+    Object.defineProperty(vproto, "paused", { configurable: true, get: function () { return vrefresh(this).paused; } });
+    Object.defineProperty(vproto, "ended", { configurable: true, get: function () { return vrefresh(this).ended; } });
+    Object.defineProperty(vproto, "duration", { configurable: true, get: function () { return vrefresh(this).duration; } });
+    Object.defineProperty(vproto, "videoWidth", { configurable: true, get: function () { return vrefresh(this).videoWidth; } });
+    Object.defineProperty(vproto, "videoHeight", { configurable: true, get: function () { return vrefresh(this).videoHeight; } });
+    Object.defineProperty(vproto, "readyState", { configurable: true, get: function () { return vrefresh(this).readyState; } });
+    Object.defineProperty(vproto, "networkState", {
+      configurable: true,
+      get: function () {
+        var s = vrefresh(this);
+        if (s.error) return 3;
+        return s.readyState >= 1 ? 1 : (sourceOf(this) ? 2 : 0);
+      },
+    });
+    Object.defineProperty(vproto, "currentTime", {
+      configurable: true,
+      get: function () { return vrefresh(this).currentTime; },
+      set: function (t) {
+        var secs = Math.max(0, Number(t) || 0);
+        vstate(this).currentTime = secs;
+        if (this._id !== undefined) vhost("seek", this._id, secs);
+        emit(this, "seeking");
+        emit(this, "seeked");
+        emit(this, "timeupdate");
+      },
+    });
+    Object.defineProperty(vproto, "muted", {
+      configurable: true,
+      get: function () { return vrefresh(this).muted; },
+      set: function (v) {
+        var m = !!v;
+        vstate(this).muted = m;
+        if (m) this.setAttribute("muted", ""); else this.removeAttribute("muted");
+        if (this._id !== undefined) vhost("mute", this._id, m ? "1" : "0");
+        emit(this, "volumechange");
+      },
+    });
+    Object.defineProperty(vproto, "volume", {
+      configurable: true,
+      get: function () { return vrefresh(this).volume; },
+      set: function (v) {
+        var vol = Math.max(0, Math.min(1, Number(v)));
+        if (isNaN(vol)) return;
+        vstate(this).volume = vol;
+        if (this._id !== undefined) vhost("volume", this._id, vol);
+        emit(this, "volumechange");
+      },
+    });
+    Object.defineProperty(vproto, "playbackRate", {
+      configurable: true,
+      get: function () { return vrefresh(this).playbackRate; },
+      set: function (v) {
+        var r = Math.max(0.25, Math.min(4, Number(v) || 1));
+        vstate(this).playbackRate = r;
+        if (this._id !== undefined) vhost("rate", this._id, r);
+        emit(this, "ratechange");
+      },
+    });
+    Object.defineProperty(vproto, "loop", {
+      configurable: true,
+      get: function () { return this.hasAttribute("loop"); },
+      set: function (v) {
+        if (v) this.setAttribute("loop", ""); else this.removeAttribute("loop");
+        if (this._id !== undefined) vhost("loop", this._id, v ? "1" : "0");
+      },
+    });
+    Object.defineProperty(vproto, "currentSrc", {
+      configurable: true,
+      get: function () { return sourceOf(this); },
+    });
+
+    // Called periodically by event_bridge.rs with live native MediaStatus updates
+    // so JS listeners receive loadedmetadata, canplay, timeupdate, playing, ended, error.
+    globalThis.__zippVideoSync = function (json) {
+      var map;
+      try { map = JSON.parse(json); } catch (e) { return; }
+      if (!map || typeof __nodesById === "undefined") return;
+      for (var k in map) {
+        var el = __nodesById[k];
+        if (!el) continue;
+        var st = map[k];
+        var s = vstate(el);
+        var prevPaused = s.paused;
+        s.paused = !!st.paused;
+        s.ended = !!st.ended;
+        s.muted = !!st.muted;
+        if (typeof st.volume === "number") s.volume = st.volume;
+        if (typeof st.playbackRate === "number") s.playbackRate = st.playbackRate;
+        if (typeof st.readyState === "number") s.readyState = st.readyState;
+        if (typeof st.currentTime === "number") s.currentTime = st.currentTime;
+        if (typeof st.duration === "number" && st.duration > 0) s.duration = st.duration;
+        if (typeof st.videoWidth === "number") s.videoWidth = st.videoWidth;
+        if (typeof st.videoHeight === "number") s.videoHeight = st.videoHeight;
+        if (st.error && !s.error) {
+          s.error = true;
+          emit(el, "error");
+        }
+        if (!s.firedMeta && (s.readyState >= 1 || s.videoWidth > 0 || !isNaN(s.duration))) {
+          s.firedMeta = true;
+          emit(el, "loadedmetadata");
+        }
+        if (!s.firedCanPlay && s.readyState >= 2) {
+          s.firedCanPlay = true;
+          emit(el, "loadeddata");
+          emit(el, "canplay");
+          if (s.readyState >= 4) emit(el, "canplaythrough");
+        }
+        if (prevPaused && !s.paused && !s.ended) {
+          emit(el, "playing");
+        }
+        if (!s.paused && Math.abs(s.currentTime - s.lastTime) >= 0.2) {
+          s.lastTime = s.currentTime;
+          emit(el, "timeupdate");
+        }
+        if (s.ended && !s.firedEnded) {
+          s.firedEnded = true;
+          emit(el, "ended");
+        }
+      }
+    };
+  }
 
   function Audio(src) {
     var el = document.createElement("audio");

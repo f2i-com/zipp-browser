@@ -237,33 +237,42 @@ impl HoistedPaintChildren {
     }
 
     pub fn compute_content_size(&mut self, doc: &BaseDocument) {
-        fn child_pos(child: &HoistedPaintChild, doc: &BaseDocument) -> Rect<f32> {
-            let node = &doc.nodes[child.node_id];
+        fn child_pos(child: &HoistedPaintChild, doc: &BaseDocument) -> Option<Rect<f32>> {
+            let node = doc.nodes.get(child.node_id)?;
             let left = child.position.x + node.final_layout.location.x;
             let top = child.position.y + node.final_layout.location.y;
             let right = left + node.final_layout.size.width;
             let bottom = top + node.final_layout.size.height;
 
-            taffy::Rect {
+            Some(taffy::Rect {
                 top,
                 left,
                 bottom,
                 right,
-            }
+            })
         }
 
-        if self.children.is_empty() {
-            self.content_area = taffy::Rect::ZERO;
-        } else {
-            self.content_area = child_pos(&self.children[0], doc);
-            for child in self.children[1..].iter() {
-                let pos = child_pos(child, doc);
-                self.content_area.left = self.content_area.left.min(pos.left);
-                self.content_area.top = self.content_area.top.min(pos.top);
-                self.content_area.right = self.content_area.right.max(pos.right);
-                self.content_area.bottom = self.content_area.bottom.max(pos.bottom);
-            }
+        // Prune any hoisted children whose nodes were removed from the slab so
+        // stale stacking contexts can never panic on invalid keys.
+        let prev_len = self.children.len();
+        self.children.retain(|child| doc.nodes.contains(child.node_id));
+        if self.children.len() != prev_len {
+            self.negative_z_count =
+                self.children.iter().take_while(|c| c.z_index < 0).count() as u32;
         }
+
+        let mut iter = self.children.iter().filter_map(|c| child_pos(c, doc));
+        let Some(mut area) = iter.next() else {
+            self.content_area = taffy::Rect::ZERO;
+            return;
+        };
+        for pos in iter {
+            area.left = area.left.min(pos.left);
+            area.top = area.top.min(pos.top);
+            area.right = area.right.max(pos.right);
+            area.bottom = area.bottom.max(pos.bottom);
+        }
+        self.content_area = area;
     }
 
     pub fn sort(&mut self) {
@@ -342,6 +351,15 @@ impl BaseDocument {
     }
 
     pub fn flush_styles_to_layout(&mut self, node_id: usize) {
+        // Clear all previous stacking contexts across the slab before rebuilding
+        // them for the live layout tree. Nodes that became `display: none`,
+        // stopped being stacking-context roots, or were detached from the
+        // document would otherwise retain stale `HoistedPaintChildren` pointing
+        // to freed slab keys (panicking in `place_hoisted_boxes` / `compute_content_size`)
+        // or double-paint hoisted children.
+        for (_, node) in self.nodes.iter_mut() {
+            node.stacking_context = None;
+        }
         self.flush_styles_to_layout_impl(node_id, None);
     }
 
@@ -357,7 +375,9 @@ impl BaseDocument {
         let stacking_context = &mut new_stacking_context;
 
         let display = {
-            let node = self.nodes.get_mut(node_id).unwrap();
+            let Some(node) = self.nodes.get_mut(node_id) else {
+                return;
+            };
             let _damage = node.damage().unwrap_or(ALL_DAMAGE);
             let stylo_element_data = node.stylo_element_data.get();
             let primary_styles = stylo_element_data
@@ -468,6 +488,7 @@ impl BaseDocument {
         // If the node has children, then take those children and...
         let children = self.nodes[node_id].layout_children.borrow_mut().take();
         if let Some(mut children) = children {
+            children.retain(|&id| self.nodes.contains(id));
             let is_flex_or_grid = matches!(display, taffy::Display::Flex | taffy::Display::Grid);
 
             // Recursively call flush_styles_to_layout on each child
@@ -600,5 +621,183 @@ fn node_to_paint_order(node: &Node, is_flex_or_grid: bool) -> i32 {
             }
             _ => 2,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::DocumentConfig;
+    use crate::html_parser::HtmlDocument;
+    use crate::traits_src::shell::Viewport;
+
+    #[test]
+    fn stale_stacking_context_after_dom_mutation_does_not_panic() {
+        // Case A: a stacking-context root becomes `display: none` while its
+        // previously hoisted child is removed/dropped from the slab.
+        let html = r#"<!doctype html><html><body style="margin:0">
+            <div id="wrap" style="position:relative;z-index:10;width:200px;height:200px">
+                <div id="inner">
+                    <div id="badge" style="position:absolute;z-index:20;width:40px;height:20px">hi</div>
+                </div>
+            </div>
+        </body></html>"#;
+        let mut doc = HtmlDocument::from_html(
+            html,
+            DocumentConfig {
+                viewport: Some(Viewport::new(800, 600, 1.0, Default::default())),
+                ..Default::default()
+            },
+        );
+        doc.resolve(0.0);
+
+        let wrap_id = doc.query_selector("#wrap").unwrap().unwrap();
+        let inner_id = doc.query_selector("#inner").unwrap().unwrap();
+        let badge_id = doc.query_selector("#badge").unwrap().unwrap();
+        let sc_children: Vec<usize> = doc
+            .get_node(wrap_id)
+            .unwrap()
+            .stacking_context
+            .as_ref()
+            .expect("wrap should establish a stacking context on initial resolve")
+            .children
+            .iter()
+            .map(|c| c.node_id)
+            .collect();
+        assert!(sc_children.contains(&badge_id), "badge should be hoisted into wrap");
+
+        let style_attr = markup5ever::QualName::new(
+            None,
+            markup5ever::ns!(),
+            markup5ever::LocalName::from("style"),
+        );
+        let mut mutator = doc.mutate();
+        mutator.set_attribute(wrap_id, style_attr.clone(), "display:none");
+        mutator.set_inner_html(inner_id, "");
+        drop(mutator);
+
+        doc.resolve(1.0);
+        assert!(
+            doc.get_node(wrap_id).unwrap().stacking_context.is_none(),
+            "display:none node should not keep a stale stacking context"
+        );
+
+        // Case B: a stacking-context root stops being one (z-index/position reset)
+        // while its previously hoisted child is dropped.
+        let mut doc2 = HtmlDocument::from_html(
+            html,
+            DocumentConfig {
+                viewport: Some(Viewport::new(800, 600, 1.0, Default::default())),
+                ..Default::default()
+            },
+        );
+        doc2.resolve(0.0);
+        let wrap2 = doc2.query_selector("#wrap").unwrap().unwrap();
+        let inner2 = doc2.query_selector("#inner").unwrap().unwrap();
+        let mut mutator = doc2.mutate();
+        mutator.set_attribute(wrap2, style_attr, "position:static;z-index:auto");
+        mutator.set_inner_html(inner2, "");
+        drop(mutator);
+        doc2.resolve(1.0);
+        assert!(
+            doc2.get_node(wrap2).unwrap().stacking_context.is_none(),
+            "stale stacking context should be cleared once node stops being a root"
+        );
+
+        // Case C: a stacking-context root is detached via remove_node while its
+        // previously hoisted child is dropped.
+        let mut doc3 = HtmlDocument::from_html(
+            html,
+            DocumentConfig {
+                viewport: Some(Viewport::new(800, 600, 1.0, Default::default())),
+                ..Default::default()
+            },
+        );
+        doc3.resolve(0.0);
+        let wrap3 = doc3.query_selector("#wrap").unwrap().unwrap();
+        let badge3 = doc3.query_selector("#badge").unwrap().unwrap();
+        let mut mutator = doc3.mutate();
+        mutator.remove_node(wrap3);
+        mutator.remove_and_drop_node(badge3);
+        drop(mutator);
+        doc3.resolve(1.0);
+    }
+
+    #[test]
+    fn inline_block_with_floated_child_computes_shrink_to_fit_width() {
+        let html = r#"<!doctype html><html><body style="margin:0">
+            <div style="width:400px">
+                <div id="wrap" style="display:inline-block;padding:4px">
+                    <a id="btn" style="float:right;width:40px;height:40px"></a>
+                </div>
+            </div>
+        </body></html>"#;
+        let mut doc = HtmlDocument::from_html(
+            html,
+            DocumentConfig {
+                viewport: Some(Viewport::new(800, 600, 1.0, Default::default())),
+                ..Default::default()
+            },
+        );
+        doc.resolve(0.0);
+
+        let wrap = doc.get_node(doc.query_selector("#wrap").unwrap().unwrap()).unwrap();
+        let btn = doc.get_node(doc.query_selector("#btn").unwrap().unwrap()).unwrap();
+        assert!(
+            (wrap.final_layout.size.width - 48.0).abs() < 0.5,
+            "inline-block shrink-to-fit width should include floated child (expected ~48, got {})",
+            wrap.final_layout.size.width
+        );
+        assert!(
+            (btn.final_layout.location.x - 4.0).abs() < 0.5,
+            "floated child should stay inside padding box at x=4 (got {})",
+            btn.final_layout.location.x
+        );
+    }
+
+    #[test]
+    fn fixed_element_inside_relative_parent_attaches_to_root() {
+        let html = r#"<!doctype html><html><body style="margin:0">
+            <div id="rel" style="position:relative;margin-top:120px;margin-left:80px;width:200px;height:200px">
+                <div id="fix" style="position:fixed;top:10px;left:14px;width:50px;height:24px"></div>
+            </div>
+        </body></html>"#;
+        let mut doc = HtmlDocument::from_html(
+            html,
+            DocumentConfig {
+                viewport: Some(Viewport::new(800, 600, 1.0, Default::default())),
+                ..Default::default()
+            },
+        );
+        doc.resolve(0.0);
+
+        let fix_id = doc.query_selector("#fix").unwrap().unwrap();
+        let pos = doc.get_node(fix_id).unwrap().absolute_position(0.0, 0.0);
+        assert!(
+            (pos.x - 14.0).abs() < 0.5 && (pos.y - 10.0).abs() < 0.5,
+            "position:fixed inside position:relative should position relative to viewport root (got {:?})",
+            pos
+        );
+    }
+
+    #[test]
+    fn submit_input_uses_inline_block_and_border_box_defaults() {
+        let html = r#"<!doctype html><html><body style="margin:0">
+            <input id="go" type="submit" value="Search" style="height:36px;padding:0 16px;border:1px solid #ccc">
+        </body></html>"#;
+        let mut doc = HtmlDocument::from_html(
+            html,
+            DocumentConfig {
+                viewport: Some(Viewport::new(800, 600, 1.0, Default::default())),
+                ..Default::default()
+            },
+        );
+        doc.resolve(0.0);
+
+        let go = doc.get_node(doc.query_selector("#go").unwrap().unwrap()).unwrap();
+        assert!(
+            (go.final_layout.size.height - 36.0).abs() < 0.5,
+            "submit input should default to border-box so height:36px stays 36px (got {})",
+            go.final_layout.size.height
+        );
     }
 }

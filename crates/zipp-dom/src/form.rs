@@ -129,7 +129,7 @@ impl BaseDocument {
             // `file:` is not in the spec's table, but browsers submit to it as to
             // http: a page opened from disk keeps working forms (the address bar
             // among them, whose form posts back to the current page).
-            ("http" | "https" | "data" | "file", FormMethod::Get) => {
+            ("http" | "https" | "data" | "file" | "zipp" | "zipp-settings", FormMethod::Get) => {
                 let pairs = convert_to_list_of_name_value_pairs(entry);
                 let mut query = String::new();
                 url::form_urlencoded::Serializer::new(&mut query).extend_pairs(pairs);
@@ -258,7 +258,8 @@ fn construct_entry_list(doc: &BaseDocument, form_id: usize, submitter_id: usize)
             || element.name.local == local_name!("input")
                 && ((matches!(element_type, Some("checkbox" | "radio"))
                     && !element.checkbox_input_checked().unwrap_or(false))
-                    || matches!(element_type, Some("submit" | "button")))
+                    || matches!(element_type, Some("button" | "reset"))
+                    || (element_type == Some("submit") && node.id != submitter_id))
         {
             continue;
         }
@@ -292,11 +293,52 @@ fn construct_entry_list(doc: &BaseDocument, form_id: usize, submitter_id: usize)
             continue;
         };
 
-        // TODO: If the field element is a select element,
-        //  then for each option element in the select element's
-        //  list of options whose selectedness is true and that is not disabled,
-        //  create an entry with name and the value of the option element,
-        //  and append it to entry list.
+        // Select element: emit each enabled selected `<option>`'s value (or text content),
+        // falling back to the first enabled option for non-multiple selects per HTML spec.
+        if element.name.local == local_name!("select") {
+            let multiple = element.attr(local_name!("multiple")).is_some();
+            let mut options = Vec::new();
+            let mut stack: Vec<usize> = node.children.iter().rev().copied().collect();
+            while let Some(cid) = stack.pop() {
+                let Some(cnode) = doc.get_node(cid) else { continue };
+                if let Some(cel) = cnode.element_data() {
+                    if cel.attr(local_name!("disabled")).is_some() {
+                        continue;
+                    }
+                    if cel.name.local == local_name!("option") {
+                        options.push(cid);
+                        continue;
+                    }
+                }
+                for &grand in cnode.children.iter().rev() {
+                    stack.push(grand);
+                }
+            }
+            let mut emitted = false;
+            for &oid in &options {
+                let onode = &doc.nodes[oid];
+                if onode.attr(local_name!("selected")).is_some() {
+                    let val = onode
+                        .attr(local_name!("value"))
+                        .map(str::to_string)
+                        .unwrap_or_else(|| onode.text_content());
+                    create_entry(name, val.as_str().into());
+                    emitted = true;
+                    if !multiple {
+                        break;
+                    }
+                }
+            }
+            if !emitted && !multiple && let Some(&oid) = options.first() {
+                let onode = &doc.nodes[oid];
+                let val = onode
+                    .attr(local_name!("value"))
+                    .map(str::to_string)
+                    .unwrap_or_else(|| onode.text_content());
+                create_entry(name, val.as_str().into());
+            }
+            continue;
+        }
 
         // Otherwise, if the field element is an input element whose type attribute is in the Checkbox state or the Radio Button state, then:
         if element.name.local == local_name!("input")
@@ -375,9 +417,13 @@ fn get_submitter_attr(
     doc.get_node(submitter_id)
         .and_then(|node| node.element_data())
         .and_then(|element_data| {
-            if element_data.name.local == local_name!("button")
-                && element_data.attr(local_name!("type")) == Some("submit")
-            {
+            let is_submitter = element_data.is_submit_button()
+                || (element_data.name.local == local_name!("input")
+                    && matches!(
+                        element_data.attr(local_name!("type")),
+                        Some("submit" | "image")
+                    ));
+            if is_submitter {
                 element_data.attr(local_name)
             } else {
                 None

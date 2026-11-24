@@ -40,6 +40,7 @@ use zipp_shell::{create_default_event_loop, ZippApp, ShellProxy, WindowConfig};
 
 mod esm;
 mod event_bridge;
+mod js_opt;
 mod seed;
 mod site_storage;
 #[cfg(windows)]
@@ -55,6 +56,9 @@ mod system;
 mod usb;
 mod canvas2d;
 mod console;
+mod history;
+mod properties_page;
+mod settings;
 mod worker;
 #[cfg(any(windows, target_os = "linux"))]
 mod webgl;
@@ -67,19 +71,13 @@ mod viewers;
 // ---------------------------------------------------------------------------
 
 lazy_static::lazy_static! {
-    /// Fetched URL content (JS bundles, CSS, HTML).
-    static ref FETCH_CACHE: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
-    /// Inlined images (URL -> base64 data URI).
-    static ref IMAGE_CACHE: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
     /// The URL of the page currently loaded, so a relative `window.open` or
     /// `location.assign` from the page can be resolved against it.
     static ref CURRENT_URL: Mutex<String> = Mutex::new(String::new());
-    /// Fully rendered HTML keyed by URL (skip JS re-compilation on revisit).
-    /// Pages as fetched, before their JS runs: what a navigation to the same URL
-    /// starts from instead of the network. It holds the fetched page rather than
-    /// the rendered one so that a revisited page still gets a live script and an
-    /// event bridge, not a frozen snapshot.
-    static ref PAGE_CACHE: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
+    /// Pages as fetched, before their JS runs, tagged with the cookie jar
+    /// generation at fetch time so any login/logout/cookie change automatically
+    /// invalidates stale HTML snapshots. Bounded to 24 entries.
+    static ref PAGE_CACHE: Mutex<HashMap<String, (u64, String)>> = Mutex::new(HashMap::new());
     /// Shared blocking HTTP client -- reused across all fetch() calls to
     /// take advantage of connection pooling and avoid per-request TLS setup.
     /// For what a page asks of another site: the same, with no cookies, as a
@@ -180,23 +178,111 @@ fn parse_viewport(spec: &str) -> Option<(u32, u32)> {
     }
 }
 
+const MAX_PAGE_CACHE_ENTRIES: usize = 24;
+
+fn page_cache_get(url: &str) -> Option<String> {
+    if zipp_shell::cache::global().is_disabled() {
+        return None;
+    }
+    let cookie_gen = zipp_shell::cookies::generation();
+    let mut cache = PAGE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    match cache.get(url) {
+        Some((entry_gen, html)) if *entry_gen == cookie_gen => Some(html.clone()),
+        Some(_) => {
+            cache.remove(url);
+            None
+        }
+        None => None,
+    }
+}
+
+fn page_cache_put(url: String, html: String) {
+    if zipp_shell::cache::global().is_disabled() {
+        return;
+    }
+    let cookie_gen = zipp_shell::cookies::generation();
+    let mut cache = PAGE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= MAX_PAGE_CACHE_ENTRIES
+        && !cache.contains_key(&url)
+        && let Some(first) = cache.keys().next().cloned()
+    {
+        cache.remove(&first);
+    }
+    cache.insert(url, (cookie_gen, html));
+}
+
+fn page_cache_clear() {
+    PAGE_CACHE.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+/// Clear all HTTP/asset/page/decoded-image caches (memory + persistent disk).
+pub(crate) fn clear_browser_cache() -> (usize, u64) {
+    page_cache_clear();
+    canvas2d::clear_image_cache();
+    let (entries, bytes) = zipp_shell::cache::clear();
+    let mb = bytes as f64 / (1024.0 * 1024.0);
+    let msg = format!("Cleared cache ({entries} entries, {mb:.2} MB)");
+    eprintln!("[CACHE] {msg}");
+    console::push(console::Level::Log, msg);
+    (entries, bytes)
+}
+
+/// Clear caches, cookies, and site storage (`localStorage`, `sessionStorage`, IndexedDB).
+pub(crate) fn clear_all_site_data() -> (usize, u64, usize) {
+    let (entries, bytes) = clear_browser_cache();
+    let cookies = zipp_shell::cookies::clear_all();
+    site_storage::clear_all();
+    let msg = format!("Cleared site data ({cookies} cookies + localStorage/sessionStorage/IndexedDB)");
+    eprintln!("[DATA] {msg}");
+    console::push(console::Level::Log, msg);
+    (entries, bytes, cookies)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum CliAction {
     Help,
     Version,
+    ClearCacheOnly,
+    ClearDataOnly,
     TestJs,
     TestVm,
     TestCompat,
-    Screenshot { out: String, url: String, width: u32, height: u32, mobile: bool, no_chrome: bool },
+    Screenshot {
+        out: String,
+        url: String,
+        width: u32,
+        height: u32,
+        mobile: bool,
+        incognito: bool,
+        no_chrome: bool,
+        clear_cache: bool,
+        clear_data: bool,
+        no_cache: bool,
+    },
     Reftest { pairs: String, results: String },
-    Run { url: String, mobile: bool, viewport: Option<(u32, u32)>, kiosk: bool, app: bool, app_files: Vec<String> },
+    Run {
+        url: String,
+        mobile: bool,
+        incognito: bool,
+        viewport: Option<(u32, u32)>,
+        kiosk: bool,
+        app: bool,
+        app_files: Vec<String>,
+        clear_cache: bool,
+        clear_data: bool,
+        no_cache: bool,
+    },
 }
 
 fn parse_cli_args(args: &[String]) -> Result<CliAction, String> {
     let mut mobile = false;
+    let mut incognito = false;
     let mut custom_viewport: Option<(u32, u32)> = None;
     let mut kiosk = false;
     let mut app = false;
+    let mut clear_cache = false;
+    let mut clear_data = false;
+    let mut no_cache = false;
     let mut screenshot_mode = false;
     let mut positional: Vec<String> = Vec::new();
     let mut i = 0;
@@ -223,6 +309,10 @@ fn parse_cli_args(args: &[String]) -> Result<CliAction, String> {
                 mobile = true;
                 i += 1;
             }
+            "--incognito" | "--private" => {
+                incognito = true;
+                i += 1;
+            }
             "--viewport" => {
                 let spec = args.get(i + 1).ok_or("--viewport requires WxH (e.g. --viewport 412x915)")?;
                 custom_viewport = Some(parse_viewport(spec).ok_or_else(|| format!("invalid --viewport {spec:?}, expected WxH"))?);
@@ -234,6 +324,18 @@ fn parse_cli_args(args: &[String]) -> Result<CliAction, String> {
             }
             "--app" => {
                 app = true;
+                i += 1;
+            }
+            "--clear-cache" => {
+                clear_cache = true;
+                i += 1;
+            }
+            "--clear-data" => {
+                clear_data = true;
+                i += 1;
+            }
+            "--no-cache" => {
+                no_cache = true;
                 i += 1;
             }
             "--screenshot" => {
@@ -249,11 +351,31 @@ fn parse_cli_args(args: &[String]) -> Result<CliAction, String> {
 
     if screenshot_mode {
         let out = positional.first().cloned().unwrap_or_else(|| "screenshot.png".to_string());
-        let url = positional.get(1).cloned().unwrap_or_else(|| "https://lance.name".to_string());
+        let url = positional.get(1).cloned().unwrap_or_else(|| settings::DEFAULT_START_PAGE.to_string());
         let (def_w, def_h) = custom_viewport.unwrap_or(if mobile { MOBILE_WINDOW_SIZE } else { (1280, 2000) });
         let width = positional.get(2).and_then(|s| s.parse().ok()).unwrap_or(def_w);
         let height = positional.get(3).and_then(|s| s.parse().ok()).unwrap_or(def_h);
-        return Ok(CliAction::Screenshot { out, url, width, height, mobile, no_chrome: app || kiosk });
+        return Ok(CliAction::Screenshot {
+            out,
+            url,
+            width,
+            height,
+            mobile,
+            incognito,
+            no_chrome: app || kiosk,
+            clear_cache,
+            clear_data,
+            no_cache,
+        });
+    }
+
+    if positional.is_empty() && !mobile && !incognito && !kiosk && !app && custom_viewport.is_none() {
+        if clear_data {
+            return Ok(CliAction::ClearDataOnly);
+        }
+        if clear_cache {
+            return Ok(CliAction::ClearCacheOnly);
+        }
     }
 
     let url = positional.first().cloned().unwrap_or_default();
@@ -262,7 +384,18 @@ fn parse_cli_args(args: &[String]) -> Result<CliAction, String> {
     } else {
         Vec::new()
     };
-    Ok(CliAction::Run { url, mobile, viewport: custom_viewport, kiosk, app, app_files })
+    Ok(CliAction::Run {
+        url,
+        mobile,
+        incognito,
+        viewport: custom_viewport,
+        kiosk,
+        app,
+        app_files,
+        clear_cache,
+        clear_data,
+        no_cache,
+    })
 }
 
 fn print_usage() {
@@ -275,10 +408,14 @@ fn print_usage() {
          \x20 zipp-browser [--mobile] [--viewport WxH] --screenshot <OUT.png> [URL] [W] [H]\n\
          \n\
          OPTIONS:\n\
+         \x20 --incognito           Private window: in-memory cookies/cache/storage only, zero history saved\n\
          \x20 --mobile              Open in Mobile View (412x915 Pixel 9a logical viewport + mobile UA/touch)\n\
          \x20 --viewport <WxH>      Set initial logical viewport size (e.g. 390x844, 1440x900)\n\
          \x20 --app                 Chromeless application window (restricted local file access)\n\
          \x20 --kiosk               Full-screen DRM/KMS mode (Linux only)\n\
+         \x20 --clear-cache         Clear persistent HTTP/asset disk cache (exits if no URL given)\n\
+         \x20 --clear-data          Clear cache, cookies, and site storage (exits if no URL given)\n\
+         \x20 --no-cache            Bypass the HTTP cache for this run\n\
          \x20 --screenshot          Headless render to PNG and exit\n\
          \x20 --test-js             Run built-in DOM/browser JS test suite\n\
          \x20 --test-compat         Run JS compatibility test suite\n\
@@ -287,9 +424,15 @@ fn print_usage() {
          \x20 -V, --version         Print version information\n\
          \n\
          SHORTCUTS:\n\
+         \x20 Ctrl+Shift+N          Open a new Incognito window\n\
+         \x20 Ctrl+,                Open Properties panel (Start Page, Cache, History)\n\
+         \x20 Ctrl+H                Open Browsing History\n\
          \x20 Ctrl+Shift+M          Toggle Desktop <-> Mobile View live in the browser window\n\
+         \x20 Ctrl+Shift+Delete     Clear browser cache and reload\n\
+         \x20 Ctrl+Shift+R          Hard reload (bypass cache)\n\
          \x20 F12                   Toggle developer console\n\
          \x20 Ctrl+L / F6           Focus address bar\n\
+         \x20 Alt+Home              Go to configured Start Page\n\
          \x20 Alt+Left / Alt+Right  History Back / Forward\n\
          \x20 F5 / Ctrl+R           Reload page",
         env!("CARGO_PKG_VERSION")
@@ -370,6 +513,19 @@ fn main() {
             println!("zipp-browser {} (zipp-vm 0.0.39)", env!("CARGO_PKG_VERSION"));
             return;
         }
+        CliAction::ClearCacheOnly => {
+            let (entries, bytes) = clear_browser_cache();
+            println!("Cleared browser cache: {entries} entries ({:.2} MB freed).", bytes as f64 / (1024.0 * 1024.0));
+            return;
+        }
+        CliAction::ClearDataOnly => {
+            let (entries, bytes, cookies) = clear_all_site_data();
+            println!(
+                "Cleared browser site data: {entries} cache entries ({:.2} MB), {cookies} cookies, and site storage.",
+                bytes as f64 / (1024.0 * 1024.0)
+            );
+            return;
+        }
         CliAction::TestJs => {
             let ok = run_js_suite("TEST", include_str!("js_tests.js"), 10);
             std::process::exit(if ok { 0 } else { 1 });
@@ -382,7 +538,16 @@ fn main() {
             let ok = run_js_suite("COMPAT", include_str!("js_compat_tests.js"), 20);
             std::process::exit(if ok { 0 } else { 1 });
         }
-        CliAction::Screenshot { out, url, width, height, mobile, no_chrome } => {
+        CliAction::Screenshot { out, url, width, height, mobile, incognito, no_chrome, clear_cache, clear_data, no_cache } => {
+            if incognito {
+                zipp_shell::profile::set_incognito(true);
+            }
+            if clear_data {
+                clear_all_site_data();
+            } else if clear_cache {
+                clear_browser_cache();
+            }
+            settings::apply_runtime(no_cache);
             if mobile {
                 MOBILE_VIEW.store(true, std::sync::atomic::Ordering::Relaxed);
             }
@@ -398,7 +563,16 @@ fn main() {
             save_profile();
             std::process::exit(if ok { 0 } else { 1 });
         }
-        CliAction::Run { url, mobile, viewport, kiosk, app, app_files } => {
+        CliAction::Run { url, mobile, incognito, viewport, kiosk, app, app_files, clear_cache, clear_data, no_cache } => {
+            if incognito {
+                zipp_shell::profile::set_incognito(true);
+            }
+            if clear_data {
+                clear_all_site_data();
+            } else if clear_cache {
+                clear_browser_cache();
+            }
+            settings::apply_runtime(no_cache);
             (url, mobile, viewport, kiosk, app, app_files)
         }
     };
@@ -434,9 +608,14 @@ fn main() {
     }
 
     let url = if raw_url.is_empty() {
-        "https://lance.name".to_string()
-    } else if raw_url.starts_with("http://") || raw_url.starts_with("https://") || raw_url.starts_with("file://") {
-        raw_url
+        normalize_url(&settings::start_page())
+    } else if raw_url.starts_with("http://")
+        || raw_url.starts_with("https://")
+        || raw_url.starts_with("file://")
+        || raw_url.starts_with("zipp:")
+        || raw_url.starts_with("about:")
+    {
+        normalize_url(&raw_url)
     } else if let Ok(canon) = std::fs::canonicalize(&raw_url) {
         let s = canon.to_string_lossy().replace('\\', "/");
         let s = s.strip_prefix("//?/").unwrap_or(&s);
@@ -445,7 +624,8 @@ fn main() {
         normalize_url(&raw_url)
     };
     eprintln!(
-        "[BROWSER] Loading {url} ({} {}x{})",
+        "[BROWSER] Loading {url} ({}{} {}x{})",
+        if zipp_shell::profile::is_incognito() { "incognito " } else { "" },
         if mobile { "mobile" } else { "desktop" },
         viewport.0,
         viewport.1,
@@ -458,22 +638,26 @@ fn main() {
     // 1-3. Fetch, run the page's JS, post-process. The ScriptState is !Send, so
     //      this stays on the main thread to keep it alive for event dispatch.
     let t_fetch = std::time::Instant::now();
-    let mut fetched = viewers::fetch_document(&url, true);
-    // A kiosk starts with its network: a page on the web may not be
-    // reachable yet (no address, or no clock for TLS until NTP), so it is
-    // asked again for two minutes before the error is what shows.
-    while kiosk && url.starts_with("http") && t_fetch.elapsed() < std::time::Duration::from_secs(120) {
-        let Err(e) = &fetched else { break };
-        eprintln!("[BROWSER] {url}: {e}; trying again");
-        std::thread::sleep(std::time::Duration::from_secs(3));
-        fetched = viewers::fetch_document(&url, true);
-    }
-    let html = match fetched {
-        Ok(html) => {
-            PAGE_CACHE.lock().unwrap().insert(url.clone(), html.clone());
-            html
+    let html = if let Some(internal) = internal_page_html(&url, None, None, None) {
+        internal
+    } else {
+        let mut fetched = viewers::fetch_document(&url, true);
+        // A kiosk starts with its network: a page on the web may not be
+        // reachable yet (no address, or no clock for TLS until NTP), so it is
+        // asked again for two minutes before the error is what shows.
+        while kiosk && url.starts_with("http") && t_fetch.elapsed() < std::time::Duration::from_secs(120) {
+            let Err(e) = &fetched else { break };
+            eprintln!("[BROWSER] {url}: {e}; trying again");
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            fetched = viewers::fetch_document(&url, true);
         }
-        Err(e) => error_page(&url, &e),
+        match fetched {
+            Ok(html) => {
+                page_cache_put(url.clone(), html.clone());
+                html
+            }
+            Err(e) => error_page(&url, &e),
+        }
     };
     let fetch_ms = t_fetch.elapsed().as_millis();
     let (final_html, event_map_json, js_state) =
@@ -513,9 +697,11 @@ fn main() {
     ))));
 
     // 7. Create Zipp document with fonts + networking + navigation
+    let initial_web = (!url.starts_with("zipp:") && !url.starts_with("about:")).then(|| url.clone());
     let nav_provider = Arc::new(BrowserNavProvider {
         proxy: proxy.clone(),
         current_url: std::sync::Mutex::new(url.clone()),
+        last_web_url: std::sync::Mutex::new(initial_web),
         history: std::sync::Mutex::new(History::new(&url)),
     });
     // Published so `browser_host_call` can drive a navigation the PAGE asked
@@ -634,8 +820,13 @@ fn open_kms() -> zipp_kms::EventLoop {
 /// Before the browser exits: write out what is waiting to be saved to the
 /// profile -- cookies, and what sites keep.
 fn save_profile() {
+    if zipp_shell::profile::is_incognito() {
+        return;
+    }
     zipp_shell::cookies::flush();
     site_storage::flush();
+    settings::save();
+    history::save();
 }
 
 // ---------------------------------------------------------------------------
@@ -826,13 +1017,13 @@ fn prerender_linked_pages(html: &str, base_url: &str) {
     // (a text match on the address also took example.com.evil.org for
     // example.com).
     for link in links.iter().filter(|l| same_origin(l)).take(MAX_PRERENDERED) {
-        if PAGE_CACHE.lock().unwrap().contains_key(link) {
+        if page_cache_get(link).is_some() {
             continue;
         }
         eprintln!("[PRERENDER] {link}");
         // Downloads off: a background prefetch must never write a file.
         if let Ok(page) = viewers::fetch_document(link, false) {
-            PAGE_CACHE.lock().unwrap().insert(link.clone(), page);
+            page_cache_put(link.clone(), page);
         }
     }
     eprintln!("[PRERENDER] Done -- {} pages cached", PAGE_CACHE.lock().unwrap().len());
@@ -908,26 +1099,36 @@ fn fetch(url: &str) -> Result<String, String> {
             .map_err(|e| format!("cannot read {}: {e}", path.display()));
     }
 
-    let is_static = url.contains("/static/") || url.ends_with(".js") || url.ends_with(".css");
-    // Check cache for static assets
-    if is_static
-        && let Some(cached) = FETCH_CACHE.lock().unwrap().get(url) {
-            return Ok(cached.clone());
+    let cache = zipp_shell::cache::global();
+    let revalidate = match cache.lookup("sub", url) {
+        zipp_shell::cache::Lookup::Fresh(entry) => {
+            return Ok(String::from_utf8_lossy(&entry.body).into_owned());
         }
-    let text = http_client()
-        .get(url)
-        .send()
-        .map_err(|e| e.to_string())?
-        .text()
-        .map_err(|e| e.to_string())?;
-    // Cache static assets
-    if is_static {
-        FETCH_CACHE
-            .lock()
-            .unwrap()
-            .insert(url.to_string(), text.clone());
+        zipp_shell::cache::Lookup::Revalidate(entry) => Some(entry),
+        zipp_shell::cache::Lookup::Miss => None,
+    };
+
+    let mut req = http_client().get(url);
+    if let Some(ref prev) = revalidate {
+        if let Some(ref etag) = prev.etag {
+            req = req.header(reqwest::header::IF_NONE_MATCH, etag.as_str());
+        }
+        if let Some(ref lm) = prev.last_modified {
+            req = req.header(reqwest::header::IF_MODIFIED_SINCE, lm.as_str());
+        }
     }
-    Ok(text)
+    let resp = req.send().map_err(|e| e.to_string())?;
+    let status = resp.status().as_u16();
+    if status == 304
+        && let Some(prev) = revalidate
+    {
+        let refreshed = cache.revalidate_304("sub", url, prev, resp.headers());
+        return Ok(String::from_utf8_lossy(&refreshed.body).into_owned());
+    }
+    let resp_headers = resp.headers().clone();
+    let bytes = resp.bytes().map_err(|e| e.to_string())?.to_vec();
+    cache.store("sub", url, status, &resp_headers, bytes.clone());
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -968,13 +1169,16 @@ var env = {
     }
 };
 
-// `credentials: "include"` for the next request (a page's fetch, an XHR's
-// withCredentials): cookies go to another site only where a page asks.
+// `credentials` ("omit" | "same-origin" | "include") and extra request headers
+// JSON for the next request (`fetch` / `XMLHttpRequest`).
 var __zippCredentials = "";
+var __zippRequestHeaders = "";
 var http = (function () {
     function request(method, url, body, contentType) {
         var credentials = __zippCredentials;
+        var extraHeaders = __zippRequestHeaders;
         __zippCredentials = "";
+        __zippRequestHeaders = "";
         // Host contract: strings in, JSON string out. A transport failure is a
         // JS throw (the host returns Err), which fetch()'s try/catch turns into
         // a rejected promise — same shape as a real browser network error.
@@ -982,15 +1186,25 @@ var http = (function () {
             "http", method, String(url),
             body == null ? "" : String(body),
             contentType == null ? "" : String(contentType),
-            credentials
+            credentials,
+            extraHeaders
         );
         var r = JSON.parse(raw);
-        return { status: r.status, ok: r.ok, body: r.body, contentType: r.contentType || "" };
+        return {
+            status: r.status,
+            ok: r.ok,
+            body: r.body,
+            contentType: r.contentType || "",
+            headers: r.headers || {}
+        };
     }
     return {
+        request: request,
         get: function (url) { return request("GET", url, "", ""); },
+        head: function (url) { return request("HEAD", url, "", ""); },
         post: function (url, body, ct) { return request("POST", url, body, ct); },
         put: function (url, body, ct) { return request("PUT", url, body, ct); },
+        patch: function (url, body, ct) { return request("PATCH", url, body, ct); },
         "delete": function (url) { return request("DELETE", url, "", ""); }
     };
 })();
@@ -1395,7 +1609,7 @@ fn host_doc_url(claimed: Option<&str>) -> Option<url::Url> {
 
 /// A URL from page script, resolved against the page as the browser would.
 fn resolve_page_url(raw: &str) -> String {
-    let base = CURRENT_URL.lock().unwrap().clone();
+    let base = page_url();
     url::Url::parse(&base)
         .and_then(|b| b.join(raw))
         .map(|u| u.to_string())
@@ -1575,7 +1789,7 @@ pub(crate) fn revoke_blob(url: &str) {
 }
 
 /// Decode a `data:[<mediatype>][;base64],<data>` URI into `(mime_type, bytes)`.
-fn decode_data_url(url: &str) -> Option<(String, Vec<u8>)> {
+pub(crate) fn decode_data_url(url: &str) -> Option<(String, Vec<u8>)> {
     use base64::Engine as _;
     let rest = url.strip_prefix("data:")?;
     let (meta, payload) = rest.split_once(',')?;
@@ -1624,12 +1838,70 @@ fn guess_mime_from_url(url: &str) -> &'static str {
 }
 
 /// GET a URL for page script, as bytes: `blob:`, `data:`, `file:`, or http(s).
+/// Fetch an `http://` or `https://` `<video>` resource through the browser's
+/// own HTTP client (cookies, HTTP cache, Incognito-isolated with zero WinINet
+/// disk leaks) up to 64 MiB. Larger/streaming resources return `None` so Media
+/// Foundation can stream them directly.
+#[cfg(windows)]
+pub(crate) fn fetch_media_bytes(url: &str) -> Option<(String, Vec<u8>)> {
+    use std::io::Read as _;
+    const MAX_INMEM_VIDEO_BYTES: u64 = 64 * 1024 * 1024;
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return None;
+    }
+    let cache = zipp_shell::cache::global();
+    let revalidate = match cache.lookup("sub", url) {
+        zipp_shell::cache::Lookup::Fresh(entry) if (200..300).contains(&entry.status) => {
+            return Some((entry.content_type, entry.body.as_ref().clone()));
+        }
+        zipp_shell::cache::Lookup::Revalidate(entry) => Some(entry),
+        _ => None,
+    };
+    let mut req = http_client().get(url);
+    if let Some(ref prev) = revalidate {
+        if let Some(ref etag) = prev.etag {
+            req = req.header(reqwest::header::IF_NONE_MATCH, etag.as_str());
+        }
+        if let Some(ref lm) = prev.last_modified {
+            req = req.header(reqwest::header::IF_MODIFIED_SINCE, lm.as_str());
+        }
+    }
+    let resp = req.send().ok()?;
+    let status = resp.status().as_u16();
+    if status == 304
+        && let Some(prev) = revalidate
+    {
+        let refreshed = cache.revalidate_304("sub", url, prev, resp.headers());
+        return Some((refreshed.content_type, refreshed.body.as_ref().clone()));
+    }
+    if !(200..300).contains(&status) {
+        return None;
+    }
+    if resp.content_length().is_some_and(|len| len > MAX_INMEM_VIDEO_BYTES) {
+        return None;
+    }
+    let resp_headers = resp.headers().clone();
+    let mime = resp_headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let mut bytes = Vec::new();
+    let mut limited = resp.take(MAX_INMEM_VIDEO_BYTES + 1);
+    limited.read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > MAX_INMEM_VIDEO_BYTES || bytes.is_empty() {
+        return None;
+    }
+    cache.store("sub", url, status, &resp_headers, bytes.clone());
+    Some((mime, bytes))
+}
+
 fn fetch_bytes_for_page(url: &str) -> Result<(u16, Vec<u8>), String> {
-    let (status, _, bytes) = fetch_bytes_with_mime(url)?;
+    let (status, _, bytes) = fetch_bytes_with_mime(url, CredentialsMode::SameOrigin)?;
     Ok((status, bytes))
 }
 
-fn fetch_bytes_with_mime(url: &str) -> Result<(u16, String, Vec<u8>), String> {
+fn fetch_bytes_with_mime(url: &str, creds: CredentialsMode) -> Result<(u16, String, Vec<u8>), String> {
     if url.starts_with("blob:") {
         return match lookup_blob(url) {
             Some((mime, bytes)) => Ok((200, mime, bytes)),
@@ -1653,16 +1925,76 @@ fn fetch_bytes_with_mime(url: &str) -> Result<(u16, String, Vec<u8>), String> {
                 Err(_) => Ok((404, String::new(), Vec::new())),
             };
         }
-    let resp = client_for_page(url, false).get(url).send().map_err(|e| format!("Error: GET {url}: {e}"))?;
+    let cache = zipp_shell::cache::global();
+    let revalidate = if creds != CredentialsMode::Omit {
+        match cache.lookup("sub", url) {
+            zipp_shell::cache::Lookup::Fresh(entry) => {
+                return Ok((entry.status, entry.content_type, entry.body.as_ref().clone()));
+            }
+            zipp_shell::cache::Lookup::Revalidate(entry) => Some(entry),
+            zipp_shell::cache::Lookup::Miss => None,
+        }
+    } else {
+        None
+    };
+
+    let mut req = client_for_page(url, creds).get(url);
+    if let Some(ref prev) = revalidate {
+        if let Some(ref etag) = prev.etag {
+            req = req.header(reqwest::header::IF_NONE_MATCH, etag.as_str());
+        }
+        if let Some(ref lm) = prev.last_modified {
+            req = req.header(reqwest::header::IF_MODIFIED_SINCE, lm.as_str());
+        }
+    }
+    let resp = req.send().map_err(|e| format!("Error: GET {url}: {e}"))?;
     let status = resp.status().as_u16();
-    let mime = resp
-        .headers()
+    if status == 304
+        && let Some(prev) = revalidate
+    {
+        let refreshed = cache.revalidate_304("sub", url, prev, resp.headers());
+        return Ok((refreshed.status, refreshed.content_type, refreshed.body.as_ref().clone()));
+    }
+    let resp_headers = resp.headers().clone();
+    let mime = resp_headers
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let bytes = resp.bytes().map_err(|e| format!("Error: reading {url}: {e}"))?;
-    Ok((status, mime, bytes.to_vec()))
+    let bytes = resp.bytes().map_err(|e| format!("Error: reading {url}: {e}"))?.to_vec();
+    if creds != CredentialsMode::Omit {
+        cache.store("sub", url, status, &resp_headers, bytes.clone());
+    }
+    Ok((status, mime, bytes))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CredentialsMode {
+    Omit,
+    SameOrigin,
+    Include,
+}
+
+impl CredentialsMode {
+    fn from_arg(arg: &str) -> Self {
+        match arg {
+            "omit" => Self::Omit,
+            "include" => Self::Include,
+            _ => Self::SameOrigin,
+        }
+    }
+
+    fn sends_cookies(self, url: &str) -> bool {
+        match self {
+            Self::Omit => false,
+            Self::SameOrigin => same_origin(url),
+            Self::Include => true,
+        }
+    }
+
+    fn is_include(self) -> bool {
+        matches!(self, Self::Include)
+    }
 }
 
 /// The origin of the page asking, when it is on the web: what the same-origin
@@ -1679,20 +2011,19 @@ fn same_origin(url: &str) -> bool {
     url::Url::parse(url).is_ok_and(|u| u.origin() == mine)
 }
 
-/// The client for a request by the page: cookies go with its own site's, and
-/// with another's only where it asked (`credentials: "include"`).
-fn client_for_page(url: &str, credentials: bool) -> &'static reqwest::blocking::Client {
-    if credentials || same_origin(url) { http_client() } else { anonymous_http_client() }
+/// The client for a request by the page: honours `omit`, `same-origin`, and `include`.
+fn client_for_page(url: &str, creds: CredentialsMode) -> &'static reqwest::blocking::Client {
+    if creds.sends_cookies(url) { http_client() } else { anonymous_http_client() }
 }
 
 /// The same-origin rule, for a page on the web reading another site: the
 /// response is the page's to see only if that site says so. Without this, any
 /// page read any site it could reach: the person's mail if logged in, the
 /// router, `127.0.0.1`.
-fn cors_allows(resp: &reqwest::blocking::Response, origin: &str, credentials: bool) -> bool {
+fn cors_allows(resp: &reqwest::blocking::Response, origin: &str, creds: CredentialsMode) -> bool {
     let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok()).unwrap_or("");
     let allowed = header("access-control-allow-origin").trim();
-    if credentials {
+    if creds.is_include() {
         allowed == origin && header("access-control-allow-credentials").trim() == "true"
     } else {
         allowed == "*" || allowed == origin
@@ -1701,17 +2032,31 @@ fn cors_allows(resp: &reqwest::blocking::Response, origin: &str, credentials: bo
 
 /// A request a form could not make (a PUT, a JSON POST) asks first, so that
 /// a site that never heard of CORS is not sent one by a page elsewhere.
-fn cors_preflight(method: &str, url: &str, origin: &str, content_type: &str, credentials: bool) -> Result<(), String> {
-    let resp = client_for_page(url, credentials)
+fn cors_preflight(
+    method: &str,
+    url: &str,
+    origin: &str,
+    content_type: &str,
+    extra_header_names: &[String],
+    creds: CredentialsMode,
+) -> Result<(), String> {
+    let mut req_headers = vec!["content-type".to_string()];
+    for h in extra_header_names {
+        let low = h.to_ascii_lowercase();
+        if !req_headers.contains(&low) {
+            req_headers.push(low);
+        }
+    }
+    let resp = client_for_page(url, creds)
         .request(reqwest::Method::OPTIONS, url)
         .header("Origin", origin)
         .header("Access-Control-Request-Method", method)
-        .header("Access-Control-Request-Headers", "content-type")
+        .header("Access-Control-Request-Headers", req_headers.join(", "))
         .send()
         .map_err(|e| format!("TypeError: Failed to fetch: {method} {url}: {e}"))?;
     let methods = resp.headers().get("access-control-allow-methods").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
     let allowed = resp.status().is_success()
-        && cors_allows(&resp, origin, credentials)
+        && cors_allows(&resp, origin, creds)
         && (matches!(method, "GET" | "HEAD" | "POST")
             || methods.split(',').any(|m| m.trim() == "*" || m.trim().eq_ignore_ascii_case(method)));
     if allowed {
@@ -1719,6 +2064,58 @@ fn cors_preflight(method: &str, url: &str, origin: &str, content_type: &str, cre
     } else {
         Err(format!("TypeError: Failed to fetch: {url} does not allow {method} from {origin} (content type {content_type})"))
     }
+}
+
+/// Whether page script is forbidden from setting a request header per Fetch spec.
+fn is_forbidden_request_header(name: &str) -> bool {
+    let low = name.to_ascii_lowercase();
+    low.starts_with("proxy-")
+        || low.starts_with("sec-")
+        || matches!(
+            low.as_str(),
+            "accept-charset"
+                | "accept-encoding"
+                | "access-control-request-headers"
+                | "access-control-request-method"
+                | "connection"
+                | "content-length"
+                | "cookie"
+                | "cookie2"
+                | "date"
+                | "dnt"
+                | "expect"
+                | "host"
+                | "keep-alive"
+                | "origin"
+                | "referer"
+                | "te"
+                | "trailer"
+                | "transfer-encoding"
+                | "upgrade"
+                | "via"
+        )
+}
+
+/// Serialize non-forbidden response headers (filtering out `set-cookie`) to JSON.
+fn safe_response_headers_json(headers: &reqwest::header::HeaderMap) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for (name, val) in headers {
+        let key = name.as_str().to_ascii_lowercase();
+        if key == "set-cookie" || key == "set-cookie2" {
+            continue;
+        }
+        let Ok(v) = val.to_str() else { continue };
+        match map.get_mut(&key) {
+            Some(serde_json::Value::String(existing)) => {
+                existing.push_str(", ");
+                existing.push_str(v);
+            }
+            _ => {
+                map.insert(key, serde_json::Value::String(v.to_string()));
+            }
+        }
+    }
+    serde_json::Value::Object(map)
 }
 
 thread_local! {
@@ -1847,18 +2244,18 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
         // can make the scratch array big enough first.
         "http_bytes" => {
             let url = resolve_page_url(args.first().map(String::as_str).unwrap_or_default());
-            let credentials = args.get(1).is_some_and(|c| c == "include");
+            let creds = CredentialsMode::from_arg(args.get(1).map(String::as_str).unwrap_or_default());
             let origin = web_origin(&page_url()).map(|o| o.ascii_serialization());
             let foreign = origin.filter(|_| url.starts_with("http") && !same_origin(&url));
             let (status, mime, bytes) = match &foreign {
-                None => fetch_bytes_with_mime(&url)?,
+                None => fetch_bytes_with_mime(&url, creds)?,
                 Some(origin) => {
-                    let resp = client_for_page(&url, credentials)
+                    let resp = client_for_page(&url, creds)
                         .get(&url)
                         .header("Origin", origin.as_str())
                         .send()
                         .map_err(|e| format!("TypeError: Failed to fetch: GET {url}: {e}"))?;
-                    if !cors_allows(&resp, origin, credentials) {
+                    if !cors_allows(&resp, origin, creds) {
                         return Err(format!("TypeError: Failed to fetch: {url} does not allow {origin} to read it"));
                     }
                     let status = resp.status().as_u16();
@@ -1954,6 +2351,8 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
         "gpu" => webgpu::host_call(ctx, args),
         // Web Audio's output, and decoding (audio.rs).
         "audio" => audio::host_call(ctx, args),
+        // HTML5 `<video>` playback control & live status (`event_bridge.rs` + `media.rs`).
+        "video" => event_bridge::video_host_call(args),
         // navigator.zipp: files, programs, the machine (system.rs).
         "zipp" => system::host_call(ctx, args),
         // WebUSB (usb.rs).
@@ -2014,21 +2413,46 @@ fn browser_host_call(kind: &str, args: &[String]) -> Result<String, String> {
             // disk reads its neighbours.
             let resolved = resolve_page_url(url);
             let url = resolved.as_str();
+            let creds = CredentialsMode::from_arg(args.get(4).map(String::as_str).unwrap_or_default());
             if method == "GET" && (url.starts_with("file:") || url.starts_with("blob:") || url.starts_with("data:")) {
-                let (status, mime, bytes) = fetch_bytes_with_mime(url)?;
+                let (status, mime, bytes) = fetch_bytes_with_mime(url, creds)?;
                 return Ok(format!(
-                    "{{\"status\":{status},\"ok\":{},\"contentType\":{},\"body\":{}}}",
+                    "{{\"status\":{status},\"ok\":{},\"contentType\":{},\"headers\":{{\"content-type\":{}}},\"body\":{}}}",
                     (200..300).contains(&status),
+                    json_quote(&mime),
                     json_quote(&mime),
                     json_quote(&String::from_utf8_lossy(&bytes))
                 ));
             }
-            let credentials = args.get(4).is_some_and(|c| c == "include");
+
+            let extra_headers: Vec<(String, String)> = args
+                .get(5)
+                .filter(|s| !s.is_empty())
+                .and_then(|s| serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(s).ok())
+                .map(|m| {
+                    m.into_iter()
+                        .filter_map(|(k, v)| {
+                            if is_forbidden_request_header(&k) {
+                                return None;
+                            }
+                            Some((k, v.as_str()?.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let has_auth_header = extra_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("authorization"));
+
             let origin = web_origin(&page_url()).map(|o| o.ascii_serialization());
             let foreign = origin.filter(|_| !same_origin(url));
             if let Some(origin) = &foreign {
-                let simple = match method {
-                    "GET" => true,
+                let has_non_simple_header = extra_headers.iter().any(|(k, _)| {
+                    !matches!(
+                        k.to_ascii_lowercase().as_str(),
+                        "accept" | "accept-language" | "content-language" | "content-type"
+                    )
+                });
+                let simple = !has_non_simple_header && match method {
+                    "GET" | "HEAD" => true,
                     "POST" => matches!(
                         content_type.split(';').next().unwrap_or("").trim(),
                         "text/plain" | "application/x-www-form-urlencoded" | "multipart/form-data"
@@ -2036,39 +2460,102 @@ fn browser_host_call(kind: &str, args: &[String]) -> Result<String, String> {
                     _ => false,
                 };
                 if !simple {
-                    cors_preflight(method, url, origin, content_type, credentials)?;
+                    let names: Vec<String> = extra_headers.iter().map(|(k, _)| k.clone()).collect();
+                    cors_preflight(method, url, origin, content_type, &names, creds)?;
                 }
             }
-            let client = client_for_page(url, credentials);
+
+            let cache = zipp_shell::cache::global();
+            let cacheable_get = method == "GET" && foreign.is_none() && !has_auth_header && creds != CredentialsMode::Omit;
+            let revalidate = if cacheable_get {
+                match cache.lookup("sub", url) {
+                    zipp_shell::cache::Lookup::Fresh(entry) => {
+                        let body = String::from_utf8_lossy(&entry.body).into_owned();
+                        return Ok(format!(
+                            "{{\"status\":{},\"ok\":{},\"contentType\":{},\"headers\":{{\"content-type\":{}}},\"body\":{}}}",
+                            entry.status,
+                            (200..300).contains(&entry.status),
+                            json_quote(&entry.content_type),
+                            json_quote(&entry.content_type),
+                            json_quote(&body)
+                        ));
+                    }
+                    zipp_shell::cache::Lookup::Revalidate(entry) => Some(entry),
+                    zipp_shell::cache::Lookup::Miss => None,
+                }
+            } else {
+                None
+            };
+
+            let client = client_for_page(url, creds);
             let mut req = match method {
                 "POST" => client.post(url).header("Content-Type", content_type).body(body),
                 "PUT" => client.put(url).header("Content-Type", content_type).body(body),
+                "PATCH" => client.patch(url).header("Content-Type", content_type).body(body),
                 "DELETE" => client.delete(url),
+                "HEAD" => client.head(url),
                 _ => client.get(url),
             };
+            for (k, v) in &extra_headers {
+                if !k.eq_ignore_ascii_case("content-type") {
+                    req = req.header(k.as_str(), v.as_str());
+                }
+            }
             if let Some(origin) = &foreign {
                 req = req.header("Origin", origin.as_str());
+            }
+            if let Some(ref prev) = revalidate {
+                if let Some(ref etag) = prev.etag {
+                    req = req.header(reqwest::header::IF_NONE_MATCH, etag.as_str());
+                }
+                if let Some(ref lm) = prev.last_modified {
+                    req = req.header(reqwest::header::IF_MODIFIED_SINCE, lm.as_str());
+                }
             }
             // Errors carry the `Error: ` prefix so the script sees an ordinary
             // JS error rather than a bare string.
             let resp = req.send().map_err(|e| format!("Error: {method} {url}: {e}"))?;
             if let Some(origin) = &foreign
-                && !cors_allows(&resp, origin, credentials)
+                && !cors_allows(&resp, origin, creds)
             {
                 return Err(format!("TypeError: Failed to fetch: {url} does not allow {origin} to read it"));
             }
             let status = resp.status().as_u16();
+            if status == 304
+                && let Some(prev) = revalidate
+            {
+                let refreshed = cache.revalidate_304("sub", url, prev, resp.headers());
+                let body = String::from_utf8_lossy(&refreshed.body).into_owned();
+                let headers_json = safe_response_headers_json(resp.headers());
+                return Ok(format!(
+                    "{{\"status\":{},\"ok\":{},\"contentType\":{},\"headers\":{},\"body\":{}}}",
+                    refreshed.status,
+                    (200..300).contains(&refreshed.status),
+                    json_quote(&refreshed.content_type),
+                    headers_json,
+                    json_quote(&body)
+                ));
+            }
             let ok = resp.status().is_success();
-            let mime = resp
-                .headers()
+            let resp_headers = resp.headers().clone();
+            let mime = resp_headers
                 .get(reqwest::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_string();
-            let body = resp.text().map_err(|e| format!("Error: reading {url}: {e}"))?;
+            let headers_json = safe_response_headers_json(&resp_headers);
+            let raw_bytes = resp.bytes().map_err(|e| format!("Error: reading {url}: {e}"))?.to_vec();
+            if cacheable_get {
+                cache.store("sub", url, status, &resp_headers, raw_bytes.clone());
+            } else if matches!(method, "POST" | "PUT" | "PATCH" | "DELETE") {
+                cache.invalidate_url(url);
+                page_cache_clear();
+            }
+            let body = String::from_utf8_lossy(&raw_bytes);
             Ok(format!(
-                "{{\"status\":{status},\"ok\":{ok},\"contentType\":{},\"body\":{}}}",
+                "{{\"status\":{status},\"ok\":{ok},\"contentType\":{},\"headers\":{},\"body\":{}}}",
                 json_quote(&mime),
+                headers_json,
                 json_quote(&body)
             ))
         }
@@ -2084,10 +2571,16 @@ fn browser_host_call(kind: &str, args: &[String]) -> Result<String, String> {
             if raw.is_empty() {
                 return Ok(String::new());
             }
-            let base = CURRENT_URL.lock().unwrap().clone();
+            let base = CURRENT_URL.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let full = resolve(&base, &raw);
             match full.parse::<url::Url>() {
                 Ok(parsed) => {
+                    // Untrusted page scripts may only navigate to normal web/document schemes,
+                    // never internal browser chrome/settings/action URLs.
+                    if !matches!(parsed.scheme(), "http" | "https" | "file" | "about") {
+                        eprintln!("[NAV] refused script navigation to internal scheme: {full}");
+                        return Ok(String::new());
+                    }
                     eprintln!("[NAV] page requested {full}");
                     match NAV_PROVIDER.get() {
                         Some(provider) => provider.navigate_to(NavigationOptions::new(
@@ -2148,10 +2641,54 @@ fn json_quote(s: &str) -> String {
 ///
 /// Returns the final HTML, the JS event map (when the page ran script), and the
 /// live `ScriptState` that keeps event handlers callable.
+/// Built-in internal browser pages (`zipp:settings`, `zipp:properties`, `zipp:history`).
+fn internal_page_html(
+    url: &str,
+    notice: Option<&str>,
+    history_filter: Option<&str>,
+    last_web_url: Option<&str>,
+) -> Option<String> {
+    let base = url.split(['?', '#']).next().unwrap_or(url).trim().to_ascii_lowercase();
+    match base.as_str() {
+        "zipp:settings" | "zipp:properties" | "about:settings" | "about:properties" => Some(
+            properties_page::render(chrome_token(), notice, history_filter, last_web_url, false),
+        ),
+        "zipp:history" | "about:history" => Some(properties_page::render(
+            chrome_token(),
+            notice,
+            history_filter,
+            last_web_url,
+            true,
+        )),
+        _ => None,
+    }
+}
+
+/// Spawn a brand-new isolated Incognito browser window (`--incognito`).
+fn launch_incognito_window() {
+    let Ok(exe) = std::env::current_exe() else {
+        eprintln!("[BROWSER] could not resolve current executable for Incognito window");
+        return;
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--incognito");
+    if is_mobile_view() {
+        cmd.arg("--mobile");
+    }
+    match cmd.spawn() {
+        Ok(_) => eprintln!("[BROWSER] Launched new Incognito window"),
+        Err(e) => eprintln!("[BROWSER] Failed to launch Incognito window: {e}"),
+    }
+}
+
 fn prepare_page(url: &str, viewport: (u32, u32)) -> (String, Option<String>, Option<ScriptState>) {
     let t_fetch = std::time::Instant::now();
-    // A PDF, image, text file or download comes back as a viewer page.
-    let html = viewers::fetch_document(url, true).unwrap_or_else(|e| error_page(url, &e));
+    let html = if let Some(internal) = internal_page_html(url, None, None, None) {
+        internal
+    } else {
+        // A PDF, image, text file or download comes back as a viewer page.
+        viewers::fetch_document(url, true).unwrap_or_else(|e| error_page(url, &e))
+    };
     let fetch_ms = t_fetch.elapsed().as_millis();
     render_page(url, &html, viewport, Some(fetch_ms))
 }
@@ -2186,6 +2723,7 @@ fn render_page(
         .replace("class=\"no-js", "class=\"js")
         .replace("class=\"client-nojs", "class=\"client-js");
     let out = inline_images(&out, url);
+    history::record(url, history::extract_html_title(&out).as_deref());
     let out = wrap_with_toolbar(&out, url);
     let post_ms = t_post.elapsed().as_millis();
 
@@ -2199,15 +2737,39 @@ fn render_page(
 
 /// The page shown when a load fails.
 fn error_page(url: &str, error: &str) -> String {
-    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let esc = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    };
+    let token = chrome_token();
     format!(
-        r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Can't load page</title><style>
-body{{margin:0;background:#f8f9fa;font:15px Arial,sans-serif;color:#202124}}
-.err{{max-width:640px;margin:72px auto;padding:0 24px}} h1{{font-size:24px;font-weight:600;margin:0 0 12px}}
-p{{line-height:1.5;overflow-wrap:anywhere}} .k{{color:#5f6368}}
-</style></head><body><div class="err"><h1>This page can't be loaded</h1><p>{}</p><p class="k">{}</p></div></body></html>"#,
-        esc(url),
-        esc(error)
+        r#"<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>Can't load page — Zipp Browser</title><style>
+*{{box-sizing:border-box}}
+body{{margin:0;min-height:100vh;background:#0a0e17;color:#e2e8f0;font-family:'Segoe UI',-apple-system,Arial,sans-serif;display:flex;align-items:center;justify-content:center;padding:24px}}
+.card{{width:100%;max-width:560px;background:#131b2c;border:1px solid #1f2a40;border-radius:16px;padding:28px 30px;box-shadow:0 8px 30px rgba(0,0,0,0.35)}}
+.ico{{width:44px;height:44px;border-radius:12px;background:rgba(239,68,68,0.14);border:1px solid rgba(239,68,68,0.3);color:#f87171;display:flex;align-items:center;justify-content:center;margin-bottom:16px}}
+h1{{margin:0 0 8px;font-size:21px;font-weight:700;color:#f8fafc;letter-spacing:-0.01em}}
+.url{{margin:0 0 14px;padding:8px 12px;background:#0c111d;border:1px solid #1f2a40;border-radius:8px;font-family:Consolas,'Liberation Mono',monospace;font-size:12px;color:#93c5fd;overflow-wrap:anywhere}}
+.detail{{margin:0 0 22px;font-size:13px;line-height:1.55;color:#94a3b8;overflow-wrap:anywhere}}
+.row{{display:flex;flex-wrap:wrap;gap:9px}}
+.btn{{display:inline-flex;align-items:center;height:36px;padding:0 15px;border-radius:9px;font-size:13px;font-weight:600;text-decoration:none;border:1px solid transparent}}
+.primary{{background:linear-gradient(180deg,#3b82f6 0%,#2563eb 100%);color:#ffffff}}
+.ghost{{background:#0c111d;border-color:#2d3d5c;color:#e2e8f0}}
+</style></head><body><div class="card">
+<div class="ico"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg></div>
+<h1>This page can't be loaded</h1>
+<div class="url">{url}</div>
+<p class="detail">{err}</p>
+<div class="row">
+  <a class="btn primary" href="zipp-nav:reload?__zipp_chrome={token}">Try Again</a>
+  <a class="btn ghost" href="zipp-nav:home?__zipp_chrome={token}">Open Home</a>
+  <a class="btn ghost" href="zipp-nav:settings?__zipp_chrome={token}">Properties</a>
+</div>
+</div></body></html>"#,
+        url = esc(url),
+        err = esc(error),
     )
 }
 
@@ -2520,6 +3082,8 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
         // the page did NOT cancel the click and the real browser would have
         // reloaded and dropped its JS state.
         navigation_provider: Some(Arc::new(RecordingNavProvider) as _),
+        #[cfg(windows)]
+        media_provider: Some(Arc::new(media::MediaFoundationProvider::muted()) as _),
         viewport: Some(Viewport::new(
             width,
             height,
@@ -2540,7 +3104,7 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
         let flid_map = event_bridge::build_flid_map(doc.as_ref());
         let bridge =
             event_bridge::JsEventBridge::new(flid_map, emap, js_state.take(), url);
-        if bridge.handler_count() > 0 {
+        if bridge.handler_count() > 0 || bridge.has_js_state() {
             doc.set_event_handler(Box::new(bridge));
         }
     }
@@ -2603,8 +3167,8 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
     doc.as_mut().resolve(0.0);
     doc.as_mut().resolve(ANIMATION_SETTLE_SECS);
     // Pump the live document loop so async mount effects, dynamic imports,
-    // Web Workers (e.g. SoftN container/archive workers), and initial WebGL
-    // frames all settle before clicks or capture.
+    // Web Workers (e.g. SoftN container/archive workers), JS-driven `<video>`,
+    // and initial WebGL frames all settle before clicks or capture.
     {
         use zipp_dom::Document;
         let wait_secs: u64 = std::env::var("ZIPP_SHOT_WAIT_SECS")
@@ -2638,6 +3202,38 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
             let _ = doc.run_tasks();
             let _ = doc.animation_frame();
             let _ = doc.poll(None);
+            doc.as_mut().resolve(ANIMATION_SETTLE_SECS * 2.0);
+        }
+    }
+    // Wait briefly for any active `<video>` players (both static markup and
+    // JS-created `blob:`/`data:` videos) to decode Frame 0 before painting.
+    #[cfg(windows)]
+    {
+        let video_ids: Vec<usize> = doc
+            .as_ref()
+            .query_selector_all("video")
+            .map(|s| s.into_iter().collect())
+            .unwrap_or_default();
+        if !video_ids.is_empty() {
+            let vt = std::time::Instant::now();
+            while vt.elapsed() < std::time::Duration::from_millis(2500) {
+                let mut any_player = false;
+                let mut all_have_frame_or_err = true;
+                for &id in &video_ids {
+                    if let Some(player) = doc.as_ref().media_player(id) {
+                        any_player = true;
+                        let st = player.status();
+                        if player.frame().is_none() && !st.error {
+                            all_have_frame_or_err = false;
+                        }
+                    }
+                }
+                if !any_player || all_have_frame_or_err {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+            let _ = zipp_dom::Document::run_tasks(&mut doc);
             doc.as_mut().resolve(ANIMATION_SETTLE_SECS * 2.0);
         }
     }
@@ -2990,12 +3586,13 @@ fn run_zipp_js_inner(
                 .replace('\r', ""),
         );
 
-    let mut full = shim;
+    let mut shim_prog = shim;
     if is_mobile_view() {
-        full.push_str("\nif (typeof __zippSetMobileMode === \"function\") __zippSetMobileMode(true);\n");
+        shim_prog.push_str("\nif (typeof __zippSetMobileMode === \"function\") __zippSetMobileMode(true);\n");
     }
-    full.push_str("\n;\n");
-    for (_url, source) in &external_scripts {
+
+    let mut prepared_scripts: Vec<(String, String)> = Vec::with_capacity(external_scripts.len());
+    for (script_url, source) in &external_scripts {
         let patched = source
             .replace(
                 "function v(e,t,n,r){let a=D(",
@@ -3019,17 +3616,12 @@ fn run_zipp_js_inner(
             }
             _ => patched,
         };
-        full.push('\n');
-        full.push_str(&patched);
-        full.push('\n');
+        let prepared = js_opt::prepare_script(&patched);
+        prepared_scripts.push((script_url.clone(), prepared));
     }
-    // Link and append the ES module graph.
-    //
-    // Every reachable module is fetched and rewritten into calls on a registry,
-    // then emitted as one classic script. It has to happen up front: our host
-    // HTTP is synchronous and there is no way to fetch from inside the VM part
-    // way through execution, so a chunk that is not linked here could never be
-    // loaded at all — including the lazily `import()`ed route chunks.
+
+    // Link ES module graph if present.
+    let mut module_bundle: Option<String> = None;
     if !module_entries.is_empty() {
         let t_link = std::time::Instant::now();
         let fetch_module = |url: &str| match inline_modules.get(url) {
@@ -3050,77 +3642,108 @@ fn run_zipp_js_inner(
             eprintln!("[ESM] FAILED {url}: {err}");
             console::push(console::Level::Error, format!("module {url} failed to load: {err}"));
         }
+        let mut mod_src = String::with_capacity(linked.source.len() + esm::MODULE_RUNTIME_JS.len() + 256);
         if std::env::var_os("ZIPP_DEBUG_ESM").is_some() {
-            full.push_str("
-var __zippEsmDebug=true;
-");
+            mod_src.push_str("\nvar __zippEsmDebug=true;\n");
         }
-        full.push_str(&format!("\nvar __zippImportMap = {};\n", import_map.to_js()));
-        full.push_str(esm::MODULE_RUNTIME_JS);
-        full.push_str(&linked.source);
-        // `ZIPP_DUMP_LINKED=<path>` writes the linked graph out. A rewrite bug
-        // shows up as a runtime error deep inside minified code, and the only
-        // way to read it is to look at what was actually emitted.
+        mod_src.push_str(&format!("\nvar __zippImportMap = {};\n", import_map.to_js()));
+        mod_src.push_str(esm::MODULE_RUNTIME_JS);
+        mod_src.push_str(&linked.source);
         if let Ok(path) = std::env::var("ZIPP_DUMP_LINKED") {
             let _ = std::fs::write(&path, &linked.source);
             eprintln!("[ESM] wrote linked graph to {path}");
         }
+        module_bundle = Some(mod_src);
     }
 
-    // The page settles after this program, in the host's event loop
-    // (`run_page_tasks`). It used to run its timers here, at the end of the
-    // program and before the program's own microtasks, so every timer saw the
-    // promises the scripts had settled as still pending.
-
-    // `ZIPP_DUMP_PROGRAM=<path>` writes the whole program out -- shim, page
-    // scripts, linked modules -- so that a stack frame's `<anonymous>:line:col`
-    // can be read off it directly.
+    let total_bytes: usize = shim_prog.len()
+        + prepared_scripts.iter().map(|(_, s)| s.len()).sum::<usize>()
+        + module_bundle.as_ref().map_or(0, String::len);
     if let Ok(path) = std::env::var("ZIPP_DUMP_PROGRAM") {
-        let _ = std::fs::write(&path, &full);
+        let mut dump = shim_prog.clone();
+        for (u, s) in &prepared_scripts {
+            dump.push_str(&format!("\n/* === {u} === */\n"));
+            dump.push_str(s);
+            dump.push('\n');
+        }
+        if let Some(m) = &module_bundle {
+            dump.push_str("\n/* === ESM === */\n");
+            dump.push_str(m);
+        }
+        let _ = std::fs::write(&path, &dump);
         eprintln!("[JS] wrote the program to {path}");
     }
-    eprintln!("[JS] Compiling {} bytes...", full.len());
+    eprintln!(
+        "[JS] Compiling {} bytes ({} script{}, {})...",
+        total_bytes,
+        prepared_scripts.len(),
+        if prepared_scripts.len() == 1 { "" } else { "s" },
+        if module_bundle.is_some() { "+esm" } else { "classic" }
+    );
     let t_compile = std::time::Instant::now();
-    let mut state = match compile_script(&full) {
+    let mut state = match compile_script(&shim_prog) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[JS] Compile error: {e}");
-            // The offending line of the program, from the error's position:
-            // the program is the shim and every script run together, so the
-            // number alone says little.
-            let line = e
-                .split("<anonymous>:")
-                .nth(1)
-                .and_then(|at| at.split(':').next()?.trim().parse::<usize>().ok())
-                .and_then(|n| full.lines().nth(n.saturating_sub(1)))
-                .map(|l| l.chars().take(240).collect::<String>());
-            if let Some(line) = &line {
-                eprintln!("[JS]   at: {line}");
-            }
-            console::push(
-                console::Level::Error,
-                match line {
-                    Some(line) => format!("SyntaxError: {e}\n  at: {line}"),
-                    None => format!("SyntaxError: {e}"),
-                },
-            );
+            eprintln!("[JS] Shim compile error: {e}");
+            console::push(console::Level::Error, format!("SyntaxError: {e}"));
             return None;
         }
     };
     let compile_ms = t_compile.elapsed().as_millis();
     let t_init = std::time::Instant::now();
     state.set_host_call_ctx(Box::new(browser_host_call_ctx));
-    // A rejection nothing handled is an error the page should hear of, as a
-    // browser's console reports one.
     state.set_unhandled_rejection_sink(Box::new(|reason| {
         eprintln!("[JS] Uncaught (in promise) {reason}");
         console::push(console::Level::Error, format!("Uncaught (in promise) {reason}"));
     }));
     if let Err(e) = state.run_init() {
-        // An uncaught throw is not fatal: the shim may still have built enough
-        // of a tree to render, so fall through and check. This matches how a
-        // real browser treats a script error — the page is what it is.
-        eprintln!("[JS] Uncaught: {e}");
+        eprintln!("[JS] Shim init error: {e}");
+        return None;
+    }
+
+    // Run each classic `<script>` tag independently via `run_script`, matching
+    // HTML's ScriptEvaluation model: each tag gets its own 32,768-register
+    // frame, global declarations persist across tags, microtasks drain after
+    // each tag, and an error in one tag does not abort subsequent tags.
+    let run_one = |state: &mut ScriptState, label: &str, code: &str| {
+        match state.run_script(code) {
+            Ok(_) => {}
+            Err(e) if js_opt::is_register_limit_error(&e) => {
+                eprintln!("[JS] {label}: hit 32768-register limit, retrying with aggressive AST split...");
+                let agg = js_opt::prepare_script_aggressive(code);
+                if let Err(e2) = state.run_script(&agg) {
+                    eprintln!("[JS] Script error ({label}): {e2}");
+                    console::push(console::Level::Error, e2);
+                }
+            }
+            Err(e) => {
+                let line = e
+                    .split("<anonymous>:")
+                    .nth(1)
+                    .and_then(|at| at.split(':').next()?.trim().parse::<usize>().ok())
+                    .and_then(|n| code.lines().nth(n.saturating_sub(1)))
+                    .map(|l| l.chars().take(240).collect::<String>());
+                eprintln!("[JS] Uncaught ({label}): {e}");
+                if let Some(line) = &line {
+                    eprintln!("[JS]   at: {line}");
+                }
+                console::push(
+                    console::Level::Error,
+                    match line {
+                        Some(line) => format!("{e}\n  at: {line}"),
+                        None => e,
+                    },
+                );
+            }
+        }
+        state.run_microtasks();
+    };
+
+    for (script_url, code) in &prepared_scripts {
+        run_one(&mut state, script_url, code);
+    }
+    if let Some(mod_src) = &module_bundle {
+        run_one(&mut state, "esm-graph", mod_src);
     }
     // Settle: run the page's event loop until it is quiet -- each due timer
     // and posted message as a task, the VM's microtasks after each (an awaited
@@ -3220,6 +3843,8 @@ struct BrowserNavProvider {
     /// The page the window is showing. Every navigation passes through this
     /// provider, so it is the one place that always knows.
     current_url: std::sync::Mutex<String>,
+    /// Last non-internal web/file URL visited, offered as "Use Current Page" in Properties.
+    last_web_url: std::sync::Mutex<Option<String>>,
     /// Back/forward history, for the same reason.
     history: std::sync::Mutex<History>,
 }
@@ -3283,28 +3908,61 @@ impl NavigationProvider for BrowserNavProvider {
         let mut url = options.url.to_string();
         eprintln!("[NAV] {url}");
 
-        // Back, forward and reload -- the toolbar's buttons, and the shell's
-        // keyboard and mouse shortcuts, ask for these by URL.
-        if let Some(command) = url.strip_prefix("zipp-nav:") {
+        // Back, forward, reload, home, settings, history, and incognito.
+        // Every `zipp-nav:` action requires either a native keyboard shortcut
+        // (`application/x-zipp-shortcut`) or our unforgeable `__zipp_chrome`
+        // token so untrusted web pages cannot spawn windows or clear user data.
+        if let Some(rest) = url.strip_prefix("zipp-nav:") {
+            let trusted = options.content_type == "application/x-zipp-shortcut" || from_chrome(&url);
+            if !trusted {
+                eprintln!("[NAV] refused unauthenticated zipp-nav action: {url}");
+                return;
+            }
+            let command = rest.split('?').next().unwrap_or(rest);
+            if command == "incognito" {
+                launch_incognito_window();
+                return;
+            }
             let target = {
-                let mut history = self.history.lock().unwrap();
+                let mut history = self.history.lock().unwrap_or_else(|e| e.into_inner());
                 match command {
                     "back" => history.back(),
                     "forward" => history.forward(),
-                    // The first page (the start page, or a kiosk's app), as a
-                    // new step: Back returns to where it was asked from.
                     "home" => {
-                        // Already there, nothing to do: on the desktop this
-                        // reloaded it, and closed every window.
-                        let home = history.entries.first().cloned().filter(|home| *home != history.current());
-                        if let Some(home) = &home {
-                            history.push(home);
+                        let home = normalize_url(&settings::start_page());
+                        if home != history.current() {
+                            history.push(&home);
                         }
-                        home
+                        Some(home)
+                    }
+                    "settings" => {
+                        let dest = "zipp:settings".to_string();
+                        if dest != history.current() {
+                            history.push(&dest);
+                        }
+                        Some(dest)
+                    }
+                    "history" => {
+                        let dest = "zipp:history".to_string();
+                        if dest != history.current() {
+                            history.push(&dest);
+                        }
+                        Some(dest)
                     }
                     "reload" => {
                         let current = history.current();
-                        PAGE_CACHE.lock().unwrap().remove(&current);
+                        PAGE_CACHE.lock().unwrap_or_else(|e| e.into_inner()).remove(&current);
+                        zipp_shell::cache::invalidate(&current);
+                        Some(current)
+                    }
+                    "hard-reload" | "clear-cache" => {
+                        let current = history.current();
+                        clear_browser_cache();
+                        Some(current)
+                    }
+                    "clear-data" => {
+                        let current = history.current();
+                        clear_all_site_data();
                         Some(current)
                     }
                     _ => None,
@@ -3314,6 +3972,131 @@ impl NavigationProvider for BrowserNavProvider {
                 Some(target) => self.load(target),
                 None => eprintln!("[NAV] nothing to go {command} to"),
             }
+            return;
+        }
+
+        // Properties panel actions (`zipp-settings:<action>?__zipp_chrome=<token>&...`).
+        // Strictly authenticated with the per-run chrome token so untrusted web
+        // pages can never alter settings, cache, or history.
+        if let Some(rest) = url.strip_prefix("zipp-settings:") {
+            if !from_chrome(&url) {
+                eprintln!("[NAV] refused unauthenticated zipp-settings action: {url}");
+                return;
+            }
+            let (action, query) = rest.split_once('?').unwrap_or((rest, ""));
+            let params: HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes())
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect();
+            let last_web = self.last_web_url.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let (page_url, notice, filter): (&str, Option<String>, Option<String>) = match action {
+                "save-start" | "set-start" => {
+                    let raw = params
+                        .get("start_page")
+                        .or_else(|| params.get("url"))
+                        .map(String::as_str)
+                        .unwrap_or("")
+                        .trim();
+                    let next = if raw.is_empty() {
+                        settings::DEFAULT_START_PAGE.to_string()
+                    } else {
+                        normalize_url(raw)
+                    };
+                    settings::update(|s| s.start_page = next.clone());
+                    let suffix = if zipp_shell::profile::is_incognito() {
+                        " (for this Incognito session only)"
+                    } else {
+                        ""
+                    };
+                    ("zipp:settings", Some(format!("Start page set to {next}{suffix}.")), None)
+                }
+                "toggle-cache" => {
+                    let updated = settings::update(|s| s.cache_enabled = !s.cache_enabled);
+                    let msg = if updated.cache_enabled {
+                        "HTTP cache enabled."
+                    } else {
+                        "HTTP cache disabled."
+                    };
+                    ("zipp:settings", Some(msg.to_string()), None)
+                }
+                "cache-limit" => {
+                    let mb = params
+                        .get("mb")
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(settings::DEFAULT_CACHE_MAX_DISK_MB);
+                    let updated = settings::update(|s| s.cache_max_disk_mb = mb);
+                    (
+                        "zipp:settings",
+                        Some(format!("Disk cache limit updated to {} MB.", updated.cache_max_disk_mb)),
+                        None,
+                    )
+                }
+                "clear-cache" => {
+                    let (entries, bytes) = clear_browser_cache();
+                    let mb = bytes as f64 / (1024.0 * 1024.0);
+                    (
+                        "zipp:settings",
+                        Some(format!("Cleared HTTP cache ({entries} entries, {mb:.2} MB freed).")),
+                        None,
+                    )
+                }
+                "clear-data" => {
+                    let (entries, bytes, cookies) = clear_all_site_data();
+                    let mb = bytes as f64 / (1024.0 * 1024.0);
+                    (
+                        "zipp:settings",
+                        Some(format!(
+                            "Cleared all site data ({entries} cache entries / {mb:.2} MB, {cookies} cookies, and site storage)."
+                        )),
+                        None,
+                    )
+                }
+                "toggle-mute" => {
+                    let updated = settings::update(|s| s.mute_media = !s.mute_media);
+                    let msg = if updated.mute_media {
+                        "Browser audio & video muted."
+                    } else {
+                        "Browser audio & video unmuted."
+                    };
+                    ("zipp:settings", Some(msg.to_string()), None)
+                }
+                "clear-history" => {
+                    let n = history::clear();
+                    (
+                        "zipp:history",
+                        Some(format!("Cleared browsing history ({n} entries removed).")),
+                        None,
+                    )
+                }
+                "delete-history" => {
+                    let id = params.get("id").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                    let removed = history::delete(id);
+                    let msg = if removed {
+                        Some("Removed entry from browsing history.".to_string())
+                    } else {
+                        None
+                    };
+                    ("zipp:history", msg, None)
+                }
+                "filter-history" => {
+                    let q = params.get("q").cloned().filter(|s| !s.trim().is_empty());
+                    ("zipp:history", None, q)
+                }
+                _ => ("zipp:settings", None, None),
+            };
+            let html = properties_page::render(
+                chrome_token(),
+                notice.as_deref(),
+                filter.as_deref(),
+                last_web.as_deref(),
+                page_url == "zipp:history",
+            );
+            *self.current_url.lock().unwrap_or_else(|e| e.into_inner()) = page_url.to_string();
+            self.proxy.send_event(zipp_shell::ShellEvent::NavigationLoad {
+                url: page_url.to_string(),
+                contents: html,
+                retain_scroll_position: false,
+                is_md: false,
+            });
             return;
         }
 
@@ -3411,7 +4194,20 @@ impl BrowserNavProvider {
     /// Show `url`: fetch it on a worker thread (or take it from the cache), then
     /// hand it to the window, whose document builder runs its JS.
     fn load(&self, url: String) {
-        *self.current_url.lock().unwrap() = url.clone();
+        *self.current_url.lock().unwrap_or_else(|e| e.into_inner()) = url.clone();
+        if !url.starts_with("zipp:") && !url.starts_with("about:") {
+            *self.last_web_url.lock().unwrap_or_else(|e| e.into_inner()) = Some(url.clone());
+        }
+        let last_web = self.last_web_url.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(html) = internal_page_html(&url, None, None, last_web.as_deref()) {
+            self.proxy.send_event(zipp_shell::ShellEvent::NavigationLoad {
+                url,
+                contents: html,
+                retain_scroll_position: false,
+                is_md: false,
+            });
+            return;
+        }
         let proxy = self.proxy.clone();
 
         std::thread::Builder::new()
@@ -3420,7 +4216,7 @@ impl BrowserNavProvider {
                 // Only the fetch happens here. The page's JS runs on the main
                 // thread, in the document builder, so that its live state can
                 // stay attached to the document it rendered.
-                let cached = PAGE_CACHE.lock().unwrap().get(&url).cloned();
+                let cached = page_cache_get(&url);
                 let contents = match cached {
                     Some(html) => {
                         eprintln!("[NAV] Cache hit for {url}");
@@ -3430,7 +4226,7 @@ impl BrowserNavProvider {
                         eprintln!("[NAV] Loading {url}...");
                         match viewers::fetch_document(&url, true) {
                             Ok(html) => {
-                                PAGE_CACHE.lock().unwrap().insert(url.clone(), html.clone());
+                                page_cache_put(url.clone(), html.clone());
                                 html
                             }
                             Err(e) => {
@@ -3475,17 +4271,24 @@ impl BrowserNavProvider {
 /// a page's own `html` padding still applies. With the console open the band
 /// grows to hold it too, under the toolbar; opening and closing it rewrites
 /// this stylesheet (`JsEventBridge::show_console`).
+const TOOLBAR_HEIGHT: u32 = 46;
+
 pub(crate) fn chrome_css(console_open: bool, mobile_open: bool) -> String {
     let panel = console::PANEL_HEIGHT;
-    let band = if console_open { 42 + panel } else { 42 };
-    let (display, button) = if console_open { ("flex", "#dbe4ff") } else { ("none", "transparent") };
-    let mobile_bg = if mobile_open { "#dbe4ff" } else { "transparent" };
+    let band = if console_open { TOOLBAR_HEIGHT + panel } else { TOOLBAR_HEIGHT };
+    let incognito = zipp_shell::profile::is_incognito();
+    let active_bg = if incognito { "rgba(167, 139, 250, 0.22)" } else { "#dbeafe" };
+    let hover_bg = if incognito { "rgba(167, 139, 250, 0.14)" } else { "rgba(15, 23, 42, 0.07)" };
+    let (display, button) = if console_open { ("flex", active_bg) } else { ("none", "transparent") };
+    let mobile_bg = if mobile_open { active_bg } else { "transparent" };
     format!(
-        "html {{ border-top:{band}px solid transparent !important; margin:0 !important; max-width:none !important; }}\n\
+        "html {{ border-top:{band}px solid transparent !important; box-sizing:border-box !important; margin:0 !important; max-width:none !important; }}\n\
          #__zipp_chrome {{ top:-{band}px; }}\n\
+         #__zipp_chrome a:hover {{ background:{hover_bg}; }}\n\
          #__zipp_console {{ display:{display}; top:-{panel}px; height:{panel}px; }}\n\
          #__zipp_console_button {{ background:{button}; }}\n\
-         #__zipp_mobile_button {{ background:{mobile_bg}; }}\n"
+         #__zipp_mobile_button {{ background:{mobile_bg}; }}\n\
+         @media (max-width: 520px) {{ #__zipp_chrome {{ padding:0 6px !important; gap:2px !important; }} #__zipp_chrome a {{ width:26px !important; height:26px !important; }} #__zipp_chrome > span {{ display:none !important; }} }}\n"
     )
 }
 
@@ -3569,20 +4372,36 @@ fn build_document(final_html: &str, config: DocumentConfig) -> HtmlDocument {
 /// sized when the canvas has no size of its own, like any image. True when
 /// there were any.
 pub(crate) fn apply_canvas_frames(doc: &mut BaseDocument) -> bool {
-    show_canvas_frames(doc, canvas::take_frames())
+    show_canvas_frames(doc, canvas::take_frames(), None)
+}
+
+/// Faster variant using the event bridge's cached `flid -> node` map (O(1) per frame).
+pub(crate) fn apply_canvas_frames_with_map(doc: &mut BaseDocument, flids: &HashMap<u32, usize>) -> bool {
+    show_canvas_frames(doc, canvas::take_frames(), Some(flids))
 }
 
 /// After a re-render rebuilt the body: each canvas shows its frame again.
 pub(crate) fn reapply_canvas_frames(doc: &mut BaseDocument) {
-    show_canvas_frames(doc, canvas::shown_frames());
+    show_canvas_frames(doc, canvas::shown_frames(), None);
 }
 
-fn show_canvas_frames(doc: &mut BaseDocument, frames: Vec<(u32, canvas::Shown)>) -> bool {
+fn show_canvas_frames(
+    doc: &mut BaseDocument,
+    frames: Vec<(u32, canvas::Shown)>,
+    cached_flids: Option<&HashMap<u32, usize>>,
+) -> bool {
     use zipp_dom::node::{ImageData, RasterImageData, SpecialElementData};
     if frames.is_empty() {
         return false;
     }
-    let flids = event_bridge::build_flid_map(doc);
+    let owned_flids;
+    let flids = match cached_flids {
+        Some(map) => map,
+        None => {
+            owned_flids = event_bridge::build_flid_map(doc);
+            &owned_flids
+        }
+    };
     for (flid, (width, height, rgba)) in frames {
         let Some(&node) = flids.get(&flid) else {
             continue;
@@ -3644,16 +4463,16 @@ pub(crate) fn rerender_body(rendered_body: &str, page_url: &str) -> String {
 /// has to cover it, or a `z-index:100` skip link paints over the URL bar.
 /// The console's input line, inside its form (put back empty after each run).
 pub(crate) fn console_input() -> String {
-    format!(r#"<input type="hidden" name="__zipp_chrome" value="{}">{CONSOLE_INPUT}"#, chrome_token())
+    format!(r#"<input type="hidden" name="__zipp_chrome" value="{}" />{CONSOLE_INPUT}"#, chrome_token())
 }
 
-const CONSOLE_INPUT: &str = r#"<span style="color:#1c7ed6">›</span><input id="__zipp_console_input" type="text" name="__js" placeholder="Run JavaScript in the page, then Enter" style="flex:1;min-width:0;height:22px;border:0;outline:none;font-family:Consolas,'Liberation Mono',monospace;font-size:12px;background:white;color:#212529" />"#;
+const CONSOLE_INPUT: &str = r#"<span style="color:#60a5fa;font-weight:700">›</span><input id="__zipp_console_input" type="text" name="__js" placeholder="Run JavaScript in the page, then Enter" style="flex:1;min-width:0;height:24px;border:0;outline:none;font-family:Consolas,'Liberation Mono',monospace;font-size:12px;background:transparent;color:#e2e8f0" />"#;
 
 /// The console button's icon, and its badge counting the page's errors.
 pub(crate) fn console_button_inner(badge: &str) -> String {
     let display = if badge.is_empty() { "none" } else { "inline-block" };
     format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></svg><span id="__zipp_console_badge" style="display:{display};min-width:16px;padding:0 4px;border-radius:8px;background:#e03131;color:white;font-size:11px;line-height:16px;text-align:center">{badge}</span>"#
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></svg><span id="__zipp_console_badge" style="display:{display};min-width:16px;padding:0 5px;border-radius:999px;background:#ef4444;color:white;font-size:10px;font-weight:700;line-height:16px;text-align:center">{badge}</span>"#
     )
 }
 
@@ -3664,27 +4483,107 @@ fn toolbar_markup(current_url: &str) -> String {
     let button = console_button_inner(&console::badge_text());
     let counts = console::counts_text();
     let lines = console::lines_html();
+    let incognito = zipp_shell::profile::is_incognito();
+    let on_settings = current_url == "zipp:settings" || current_url == "zipp:properties";
+    let on_history = current_url == "zipp:history";
+    let (bar_bg, bar_border, icon_color, divider_color, omni_bg, omni_border, input_fg, active_pill, incog_pill) = if incognito {
+        (
+            "linear-gradient(180deg, #1b162e 0%, #151026 100%)",
+            "#2d234a",
+            "#c4b5fd",
+            "#2f254f",
+            "#241d3d",
+            "#3e3168",
+            "#f8fafc",
+            "rgba(167, 139, 250, 0.24)",
+            r#"<span id="__zipp_incognito_badge" style="display:inline-flex;align-items:center;gap:5px;background:linear-gradient(180deg,#8b5cf6 0%,#6d28d9 100%);color:#ffffff;font-size:11px;font-weight:700;padding:3px 9px;border-radius:999px;white-space:nowrap;letter-spacing:0.01em"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/><path d="m3 3 18 18"/></svg>Incognito</span>"#,
+        )
+    } else {
+        (
+            "linear-gradient(180deg, #ffffff 0%, #f4f6fa 100%)",
+            "#dde3ec",
+            "#475569",
+            "#e2e8f0",
+            "#eef2f7",
+            "#d5dde8",
+            "#0f172a",
+            "#dbeafe",
+            "",
+        )
+    };
+    let proto_icon = if current_url.starts_with("https://") {
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>"##
+    } else if current_url.starts_with("zipp:") || current_url.starts_with("about:") {
+        if incognito {
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#a78bfa" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>"##
+        } else {
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#2563eb" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>"##
+        }
+    } else {
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#64748b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>"##
+    };
+    let settings_bg = if on_settings { active_pill } else { "transparent" };
+    let history_bg = if on_history { active_pill } else { "transparent" };
+    let form_action = if current_url.starts_with("zipp:") || current_url.starts_with("about:") {
+        "https://lance.name"
+    } else {
+        current_url
+    };
+    let form_action_esc = escape_html_attr(form_action);
+    let current_url_esc = escape_html_attr(current_url);
+    let btn_style = format!(
+        "display:flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:8px;text-decoration:none;color:{icon_color};flex-shrink:0"
+    );
     format!(
-        r#"<form id="__zipp_chrome" action="{current_url}" method="GET" style="position:absolute;left:0;right:0;z-index:2147483647;color:#212529;height:42px;background:#f8f9fa;border-bottom:1px solid #dee2e6;display:flex;align-items:center;padding:4px 8px;gap:6px;font-family:Arial,sans-serif;font-size:14px;line-height:normal;text-align:left;box-sizing:border-box;margin:0">
+        r#"<form id="__zipp_chrome" action="{form_action_esc}" method="GET" style="position:absolute;left:0;right:0;z-index:2147483647;color:{input_fg};height:{TOOLBAR_HEIGHT}px;background:{bar_bg};border-bottom:1px solid {bar_border};display:flex;align-items:center;padding:0 10px;gap:4px;font-family:'Segoe UI',Arial,sans-serif;font-size:13px;line-height:normal;text-align:left;box-sizing:border-box;margin:0">
     <style id="__zipp_chrome_css">{css}</style>
-    <input type="hidden" name="__zipp_chrome" value="{token}">
-    <a href="zipp-nav:back" title="Back (Alt+Left)" style="display:flex;align-items:center;padding:3px;border-radius:4px;text-decoration:none;color:#495057"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg></a>
-    <a href="zipp-nav:forward" title="Forward (Alt+Right)" style="display:flex;align-items:center;padding:3px;border-radius:4px;text-decoration:none;color:#495057"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg></a>
-    <a href="zipp-nav:reload" title="Reload (F5)" style="display:flex;align-items:center;padding:3px;border-radius:4px;text-decoration:none;color:#495057"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg></a>
-    <input type="text" name="__nav_url" value="{current_url}" style="flex:1;min-width:0;height:32px;padding:0 12px;border:1px solid #ced4da;border-radius:8px;font-family:Arial,sans-serif;font-size:14px;font-weight:normal;font-style:normal;letter-spacing:normal;background:white;color:#212529;outline:none;box-sizing:border-box" />
-    <a id="__zipp_mobile_button" href="zipp-view:mobile" title="Toggle Mobile View (Ctrl+Shift+M)" style="display:flex;align-items:center;padding:4px 5px;border-radius:4px;text-decoration:none;color:#495057"><svg xmlns="http://www.w3.org/2000/svg" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><path d="M12 18h.01"/></svg></a>
-    <a id="__zipp_console_button" href="zipp-console:toggle" title="Console (F12)" style="display:flex;align-items:center;gap:4px;padding:4px 6px;border-radius:4px;text-decoration:none;color:#495057">{button}</a>
-  </form>
-  <div id="__zipp_console" style="position:absolute;left:0;right:0;z-index:2147483646;flex-direction:column;background:white;border-bottom:2px solid #ced4da;font-family:Consolas,'Liberation Mono',monospace;font-size:12px;line-height:16px;color:#212529;text-align:left;box-sizing:border-box;margin:0">
-    <div style="display:flex;align-items:center;gap:14px;padding:4px 10px;background:#f1f3f5;border-bottom:1px solid #dee2e6;font-family:Arial,sans-serif;font-size:12px;flex-shrink:0">
-      <b>Console</b><span id="__zipp_console_counts" style="color:#495057">{counts}</span><span style="flex:1"></span>
-      <a href="zipp-console:clear" id="__zipp_console_clear" style="color:#1c7ed6;text-decoration:none">Clear</a>
-      <a href="zipp-console:toggle" id="__zipp_console_close" style="color:#1c7ed6;text-decoration:none">Close</a>
+    <input type="hidden" name="__zipp_chrome" value="{token}" />
+    <a href="zipp-nav:back?__zipp_chrome={token}" title="Back (Alt+Left)" style="{btn_style}"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg></a>
+    <a href="zipp-nav:forward?__zipp_chrome={token}" title="Forward (Alt+Right)" style="{btn_style}"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg></a>
+    <a href="zipp-nav:reload?__zipp_chrome={token}" title="Reload (F5)" style="{btn_style}"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg></a>
+    <a id="__zipp_home_button" href="zipp-nav:home?__zipp_chrome={token}" title="Home / Start Page (Alt+Home)" style="{btn_style}"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg></a>
+    <span style="width:1px;height:18px;background:{divider_color};margin:0 3px;flex-shrink:0"></span>
+    {incog_pill}
+    <div style="flex:1;min-width:0;height:32px;display:flex;align-items:center;gap:8px;padding:0 12px;background:{omni_bg};border:1px solid {omni_border};border-radius:10px;box-sizing:border-box">
+      {proto_icon}
+      <input type="text" name="__nav_url" value="{current_url_esc}" style="flex:1;min-width:0;height:28px;padding:0;border:0;font-family:'Segoe UI',Arial,sans-serif;font-size:13px;font-weight:normal;font-style:normal;letter-spacing:normal;background:transparent;color:{input_fg};outline:none;box-sizing:border-box" />
     </div>
-    <div id="__zipp_console_lines" style="flex:1;overflow:auto;min-height:0">{lines}</div>
-    <form id="__zipp_console_form" action="{current_url}" method="GET" style="display:flex;align-items:center;gap:6px;margin:0;padding:3px 10px;border-top:1px solid #dee2e6;flex-shrink:0">{console_line}</form>
+    <span style="width:1px;height:18px;background:{divider_color};margin:0 3px;flex-shrink:0"></span>
+    <a id="__zipp_incognito_button" href="zipp-nav:incognito?__zipp_chrome={token}" title="New Incognito Window (Ctrl+Shift+N)" style="{btn_style}"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/><path d="m3 3 18 18"/></svg></a>
+    <a id="__zipp_history_button" href="zipp-nav:history?__zipp_chrome={token}" title="Browsing History (Ctrl+H)" style="{btn_style};background:{history_bg}"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></a>
+    <a id="__zipp_cache_button" href="zipp-nav:clear-cache?__zipp_chrome={token}" title="Clear Cache &amp; Reload (Ctrl+Shift+Delete)" style="{btn_style}"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg></a>
+    <a id="__zipp_settings_button" href="zipp-nav:settings?__zipp_chrome={token}" title="Properties, Cache &amp; History (Ctrl+,)" style="{btn_style};background:{settings_bg}"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.604.852.997 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></a>
+    <a id="__zipp_mobile_button" href="zipp-view:mobile" title="Toggle Mobile View (Ctrl+Shift+M)" style="{btn_style}"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><path d="M12 18h.01"/></svg></a>
+    <a id="__zipp_console_button" href="zipp-console:toggle" title="Console (F12)" style="display:flex;align-items:center;justify-content:center;gap:4px;min-width:30px;height:30px;padding:0 6px;border-radius:8px;text-decoration:none;color:{icon_color};flex-shrink:0">{button}</a>
+  </form>
+  <div id="__zipp_console" style="position:absolute;left:0;right:0;z-index:2147483646;flex-direction:column;background:#0f172a;border-bottom:1px solid #1e293b;font-family:Consolas,'Liberation Mono',monospace;font-size:12px;line-height:17px;color:#e2e8f0;text-align:left;box-sizing:border-box;margin:0">
+    <div style="display:flex;align-items:center;gap:12px;padding:6px 12px;background:#131b2c;border-bottom:1px solid #1f2a40;font-family:'Segoe UI',Arial,sans-serif;font-size:12px;flex-shrink:0">
+      <b style="color:#f8fafc">Console</b><span id="__zipp_console_counts" style="color:#94a3b8">{counts}</span><span style="flex:1"></span>
+      <a href="zipp-nav:settings?__zipp_chrome={token}" style="color:#60a5fa;text-decoration:none;font-weight:500">Properties</a>
+      <a href="zipp-nav:history?__zipp_chrome={token}" style="color:#60a5fa;text-decoration:none;font-weight:500">History</a>
+      <a href="zipp-nav:clear-cache?__zipp_chrome={token}" style="color:#60a5fa;text-decoration:none;font-weight:500">Clear Cache</a>
+      <a href="zipp-nav:clear-data?__zipp_chrome={token}" style="color:#f87171;text-decoration:none;font-weight:500">Clear Site Data</a>
+      <a href="zipp-console:clear" id="__zipp_console_clear" style="color:#cbd5e1;text-decoration:none;font-weight:500">Clear</a>
+      <a href="zipp-console:toggle" id="__zipp_console_close" style="color:#cbd5e1;text-decoration:none;font-weight:500">Close</a>
+    </div>
+    <div id="__zipp_console_lines" style="flex:1;overflow:auto;min-height:0;padding:4px 8px">{lines}</div>
+    <form id="__zipp_console_form" action="{form_action_esc}" method="GET" style="display:flex;align-items:center;gap:8px;margin:0;padding:4px 12px;background:#0a0e17;border-top:1px solid #1f2a40;flex-shrink:0">{console_line}</form>
   </div>"#
     )
+}
+
+fn escape_html_attr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -3697,39 +4596,49 @@ fn toolbar_markup(current_url: &str) -> String {
 /// Remove `<noscript>...</noscript>` blocks from HTML.
 /// Our browser supports JS, so noscript fallback content should not render.
 fn strip_noscript(html: &str) -> String {
-    let mut result = html.to_string();
-    while let Some(start) = result.find("<noscript") {
-        // Find matching </noscript>
-        if let Some(end) = result[start..].find("</noscript>") {
-            result.replace_range(start..start + end + 11, "");
+    if !html.contains("<noscript") {
+        return html.to_string();
+    }
+    let mut out = String::with_capacity(html.len());
+    let mut pos = 0;
+    while let Some(rel_start) = html[pos..].find("<noscript") {
+        let start = pos + rel_start;
+        out.push_str(&html[pos..start]);
+        if let Some(rel_end) = html[start..].find("</noscript>") {
+            pos = start + rel_end + 11;
         } else {
-            break;
+            out.push_str(&html[start..]);
+            return out;
         }
     }
-    result
+    out.push_str(&html[pos..]);
+    out
 }
 
 fn inline_images(html: &str, base_url: &str) -> String {
-    let mut result = html.to_string();
+    if !html.contains("src=\"") {
+        return html.to_string();
+    }
+    let mut out = String::with_capacity(html.len() + 256);
+    let mut copied = 0;
     let mut search_pos = 0;
 
-    while let Some(idx) = result[search_pos..].find("src=\"") {
+    while let Some(idx) = html[search_pos..].find("src=\"") {
         let abs_idx = search_pos + idx + 5;
-        if let Some(end) = result[abs_idx..].find('"') {
-            let src = &result[abs_idx..abs_idx + end];
-            if src.starts_with("data:") || src.starts_with("http") || src.is_empty() {
-                search_pos = abs_idx + end;
-                continue;
-            }
-            let full_url = resolve(base_url, src);
-            // Replace just the src value in place instead of rebuilding the whole string
-            result.replace_range(abs_idx..abs_idx + end, &full_url);
-            search_pos = abs_idx + full_url.len();
-        } else {
+        let Some(end) = html[abs_idx..].find('"') else {
             break;
+        };
+        let src = &html[abs_idx..abs_idx + end];
+        if !src.is_empty() && !src.starts_with("data:") && !src.starts_with("http") && !src.starts_with("blob:") {
+            let full_url = resolve(base_url, src);
+            out.push_str(&html[copied..abs_idx]);
+            out.push_str(&full_url);
+            copied = abs_idx + end;
         }
+        search_pos = abs_idx + end + 1;
     }
-    result
+    out.push_str(&html[copied..]);
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -3837,7 +4746,17 @@ fn normalize_url(s: &str) -> String {
     if s.is_empty() {
         return "https://html.duckduckgo.com".to_string();
     }
-    if s.starts_with("http://") || s.starts_with("https://") || s.starts_with("file://") {
+    let lower = s.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "zipp:settings" | "zipp:properties" | "about:settings" | "about:properties"
+    ) {
+        return "zipp:settings".to_string();
+    }
+    if matches!(lower.as_str(), "zipp:history" | "about:history") {
+        return "zipp:history".to_string();
+    }
+    if s.starts_with("http://") || s.starts_with("https://") || s.starts_with("file://") || s.starts_with("zipp:") {
         return s.to_string();
     }
     // A local path, with or without a drive letter: treat it as a file URL
@@ -3851,7 +4770,7 @@ fn normalize_url(s: &str) -> String {
         url.push_str(s);
         return url;
     }
-    let encoded = s.replace(' ', "+");
+    let encoded = urlencoding::encode(s);
     let mut url = String::with_capacity(37 + encoded.len());
     url.push_str("https://html.duckduckgo.com/?q=");
     url.push_str(&encoded);
@@ -4075,15 +4994,36 @@ mod tests {
         let s = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         assert_eq!(parse_cli_args(&s(&["--help"])), Ok(CliAction::Help));
         assert_eq!(parse_cli_args(&s(&["-V"])), Ok(CliAction::Version));
+        assert_eq!(parse_cli_args(&s(&["--clear-cache"])), Ok(CliAction::ClearCacheOnly));
+        assert_eq!(parse_cli_args(&s(&["--clear-data"])), Ok(CliAction::ClearDataOnly));
         assert_eq!(
-            parse_cli_args(&s(&["--mobile", "https://example.com"])),
+            parse_cli_args(&s(&["--incognito", "https://example.com"])),
             Ok(CliAction::Run {
                 url: "https://example.com".into(),
-                mobile: true,
+                mobile: false,
+                incognito: true,
                 viewport: None,
                 kiosk: false,
                 app: false,
                 app_files: vec![],
+                clear_cache: false,
+                clear_data: false,
+                no_cache: false,
+            })
+        );
+        assert_eq!(
+            parse_cli_args(&s(&["--mobile", "--no-cache", "https://example.com"])),
+            Ok(CliAction::Run {
+                url: "https://example.com".into(),
+                mobile: true,
+                incognito: false,
+                viewport: None,
+                kiosk: false,
+                app: false,
+                app_files: vec![],
+                clear_cache: false,
+                clear_data: false,
+                no_cache: true,
             })
         );
         assert_eq!(
@@ -4091,32 +5031,44 @@ mod tests {
             Ok(CliAction::Run {
                 url: "index.html".into(),
                 mobile: true,
+                incognito: false,
                 viewport: None,
                 kiosk: false,
                 app: true,
                 app_files: vec!["app.softn".into()],
+                clear_cache: false,
+                clear_data: false,
+                no_cache: false,
             })
         );
         assert_eq!(
-            parse_cli_args(&s(&["--viewport", "390x844", "https://example.com"])),
+            parse_cli_args(&s(&["--viewport", "390x844", "--clear-cache", "https://example.com"])),
             Ok(CliAction::Run {
                 url: "https://example.com".into(),
                 mobile: false,
+                incognito: false,
                 viewport: Some((390, 844)),
                 kiosk: false,
                 app: false,
                 app_files: vec![],
+                clear_cache: true,
+                clear_data: false,
+                no_cache: false,
             })
         );
         assert_eq!(
-            parse_cli_args(&s(&["--mobile", "--screenshot", "out.png", "https://example.com"])),
+            parse_cli_args(&s(&["--mobile", "--incognito", "--screenshot", "out.png", "https://example.com"])),
             Ok(CliAction::Screenshot {
                 out: "out.png".into(),
                 url: "https://example.com".into(),
                 width: MOBILE_WINDOW_SIZE.0,
                 height: MOBILE_WINDOW_SIZE.1,
                 mobile: true,
+                incognito: true,
                 no_chrome: false,
+                clear_cache: false,
+                clear_data: false,
+                no_cache: false,
             })
         );
         assert_eq!(
@@ -4127,16 +5079,244 @@ mod tests {
                 width: MOBILE_WINDOW_SIZE.0,
                 height: MOBILE_WINDOW_SIZE.1,
                 mobile: true,
+                incognito: false,
                 no_chrome: true,
+                clear_cache: false,
+                clear_data: false,
+                no_cache: false,
             })
         );
         assert!(parse_cli_args(&s(&["--viewport", "bad"])).is_err());
     }
 
     #[test]
-    fn toolbar_includes_mobile_view_toggle() {
+    fn toolbar_includes_mobile_view_and_clear_cache_controls() {
         let out = wrap_with_toolbar("<p>hi</p>", "https://example.com/");
+        assert!(out.contains(r#"id="__zipp_home_button""#));
+        assert!(out.contains(r#"id="__zipp_incognito_button""#));
+        assert!(out.contains(r#"id="__zipp_settings_button""#));
         assert!(out.contains(r#"id="__zipp_mobile_button""#));
         assert!(out.contains(r#"href="zipp-view:mobile""#));
+        assert!(out.contains(r#"id="__zipp_cache_button""#));
+        assert!(out.contains(r#"href="zipp-nav:clear-cache?__zipp_chrome="#));
+        assert!(out.contains(r#"href="zipp-nav:clear-data?__zipp_chrome="#));
+        assert!(out.contains(r#"href="zipp-nav:settings?__zipp_chrome="#));
+        assert!(out.contains(r#"href="zipp-nav:incognito?__zipp_chrome="#));
+    }
+
+    #[test]
+    fn properties_page_and_internal_url_normalization() {
+        assert_eq!(normalize_url("about:settings"), "zipp:settings");
+        assert_eq!(normalize_url("about:history"), "zipp:history");
+        assert_eq!(normalize_url("zipp:properties"), "zipp:settings");
+        let html = internal_page_html("zipp:settings", Some("Start page saved"), None, Some("https://softn.com"))
+            .expect("properties page html");
+        assert!(html.contains("Start Page"));
+        assert!(html.contains("Cache &amp; Storage Management"));
+        assert!(html.contains("Browsing History"));
+        assert!(html.contains("New Incognito Window"));
+        assert!(html.contains("Start page saved"));
+        assert!(html.contains("Use Current Page"));
+    }
+
+    #[test]
+    fn end_to_end_cookies_sessions_headers_and_http_cache() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let port = listener.local_addr().unwrap().port();
+        let asset_hits = Arc::new(AtomicUsize::new(0));
+        let asset_hits_srv = Arc::clone(&asset_hits);
+
+        let handle = std::thread::spawn(move || {
+            for _ in 0..16 {
+                let Ok((mut stream, _)) = listener.accept() else { break };
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    continue;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let first_line = req.lines().next().unwrap_or("");
+                let mut parts = first_line.split_whitespace();
+                let method = parts.next().unwrap_or("GET");
+                let path = parts.next().unwrap_or("/");
+                let cookie_hdr = req
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("cookie:"))
+                    .map(|l| l[7..].trim().to_string())
+                    .unwrap_or_default();
+                let auth_hdr = req
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("x-token:"))
+                    .map(|l| l[8..].trim().to_string())
+                    .unwrap_or_default();
+
+                let resp = match (method, path) {
+                    ("POST", "/login") => {
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nSet-Cookie: sid=sess_42; Path=/; HttpOnly\r\nSet-Cookie: user=alice; Path=/; Max-Age=3600\r\nX-Session-State: active\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}".to_string()
+                    }
+                    ("GET", "/me") => {
+                        let body = format!(
+                            "{{\"cookie\":{},\"token\":{}}}",
+                            json_quote(&cookie_hdr),
+                            json_quote(&auth_hdr)
+                        );
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    }
+                    ("GET", "/cached.js") => {
+                        let hits = asset_hits_srv.fetch_add(1, Ordering::SeqCst) + 1;
+                        let body = format!("// hit {hits}");
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nCache-Control: public, max-age=3600\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    }
+                    ("POST", "/logout") => {
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nSet-Cookie: sid=; Path=/; Max-Age=0; HttpOnly\r\nSet-Cookie: user=; Path=/; Max-Age=0\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}".to_string()
+                    }
+                    ("GET", "/binary.softn") => {
+                        let bin: [u8; 8] = [0x50, 0x4b, 0x03, 0x04, 0x00, 0xff, 0x80, 0xfe];
+                        let hdr = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nCache-Control: public, max-age=600\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            bin.len()
+                        );
+                        let _ = stream.write_all(hdr.as_bytes());
+                        let _ = stream.write_all(&bin);
+                        continue;
+                    }
+                    ("GET", "/done") => {
+                        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+                        break;
+                    }
+                    _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                };
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        let base = format!("http://127.0.0.1:{port}");
+        let page = format!("{base}/app");
+        set_thread_page(page.clone());
+        DOC_URL.with(|d| *d.borrow_mut() = url::Url::parse(&page).ok());
+        zipp_shell::cache::clear();
+
+        // 1. Login sets HttpOnly session cookie + persistent user cookie + custom response header.
+        let login_res = browser_host_call(
+            "http",
+            &[
+                "POST".into(),
+                format!("{base}/login"),
+                "{}".into(),
+                "application/json".into(),
+                "same-origin".into(),
+                "{}".into(),
+            ],
+        )
+        .expect("login");
+        let login_json: serde_json::Value = serde_json::from_str(&login_res).unwrap();
+        assert_eq!(login_json["status"], 200);
+        assert_eq!(login_json["headers"]["x-session-state"], "active");
+        // Set-Cookie must never be exposed in Response.headers.
+        assert!(login_json["headers"].get("set-cookie").is_none());
+
+        // 2. Same-origin GET sends BOTH HttpOnly and non-HttpOnly cookies + custom request header.
+        let me_res = browser_host_call(
+            "http",
+            &[
+                "GET".into(),
+                format!("{base}/me"),
+                String::new(),
+                String::new(),
+                "same-origin".into(),
+                r#"{"X-Token":"jwt-99"}"#.into(),
+            ],
+        )
+        .expect("me");
+        let me_json: serde_json::Value = serde_json::from_str(&me_res).unwrap();
+        let me_body: serde_json::Value = serde_json::from_str(me_json["body"].as_str().unwrap()).unwrap();
+        let sent_cookie = me_body["cookie"].as_str().unwrap();
+        assert!(sent_cookie.contains("sid=sess_42"), "missing HttpOnly session cookie: {sent_cookie}");
+        assert!(sent_cookie.contains("user=alice"), "missing user cookie: {sent_cookie}");
+        assert_eq!(me_body["token"], "jwt-99");
+
+        // 3. `credentials: "omit"` sends NO cookies even on same-origin.
+        let omit_res = browser_host_call(
+            "http",
+            &[
+                "GET".into(),
+                format!("{base}/me"),
+                String::new(),
+                String::new(),
+                "omit".into(),
+                "{}".into(),
+            ],
+        )
+        .expect("omit");
+        let omit_json: serde_json::Value = serde_json::from_str(&omit_res).unwrap();
+        let omit_body: serde_json::Value = serde_json::from_str(omit_json["body"].as_str().unwrap()).unwrap();
+        assert_eq!(omit_body["cookie"], "");
+
+        // 4. `document.cookie` hides HttpOnly `sid` and lets script add/read its own cookie.
+        let doc_cookie = browser_host_call("cookie_get", std::slice::from_ref(&page)).unwrap();
+        assert!(!doc_cookie.contains("sid="), "HttpOnly leaked to document.cookie: {doc_cookie}");
+        assert!(doc_cookie.contains("user=alice"), "{doc_cookie}");
+        let _ = browser_host_call("cookie_set", &[page.clone(), "ui=compact; Path=/".into()]);
+        assert!(browser_host_call("cookie_get", std::slice::from_ref(&page)).unwrap().contains("ui=compact"));
+
+        // 5. Persistent HTTP cache serves second fetch without hitting the server, and clear_browser_cache forces fresh fetch.
+        let asset_url = format!("{base}/cached.js");
+        let first = fetch(&asset_url).expect("first fetch");
+        let second = fetch(&asset_url).expect("cached fetch");
+        assert_eq!(first, "// hit 1");
+        assert_eq!(second, "// hit 1");
+        assert_eq!(asset_hits.load(Ordering::SeqCst), 1);
+
+        clear_browser_cache();
+        let third = fetch(&asset_url).expect("post-clear fetch");
+        assert_eq!(third, "// hit 2");
+        assert_eq!(asset_hits.load(Ordering::SeqCst), 2);
+
+        // 5b. Caching a binary fetch via `http` must preserve exact raw bytes for `arrayBuffer()`/`fetch_bytes_with_mime`.
+        let bin_url = format!("{base}/binary.softn");
+        let _ = browser_host_call(
+            "http",
+            &[
+                "GET".into(),
+                bin_url.clone(),
+                String::new(),
+                String::new(),
+                "same-origin".into(),
+                "{}".into(),
+            ],
+        )
+        .expect("binary http fetch");
+        let (bstatus, _, bbytes) =
+            fetch_bytes_with_mime(&bin_url, CredentialsMode::SameOrigin).expect("cached binary fetch");
+        assert_eq!(bstatus, 200);
+        assert_eq!(bbytes, vec![0x50, 0x4b, 0x03, 0x04, 0x00, 0xff, 0x80, 0xfe]);
+
+        // 6. Per-origin sessionStorage survives across reads and clears on clear_sessions().
+        let _ = browser_host_call("site_write", &["session".into(), "".into(), r#"{"step":"2"}"#.into()]);
+        let sess = browser_host_call("site_read", &["session".into(), "".into()]).unwrap();
+        assert_eq!(sess, r#"{"step":"2"}"#);
+        site_storage::clear_sessions();
+        assert_eq!(browser_host_call("site_read", &["session".into(), "".into()]).unwrap(), "");
+
+        // 7. Logout clears session cookies via Max-Age=0.
+        let _ = browser_host_call("http", &["POST".into(), format!("{base}/logout"), String::new(), String::new(), "same-origin".into(), "{}".into()]);
+        let after_logout = browser_host_call("http", &["GET".into(), format!("{base}/me"), String::new(), String::new(), "same-origin".into(), "{}".into()]).unwrap();
+        let after_json: serde_json::Value = serde_json::from_str(&after_logout).unwrap();
+        let after_body: serde_json::Value = serde_json::from_str(after_json["body"].as_str().unwrap()).unwrap();
+        assert!(!after_body["cookie"].as_str().unwrap().contains("sid=sess_42"));
+
+        let _ = fetch(&format!("{base}/done"));
+        let _ = handle.join();
     }
 }

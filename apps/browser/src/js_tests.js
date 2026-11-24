@@ -286,6 +286,66 @@ A("Request and binary Blob preserve raw bytes and blob: URLs", async function() 
         && resp.ok && fetched.length === 8 && fetched[5] === 255 && fetched[6] === 128;
 });
 
+A("MutationObserver fires for attributes, style, classList, and childList", async function() {
+    var box = document.createElement("div");
+    var child = document.createElement("span");
+    document.body.appendChild(box);
+    var seen = [];
+    var mo = new MutationObserver(function(records) {
+        for (var i = 0; i < records.length; i++) seen.push(records[i].type + ":" + (records[i].attributeName || ""));
+    });
+    mo.observe(box, { attributes: true, childList: true, subtree: true, attributeFilter: ["style", "class", "data-k"] });
+    box.setAttribute("data-k", "1");
+    box.setAttribute("data-ignored", "2");
+    box.style.transform = "translate(10px, 20px)";
+    box.classList.add("panning");
+    box.appendChild(child);
+    await Promise.resolve();
+    mo.disconnect();
+    box.setAttribute("data-k", "3");
+    await Promise.resolve();
+    document.body.removeChild(box);
+    return seen.indexOf("attributes:data-k") >= 0
+        && seen.indexOf("attributes:data-ignored") < 0
+        && seen.indexOf("attributes:style") >= 0
+        && seen.indexOf("attributes:class") >= 0
+        && seen.indexOf("childList:") >= 0
+        && seen.length === 4;
+});
+
+T("DOMImplementation, TreeWalker, Node interfaces, NamedNodeMap[i], ClassList iterator, and template.innerHTML", function() {
+    var inert = document.implementation.createHTMLDocument("inert");
+    var base = inert.createElement("base");
+    inert.head.appendChild(base);
+    var a = inert.createElement("a");
+    inert.body.appendChild(a);
+    base.href = "https://example.com/dir/page.html";
+    a.href = "../next";
+    var resolvedOk = a.href === "https://example.com/next" && inert.title === "inert";
+
+    var tpl = document.createElement("template");
+    tpl.innerHTML = "<style>:host{color:red}</style><div id=\"box\" class=\"one two\" data-x=\"42\"><span>hi</span></div>";
+    var cloned = tpl.cloneNode(true);
+    var box = cloned.content.querySelector("#box");
+    var attrOk = box && box.attributes.length >= 3 && box.attributes[0] && typeof box.attributes[0].name === "string";
+    var clsArr = box ? Array.from(box.classList) : [];
+    var clsOk = clsArr.length === 2 && clsArr[0] === "one" && clsArr[1] === "two";
+
+    var tw = document.createTreeWalker(cloned.content, NodeFilter.SHOW_ELEMENT, null);
+    var firstEl = tw.firstChild();
+    var secondEl = tw.nextSibling();
+    var twOk = firstEl && firstEl.localName === "style" && secondEl && secondEl.id === "box";
+
+    var protoOk = typeof Window === "function" && window instanceof Window
+        && typeof window.addEventListener === "function"
+        && typeof CDATASection === "function" && typeof ProcessingInstruction === "function"
+        && typeof CharacterData === "function" && typeof DocumentType === "function"
+        && !!Object.getOwnPropertyDescriptor(Node.prototype, "parentNode")
+        && !!Object.getOwnPropertyDescriptor(Node.prototype, "childNodes");
+
+    return resolvedOk && attrOk && clsOk && twOk && protoOk;
+});
+
 env.log("info", "");
 env.log("info", "=== JS TEST RESULTS: " + _p + "/" + (_p + _f) + " passed ===");
 if (_f > 0) { env.log("warn", _f + " failures:"); for (var i = 0; i < _e.length; i++) env.log("warn", "  " + _e[i]); }

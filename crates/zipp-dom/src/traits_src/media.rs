@@ -36,6 +36,12 @@ pub struct MediaStatus {
     pub paused: bool,
     pub ended: bool,
     pub muted: bool,
+    /// Volume in `0.0..=1.0`.
+    pub volume: f64,
+    /// Playback speed multiplier (`1.0` normal).
+    pub playback_rate: f64,
+    /// HTMLMediaElement `readyState` (`0` = HAVE_NOTHING .. `4` = HAVE_ENOUGH_DATA).
+    pub ready_state: u8,
     /// Seconds from the start.
     pub position: f64,
     /// Seconds, once known; `None` before metadata or for a live stream.
@@ -52,6 +58,9 @@ impl Default for MediaStatus {
             paused: true,
             ended: false,
             muted: false,
+            volume: 1.0,
+            playback_rate: 1.0,
+            ready_state: 0,
             position: 0.0,
             duration: None,
             video_size: None,
@@ -67,6 +76,15 @@ pub trait MediaPlayer: Send + Sync {
     fn pause(&self);
     fn seek(&self, seconds: f64);
     fn set_muted(&self, muted: bool);
+    fn set_volume(&self, volume: f64) {
+        let _ = volume;
+    }
+    fn set_playback_rate(&self, rate: f64) {
+        let _ = rate;
+    }
+    fn set_loop(&self, looping: bool) {
+        let _ = looping;
+    }
     fn status(&self) -> MediaStatus;
     /// The latest decoded frame, if any. Cheap: the pixels are shared.
     fn frame(&self) -> Option<RasterImageData>;

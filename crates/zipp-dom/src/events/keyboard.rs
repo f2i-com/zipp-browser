@@ -322,9 +322,9 @@ fn implicit_form_submission(doc: &BaseDocument, text_target: usize) {
         .filter(|(_control_id, form_id)| *form_id == form_owner_id)
         .filter_map(|(control_id, _)| doc.nodes[*control_id].element_data())
         .filter(|element_data| {
-            element_data.attr(local_name!("type")).is_some_and(|t| {
-                matches!(
-                    t,
+            element_data.name.local == local_name!("input")
+                && matches!(
+                    element_data.attr(local_name!("type")).unwrap_or("text"),
                     "text"
                         | "search"
                         | "email"
@@ -338,7 +338,6 @@ fn implicit_form_submission(doc: &BaseDocument, text_target: usize) {
                         | "datetime-local"
                         | "number"
                 )
-            })
         })
         .count()
         > 1

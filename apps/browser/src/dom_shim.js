@@ -219,10 +219,12 @@ function __makeStyle(el) {
         configurable: true,
         get: function () { return __styleText(s); },
         set: function (v) {
+            var old = __moCount && s._el ? __styleText(s) : null;
             __clearStyle(s);
             __parseCssDecls(s, v);
             if (s._el && s._el.attributes) delete s._el.attributes.style;
             __domMutations++;
+            if (__moCount && s._el) __moNotify(s._el, "attributes", "style", old, null, null);
         }
     });
     Object.defineProperty(s, 'length', {
@@ -241,6 +243,7 @@ function __makeStyle(el) {
         if (name == null) return;
         var rawName = String(name).trim();
         if (!rawName) return;
+        var old = __moCount && s._el ? __styleText(s) : null;
         var n = rawName.indexOf("--") === 0 ? rawName : rawName.toLowerCase();
         var k = __camelProp(n);
         var val = value == null ? '' : String(value).trim();
@@ -262,6 +265,7 @@ function __makeStyle(el) {
         }
         if (s._el && s._el.attributes) delete s._el.attributes.style;
         __domMutations++;
+        if (__moCount && s._el) __moNotify(s._el, "attributes", "style", old, null, null);
     });
     // Either spelling: `style.backgroundColor = x` then
     // `getPropertyValue("background-color")` finds it.
@@ -277,6 +281,7 @@ function __makeStyle(el) {
     def('removeProperty', function (name) {
         if (name == null) return '';
         var rawName = String(name).trim();
+        var old = __moCount && s._el ? __styleText(s) : null;
         var n = rawName.indexOf("--") === 0 ? rawName : rawName.toLowerCase();
         var k = __camelProp(n);
         var v = Object.prototype.hasOwnProperty.call(s, k) && typeof s[k] === 'string' ? s[k]
@@ -287,6 +292,7 @@ function __makeStyle(el) {
         delete s._imp[n];
         if (s._el && s._el.attributes) delete s._el.attributes.style;
         __domMutations++;
+        if (__moCount && s._el) __moNotify(s._el, "attributes", "style", old, null, null);
         return v;
     });
     def('getPropertyPriority', function (name) {
@@ -316,16 +322,28 @@ function __zippListenerVersion() { return __listenerVersion; }
 var ClassList = class ClassList {
     constructor(el) { this._el = el; }
     _list() { return (this._el.className||"").split(/\s+/).filter(function(x){return x;}); }
+    _commit(next) {
+        var old = this._el.className || "";
+        if (old === next) return;
+        this._el.className = next;
+        __domMutations++;
+        if (__moCount) __moNotify(this._el, "attributes", "class", old, null, null);
+    }
     get length() { return this._list().length; }
     item(index) { var l=this._list(); return index>=0&&index<l.length?l[index]:null; }
-    add() { var c=this._list(); for(var i=0;i<arguments.length;i++) if(c.indexOf(arguments[i])<0) c.push(arguments[i]); this._el.className=c.join(" "); }
-    remove() { var c=this._list(); for(var i=0;i<arguments.length;i++){var j=c.indexOf(arguments[i]);if(j>=0)c.splice(j,1);} this._el.className=c.join(" "); }
+    add() { var c=this._list(); for(var i=0;i<arguments.length;i++) if(c.indexOf(arguments[i])<0) c.push(arguments[i]); this._commit(c.join(" ")); }
+    remove() { var c=this._list(); for(var i=0;i<arguments.length;i++){var j=c.indexOf(arguments[i]);if(j>=0)c.splice(j,1);} this._commit(c.join(" ")); }
     contains(v) { return (" "+(this._el.className||"")+" ").indexOf(" "+v+" ")>=0; }
     toggle(v,f) { if(f!==undefined){f?this.add(v):this.remove(v);return !!f;} if(this.contains(v)){this.remove(v);return false;} this.add(v);return true; }
-    replace(oldCls,newCls) { var c=this._list(); var i=c.indexOf(oldCls); if(i<0) return false; c[i]=newCls; this._el.className=c.join(" "); return true; }
+    replace(oldCls,newCls) { var c=this._list(); var i=c.indexOf(oldCls); if(i<0) return false; c[i]=newCls; this._commit(c.join(" ")); return true; }
     get value() { return this._el.className||""; }
+    set value(v) { this._commit(String(v == null ? "" : v)); }
     toString() { return this._el.className||""; }
-    forEach(fn) { this._list().forEach(fn); }
+    forEach(fn, thisArg) { this._list().forEach(fn, thisArg); }
+    keys() { return this._list().keys(); }
+    values() { return this._list().values(); }
+    entries() { return this._list().entries(); }
+    [Symbol.iterator]() { return this._list()[Symbol.iterator](); }
 };
 
 // Live nodes by _id. The Rust event bridge identifies the clicked element by
@@ -415,6 +433,61 @@ var EventTarget = class EventTarget {
     }
 };
 
+// Low-level native tree mutations. Keeping these free of dynamic calls back
+// into `this.appendChild`/`this.insertBefore`/`parent.removeChild` prevents
+// infinite recursion when polyfills like ShadyDOM monkey-patch Node.prototype
+// and invoke `__shady_native_insertBefore(frag, null)` from `appendChild`.
+function __rawRemoveChild(parent, child) {
+    if (!parent || !child || !parent._childNodes) return child;
+    var was = __ceCount > 0 && child.isConnected;
+    for (var i = 0; i < parent._childNodes.length; i++) {
+        if (parent._childNodes[i] === child) {
+            parent._childNodes.splice(i, 1);
+            child._parentNode = null;
+            __markMut(parent);
+            if (__moCount) __moNotify(parent, "childList", null, null, [], [child]);
+            break;
+        }
+    }
+    if (was) __ceDisconnected(child);
+    return child;
+}
+function __rawAppendChild(parent, child) {
+    if (!child) return child;
+    if (child.nodeType === 11) {
+        var k = child._childNodes.slice();
+        for (var i = 0; i < k.length; i++) __rawAppendChild(parent, k[i]);
+        return child;
+    }
+    if (child._parentNode) __rawRemoveChild(child._parentNode, child);
+    child._parentNode = parent;
+    child.ownerDocument = parent.ownerDocument || parent;
+    parent._childNodes.push(child);
+    __markMut(parent);
+    if (__moCount) __moNotify(parent, "childList", null, null, [child], []);
+    __ceConnected(child);
+    return child;
+}
+function __rawInsertBefore(parent, n, ref) {
+    if (!n) return n;
+    __markMut(parent);
+    if (!ref) return __rawAppendChild(parent, n);
+    if (n.nodeType === 11) {
+        var k = n._childNodes.slice();
+        for (var i = 0; i < k.length; i++) __rawInsertBefore(parent, k[i], ref);
+        return n;
+    }
+    if (n._parentNode) __rawRemoveChild(n._parentNode, n);
+    var i = parent._findChild ? parent._findChild(ref) : parent._childNodes.indexOf(ref);
+    if (i >= 0) parent._childNodes.splice(i, 0, n);
+    else parent._childNodes.push(n);
+    n._parentNode = parent;
+    n.ownerDocument = parent.ownerDocument || parent;
+    if (__moCount) __moNotify(parent, "childList", null, null, [n], []);
+    __ceConnected(n);
+    return n;
+}
+
 var DOMNode = class DOMNode extends EventTarget {
     constructor(nodeType, nodeName) {
         super();
@@ -422,68 +495,60 @@ var DOMNode = class DOMNode extends EventTarget {
         if (nodeType === 1) { __nodesById[this._id] = this; __nodeCount++; }
         this.nodeType = nodeType;
         this.nodeName = nodeName || "";
-        this.childNodes = [];
-        this.parentNode = null;
+        this._childNodes = [];
+        this._parentNode = null;
         // Use _id-based lookup since VM indexOf may fail on object references
         this._findChild = function(target) {
-            for (var i = 0; i < this.childNodes.length; i++) {
-                if (this.childNodes[i] === target || (this.childNodes[i] && target && this.childNodes[i]._id === target._id)) return i;
+            var kids = this._childNodes;
+            for (var i = 0; i < kids.length; i++) {
+                if (kids[i] === target || (kids[i] && target && kids[i]._id === target._id)) return i;
             }
             return -1;
         };
         this.ownerDocument = null;
         this._listeners = {};
     }
-    get firstChild() { return this.childNodes[0] || null; }
-    get lastChild() { return this.childNodes[this.childNodes.length-1] || null; }
-    get nextSibling() { if(!this.parentNode) return null; var i=this.parentNode._findChild(this); return this.parentNode.childNodes[i+1]||null; }
-    get previousSibling() { if(!this.parentNode) return null; var i=this.parentNode._findChild(this); return i>0?this.parentNode.childNodes[i-1]:null; }
-    get parentElement() { return this.parentNode&&this.parentNode.nodeType===1?this.parentNode:null; }
-    get nextElementSibling() { var p=this.parentNode; if(!p) return null; for(var i=p._findChild(this)+1;i<p.childNodes.length;i++) if(p.childNodes[i].nodeType===1) return p.childNodes[i]; return null; }
-    get previousElementSibling() { var p=this.parentNode; if(!p) return null; for(var i=p._findChild(this)-1;i>=0;i--) if(p.childNodes[i].nodeType===1) return p.childNodes[i]; return null; }
+    get childNodes() { return this._childNodes; }
+    get parentNode() { return this._parentNode; }
+    get textContent() {
+        var t = "", kids = this._childNodes;
+        for (var i = 0; i < kids.length; i++) {
+            var c = kids[i];
+            if (c.nodeType === 3) t += c.data;
+            else if (c.nodeType === 1 || c.nodeType === 11) t += c.textContent;
+        }
+        return t;
+    }
+    set textContent(v) {
+        if (this._childNodes.length) __markMut(this);
+        while (this._childNodes.length) __rawRemoveChild(this, this._childNodes[this._childNodes.length - 1]);
+        if (v !== null && v !== undefined && String(v) !== "") __rawAppendChild(this, new Text(String(v)));
+    }
+    get firstChild() { return this._childNodes[0] || null; }
+    get lastChild() { return this._childNodes[this._childNodes.length-1] || null; }
+    get nextSibling() { var p=this._parentNode; if(!p) return null; var i=p._findChild(this); return p._childNodes[i+1]||null; }
+    get previousSibling() { var p=this._parentNode; if(!p) return null; var i=p._findChild(this); return i>0?p._childNodes[i-1]:null; }
+    get parentElement() { var p=this._parentNode; return p&&p.nodeType===1?p:null; }
+    get nextElementSibling() { var p=this._parentNode; if(!p) return null; for(var i=p._findChild(this)+1;i<p._childNodes.length;i++) if(p._childNodes[i].nodeType===1) return p._childNodes[i]; return null; }
+    get previousElementSibling() { var p=this._parentNode; if(!p) return null; for(var i=p._findChild(this)-1;i>=0;i--) if(p._childNodes[i].nodeType===1) return p._childNodes[i]; return null; }
     // ParentNode's element navigation, the document's included (GitHub reads
     // `document.firstElementChild.classList` as it starts).
-    get firstElementChild() { for(var i=0;i<this.childNodes.length;i++) if(this.childNodes[i].nodeType===1) return this.childNodes[i]; return null; }
-    get lastElementChild() { for(var i=this.childNodes.length-1;i>=0;i--) if(this.childNodes[i].nodeType===1) return this.childNodes[i]; return null; }
-    get childElementCount() { var n=0; for(var i=0;i<this.childNodes.length;i++) if(this.childNodes[i].nodeType===1) n++; return n; }
-    appendChild(child) {
-        if(!child) return child;
-        if(child.nodeType===11) { var k=child.childNodes.slice(); for(var i=0;i<k.length;i++) this.appendChild(k[i]); return child; }
-        if(child.parentNode) child.parentNode.removeChild(child);
-        child.parentNode=this; child.ownerDocument=this.ownerDocument||this;
-        this.childNodes.push(child);
-        __domMutations++;
-        __ceConnected(child);
-        return child;
-    }
-    removeChild(child) {
-        var was = __ceCount > 0 && child && child.isConnected;
-        for(var i=0;i<this.childNodes.length;i++){if(this.childNodes[i]===child){this.childNodes.splice(i,1);child.parentNode=null;__domMutations++;break;}}
-        if (was) __ceDisconnected(child);
-        return child;
-    }
-    insertBefore(n,ref) {
-        __domMutations++;
-
-
-        if(!ref) return this.appendChild(n);
-        if(n.nodeType===11){var k=n.childNodes.slice();for(var i=0;i<k.length;i++)this.insertBefore(k[i],ref);return n;}
-        if(n.parentNode) n.parentNode.removeChild(n);
-        var i=this._findChild(ref); if(i>=0) this.childNodes.splice(i,0,n); else this.childNodes.push(n);
-        n.parentNode=this; n.ownerDocument=this.ownerDocument||this;
-        __ceConnected(n);
-        return n;
-    }
+    get firstElementChild() { for(var i=0;i<this._childNodes.length;i++) if(this._childNodes[i].nodeType===1) return this._childNodes[i]; return null; }
+    get lastElementChild() { for(var i=this._childNodes.length-1;i>=0;i--) if(this._childNodes[i].nodeType===1) return this._childNodes[i]; return null; }
+    get childElementCount() { var n=0; for(var i=0;i<this._childNodes.length;i++) if(this._childNodes[i].nodeType===1) n++; return n; }
+    appendChild(child) { return __rawAppendChild(this, child); }
+    removeChild(child) { return __rawRemoveChild(this, child); }
+    insertBefore(n,ref) { return __rawInsertBefore(this, n, ref); }
     // ParentNode's append and prepend: nodes, or strings as text.
     append() { for(var i=0;i<arguments.length;i++){var n=arguments[i]; this.appendChild(n!==null&&typeof n==="object"?n:doc.createTextNode(String(n)));} }
-    prepend() { var first=this.childNodes[0]||null; for(var i=0;i<arguments.length;i++){var n=arguments[i]; n=n!==null&&typeof n==="object"?n:doc.createTextNode(String(n)); if(first) this.insertBefore(n,first); else this.appendChild(n);} }
+    prepend() { var first=this._childNodes[0]||null; for(var i=0;i<arguments.length;i++){var n=arguments[i]; n=n!==null&&typeof n==="object"?n:doc.createTextNode(String(n)); if(first) this.insertBefore(n,first); else this.appendChild(n);} }
     replaceChild(n,old) {
         var i=this._findChild(old);
         if(i>=0){
             var was = __ceCount > 0 && old.isConnected;
-            if(n.parentNode)n.parentNode.removeChild(n);
+            if(n._parentNode) __rawRemoveChild(n._parentNode, n);
             i=this._findChild(old);
-            this.childNodes[i]=n;n.parentNode=this;n.ownerDocument=this.ownerDocument||this;old.parentNode=null;__domMutations++;
+            this._childNodes[i]=n;n._parentNode=this;n.ownerDocument=this.ownerDocument||this;old._parentNode=null;__markMut(this);
             if (was) __ceDisconnected(old);
             __ceConnected(n);
         }
@@ -532,6 +597,7 @@ var DOMNode = class DOMNode extends EventTarget {
         insert(__eventHandlers[this._id][t], wrapped);
         if (signal && signal.addEventListener) signal.addEventListener("abort", function () { self_.removeEventListener(t, fn, opts); });
         __listenerVersion++;
+        if (__zippSeeded && this.nodeType === 1 && this !== doc.body && __inBody(this)) __bodyMutations++;
     }
     // Must also drop it from __eventHandlers: that registry is what Rust reads
     // to decide which nodes get events, so a listener removed here but left
@@ -616,35 +682,70 @@ var __attrMapProto = Object.create(Object.prototype, {
 Object.defineProperty(__attrMapProto, Symbol.iterator, {
     value: function () { var self = this; return __attrNames(this).map(function (n) { return __attrNode(self, n); })[Symbol.iterator](); }
 });
+function __makeAttrMap(el) {
+    var map = Object.create(__attrMapProto);
+    Object.defineProperty(map, "__el", { value: el });
+    return new Proxy(map, {
+        get: function (t, k) {
+            if (typeof k === "string" && k.length > 0) {
+                var c0 = k.charCodeAt(0);
+                if (c0 >= 48 && c0 <= 57 && /^(0|[1-9]\d*)$/.test(k)) {
+                    var name = __attrNames(t)[Number(k)];
+                    return name === undefined ? undefined : __attrNode(t, name);
+                }
+            }
+            var v = t[k];
+            return typeof v === "function" ? v.bind(t) : v;
+        }
+    });
+}
 
 var Element = class Element extends DOMNode {
     constructor(tag,ns) {
         super(1, tag.toUpperCase());
-        this.tagName = tag.toUpperCase();
-        this.localName = tag.toLowerCase();
-        this.namespaceURI = ns || "http://www.w3.org/1999/xhtml";
-        this.attributes = Object.create(__attrMapProto);
-        Object.defineProperty(this.attributes, "__el", { value: this });
-        this.style = __makeStyle(this);
-        this.className = "";
-        this.id = "";
-        this.dataset = _makeDataset(this);
-        this.classList = new ClassList(this);
-        this.offsetTop = 0; this.offsetLeft = 0;
-        this.clientTop = 0; this.clientLeft = 0;
-        // Form-control state. React reads `value`/`checked` back off the node
-        // when it commits a controlled input, and reconciles `<select>` through
-        // `element.options` — which is why a page with a select died in React's
-        // updateOptions with "Cannot read properties of undefined (reading
-        // 'length')" before this existed.
-        // value, selected and selectedIndex are accessors (below): a default
-        // set here went through them, and every option's value read "".
-        this.checked = false;
-        this.defaultValue = "";
-        this.defaultChecked = false;
-        this.defaultSelected = false;
-        this.disabled = false;
-        this.multiple = false;
+        var ltag = tag.toLowerCase();
+        // Define built-in DOM fields as own properties via defineProperty so
+        // custom element subclasses that define prototype setters (e.g.
+        // Polymer's `set style`/`set dataset`) never fire before `super()`
+        // finishes initializing subclass state.
+        Object.defineProperties(this, {
+            tagName: { value: tag.toUpperCase(), writable: true, enumerable: true, configurable: true },
+            localName: { value: ltag, writable: true, enumerable: true, configurable: true },
+            namespaceURI: { value: ns || "http://www.w3.org/1999/xhtml", writable: true, enumerable: true, configurable: true },
+            attributes: { value: __makeAttrMap(this), writable: true, enumerable: true, configurable: true },
+            style: { value: __makeStyle(this), writable: true, enumerable: true, configurable: true },
+            _className: { value: "", writable: true, configurable: true },
+            _domId: { value: "", writable: true, configurable: true },
+            dataset: { value: _makeDataset(this), writable: true, enumerable: true, configurable: true },
+            classList: { value: new ClassList(this), writable: true, enumerable: true, configurable: true },
+            offsetTop: { value: 0, writable: true, enumerable: true, configurable: true },
+            offsetLeft: { value: 0, writable: true, enumerable: true, configurable: true },
+            clientTop: { value: 0, writable: true, enumerable: true, configurable: true },
+            clientLeft: { value: 0, writable: true, enumerable: true, configurable: true },
+        });
+        if (ltag === "input" || ltag === "button" || ltag === "select" || ltag === "option" || ltag === "textarea" || ltag === "fieldset" || ltag === "optgroup") {
+            this.checked = false;
+            this.defaultValue = "";
+            this.defaultChecked = false;
+            this.defaultSelected = false;
+            this.disabled = false;
+            this.multiple = false;
+        }
+    }
+
+    get className() { return this._className || ""; }
+    set className(v) {
+        v = v == null ? "" : String(v);
+        if (this._className !== v) __markMut(this);
+        this._className = v;
+        this.attributes["class"] = v;
+    }
+    get id() { return this._domId || ""; }
+    set id(v) {
+        v = v == null ? "" : String(v);
+        if (this._domId !== v) __markMut(this);
+        this._domId = v;
+        this.attributes["id"] = v;
     }
 
     /// The `<option>` elements under a `<select>`, in document order.
@@ -652,10 +753,10 @@ var Element = class Element extends DOMNode {
         if (this.tagName !== "SELECT") return undefined;
         return this.getElementsByTagName("option");
     }
-    get textContent() { var t=""; for(var i=0;i<this.childNodes.length;i++){var c=this.childNodes[i]; if(c.nodeType===3)t+=c.data; else if(c.nodeType===1)t+=c.textContent;} return t; }
-    set textContent(v) { if(this.childNodes.length) __domMutations++; this.childNodes=[]; if(v) this.appendChild(new Text(String(v))); }
+    get textContent() { var t=""; for(var i=0;i<this._childNodes.length;i++){var c=this._childNodes[i]; if(c.nodeType===3)t+=c.data; else if(c.nodeType===1)t+=c.textContent;} return t; }
+    set textContent(v) { if(this._childNodes.length) __markMut(this); while(this._childNodes.length) __rawRemoveChild(this, this._childNodes[this._childNodes.length-1]); if(v !== null && v !== undefined && String(v) !== "") __rawAppendChild(this, new Text(String(v))); }
     get innerHTML() { return __sc(this); }
-    set innerHTML(v) { if(this.childNodes.length) __domMutations++; this.childNodes=[]; if(v) this.appendChild(__markupText(String(v))); }
+    set innerHTML(v) { if(this._childNodes.length) __markMut(this); while(this._childNodes.length) __rawRemoveChild(this, this._childNodes[this._childNodes.length-1]); if(v) __rawAppendChild(this, __markupText(String(v))); }
     get outerHTML() { return __sn(this); }
     // As textContent: the shim lays out no lines for innerText to read its
     // breaks from. Monaco sets its labels' text this way.
@@ -669,17 +770,19 @@ var Element = class Element extends DOMNode {
     // turned a harmless call into a dead page.
     setAttribute(n,v) {
         n=String(n); v=String(v);
-        var old = __ceCount > 0 ? this.getAttribute(n) : null;
-        if(this.attributes[n]!==v) __domMutations++; this.attributes[n]=v; if(n==="class")this.className=v; if(n==="id")this.id=v; if(n==="style"){__clearStyle(this.style);this._ps(v);}
+        var old = (__ceCount > 0 || __moCount > 0) ? this.getAttribute(n) : null;
+        if(this.attributes[n]!==v) __markMut(this); this.attributes[n]=v; if(n==="class")this._className=v; if(n==="id")this._domId=v; if(n==="style"){__clearStyle(this.style);this._ps(v);}
+        if (__moCount > 0) __moNotify(this, "attributes", n, old, null, null);
         if (__ceCount > 0) __ceAttributeChanged(this, n, old, v);
     }
-    getAttribute(n) { n=String(n); if(n==="class")return this.className||null; if(n==="id")return this.id||null; if(n==="style"){ if(Object.prototype.hasOwnProperty.call(this.attributes,"style"))return this.attributes.style; var st=__styleText(this.style); return st||null; } return Object.prototype.hasOwnProperty.call(this.attributes,n)?this.attributes[n]:null; }
+    getAttribute(n) { n=String(n); if(n==="class")return Object.prototype.hasOwnProperty.call(this.attributes,"class")?this.attributes["class"]:(this._className||null); if(n==="id")return Object.prototype.hasOwnProperty.call(this.attributes,"id")?this.attributes["id"]:(this._domId||null); if(n==="style"){ if(Object.prototype.hasOwnProperty.call(this.attributes,"style"))return this.attributes.style; var st=__styleText(this.style); return st||null; } return Object.prototype.hasOwnProperty.call(this.attributes,n)?this.attributes[n]:null; }
     removeAttribute(n) {
         n=String(n);
         var old = this.getAttribute(n);
         if(old===null) return;
-        __domMutations++; delete this.attributes[n];
-        if(n==="class")this.className=""; if(n==="id")this.id=""; if(n==="style")__clearStyle(this.style);
+        __markMut(this); delete this.attributes[n];
+        if(n==="class")this._className=""; if(n==="id")this._domId=""; if(n==="style")__clearStyle(this.style);
+        if (__moCount > 0) __moNotify(this, "attributes", n, old, null, null);
         if (__ceCount > 0) __ceAttributeChanged(this, n, old, null);
     }
     hasAttribute(n) { n=String(n); return Object.prototype.hasOwnProperty.call(this.attributes,n)||!!(n==="class"&&this.className)||!!(n==="id"&&this.id)||!!(n==="style"&&__styleText(this.style)); }
@@ -746,8 +849,8 @@ var Element = class Element extends DOMNode {
     toggleAttribute(name,force) { if(force!==undefined){if(force)this.setAttribute(name,"");else this.removeAttribute(name);return force;} if(this.hasAttribute(name)){this.removeAttribute(name);return false;} this.setAttribute(name,""); return true; }
 };
 
-var Text = class Text extends DOMNode {
-    constructor(d) { super(3,"#text"); this._d=String(d||""); }
+var CharacterData = class CharacterData extends DOMNode {
+    constructor(type, name, d) { super(type, name); this._d = String(d == null ? "" : d); }
     // `data`, `nodeValue` and `textContent` are one text, as in the DOM. They
     // were three properties, of which only `data` was drawn: React changes a
     // text node through `nodeValue` (a count going from 3 to 4), and nothing
@@ -758,27 +861,71 @@ var Text = class Text extends DOMNode {
     set nodeValue(v) { this.data = v; }
     get textContent() { return this._d; }
     set textContent(v) { this.data = v; }
-    cloneNode() { var t=new Text(this.data); t._html=this._html; return t; }
-    get length() { return this.data.length; }
+    get length() { return this._d.length; }
+    get previousElementSibling() { var n = this.previousSibling; while (n && n.nodeType !== 1) n = n.previousSibling; return n || null; }
+    get nextElementSibling() { var n = this.nextSibling; while (n && n.nodeType !== 1) n = n.nextSibling; return n || null; }
+    before() { if (!this.parentNode) return; for (var i = 0; i < arguments.length; i++) this.parentNode.insertBefore(typeof arguments[i] === "string" ? doc.createTextNode(arguments[i]) : arguments[i], this); }
+    after() { if (!this.parentNode) return; var ref = this.nextSibling; for (var i = 0; i < arguments.length; i++) { var n = typeof arguments[i] === "string" ? doc.createTextNode(arguments[i]) : arguments[i]; if (ref) this.parentNode.insertBefore(n, ref); else this.parentNode.appendChild(n); } }
+    substringData(offset, count) { return this._d.slice(offset, offset + count); }
+    appendData(s) { this.data = this._d + String(s); }
+    insertData(offset, s) { this.data = this._d.slice(0, offset) + String(s) + this._d.slice(offset); }
+    deleteData(offset, count) { this.data = this._d.slice(0, offset) + this._d.slice(offset + count); }
+    replaceData(offset, count, s) { this.data = this._d.slice(0, offset) + String(s) + this._d.slice(offset + count); }
+};
+var Text = class Text extends CharacterData {
+    constructor(d) { super(3, "#text", d); }
+    cloneNode() { var t = new Text(this.data); t._html = this._html; return t; }
+    get wholeText() { return this._d; }
+    splitText(offset) {
+        var tail = new Text(this._d.slice(offset));
+        tail.ownerDocument = this.ownerDocument;
+        this.data = this._d.slice(0, offset);
+        if (this.parentNode) this.parentNode.insertBefore(tail, this.nextSibling);
+        return tail;
+    }
+};
+var CDATASection = class CDATASection extends Text {
+    constructor(d) { super(d); this.nodeType = 4; this.nodeName = "#cdata-section"; }
+    cloneNode() { return new CDATASection(this.data); }
 };
 // The shim has no HTML parser: `innerHTML` and `insertAdjacentHTML` keep their
 // markup as a single text node that the serialisers emit verbatim, and the real
 // parser turns it into elements downstream. The `_html` mark is what separates
 // that from genuine text (`textContent`, `createTextNode`), which must be
 // escaped -- without it, `<b>` set through innerHTML rendered as literal tags.
-function __markupText(html) { var t=new Text(html); t._html=true; return t; }
-var Comment = class Comment extends DOMNode {
-    constructor(d) { super(8,"#comment"); this.data=String(d||""); }
+function __markupText(html) { var t = new Text(html); t._html = true; return t; }
+var Comment = class Comment extends CharacterData {
+    constructor(d) { super(8, "#comment", d); }
+    cloneNode() { return new Comment(this.data); }
+};
+var ProcessingInstruction = class ProcessingInstruction extends CharacterData {
+    constructor(target, d) { super(7, String(target || ""), d); this.target = String(target || ""); }
+    cloneNode() { return new ProcessingInstruction(this.target, this.data); }
+};
+var DocumentType = class DocumentType extends DOMNode {
+    constructor(name, publicId, systemId) {
+        super(10, String(name || "html"));
+        this.name = String(name || "html");
+        this.publicId = String(publicId || "");
+        this.systemId = String(systemId || "");
+    }
+    cloneNode() { return new DocumentType(this.name, this.publicId, this.systemId); }
 };
 var DocumentFragment = class DocumentFragment extends DOMNode {
     constructor() { super(11,"#document-fragment"); }
     // ParentNode, as an element has it: a fragment, and a shadow root, are
     // filled and searched the same way.
     get children() { return this.childNodes.filter(function(c){return c.nodeType===1;}); }
+    get firstElementChild() { for(var i=0;i<this.childNodes.length;i++) if(this.childNodes[i].nodeType===1) return this.childNodes[i]; return null; }
+    get lastElementChild() { for(var i=this.childNodes.length-1;i>=0;i--) if(this.childNodes[i].nodeType===1) return this.childNodes[i]; return null; }
+    get childElementCount() { var n=0; for(var i=0;i<this.childNodes.length;i++) if(this.childNodes[i].nodeType===1) n++; return n; }
+    append() { for(var i=0;i<arguments.length;i++){ var n=arguments[i]; this.appendChild(typeof n==="string"?doc.createTextNode(n):n); } }
+    prepend() { var first=this.firstChild; for(var i=0;i<arguments.length;i++){ var n=arguments[i]; this.insertBefore(typeof n==="string"?doc.createTextNode(n):n, first); } }
     replaceChildren() { while(this.childNodes.length) this.removeChild(this.childNodes[this.childNodes.length-1]); for(var i=0;i<arguments.length;i++){ var n=arguments[i]; this.appendChild(typeof n==="string"?doc.createTextNode(n):n); } }
     querySelector(s) { return _qs(this,s,false); }
     querySelectorAll(s) { return _qs(this,s,true); }
     getElementById(id) { var r=null; (function w(n){for(var i=0;i<n.childNodes.length&&!r;i++){var c=n.childNodes[i]; if(c.nodeType===1&&c.id===id){r=c;return;} w(c);}})(this); return r; }
+    cloneNode(deep) { var c=new DocumentFragment(); c.ownerDocument=this.ownerDocument; if(deep) for(var i=0;i<this.childNodes.length;i++) c.appendChild(this.childNodes[i].cloneNode(true)); return c; }
 };
 
 // `Node` is the base of the node hierarchy, which here is DOMNode — Element,
@@ -934,7 +1081,30 @@ var HTMLProgressElement = class HTMLProgressElement extends HTMLElement {};
 var HTMLQuoteElement = class HTMLQuoteElement extends HTMLElement {};
 var HTMLScriptElement = class HTMLScriptElement extends HTMLElement {};
 var HTMLSelectElement = class HTMLSelectElement extends HTMLElement {};
-var HTMLSlotElement = class HTMLSlotElement extends HTMLElement {};
+var HTMLSlotElement = class HTMLSlotElement extends HTMLElement {
+    get name() { return this.getAttribute("name") || ""; }
+    set name(v) { this.setAttribute("name", String(v)); }
+    assignedNodes(opts) {
+        var root = this.getRootNode ? this.getRootNode() : null;
+        var host = root && root.host;
+        var slotName = this.name;
+        var out = [];
+        if (host && host.childNodes) {
+            for (var i = 0; i < host.childNodes.length; i++) {
+                var c = host.childNodes[i];
+                var target = c.nodeType === 1 ? (c.getAttribute("slot") || "") : "";
+                if (target === slotName) out.push(c);
+            }
+        }
+        if (!out.length && opts && opts.flatten) {
+            for (var j = 0; j < this.childNodes.length; j++) out.push(this.childNodes[j]);
+        }
+        return out;
+    }
+    assignedElements(opts) {
+        return this.assignedNodes(opts).filter(function (n) { return n.nodeType === 1; });
+    }
+};
 var HTMLSourceElement = class HTMLSourceElement extends HTMLElement {};
 var HTMLSpanElement = class HTMLSpanElement extends HTMLElement {};
 var HTMLStyleElement = class HTMLStyleElement extends HTMLElement {};
@@ -968,15 +1138,64 @@ var HTMLDialogElement = class HTMLDialogElement extends HTMLElement {
         if (!ev.defaultPrevented) this.close(value);
     }
 };
+function __zippSubmitForm(form, submitter) {
+    var action = (submitter && typeof submitter.getAttribute === "function" && submitter.getAttribute("formaction"))
+        || form.getAttribute("action") || "";
+    var method = String((submitter && typeof submitter.getAttribute === "function" && submitter.getAttribute("formmethod"))
+        || form.getAttribute("method") || "get").toLowerCase();
+    var target;
+    try { target = new URL(action || location.href, __baseURI()); } catch (e) { return; }
+    if (target.protocol !== "http:" && target.protocol !== "https:" && target.protocol !== "file:") return;
+    var pairs = [];
+    var els = form.elements;
+    for (var i = 0; i < els.length; i++) {
+        var el = els[i];
+        if (!el || el.disabled || el.hasAttribute("disabled")) continue;
+        var name = el.getAttribute("name");
+        if (!name) continue;
+        var tag = el.localName;
+        if (tag === "fieldset" || tag === "object" || tag === "output") continue;
+        var t = (el.getAttribute("type") || "").toLowerCase();
+        if (tag === "button" || (tag === "input" && (t === "submit" || t === "button" || t === "reset" || t === "image"))) {
+            if (el !== submitter) continue;
+            pairs.push([name, el.value != null ? String(el.value) : ""]);
+            continue;
+        }
+        if (tag === "input" && (t === "checkbox" || t === "radio")) {
+            if (!el.checked) continue;
+            pairs.push([name, el.getAttribute("value") !== null ? String(el.getAttribute("value")) : "on"]);
+            continue;
+        }
+        if (tag === "select") {
+            var opts = el.querySelectorAll("option");
+            var added = false;
+            for (var oi = 0; oi < opts.length; oi++) {
+                var o = opts[oi];
+                if (o.selected || o.hasAttribute("selected")) {
+                    pairs.push([name, o.getAttribute("value") !== null ? String(o.getAttribute("value")) : String(o.textContent || "")]);
+                    added = true;
+                    if (!el.hasAttribute("multiple")) break;
+                }
+            }
+            if (!added && el.value != null && el.value !== "") pairs.push([name, String(el.value)]);
+            continue;
+        }
+        pairs.push([name, el.value != null ? String(el.value) : (el.getAttribute("value") || "")]);
+    }
+    if (method !== "post") {
+        var sp = new URLSearchParams();
+        for (var pi = 0; pi < pairs.length; pi++) sp.append(pairs[pi][0], pairs[pi][1]);
+        target.search = sp.toString();
+        location.assign(target.href);
+    }
+}
 var HTMLFormElement = class HTMLFormElement extends HTMLElement {
-    // A submit the page can cancel, as a submit button's click is. There is
-    // no navigation to follow it: a form that is not handled in script goes
-    // nowhere.
     requestSubmit(submitter) {
         var ev = new SubmitEvent("submit", { bubbles: true, cancelable: true, submitter: submitter || null });
         this.dispatchEvent(ev);
+        if (!ev.defaultPrevented) __zippSubmitForm(this, submitter || null);
     }
-    submit() {}
+    submit() { __zippSubmitForm(this, null); }
     reset() { this.dispatchEvent(new Event("reset", { bubbles: true, cancelable: true })); }
     checkValidity() {
         var els = this.elements;
@@ -1002,20 +1221,22 @@ var __htmlInterfaces = { a: HTMLAnchorElement, area: HTMLAreaElement, audio: HTM
 // document's base, as in a browser (GitHub hands a `<link>`'s `href` to
 // `new URL`), and a link's parts -- `a.pathname`, `a.search`... -- are its
 // URL's. (`src` stays as written: see webgl_shim.js.)
-function __baseURI() {
-    var base = null, head = doc.head;
+function __baseURI(ownerDoc) {
+    var d = ownerDoc || doc;
+    var base = null, head = d.head;
     for (var i = 0; head && i < head.childNodes.length; i++) {
         var c = head.childNodes[i];
         if (c.localName === "base" && c.getAttribute("href") !== null) { base = c.getAttribute("href"); break; }
     }
-    if (base === null) return location.href;
-    try { return new URL(base, location.href).href; } catch (e) { return location.href; }
+    var fallback = d === doc ? location.href : (d._url || "about:blank");
+    if (base === null) return fallback;
+    try { return new URL(base, fallback).href; } catch (e) { return fallback; }
 }
-Object.defineProperty(DOMNode.prototype, "baseURI", { configurable: true, get: function () { return __baseURI(); } });
+Object.defineProperty(DOMNode.prototype, "baseURI", { configurable: true, get: function () { return __baseURI(this.nodeType === 9 ? this : this.ownerDocument); } });
 function __absoluteAttr(el, attr) {
     var v = el.getAttribute(attr);
     if (v === null) return "";
-    try { return new URL(v, __baseURI()).href; } catch (e) { return v; }
+    try { return new URL(v, __baseURI(el.ownerDocument)).href; } catch (e) { return v; }
 }
 [HTMLAnchorElement, HTMLAreaElement, HTMLLinkElement, HTMLBaseElement].forEach(function (cls) {
     Object.defineProperty(cls.prototype, "href", {
@@ -1047,60 +1268,104 @@ Object.defineProperty(HTMLFormElement.prototype, "action", {
 
     // Build a standalone Document hydrated from Rust's html5ever parser.
     var __NS_MAP = { s: "http://www.w3.org/2000/svg", m: "http://www.w3.org/1998/Math/MathML" };
-    function __hydrateTree(n, parent, ownerDoc) {
+    function __hydrateTree(n, parent, ownerDoc, inert) {
         if (typeof n === "string") {
             var t = doc.createTextNode(n);
             t.ownerDocument = ownerDoc;
             parent.appendChild(t);
             return;
         }
-        var el = n[3] ? doc.createElementNS(__NS_MAP[n[3]], n[0]) : doc.createElement(n[0]);
+        var el;
+        if (n[3]) {
+            el = doc.createElementNS(__NS_MAP[n[3]], n[0]);
+        } else if (inert) {
+            var tagName = String(n[0]).toLowerCase();
+            el = new (__htmlInterfaces[tagName] || __HTMLElementClass)(tagName);
+        } else {
+            el = doc.createElement(n[0]);
+        }
         el.ownerDocument = ownerDoc;
         var a = n[1], c = n[2];
         for (var i = 0; i < a.length; i += 2) el.setAttribute(a[i], a[i + 1]);
-        for (var j = 0; j < c.length; j++) __hydrateTree(c[j], el, ownerDoc);
+        var isTpl = el.localName === "template";
+        var target = isTpl ? el.content : el;
+        for (var j = 0; j < c.length; j++) __hydrateTree(c[j], target, ownerDoc, inert || isTpl);
         parent.appendChild(el);
     }
+    function __createDetachedDocument(kind, withHtmlSkeleton) {
+        var d = new Document(9, "#document");
+        d._url = "about:blank";
+        d.contentType = kind || "text/html";
+        d.compatMode = "CSS1Compat";
+        d.characterSet = "UTF-8";
+        d.readyState = "complete";
+        d.defaultView = null;
+        if (withHtmlSkeleton !== false) {
+            d.documentElement = new HTMLHtmlElement("html");
+            d.head = new HTMLHeadElement("head");
+            d.body = new HTMLBodyElement("body");
+            d.documentElement.ownerDocument = d;
+            d.head.ownerDocument = d;
+            d.body.ownerDocument = d;
+            d.documentElement.appendChild(d.head);
+            d.documentElement.appendChild(d.body);
+            d.appendChild(d.documentElement);
+        } else {
+            d.documentElement = null;
+            d.head = null;
+            d.body = null;
+        }
+        Object.defineProperty(d, "title", {
+            configurable: true,
+            get: function () {
+                var t = d.querySelector("title");
+                return t ? (t.textContent || "").trim() : "";
+            },
+            set: function (v) {
+                var t = d.querySelector("title");
+                if (!t && d.head) { t = d.createElement("title"); d.head.appendChild(t); }
+                if (t) t.textContent = String(v);
+            }
+        });
+        return d;
+    }
+    var DOMImplementation = class DOMImplementation {
+        createHTMLDocument(title) {
+            var d = __createDetachedDocument("text/html", true);
+            d.implementation = this;
+            if (title !== undefined) {
+                var t = d.createElement("title");
+                t.textContent = String(title);
+                d.head.appendChild(t);
+            }
+            return d;
+        }
+        createDocument(namespaceURI, qualifiedName, doctype) {
+            var kind = namespaceURI === "http://www.w3.org/1999/xhtml" ? "application/xhtml+xml"
+                : (namespaceURI === "http://www.w3.org/2000/svg" ? "image/svg+xml" : "application/xml");
+            var d = __createDetachedDocument(kind, false);
+            d.implementation = this;
+            if (doctype) { doctype.ownerDocument = d; d.appendChild(doctype); }
+            if (qualifiedName) {
+                var root = namespaceURI ? d.createElementNS(namespaceURI, qualifiedName) : d.createElement(qualifiedName);
+                d.documentElement = root;
+                d.appendChild(root);
+            }
+            return d;
+        }
+        createDocumentType(qualifiedName, publicId, systemId) {
+            return new DocumentType(qualifiedName, publicId, systemId);
+        }
+        hasFeature() { return true; }
+    };
     var DOMParser = class DOMParser {
         parseFromString(str, type) {
             var kind = String(type || "text/html").toLowerCase();
             if (kind !== "text/html" && kind !== "text/xml" && kind !== "application/xml" && kind !== "application/xhtml+xml" && kind !== "image/svg+xml") {
                 throw new TypeError("Failed to execute 'parseFromString' on 'DOMParser': The provided value '" + type + "' is not a valid enum value of type SupportedType.");
             }
-            var parsedDoc = new Document(9, "#document");
-            parsedDoc.contentType = kind;
-            parsedDoc.compatMode = "CSS1Compat";
-            parsedDoc.documentElement = new HTMLHtmlElement("html");
-            parsedDoc.head = new HTMLHeadElement("head");
-            parsedDoc.body = new HTMLBodyElement("body");
-            parsedDoc.documentElement.ownerDocument = parsedDoc;
-            parsedDoc.head.ownerDocument = parsedDoc;
-            parsedDoc.body.ownerDocument = parsedDoc;
-            parsedDoc.documentElement.appendChild(parsedDoc.head);
-            parsedDoc.documentElement.appendChild(parsedDoc.body);
-            parsedDoc.appendChild(parsedDoc.documentElement);
-            parsedDoc.querySelector = function (s) { return _qs(parsedDoc, s, false); };
-            parsedDoc.querySelectorAll = function (s) { return _qs(parsedDoc, s, true); };
-            parsedDoc.getElementById = function (id) { return _qs(parsedDoc, "#" + id, false); };
-            parsedDoc.getElementsByTagName = function (t) { return parsedDoc.documentElement.getElementsByTagName(t); };
-            parsedDoc.getElementsByClassName = function (c) { return parsedDoc.documentElement.getElementsByClassName(c); };
-            parsedDoc.createElement = function (t) { var e = doc.createElement(t); e.ownerDocument = parsedDoc; return e; };
-            parsedDoc.createElementNS = function (ns, t) { var e = doc.createElementNS(ns, t); e.ownerDocument = parsedDoc; return e; };
-            parsedDoc.createTextNode = function (s) { var t = doc.createTextNode(s); t.ownerDocument = parsedDoc; return t; };
-            parsedDoc.createComment = function (s) { var c = doc.createComment(s); c.ownerDocument = parsedDoc; return c; };
-            parsedDoc.createDocumentFragment = function () { var f = doc.createDocumentFragment(); f.ownerDocument = parsedDoc; return f; };
-            Object.defineProperty(parsedDoc, "title", {
-                configurable: true,
-                get: function () {
-                    var t = parsedDoc.querySelector("title");
-                    return t ? (t.textContent || "").trim() : "";
-                },
-                set: function (v) {
-                    var t = parsedDoc.querySelector("title");
-                    if (!t) { t = parsedDoc.createElement("title"); parsedDoc.head.appendChild(t); }
-                    t.textContent = String(v);
-                }
-            });
+            var parsedDoc = __createDetachedDocument(kind, true);
+            parsedDoc.implementation = doc.implementation;
             var raw = "";
             try { raw = __zippHostCall("parse_html", String(str == null ? "" : str)); } catch (e) {}
             if (raw) {
@@ -1150,7 +1415,7 @@ var ShadowRoot = class ShadowRoot extends DocumentFragment {
         __shadowRootsById[this._id] = this;
     }
     get innerHTML() { return __sc(this); }
-    set innerHTML(v) { this.childNodes = []; if (v) this.appendChild(__markupText(String(v))); __domMutations++; }
+    set innerHTML(v) { while (this._childNodes.length) __rawRemoveChild(this, this._childNodes[this._childNodes.length - 1]); if (v) __rawAppendChild(this, __markupText(String(v))); __domMutations++; }
     get activeElement() { var a = doc.activeElement; return a && this.contains(a) ? a : null; }
     getElementById(id) { function w(n) { for (var i = 0; i < n.childNodes.length; i++) { var c = n.childNodes[i]; if (c.nodeType === 1 && c.id === id) return c; var f = w(c); if (f) return f; } return null; } return w(this); }
     querySelector(s) { return _qs(this, s, false); }
@@ -1197,19 +1462,64 @@ HTMLElement.prototype.attachInternals = function () {
 
 // A template's contents: a fragment of their own, as parsed. The page's
 // markup gives them as the template's children, which move there when they
-// are first asked for.
+// are first asked for. Setting `template.innerHTML` parses the markup in
+// HTML5 template mode (preserving `<style>`, `<tr>`, `<option>`, and nested
+// `<template>` order) into `template.content`, and `cloneNode(true)` clones
+// `content` too, as Polymer / Web Components rely on both.
+function __hydrateTemplateHtml(tpl, html) {
+    var frag = tpl.content;
+    while (frag.childNodes.length) frag.removeChild(frag.childNodes[frag.childNodes.length - 1]);
+    var s = String(html == null ? "" : html);
+    if (!s) return;
+    if (s.indexOf("<") < 0 && s.indexOf("&") < 0) {
+        frag.appendChild((tpl.ownerDocument || doc).createTextNode(s));
+        return;
+    }
+    var raw = "";
+    try { raw = __zippHostCall("parse_html", "<template>" + s + "</template>"); } catch (e) {}
+    if (raw) {
+        try {
+            var tree = JSON.parse(raw);
+            var nodes = (tree[2] && tree[2].length && tree[2][0] && tree[2][0][0] === "template")
+                ? tree[2][0][2]
+                : (tree[1] && tree[1].length && tree[1][0] && tree[1][0][0] === "template" ? tree[1][0][2] : null);
+            if (nodes) {
+                var owner = tpl.ownerDocument || doc;
+                for (var i = 0; i < nodes.length; i++) __hydrateTree(nodes[i], frag, owner, true);
+                return;
+            }
+        } catch (e) {}
+    }
+    frag.appendChild(__markupText(s));
+}
 Object.defineProperty(HTMLTemplateElement.prototype, "content", {
     configurable: true,
     get: function () {
         if (!this._content) {
             this._content = new DocumentFragment();
-            this._content.ownerDocument = doc;
+            this._content.ownerDocument = this.ownerDocument || doc;
             var kids = this.childNodes.slice();
             for (var i = 0; i < kids.length; i++) this._content.appendChild(kids[i]);
         }
         return this._content;
     }
 });
+Object.defineProperty(HTMLTemplateElement.prototype, "innerHTML", {
+    configurable: true,
+    get: function () { return __sc(this.content); },
+    set: function (v) { __hydrateTemplateHtml(this, v); }
+});
+HTMLTemplateElement.prototype.cloneNode = function (deep) {
+    var copy = Element.prototype.cloneNode.call(this, false);
+    if (deep) {
+        var src = this.content;
+        var dst = copy.content;
+        for (var i = 0; i < src.childNodes.length; i++) {
+            dst.appendChild(src.childNodes[i].cloneNode(true));
+        }
+    }
+    return copy;
+};
 
 // The document's fonts. The page's are loaded with it, so `ready` has
 // settled: GitHub waits on it before fading its hero in.
@@ -1325,6 +1635,7 @@ function __ceMake(def) {
         return new HTMLUnknownElement(def.name);
     }
 }
+var __ceConnectedSet = new WeakSet();
 function __ceUpgrade(el) {
     if (__ceDefinitions.has(el) || el.namespaceURI !== "http://www.w3.org/1999/xhtml") return;
     var def = customElements._defs[el.localName];
@@ -1338,18 +1649,33 @@ function __ceUpgrade(el) {
         var v = el.getAttribute(def.observed[i]);
         if (v !== null) __ceCall(el, "attributeChangedCallback", [def.observed[i], null, v]);
     }
-    if (el.isConnected) __ceCall(el, "connectedCallback");
+    if (el.isConnected) {
+        __ceConnectedSet.add(el);
+        __ceCall(el, "connectedCallback");
+    }
 }
 // A node joined the document: elements already custom are told so, and those
 // whose name is defined are upgraded.
 function __ceConnected(node) {
     if (__ceCount === 0 || !node || !node.isConnected) return;
     __ceWalk(node, function (el) {
-        if (__ceDefinitions.has(el)) __ceCall(el, "connectedCallback"); else __ceUpgrade(el);
+        if (__ceDefinitions.has(el)) {
+            if (!__ceConnectedSet.has(el)) {
+                __ceConnectedSet.add(el);
+                __ceCall(el, "connectedCallback");
+            }
+        } else {
+            __ceUpgrade(el);
+        }
     });
 }
 function __ceDisconnected(node) {
-    __ceWalk(node, function (el) { if (__ceDefinitions.has(el)) __ceCall(el, "disconnectedCallback"); });
+    __ceWalk(node, function (el) {
+        if (__ceDefinitions.has(el) && __ceConnectedSet.has(el)) {
+            __ceConnectedSet.delete(el);
+            __ceCall(el, "disconnectedCallback");
+        }
+    });
 }
 function __ceAttributeChanged(el, name, old, value) {
     var def = __ceDefinitions.get(el);
@@ -1660,6 +1986,7 @@ var DOMException = class DOMException extends Error {
 
 var Event = class Event {
     constructor(type,opts) { opts=opts||{}; this.type=type; this.bubbles=!!opts.bubbles; this.cancelable=!!opts.cancelable; this.composed=!!opts.composed; this.target=null; this.currentTarget=null; this.defaultPrevented=false; this._stopped=false; this._immStopped=false; }
+    initEvent(type, bubbles, cancelable) { this.type=String(type); this.bubbles=!!bubbles; this.cancelable=!!cancelable; }
     preventDefault() { if (this.cancelable !== false) this.defaultPrevented=true; }
     stopPropagation() { this._stopped=true; }
     stopImmediatePropagation() { this._stopped=true; this._immStopped=true; }
@@ -1672,8 +1999,19 @@ var Event = class Event {
 };
 var CustomEvent = class CustomEvent extends Event {
     constructor(type,opts) { super(type,opts); this.detail=opts?opts.detail:null; }
+    initCustomEvent(type, bubbles, cancelable, detail) {
+        this.initEvent(type, bubbles, cancelable);
+        this.detail = detail === undefined ? null : detail;
+    }
 };
 Event.NONE = 0; Event.CAPTURING_PHASE = 1; Event.AT_TARGET = 2; Event.BUBBLING_PHASE = 3;
+var NodeFilter = {
+    FILTER_ACCEPT: 1, FILTER_REJECT: 2, FILTER_SKIP: 3,
+    SHOW_ALL: 0xFFFFFFFF, SHOW_ELEMENT: 1, SHOW_ATTRIBUTE: 2, SHOW_TEXT: 4,
+    SHOW_CDATA_SECTION: 8, SHOW_ENTITY_REFERENCE: 16, SHOW_ENTITY: 32,
+    SHOW_PROCESSING_INSTRUCTION: 64, SHOW_COMMENT: 128, SHOW_DOCUMENT: 256,
+    SHOW_DOCUMENT_TYPE: 512, SHOW_DOCUMENT_FRAGMENT: 1024, SHOW_NOTATION: 2048
+};
 
 // Event's family, for pages that make their own (`new KeyboardEvent(...)`),
 // build on one (monaco declares `class extends UIEvent` as it loads, and
@@ -1803,11 +2141,138 @@ function __nativeEventClass(type) {
     return Event;
 }
 
+var __moObservers = [];
+var __moCount = 0;
+var __moScheduled = false;
+function __moFlush() {
+    __moScheduled = false;
+    var list = __moObservers.slice();
+    for (var i = 0; i < list.length; i++) {
+        var obs = list[i];
+        if (obs._records.length === 0) continue;
+        var recs = obs._records.splice(0, obs._records.length);
+        try { obs._cb.call(obs, recs, obs); }
+        catch (e) { console.error("Uncaught (in MutationObserver) " + ((e && (e.stack || e.message)) || e)); }
+    }
+}
+function __moNotify(target, type, attrName, oldValue, addedNodes, removedNodes) {
+    if (__moCount === 0 || !target) return;
+    var queued = false;
+    for (var i = 0; i < __moObservers.length; i++) {
+        var obs = __moObservers[i];
+        var matched = false;
+        var wantOld = false;
+        for (var j = 0; j < obs._regs.length; j++) {
+            var reg = obs._regs[j];
+            var o = reg.opts;
+            if (type === "attributes") {
+                if (!o.attributes) continue;
+                if (o.attributeFilter && o.attributeFilter.indexOf(attrName) < 0) continue;
+            } else if (type === "childList") {
+                if (!o.childList) continue;
+            } else if (type === "characterData") {
+                if (!o.characterData) continue;
+            }
+            var hit = (reg.target === target);
+            if (!hit && o.subtree) {
+                for (var p = target.parentNode; p; p = p.parentNode) {
+                    if (p === reg.target) { hit = true; break; }
+                }
+            }
+            if (hit) {
+                matched = true;
+                if ((type === "attributes" && o.attributeOldValue) || (type === "characterData" && o.characterDataOldValue)) wantOld = true;
+                break;
+            }
+        }
+        if (matched) {
+            obs._records.push({
+                type: type,
+                target: target,
+                addedNodes: addedNodes || [],
+                removedNodes: removedNodes || [],
+                previousSibling: null,
+                nextSibling: null,
+                attributeName: attrName || null,
+                attributeNamespace: null,
+                oldValue: wantOld ? oldValue : null
+            });
+            queued = true;
+        }
+    }
+    if (queued && !__moScheduled) {
+        __moScheduled = true;
+        __zippMicrotask(__moFlush);
+    }
+}
+function __moWatchStyle(el) {
+    if (!el || !el.style || el.style.__moProxy) return;
+    var raw = el.style;
+    el.style = new Proxy(raw, {
+        get: function (t, k) {
+            if (k === "__moProxy") return true;
+            var v = t[k];
+            return typeof v === "function" ? v.bind(t) : v;
+        },
+        set: function (t, k, v) {
+            var old = __moCount ? __styleText(t) : null;
+            t[k] = v;
+            if (k !== "_el" && k !== "_imp" && k !== "cssText") {
+                if (el.attributes) delete el.attributes.style;
+                __domMutations++;
+                if (__moCount) __moNotify(el, "attributes", "style", old, null, null);
+            }
+            return true;
+        }
+    });
+}
 var MutationObserver = class MutationObserver {
-    constructor(cb) { this._cb=cb; }
-    observe() {}
-    disconnect() {}
-    takeRecords() { return []; }
+    constructor(cb) {
+        if (typeof cb !== "function") throw new TypeError("MutationObserver callback must be a function");
+        this._cb = cb;
+        this._regs = [];
+        this._records = [];
+    }
+    observe(target, options) {
+        if (!target) throw new TypeError("MutationObserver.observe requires a Node target");
+        var opts = options || {};
+        var norm = {
+            childList: !!opts.childList,
+            attributes: opts.attributes !== undefined ? !!opts.attributes : !!(opts.attributeOldValue || opts.attributeFilter),
+            characterData: opts.characterData !== undefined ? !!opts.characterData : !!opts.characterDataOldValue,
+            subtree: !!opts.subtree,
+            attributeOldValue: !!opts.attributeOldValue,
+            characterDataOldValue: !!opts.characterDataOldValue,
+            attributeFilter: Array.isArray(opts.attributeFilter) ? opts.attributeFilter.slice() : null
+        };
+        if (!norm.childList && !norm.attributes && !norm.characterData) {
+            throw new TypeError("MutationObserver.observe: at least one of childList, attributes, or characterData must be true");
+        }
+        if (norm.attributes && (!norm.attributeFilter || norm.attributeFilter.indexOf("style") >= 0)) {
+            __moWatchStyle(target);
+        }
+        var found = false;
+        for (var i = 0; i < this._regs.length; i++) {
+            if (this._regs[i].target === target) { this._regs[i].opts = norm; found = true; break; }
+        }
+        if (!found) this._regs.push({ target: target, opts: norm });
+        if (__moObservers.indexOf(this) < 0) {
+            __moObservers.push(this);
+            __moCount = __moObservers.length;
+        }
+    }
+    disconnect() {
+        this._regs = [];
+        this._records = [];
+        var idx = __moObservers.indexOf(this);
+        if (idx >= 0) {
+            __moObservers.splice(idx, 1);
+            __moCount = __moObservers.length;
+        }
+    }
+    takeRecords() {
+        return this._records.splice(0, this._records.length);
+    }
 };
 
 // --- Selectors (querySelector, matches, closest) ---
@@ -2141,17 +2606,230 @@ function __sc(node) { var h=""; for(var i=0;i<node.childNodes.length;i++) h+=__s
 function __eh(s) { return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
 function __ea(s) { return String(s).replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
 
+function __treeWalkerAccept(node, whatToShow, filter) {
+    if (!node) return 2;
+    var bit = 1 << ((node.nodeType || 1) - 1);
+    if ((whatToShow & bit) === 0) return 3; // FILTER_SKIP
+    if (!filter) return 1; // FILTER_ACCEPT
+    if (typeof filter === "function") return filter(node);
+    if (typeof filter.acceptNode === "function") return filter.acceptNode(node);
+    return 1;
+}
+function __rawFirstChild(n) { return (n && n._childNodes && n._childNodes[0]) || null; }
+function __rawLastChild(n) { return (n && n._childNodes && n._childNodes[n._childNodes.length - 1]) || null; }
+function __rawNextSibling(n) {
+    var p = n && n._parentNode;
+    if (!p || !p._childNodes) return null;
+    var i = p._findChild ? p._findChild(n) : p._childNodes.indexOf(n);
+    return i >= 0 ? (p._childNodes[i + 1] || null) : null;
+}
+function __rawPrevSibling(n) {
+    var p = n && n._parentNode;
+    if (!p || !p._childNodes) return null;
+    var i = p._findChild ? p._findChild(n) : p._childNodes.indexOf(n);
+    return i > 0 ? p._childNodes[i - 1] : null;
+}
+function __makeTreeWalker(root, whatToShow, filter) {
+    var mask = whatToShow === undefined ? 0xFFFFFFFF : (whatToShow >>> 0);
+    return {
+        root: root,
+        whatToShow: mask,
+        filter: filter || null,
+        currentNode: root,
+        parentNode: function () {
+            var n = this.currentNode;
+            while (n && n !== this.root) {
+                n = n._parentNode;
+                if (n && __treeWalkerAccept(n, mask, filter) === 1) {
+                    this.currentNode = n;
+                    return n;
+                }
+            }
+            return null;
+        },
+        firstChild: function () {
+            var n = __rawFirstChild(this.currentNode);
+            while (n) {
+                var r = __treeWalkerAccept(n, mask, filter);
+                if (r === 1) { this.currentNode = n; return n; }
+                if (r === 3 && __rawFirstChild(n)) { n = __rawFirstChild(n); continue; }
+                while (n && !__rawNextSibling(n)) {
+                    n = n._parentNode;
+                    if (!n || n === this.currentNode || n === this.root) return null;
+                }
+                n = __rawNextSibling(n);
+            }
+            return null;
+        },
+        lastChild: function () {
+            var n = __rawLastChild(this.currentNode);
+            while (n) {
+                var r = __treeWalkerAccept(n, mask, filter);
+                if (r === 1) { this.currentNode = n; return n; }
+                if (r === 3 && __rawLastChild(n)) { n = __rawLastChild(n); continue; }
+                while (n && !__rawPrevSibling(n)) {
+                    n = n._parentNode;
+                    if (!n || n === this.currentNode || n === this.root) return null;
+                }
+                n = __rawPrevSibling(n);
+            }
+            return null;
+        },
+        nextSibling: function () {
+            var n = this.currentNode;
+            if (!n || n === this.root) return null;
+            var cur = __rawNextSibling(n);
+            while (cur) {
+                var r = __treeWalkerAccept(cur, mask, filter);
+                if (r === 1) { this.currentNode = cur; return cur; }
+                if (r === 3 && __rawFirstChild(cur)) { cur = __rawFirstChild(cur); continue; }
+                while (cur && !__rawNextSibling(cur)) {
+                    cur = cur._parentNode;
+                    if (!cur || cur === n._parentNode || cur === this.root) return null;
+                }
+                cur = __rawNextSibling(cur);
+            }
+            return null;
+        },
+        previousSibling: function () {
+            var n = this.currentNode;
+            if (!n || n === this.root) return null;
+            var cur = __rawPrevSibling(n);
+            while (cur) {
+                var r = __treeWalkerAccept(cur, mask, filter);
+                if (r === 1) { this.currentNode = cur; return cur; }
+                if (r === 3 && __rawLastChild(cur)) { cur = __rawLastChild(cur); continue; }
+                while (cur && !__rawPrevSibling(cur)) {
+                    cur = cur._parentNode;
+                    if (!cur || cur === n._parentNode || cur === this.root) return null;
+                }
+                cur = __rawPrevSibling(cur);
+            }
+            return null;
+        },
+        nextNode: function () {
+            var n = this.currentNode;
+            while (n) {
+                if (__rawFirstChild(n)) {
+                    n = __rawFirstChild(n);
+                } else {
+                    while (n && n !== this.root && !__rawNextSibling(n)) n = n._parentNode;
+                    if (!n || n === this.root) return null;
+                    n = __rawNextSibling(n);
+                }
+                var r = __treeWalkerAccept(n, mask, filter);
+                if (r === 1) { this.currentNode = n; return n; }
+                if (r === 2) {
+                    while (n && n !== this.root && !__rawNextSibling(n)) n = n._parentNode;
+                    if (!n || n === this.root) return null;
+                    n = __rawNextSibling(n);
+                    if (__treeWalkerAccept(n, mask, filter) === 1) { this.currentNode = n; return n; }
+                }
+            }
+            return null;
+        },
+        previousNode: function () {
+            var n = this.currentNode;
+            while (n && n !== this.root) {
+                if (__rawPrevSibling(n)) {
+                    n = __rawPrevSibling(n);
+                    while (__rawLastChild(n)) n = __rawLastChild(n);
+                } else {
+                    n = n._parentNode;
+                }
+                if (n && __treeWalkerAccept(n, mask, filter) === 1) {
+                    this.currentNode = n;
+                    return n;
+                }
+            }
+            return null;
+        }
+    };
+}
+
 // The document. `document.location` is the window's: GitHub's marketing script
 // reads `document.location.search` as it starts, and it was undefined.
 var Document = class Document extends DOMNode {
-    get location() { return location; }
-    set location(v) { location.assign(String(v)); }
+    get location() { return this._url !== undefined ? null : location; }
+    set location(v) { if (this._url === undefined) location.assign(String(v)); }
     get domain() { return location.hostname; }
     set domain(v) {}
-    get URL() { return location.href; }
-    get documentURI() { return location.href; }
+    get URL() { return this._url !== undefined ? this._url : location.href; }
+    get documentURI() { return this._url !== undefined ? this._url : location.href; }
+    get activeElement() { return this._activeElement || this.body || null; }
+    createElement(tag) {
+        __createElement_count++;
+        var name = String(tag).toLowerCase(), def = customElements._defs[name];
+        var el = def ? __ceMake(def) : new (__htmlInterfaces[name] || __HTMLElementClass)(name);
+        el.ownerDocument = this;
+        return el;
+    }
+    createElementNS(ns, tag) {
+        if (ns == null || ns === "http://www.w3.org/1999/xhtml") return this.createElement(tag);
+        var el = ns === "http://www.w3.org/2000/svg" ? new SVGElement(tag, ns) : new Element(tag, ns);
+        el.ownerDocument = this;
+        return el;
+    }
+    createTextNode(d) { var t = new Text(d); t.ownerDocument = this; return t; }
+    createComment(d) { var c = new Comment(d); c.ownerDocument = this; return c; }
+    createDocumentFragment() { var f = new DocumentFragment(); f.ownerDocument = this; return f; }
+    createEvent(iface) {
+        var k = String(iface || "").toLowerCase();
+        if (k === "customevent") return new CustomEvent("");
+        if (k === "mouseevent" || k === "mouseevents") return new MouseEvent("");
+        if (k === "keyboardevent" || k === "keyevents") return new KeyboardEvent("");
+        if (k === "uievent" || k === "uievents") return new UIEvent("");
+        return new Event("");
+    }
+    createTreeWalker(root, what, filter) { return __makeTreeWalker(root, what, filter); }
+    createNodeIterator(root, what, filter) {
+        var tw = __makeTreeWalker(root, what, filter);
+        var started = false;
+        return {
+            root: root,
+            whatToShow: tw.whatToShow,
+            filter: tw.filter,
+            nextNode: function () {
+                if (!started) {
+                    started = true;
+                    if (__treeWalkerAccept(root, tw.whatToShow, tw.filter) === 1) return root;
+                }
+                return tw.nextNode();
+            },
+            previousNode: function () { return tw.previousNode(); }
+        };
+    }
+    createRange() { return new Range(); }
+    getElementById(id) {
+        function w(n) { if (n.nodeType === 1 && n.id === id) return n; for (var i = 0; i < n.childNodes.length; i++) { var f = w(n.childNodes[i]); if (f) return f; } return null; }
+        return w(this);
+    }
+    getElementsByName(name) {
+        name = String(name);
+        var r = [];
+        (function w(n) { for (var i = 0; i < n.childNodes.length; i++) { var c = n.childNodes[i]; if (c.nodeType === 1) { if (c.getAttribute("name") === name) r.push(c); w(c); } } })(this);
+        return r;
+    }
+    getElementsByTagName(t) { return this.documentElement ? this.documentElement.getElementsByTagName(t) : []; }
+    getElementsByClassName(c) { return this.documentElement ? this.documentElement.getElementsByClassName(c) : []; }
+    querySelector(s) { return _qs(this, s, false); }
+    querySelectorAll(s) { return _qs(this, s, true); }
+    adoptNode(node) {
+        if (node && node.parentNode) node.parentNode.removeChild(node);
+        var target = this;
+        (function setOwner(n) { if (!n) return; n.ownerDocument = target; for (var i = 0; n.childNodes && i < n.childNodes.length; i++) setOwner(n.childNodes[i]); })(node);
+        return node;
+    }
+    importNode(node, deep) {
+        var cloned = node.cloneNode(!!deep);
+        var target = this;
+        (function setOwner(n) { if (!n) return; n.ownerDocument = target; for (var i = 0; n.childNodes && i < n.childNodes.length; i++) setOwner(n.childNodes[i]); })(cloned);
+        return cloned;
+    }
+    hasFocus() { return true; }
 };
 var doc = new Document(9, "#document");
+doc.implementation = new DOMImplementation();
 doc.documentElement = new HTMLHtmlElement("html");
 doc.head = new HTMLHeadElement("head");
 doc.body = new HTMLBodyElement("body");
@@ -2188,46 +2866,30 @@ Object.defineProperty(doc, "cookie", {
 
 var __createElement_count = 0;
 var __domMutations = 0;
-doc.createElement = function(tag) {
-    __createElement_count++;
-    var name = String(tag).toLowerCase(), def = customElements._defs[name];
-    var el = def ? __ceMake(def) : new (__htmlInterfaces[name] || __HTMLElementClass)(name);
-    el.ownerDocument = doc;
-    return el;
-};
-doc.createElementNS = function(ns,tag) {
-    if (ns == null || ns === "http://www.w3.org/1999/xhtml") return doc.createElement(tag);
-    var el = ns === "http://www.w3.org/2000/svg" ? new SVGElement(tag, ns) : new Element(tag, ns);
-    el.ownerDocument = doc;
-    return el;
-};
-doc.createTextNode = function(d) { var t=new Text(d); t.ownerDocument=doc; return t; };
-doc.createComment = function(d) { var c=new Comment(d); c.ownerDocument=doc; return c; };
-doc.createDocumentFragment = function() { var f=new DocumentFragment(); f.ownerDocument=doc; return f; };
-doc.createEvent = function() { return new Event(""); };
-doc.getElementById = function(id) { function w(n){if(n.nodeType===1&&n.id===id)return n;for(var i=0;i<n.childNodes.length;i++){var f=w(n.childNodes[i]);if(f)return f;}return null;} return w(doc); };
-doc.getElementsByName = function(name) {
-    name = String(name);
-    var r = [];
-    (function w(n) { for (var i = 0; i < n.childNodes.length; i++) { var c = n.childNodes[i]; if (c.nodeType === 1) { if (c.getAttribute("name") === name) r.push(c); w(c); } } })(doc);
-    return r;
-};
-doc.getElementsByTagName = function(t) { return doc.documentElement.getElementsByTagName(t); };
-doc.getElementsByClassName = function(c) { return doc.documentElement.getElementsByClassName(c); };
-doc.querySelector = function(s) { return _qs(doc,s,false); };
-doc.querySelectorAll = function(s) { return _qs(doc,s,true); };
-
-// Document missing methods/properties
+var __zippSeeded = false;
+var __bodyMutations = 0;
+function __inBody(n) {
+    if (typeof doc === "undefined" || !doc || !doc.body) return false;
+    var cur = n;
+    while (cur) {
+        if (cur === doc.body) return true;
+        cur = cur.parentNode || cur.host || null;
+    }
+    return false;
+}
+function __markMut(n) {
+    __domMutations++;
+    if (__zippSeeded && n && __inBody(n)) __bodyMutations++;
+}
+// Document properties (core methods live on Document.prototype so detached
+// documents from DOMImplementation.createHTMLDocument() and prototype-patching
+// polyfills like ShadyDOM/Polymer share them).
 doc.readyState = "complete";
-doc.createTreeWalker = function(root,what,filter) { return { currentNode:root, nextNode:function(){return null;}, previousNode:function(){return null;}, firstChild:function(){return null;}, lastChild:function(){return null;}, nextSibling:function(){return null;}, previousSibling:function(){return null;}, parentNode:function(){return null;} }; };
-doc.createRange = function() { return new Range(); };
 doc.scripts = [];
 doc.forms = [];
 doc.images = [];
 doc.links = [];
 doc.styleSheets = [];
-Object.defineProperty(doc, 'activeElement', { get: function() { return doc._activeElement || doc.body; } });
-doc.hasFocus = function() { return true; };
 // A select's list opens and closes on these (see __openSelectPopup).
 doc.addEventListener("mousedown", function (e) {
     var t = e && e.target;
@@ -2468,9 +3130,6 @@ var DOMMatrixReadOnly = class DOMMatrixReadOnly {
     toString() { return "matrix(" + this._m().join(", ") + ")"; }
 };
 var DOMMatrix = class DOMMatrix extends DOMMatrixReadOnly {};
-doc.createNodeIterator = function(root) { return { nextNode:function(){return null;}, previousNode:function(){return null;} }; };
-doc.adoptNode = function(node) { node.ownerDocument=doc; return node; };
-doc.importNode = function(node,deep) { return node.cloneNode(deep); };
 // The title: the window's, when script sets it (SoftN names its app's window
 // this way). It was a plain property, and the window kept the page's <title>.
 var __docTitle = '__PAGE_TITLE__';
@@ -2679,6 +3338,7 @@ if (!_rootDiv) {
 // The DOM as the page's HTML made it: what the page's script changes after
 // this is the script's (`__getRenderedHTML`).
 var __zippSeedMutations = __domMutations;
+__zippSeeded = true;
 
 // `performance`: a real clock, in milliseconds since the page started. It
 // was a counter creeping 0.01 ms a call, so that React's scheduler -- when the
@@ -3206,19 +3866,20 @@ if (!Array.prototype.keys) Array.prototype.keys = function() { var i = 0, self =
 // `|| null`, which turned a stored "" or "0" into null.
 //
 // `localStorage` is kept in the browser's profile, per site (site_storage.rs),
-// and saved on every change; `sessionStorage` lasts as long as the page.
-function __Storage(kept) {
+// and saved on every change; `sessionStorage` is kept per origin in the browser
+// session so it survives reloads and same-origin navigations until exit.
+function __Storage(kind) {
     this._data = {};
-    this._kept = !!kept;
-    if (kept) {
+    this._kind = kind === true ? "local" : (typeof kind === "string" ? kind : "");
+    if (this._kind) {
         try {
-            var saved = JSON.parse(__zippHostCall("site_read", "local", "") || "{}");
+            var saved = JSON.parse(__zippHostCall("site_read", this._kind, "") || "{}");
             if (saved && typeof saved === "object") this._data = saved;
         } catch (e) {}
     }
 }
 __Storage.prototype._save = function() {
-    if (this._kept) { try { __zippHostCall("site_write", "local", "", JSON.stringify(this._data)); } catch (e) {} }
+    if (this._kind) { try { __zippHostCall("site_write", this._kind, "", JSON.stringify(this._data)); } catch (e) {} }
 };
 __Storage.prototype.getItem = function(k) {
     k = String(k);
@@ -3245,8 +3906,8 @@ Object.defineProperty(__Storage.prototype, "length", {
     get: function() { return Object.keys(this._data).length; }
 });
 
-var sessionStorage = new __Storage();
-var localStorage = new __Storage(true);
+var sessionStorage = new __Storage("session");
+var localStorage = new __Storage("local");
 
 var __b64chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 function __btoa(s) {
@@ -3294,20 +3955,39 @@ XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
     this._headers[name] = value;
 };
 XMLHttpRequest.prototype.getResponseHeader = function(name) {
-    return null;
+    if (!this._respHeaders) return null;
+    var k = String(name).toLowerCase();
+    return Object.prototype.hasOwnProperty.call(this._respHeaders, k) ? this._respHeaders[k] : null;
 };
-XMLHttpRequest.prototype.getAllResponseHeaders = function() { return ""; };
+XMLHttpRequest.prototype.getAllResponseHeaders = function() {
+    if (!this._respHeaders) return "";
+    var out = "";
+    for (var k in this._respHeaders) {
+        if (Object.prototype.hasOwnProperty.call(this._respHeaders, k)) {
+            out += k + ": " + this._respHeaders[k] + "\r\n";
+        }
+    }
+    return out;
+};
 XMLHttpRequest.prototype.send = function(body) {
     var self = this;
     try {
         var r;
-        __zippCredentials = self.withCredentials ? "include" : "";
-        if (self._method === "POST") r = http.post(self._url, String(body || ""), __headerNamed(self._headers, "content-type") || "");
-        else if (self._method === "PUT") r = http.put(self._url, String(body || ""), __headerNamed(self._headers, "content-type") || "");
-        else if (self._method === "DELETE") r = http.delete(self._url);
+        var method = String(self._method || "GET").toUpperCase();
+        __zippCredentials = self.withCredentials ? "include" : "same-origin";
+        if (typeof __zippRequestHeaders !== "undefined") {
+            __zippRequestHeaders = JSON.stringify(self._headers || {});
+        }
+        var ct = __headerNamed(self._headers, "content-type") || "";
+        if (typeof http.request === "function") {
+            r = http.request(method, self._url, body == null ? "" : String(body), ct);
+        } else if (method === "POST") r = http.post(self._url, String(body || ""), ct);
+        else if (method === "PUT") r = http.put(self._url, String(body || ""), ct);
+        else if (method === "DELETE") r = http.delete(self._url);
         else r = http.get(self._url);
         self.status = r.status;
         self.statusText = r.ok ? "OK" : "Error";
+        self._respHeaders = r.headers || (r.contentType ? { "content-type": r.contentType } : {});
         self.responseText = r.body;
         self.response = self.responseType === "json" ? JSON.parse(r.body) : r.body;
         self.readyState = 4;
@@ -3724,7 +4404,7 @@ var window = {
     PopStateEvent:PopStateEvent, HashChangeEvent:HashChangeEvent, PageTransitionEvent:PageTransitionEvent,
     StorageEvent:StorageEvent, SubmitEvent:SubmitEvent, AnimationEvent:AnimationEvent,
     TransitionEvent:TransitionEvent, PromiseRejectionEvent:PromiseRejectionEvent,
-    Node:DOMNode,
+    Node:DOMNode, NodeFilter:NodeFilter,
     HTMLElement:HTMLElement, DocumentFragment:DocumentFragment,
     HTMLIFrameElement:HTMLIFrameElement, HTMLInputElement:HTMLInputElement,
     HTMLTextAreaElement:HTMLTextAreaElement, HTMLSelectElement:HTMLSelectElement,
@@ -3744,9 +4424,6 @@ var window = {
     clearTimeout:function(id){__zippClearTimer(id);},
     setInterval:function(fn,ms){return __zippSetTimer(fn,ms,Array.prototype.slice.call(arguments,2),true);},
     clearInterval:function(id){__zippClearTimer(id);},
-    addEventListener:function(t,fn){doc.addEventListener(t,fn);},
-    removeEventListener:function(t,fn){doc.removeEventListener(t,fn);},
-    dispatchEvent:function(ev){return doc.dispatchEvent(ev);},
     matchMedia:function(q){return {matches:__zippMediaMatches(String(q)),media:q,onchange:null,addEventListener:function(){},removeEventListener:function(){},addListener:function(){},removeListener:function(){}};},
     scrollTo:function(){}, scroll:function(){}, scrollBy:function(){},
     history:{state:null,pushState:function(s,t,u){this.state=s;__historyMove(u);},replaceState:function(s,t,u){this.state=s;__historyMove(u);},back:function(){},forward:function(){},go:function(n){},length:1},
@@ -3820,10 +4497,26 @@ var window = {
         var method = String(opts.method || (isReq ? input.method : "GET")).toUpperCase();
         var body = opts.body !== undefined ? opts.body : (isReq ? input.body : null);
         var headers = opts.headers !== undefined ? opts.headers : (isReq ? input.headers : {});
+        var hdrObj = {};
+        if (headers) {
+            if (typeof headers.forEach === "function") {
+                headers.forEach(function(v, k) { hdrObj[String(k)] = String(v); });
+            } else if (Array.isArray(headers)) {
+                for (var hi = 0; hi < headers.length; hi++) {
+                    if (headers[hi] && headers[hi].length >= 2) hdrObj[String(headers[hi][0])] = String(headers[hi][1]);
+                }
+            } else if (headers._headers) {
+                for (var hk in headers._headers) hdrObj[hk] = String(headers._headers[hk]);
+            } else if (typeof headers === "object") {
+                for (var ok in headers) {
+                    if (Object.prototype.hasOwnProperty.call(headers, ok)) hdrObj[ok] = String(headers[ok]);
+                }
+            }
+        }
         // As fetch has it: what a string body is, unless the page says.
         var contentType = __headerNamed(headers, "content-type") || "text/plain;charset=UTF-8";
         var creds = opts.credentials || (isReq ? input.credentials : "");
-        var credentials = creds === "include" ? "include" : "";
+        var credentials = creds === "omit" ? "omit" : (creds === "include" ? "include" : "same-origin");
         return new Promise(function(resolve, reject) {
             try {
                 // Fast binary path for blob: and data: URLs (e.g. Three.js GLB/HDR
@@ -3843,7 +4536,12 @@ var window = {
                 }
                 var r;
                 __zippCredentials = credentials;
-                if (method === "POST") {
+                if (typeof __zippRequestHeaders !== "undefined") {
+                    __zippRequestHeaders = JSON.stringify(hdrObj);
+                }
+                if (typeof http.request === "function") {
+                    r = http.request(method, String(url), body == null ? "" : String(body), contentType);
+                } else if (method === "POST") {
                     r = http.post(String(url), String(body || ""), contentType);
                 } else if (method === "PUT") {
                     r = http.put(String(url), String(body || ""), contentType);
@@ -3853,8 +4551,8 @@ var window = {
                     r = http.get(String(url));
                 }
                 var responseBody = r.body;
-                var respHeaders = new Headers(r.contentType ? { "content-type": r.contentType } : {});
-                var respType = r.contentType || "";
+                var respHeaders = new Headers(r.headers || (r.contentType ? { "content-type": r.contentType } : {}));
+                var respType = r.contentType || respHeaders.get("content-type") || "";
                 resolve(__asResponse({
                     ok: r.ok,
                     status: r.status,
@@ -3928,7 +4626,22 @@ window.URL = URL;
 })();
 window.window = window; window.self = window; window.top = window; window.parent = window; window.frames = window;
 // The DOM's interfaces, on the window as in a browser (`window.HTMLElement`).
-var __domInterfaces = { EventTarget: EventTarget, Document: Document, HTMLDocument: Document, DOMParser: DOMParser, XMLSerializer: XMLSerializer, AbortSignal: AbortSignal,
+// Use a plain-object prototype chain (`Object.create(EventTarget.prototype)`)
+// rather than an ES6 `class` prototype so `globalThis` property lookup and
+// polyfill patching (ShadyDOM's `Window.prototype.__shady_native_*`) work.
+function Window() {}
+Window.prototype = Object.create(EventTarget.prototype);
+Window.prototype.constructor = Window;
+Window.prototype.addEventListener = function (t, fn, opts) { return doc.addEventListener(t, fn, opts); };
+Window.prototype.removeEventListener = function (t, fn, opts) { return doc.removeEventListener(t, fn, opts); };
+Window.prototype.dispatchEvent = function (ev) { return doc.dispatchEvent(ev); };
+try { Object.setPrototypeOf(window, Window.prototype); } catch (e) {}
+if (typeof window.addEventListener !== "function") {
+    window.addEventListener = Window.prototype.addEventListener;
+    window.removeEventListener = Window.prototype.removeEventListener;
+    window.dispatchEvent = Window.prototype.dispatchEvent;
+}
+var __domInterfaces = { Window: Window, EventTarget: EventTarget, Node: DOMNode, Element: Element, CharacterData: CharacterData, Text: Text, CDATASection: CDATASection, Comment: Comment, ProcessingInstruction: ProcessingInstruction, DocumentType: DocumentType, Document: Document, HTMLDocument: Document, DOMImplementation: DOMImplementation, DOMTokenList: ClassList, DOMParser: DOMParser, XMLSerializer: XMLSerializer, AbortSignal: AbortSignal,
     AbortController: AbortController, BroadcastChannel: BroadcastChannel, CustomElementRegistry: CustomElementRegistry,
     customElements: customElements, SVGElement: SVGElement, ShadowRoot: ShadowRoot, ElementInternals: ElementInternals,
     CustomStateSet: CustomStateSet, FontFace: FontFace, FontFaceSet: FontFaceSet, CSS: CSS, PerformanceObserver: PerformanceObserver, HTMLElement: HTMLElement, HTMLAnchorElement: HTMLAnchorElement, HTMLAreaElement: HTMLAreaElement, HTMLMediaElement: HTMLMediaElement, HTMLAudioElement: HTMLAudioElement, HTMLVideoElement: HTMLVideoElement, HTMLBRElement: HTMLBRElement, HTMLBaseElement: HTMLBaseElement, HTMLBodyElement: HTMLBodyElement, HTMLButtonElement: HTMLButtonElement, HTMLCanvasElement: HTMLCanvasElement, HTMLDListElement: HTMLDListElement, HTMLDataElement: HTMLDataElement, HTMLDataListElement: HTMLDataListElement, HTMLDetailsElement: HTMLDetailsElement, HTMLDivElement: HTMLDivElement, HTMLEmbedElement: HTMLEmbedElement, HTMLFieldSetElement: HTMLFieldSetElement, HTMLHRElement: HTMLHRElement, HTMLHeadElement: HTMLHeadElement, HTMLHeadingElement: HTMLHeadingElement, HTMLHtmlElement: HTMLHtmlElement, HTMLIFrameElement: HTMLIFrameElement, HTMLImageElement: HTMLImageElement, HTMLInputElement: HTMLInputElement, HTMLLIElement: HTMLLIElement, HTMLLabelElement: HTMLLabelElement, HTMLLegendElement: HTMLLegendElement, HTMLLinkElement: HTMLLinkElement, HTMLMapElement: HTMLMapElement, HTMLMenuElement: HTMLMenuElement, HTMLMetaElement: HTMLMetaElement, HTMLMeterElement: HTMLMeterElement, HTMLModElement: HTMLModElement, HTMLOListElement: HTMLOListElement, HTMLObjectElement: HTMLObjectElement, HTMLOptGroupElement: HTMLOptGroupElement, HTMLOptionElement: HTMLOptionElement, HTMLOutputElement: HTMLOutputElement, HTMLParagraphElement: HTMLParagraphElement, HTMLPictureElement: HTMLPictureElement, HTMLPreElement: HTMLPreElement, HTMLProgressElement: HTMLProgressElement, HTMLQuoteElement: HTMLQuoteElement, HTMLScriptElement: HTMLScriptElement, HTMLSelectElement: HTMLSelectElement, HTMLSlotElement: HTMLSlotElement, HTMLSourceElement: HTMLSourceElement, HTMLSpanElement: HTMLSpanElement, HTMLStyleElement: HTMLStyleElement, HTMLTableCaptionElement: HTMLTableCaptionElement, HTMLTableCellElement: HTMLTableCellElement, HTMLTableColElement: HTMLTableColElement, HTMLTableElement: HTMLTableElement, HTMLTableRowElement: HTMLTableRowElement, HTMLTableSectionElement: HTMLTableSectionElement, HTMLTemplateElement: HTMLTemplateElement, HTMLTextAreaElement: HTMLTextAreaElement, HTMLTimeElement: HTMLTimeElement, HTMLTitleElement: HTMLTitleElement, HTMLTrackElement: HTMLTrackElement, HTMLUListElement: HTMLUListElement, HTMLUnknownElement: HTMLUnknownElement, HTMLDialogElement: HTMLDialogElement, HTMLFormElement: HTMLFormElement };
@@ -4131,26 +4844,44 @@ var __svgAttrCase = {
     basefrequency:"baseFrequency", numoctaves:"numOctaves",
     tablevalues:"tableValues", pathlength:"pathLength"
 };
-function __serializeSvgChild(cn) {
+var __htmlVoidSet = {
+    area:1, base:1, br:1, col:1, embed:1, hr:1, img:1, input:1,
+    link:1, meta:1, param:1, source:1, track:1, wbr:1
+};
+function __serializeSvgChild(cn, inForeign) {
     if(!cn) return "";
     if(cn.nodeType===3) return cn._html ? (cn.data||"") : __eh(cn.data||"");
     if(cn.nodeType!==1) return "";
     var raw=(cn.localName||cn.tagName||"").toLowerCase();
-    var ct=__svgTagCase[raw]||raw;
+    var ct=inForeign ? raw : (__svgTagCase[raw]||raw);
     var ca="";
     if(cn.id) ca+=" id=\""+__ea(cn.id)+"\"";
     if(cn.className) ca+=" class=\""+__ea(cn.className)+"\"";
     for(var ak in cn.attributes) {
+        if(!ak || ak.charAt(0)===":") continue;
         var al=ak.toLowerCase();
         if(al==="id"||al==="class"||al==="style") continue;
-        var mapped=__svgAttrCase[al]||ak;
+        var mapped=inForeign ? ak : (__svgAttrCase[al]||ak);
         ca+=" "+mapped+"=\""+__ea(cn.attributes[ak])+"\"";
     }
     var cst=__elementStyleAttr(cn);
     if(cst!==""&&cst!==";") ca+=" style=\""+__ea(cst)+"\"";
+    // HTML integration points inside SVG (<foreignObject>, <desc>, <title>)
+    // re-enter HTML insertion mode in HTML5 parsers: non-void HTML tags like
+    // <div> MUST NOT be emitted self-closing (<div/>), or html5ever leaves
+    // them open and swallows the closing </foreignObject></svg> and the rest
+    // of the page.
+    var isIntegration = !inForeign && (raw==="foreignobject" || raw==="desc" || raw==="title");
+    var childForeign = isIntegration ? true : (raw==="svg" ? false : !!inForeign);
     var inner="";
-    for(var i=0;i<cn.childNodes.length;i++) inner+=__serializeSvgChild(cn.childNodes[i]);
-    return inner==="" ? "<"+ct+ca+"/>" : "<"+ct+ca+">"+inner+"</"+ct+">";
+    for(var i=0;i<cn.childNodes.length;i++) inner+=__serializeSvgChild(cn.childNodes[i], childForeign);
+    if (inner==="") {
+        if (isIntegration || (inForeign && !__htmlVoidSet[raw])) {
+            return "<"+ct+ca+"></"+ct+">";
+        }
+        return "<"+ct+ca+"/>";
+    }
+    return "<"+ct+ca+">"+inner+"</"+ct+">";
 }
 
 // Scope CSS rules inside a ShadowRoot to `[data-zsr="<id>"]` so styles
@@ -4280,6 +5011,7 @@ function __serializeNode(node, scopeId) {
     var fieldValue=(tag==="input"||tag==="textarea")&&node._value!==undefined&&!/^file$/i.test(node.attributes.type||"");
     for(var k in node.attributes){if(k==="id"||k==="class"||k==="style") continue; if(k==="value"&&fieldValue&&tag==="input") continue; r+=" "+k+"=\""+__ea(node.attributes[k])+"\"";}
     if(fieldValue&&tag==="input") r+=" value=\""+__ea(node._value)+"\"";
+    if(tag==="input"&&node.checked&&!Object.prototype.hasOwnProperty.call(node.attributes,"checked")) r+=" checked=\"checked\"";
     // One style attribute: the author's text, then the object's declarations,
     // which come later so a value JS changed wins.
     var st=__elementStyleAttr(node);
@@ -4311,7 +5043,7 @@ function __serializeNode(node, scopeId) {
         var xmlH=(rawH&&!isPctH)?rawH:(vbH||"24");
         if(!vb) vb="0 0 "+xmlW+" "+xmlH;
         var svgChildren="";
-        for(var i=0;i<node.childNodes.length;i++) svgChildren+=__serializeSvgChild(node.childNodes[i]);
+        for(var i=0;i<node.childNodes.length;i++) svgChildren+=__serializeSvgChild(node.childNodes[i], false);
         var svgAttrs="";
         if(node.id) svgAttrs+=" id=\""+__ea(node.id)+"\"";
         if(node.className) svgAttrs+=" class=\""+__ea(node.className)+"\"";
@@ -4319,6 +5051,7 @@ function __serializeNode(node, scopeId) {
         svgAttrs+=" width=\""+__ea(xmlW)+"\" height=\""+__ea(xmlH)+"\" viewBox=\""+__ea(vb)+"\"";
         var hasFill=false;
         for(var ak in node.attributes) {
+            if(!ak || ak.charAt(0)===":") continue;
             var al=ak.toLowerCase();
             if(al==="id"||al==="class"||al==="style"||al==="xmlns"||al==="width"||al==="height"||al==="viewbox") continue;
             if(al==="fill") hasFill=true;
@@ -4379,9 +5112,12 @@ function __drawnFromScript() {
     if(root && root.childNodes.length > 0) return true;
     // An app on this machine (a file: page) that changes the page its HTML
     // made -- a status line's text, a list it fills -- is drawn from the
-    // script's tree from then on. A web page keeps the HTML it came with
-    // until its script fills #root or draws on a canvas.
+    // script's tree from then on. Any web page whose script mutates connected
+    // elements inside <body> or attaches listeners inside <body> likewise renders
+    // its live DOM so interactive vanilla JS apps, media players, and dynamic
+    // pages work seamlessly without breaking static server-rendered pages.
     if(__locUrl.protocol === "file:" && __domMutations !== __zippSeedMutations) return true;
+    if(__bodyMutations > 0) return true;
     // A canvas drawing in the page -- not one kept off it to measure text or
     // test emoji, which many pages make and never show.
     if(typeof __zippCanvasContexts !== "undefined" && __zippCanvasContexts.some(function(c){return c.canvas && c.canvas.isConnected;})) return true;
@@ -4437,6 +5173,7 @@ function __attrPairs(node, tag) {
         out.push([k, String(node.attributes[k])]);
     }
     if (fieldValue && tag==="input") out.push(["value", String(node._value)]);
+    if (tag==="input" && node.checked && !Object.prototype.hasOwnProperty.call(node.attributes, "checked")) out.push(["checked", "checked"]);
     var st=__elementStyleAttr(node);
     if (st!==""&&st!==";") out.push(["style", st]);
     __keepNode(node);

@@ -28,8 +28,8 @@ impl BaseDocument {
 
     /// The element's candidate resources, in the order the HTML spec tries
     /// them: its `src` if it has one, otherwise each `<source>` child.
-    fn media_sources(&self, node_id: usize) -> Vec<MediaSource> {
-        let Some(element) = self.nodes[node_id].element_data() else {
+    pub fn media_sources_for(&self, node_id: usize) -> Vec<MediaSource> {
+        let Some(element) = self.nodes.get(node_id).and_then(|n| n.element_data()) else {
             return Vec::new();
         };
         if let Some(src) = element.attr(local_name!("src")).filter(|s| !s.trim().is_empty()) {
@@ -57,38 +57,64 @@ impl BaseDocument {
     }
 
     /// Start the element's player, or return the one it already has.
-    fn start_media_player(&mut self, node_id: usize, autoplay: bool) -> Option<Arc<dyn MediaPlayer>> {
+    pub fn start_media_player(&mut self, node_id: usize, autoplay: bool) -> Option<Arc<dyn MediaPlayer>> {
         if let Some(player) = self.media_player(node_id) {
             return Some(player);
         }
         let provider = self.media_provider.clone()?;
-        let sources = self.media_sources(node_id);
+        let sources = self.media_sources_for(node_id);
         if sources.is_empty() {
             return None;
         }
-        let element = self.nodes[node_id].element_data()?;
+        let element = self.nodes.get(node_id)?.element_data()?;
         let options = MediaOptions {
             autoplay,
             muted: element.attr(local_name!("muted")).is_some(),
             looping: element.attr(local_name!("loop")).is_some(),
         };
         let player = provider.create_player(sources, options, self.shell_provider.clone())?;
-        let element = self.nodes[node_id].element_data_mut()?;
+        let element = self.nodes.get_mut(node_id)?.element_data_mut()?;
         element.media = Some(MediaElement(player.clone()));
         Some(player)
     }
 
+    /// Re-attach a preserved player (e.g. across a JS DOM re-render) to `node_id`.
+    pub fn attach_media_player(&mut self, node_id: usize, player: Arc<dyn MediaPlayer>) {
+        player.set_shell_provider(self.shell_provider.clone());
+        if let Some(element) = self.nodes.get_mut(node_id).and_then(|n| n.element_data_mut()) {
+            element.media = Some(MediaElement(player));
+        }
+    }
+
+    /// Drop any active player attached to `node_id` so the next load/play recreates it.
+    pub fn reset_media_player(&mut self, node_id: usize) {
+        if let Some(element) = self.nodes.get_mut(node_id).and_then(|n| n.element_data_mut()) {
+            element.media = None;
+        }
+    }
+
     /// A `<video>` was added to the document. A muted `autoplay` video starts
-    /// at once, as in Chrome; one with sound waits for a click, rather than
-    /// surprising the user with audio.
+    /// at once, as in Chrome; one with `preload="metadata"` or `preload="auto"`
+    /// (or default with `controls`) loads its first frame paused so it doesn't
+    /// stay a blank black box until clicked.
     pub(crate) fn media_element_added(&mut self, node_id: usize) {
         let Some(element) = self.nodes.get(node_id).and_then(|n| n.element_data()) else {
             return;
         };
-        if element.attr(local_name!("autoplay")).is_some()
-            && element.attr(local_name!("muted")).is_some()
-        {
+        let autoplay = element.attr(local_name!("autoplay")).is_some();
+        let muted = element.attr(local_name!("muted")).is_some();
+        if autoplay && muted {
             self.start_media_player(node_id, true);
+        } else {
+            let preload = element.attr(local_name!("preload")).unwrap_or("");
+            if !preload.eq_ignore_ascii_case("none")
+                && (element.attr(local_name!("controls")).is_some()
+                    || preload.eq_ignore_ascii_case("auto")
+                    || preload.eq_ignore_ascii_case("metadata")
+                    || autoplay)
+            {
+                self.start_media_player(node_id, false);
+            }
         }
     }
 

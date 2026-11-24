@@ -308,8 +308,10 @@ fn write_attrs(out: &mut String, attrs: &[Attribute]) {
             out.push(',');
         }
         match &attr.name.prefix {
-            Some(prefix) => write_str(out, &format!("{prefix}:{}", attr.name.local)),
-            None => write_str(out, &attr.name.local),
+            Some(prefix) if !prefix.is_empty() => {
+                write_str(out, &format!("{prefix}:{}", attr.name.local))
+            }
+            _ => write_str(out, &attr.name.local),
         }
         out.push(',');
         write_str(out, &attr.value);
@@ -372,5 +374,15 @@ mod tests {
         assert!(json.contains("[\"div\",[\"id\",\"root\"],[[\"p\",[],[\"ok\"]]]]"), "{json}");
         assert!(json.contains("[\"noscript\",[],[\"fb\"]]"), "{json}");
         assert!(json.contains("[\"title\",[],[\"T\"]]"), "{json}");
+    }
+
+    #[test]
+    fn empty_attr_prefix_does_not_emit_leading_colon() {
+        let json = body_json(
+            "<!doctype html><html><body><svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\"><path d=\"M0 0\"/></svg></body></html>",
+        )
+        .unwrap();
+        assert!(!json.contains("\":xmlns\""), "unexpected :xmlns in {json}");
+        assert!(json.contains("\"xmlns\",\"http://www.w3.org/2000/svg\""), "{json}");
     }
 }

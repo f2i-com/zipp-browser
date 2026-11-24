@@ -47,17 +47,20 @@ input[type=tel]:dir(ltr) {
     direction: ltr;
 }
 
-input {
+input,
+textarea {
     display: inline-block;
 }
 
 input[type="checkbox"] {
+    box-sizing: border-box;
     width: 14px;
     height: 14px;
     margin: 3px 3px 3px 4px;
 }
 
 input[type="radio"] {
+    box-sizing: border-box;
     width: 14px;
     height: 14px;
     border-radius: 14px;
@@ -81,6 +84,8 @@ button,
 input[type="submit"],
 input[type="reset"],
 input[type="button"] {
+    display: inline-block;
+    box-sizing: border-box;
     border: 1px solid #999;
     border-radius: 1px;
     padding: 1px 6px;

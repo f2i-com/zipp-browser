@@ -11,6 +11,7 @@
 mod application;
 mod convert_events;
 mod event;
+pub mod cache;
 pub mod net;
 pub mod profile;
 #[cfg(feature = "cookies")]

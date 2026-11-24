@@ -204,7 +204,7 @@ Headers.prototype.get = function (k) { k = String(k).toLowerCase(); return k in 
 Headers.prototype.has = function (k) { return String(k).toLowerCase() in this._h; };
 Headers.prototype.set = function (k, v) { this._h[String(k).toLowerCase()] = String(v); };
 Headers.prototype.forEach = function (fn, that) { for (var k in this._h) fn.call(that, this._h[k], k, this); };
-function Response(bytes, status, url, contentType) {
+function Response(bytes, status, url, contentType, extraHeaders) {
   this.status = status;
   this.ok = status >= 200 && status < 300;
   this.statusText = this.ok ? "OK" : "Error";
@@ -214,14 +214,19 @@ function Response(bytes, status, url, contentType) {
   this.bodyUsed = false;
   this._bytes = bytes;
   var type = contentType || (/\.wasm(\?|#|$)/.test(url) ? "application/wasm" : /\.m?js(\?|#|$)/.test(url) ? "text/javascript" : /\.json(\?|#|$)/.test(url) ? "application/json" : "");
-  this.headers = new Headers(type ? { "content-type": type } : {});
+  var initHdrs = {};
+  if (extraHeaders && typeof extraHeaders === "object") {
+    for (var k in extraHeaders) initHdrs[k] = extraHeaders[k];
+  }
+  if (type && !initHdrs["content-type"]) initHdrs["content-type"] = type;
+  this.headers = new Headers(initHdrs);
 }
 Response.prototype.arrayBuffer = function () { return Promise.resolve(this._bytes.slice(0).buffer); };
 Response.prototype.bytes = function () { return Promise.resolve(this._bytes.slice(0)); };
 Response.prototype.text = function () { return Promise.resolve(new TextDecoder().decode(this._bytes)); };
 Response.prototype.json = function () { return this.text().then(JSON.parse); };
 Response.prototype.blob = function () { return Promise.resolve(new Blob([this._bytes], { type: this.headers.get("content-type") || "" })); };
-Response.prototype.clone = function () { return new Response(this._bytes, this.status, this.url, this.headers.get("content-type") || ""); };
+Response.prototype.clone = function () { return new Response(this._bytes, this.status, this.url, this.headers.get("content-type") || "", this.headers._h); };
 var Request = function (input, init) {
   init = init || {};
   var raw = input && input.url ? input.url : (input && input.href ? input.href : String(input));
@@ -236,15 +241,23 @@ var fetch = function (input, init) {
   var rawUrl = input && input.url ? input.url : String(input && input.href ? input.href : input);
   var url = (rawUrl.indexOf("blob:") === 0 || rawUrl.indexOf("data:") === 0) ? rawUrl : new URL(rawUrl, location.href).href;
   var method = String((init && init.method) || (input && input.method) || "GET").toUpperCase();
+  var creds = (init && init.credentials) || (input && input.credentials) || "same-origin";
+  var credentials = creds === "omit" ? "omit" : (creds === "include" ? "include" : "same-origin");
+  var rawHdrs = (init && init.headers) || (input && input.headers) || {};
+  var hdrObj = {};
+  if (typeof rawHdrs.forEach === "function") rawHdrs.forEach(function (v, k) { hdrObj[String(k)] = String(v); });
+  else if (rawHdrs && rawHdrs._h) { for (var hk in rawHdrs._h) hdrObj[hk] = String(rawHdrs._h[hk]); }
+  else if (rawHdrs && typeof rawHdrs === "object") { for (var ok in rawHdrs) hdrObj[ok] = String(rawHdrs[ok]); }
   return new Promise(function (resolve, reject) {
     try {
-      if (method !== "GET") {
+      if (method !== "GET" || Object.keys(hdrObj).length > 0) {
         var body = init && init.body != null ? String(init.body) : "";
-        var r = JSON.parse(__zippHostCall("http", method, url, body, (init && init.headers && (init.headers["Content-Type"] || init.headers["content-type"])) || ""));
-        resolve(new Response(new TextEncoder().encode(r.body), r.status, url, r.contentType || ""));
+        var ct = hdrObj["content-type"] || hdrObj["Content-Type"] || "";
+        var r = JSON.parse(__zippHostCall("http", method, url, body, ct, credentials, JSON.stringify(hdrObj)));
+        resolve(new Response(new TextEncoder().encode(r.body), r.status, url, r.contentType || "", r.headers));
         return;
       }
-      var info = JSON.parse(__zippHostCall("http_bytes", url));
+      var info = JSON.parse(__zippHostCall("http_bytes", url, credentials));
       if (__zippHostBytes.length < info.len) __zippHostBytes = new Uint8Array(Math.max(info.len, __zippHostBytes.length * 2));
       __zippHostCall("take_bytes");
       resolve(new Response(__zippHostBytes.slice(0, info.len), info.status, url, info.contentType || ""));

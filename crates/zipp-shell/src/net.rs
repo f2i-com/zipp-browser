@@ -185,17 +185,58 @@ impl Provider {
                 (request.url.to_string(), Bytes::from(file_content))
             }
             _ => {
-                let response = client
+                let url_str = request.url.as_str().to_string();
+                let is_get = request.method == reqwest::Method::GET;
+                let has_auth = request.headers.contains_key(reqwest::header::AUTHORIZATION);
+                let cache = crate::cache::global();
+
+                let revalidate = if is_get && !has_auth {
+                    match cache.lookup("sub", &url_str) {
+                        crate::cache::Lookup::Fresh(entry) => {
+                            return Ok((entry.url, Bytes::from(entry.body.as_ref().clone())));
+                        }
+                        crate::cache::Lookup::Revalidate(entry) => Some(entry),
+                        crate::cache::Lookup::Miss => None,
+                    }
+                } else {
+                    None
+                };
+
+                let mut req = client
                     .request(request.method, request.url)
                     .headers(request.headers)
                     .header("Content-Type", request.content_type.as_str())
-                    .header("User-Agent", user_agent.as_str())
+                    .header("User-Agent", user_agent.as_str());
+                if let Some(ref prev) = revalidate {
+                    if let Some(ref etag) = prev.etag {
+                        req = req.header(reqwest::header::IF_NONE_MATCH, etag.as_str());
+                    }
+                    if let Some(ref lm) = prev.last_modified {
+                        req = req.header(reqwest::header::IF_MODIFIED_SINCE, lm.as_str());
+                    }
+                }
+                let response = req
                     .apply_body(request.body, request.content_type.as_str())
                     .await
                     .send()
                     .await?;
 
-                (response.url().to_string(), response.bytes().await?)
+                let status = response.status().as_u16();
+                if status == 304
+                    && let Some(prev) = revalidate
+                {
+                    let refreshed = cache.revalidate_304("sub", &url_str, prev, response.headers());
+                    return Ok((refreshed.url, Bytes::from(refreshed.body.as_ref().clone())));
+                }
+                let final_url = response.url().to_string();
+                let resp_headers = response.headers().clone();
+                let bytes = response.bytes().await?;
+                if is_get && !has_auth {
+                    cache.store("sub", &url_str, status, &resp_headers, bytes.to_vec());
+                } else if !is_get {
+                    cache.invalidate_url(&url_str);
+                }
+                (final_url, bytes)
             }
         })
     }

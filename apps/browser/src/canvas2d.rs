@@ -286,6 +286,11 @@ thread_local! {
     static IMAGES: RefCell<HashMap<String, Arc<Pixmap>>> = RefCell::new(HashMap::new());
 }
 
+/// Drop cached decoded images on the current thread (used on Clear Cache).
+pub(crate) fn clear_image_cache() {
+    IMAGES.with(|i| i.borrow_mut().clear());
+}
+
 #[derive(Default)]
 struct Reply {
     result: String,
@@ -337,10 +342,27 @@ fn new_pixmap(w: f64, h: f64) -> Pixmap {
         .unwrap_or_else(|| Pixmap::new(1, 1).unwrap())
 }
 
+thread_local! {
+    static COLOR_CACHE: RefCell<HashMap<String, Option<Color>>> = RefCell::new(HashMap::new());
+}
+
 fn parse_color(css: &str) -> Option<Color> {
-    let parsed = color::parse_color(css.trim()).ok()?;
-    let c = parsed.to_alpha_color::<color::Srgb>().to_rgba8();
-    Some(Color::from_rgba8(c.r, c.g, c.b, c.a))
+    let trimmed = css.trim();
+    COLOR_CACHE.with(|cache| {
+        let mut map = cache.borrow_mut();
+        if let Some(&hit) = map.get(trimmed) {
+            return hit;
+        }
+        let res = color::parse_color(trimmed).ok().map(|parsed| {
+            let c = parsed.to_alpha_color::<color::Srgb>().to_rgba8();
+            Color::from_rgba8(c.r, c.g, c.b, c.a)
+        });
+        if map.len() >= 1024 {
+            map.clear();
+        }
+        map.insert(trimmed.to_string(), res);
+        res
+    })
 }
 
 fn blend_mode(name: &str) -> Option<BlendMode> {
@@ -447,13 +469,42 @@ fn demultiply(px: &[u8]) -> [u8; 4] {
 fn read_pixels(pixmap: &Pixmap, x: i32, y: i32, w: i32, h: i32) -> Vec<u8> {
     let (pw, ph) = (pixmap.width() as i32, pixmap.height() as i32);
     let data = pixmap.data();
-    let mut out = vec![0u8; (w.max(0) * h.max(0) * 4) as usize];
-    for row in 0..h.max(0) {
+    let (w, h) = (w.max(0), h.max(0));
+    let mut out = vec![0u8; (w * h * 4) as usize];
+    if w == 0 || h == 0 {
+        return out;
+    }
+    // Fast path for in-bounds rectangles (including full-canvas `present()`).
+    if x >= 0 && y >= 0 && x + w <= pw && y + h <= ph {
+        let src_stride = (pw * 4) as usize;
+        let dst_stride = (w * 4) as usize;
+        let x_off = (x * 4) as usize;
+        for row in 0..h as usize {
+            let src_row = &data[(y as usize + row) * src_stride + x_off..][..dst_stride];
+            let dst_row = &mut out[row * dst_stride..][..dst_stride];
+            for (d, s) in dst_row.chunks_exact_mut(4).zip(src_row.chunks_exact(4)) {
+                match s[3] {
+                    255 => d.copy_from_slice(s),
+                    0 => {}
+                    a => {
+                        let a32 = a as u32;
+                        let half = a32 / 2;
+                        d[0] = ((s[0] as u32 * 255 + half) / a32).min(255) as u8;
+                        d[1] = ((s[1] as u32 * 255 + half) / a32).min(255) as u8;
+                        d[2] = ((s[2] as u32 * 255 + half) / a32).min(255) as u8;
+                        d[3] = a;
+                    }
+                }
+            }
+        }
+        return out;
+    }
+    for row in 0..h {
         let sy = y + row;
         if sy < 0 || sy >= ph {
             continue;
         }
-        for col in 0..w.max(0) {
+        for col in 0..w {
             let sx = x + col;
             if sx < 0 || sx >= pw {
                 continue;

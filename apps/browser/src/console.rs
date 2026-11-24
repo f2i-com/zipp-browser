@@ -185,27 +185,27 @@ pub(crate) fn counts_text() -> String {
 pub(crate) fn lines_html() -> String {
     let log = LOG.lock().unwrap();
     if log.entries.is_empty() {
-        return r#"<div style="padding:6px 10px;color:#868e96;font-family:Arial,sans-serif">Nothing logged yet.</div>"#.into();
+        return r#"<div style="padding:10px 12px;color:#64748b;font-family:'Segoe UI',Arial,sans-serif">Nothing logged yet.</div>"#.into();
     }
     let mut out = String::with_capacity(log.entries.len() * 80);
     for entry in log.entries.iter().rev() {
         let (color, background, mark) = match entry.level {
-            Level::Error => ("#c92a2a", "#fff5f5", "✖"),
-            Level::Warn => ("#8a6100", "#fff9db", "⚠"),
-            Level::Input => ("#1c7ed6", "#ffffff", "›"),
-            Level::Result => ("#495057", "#ffffff", "‹"),
-            Level::Log => ("#212529", "#ffffff", ""),
+            Level::Error => ("#fca5a5", "rgba(239,68,68,0.14)", "✖"),
+            Level::Warn => ("#fcd34d", "rgba(245,158,11,0.12)", "⚠"),
+            Level::Input => ("#60a5fa", "transparent", "›"),
+            Level::Result => ("#94a3b8", "transparent", "‹"),
+            Level::Log => ("#e2e8f0", "transparent", ""),
         };
         let _ = write!(
             out,
-            r#"<div style="display:flex;gap:6px;padding:2px 10px;border-bottom:1px solid #f1f3f5;color:{color};background:{background};white-space:pre-wrap;word-break:break-word"><span style="width:12px;flex-shrink:0">{mark}</span><span style="flex:1">"#
+            r#"<div style="display:flex;gap:8px;padding:3px 10px;border-bottom:1px solid #1e293b;color:{color};background:{background};white-space:pre-wrap;word-break:break-word"><span style="width:12px;flex-shrink:0">{mark}</span><span style="flex:1">"#
         );
         escape(&entry.text, &mut out);
         out.push_str("</span>");
         if entry.repeats > 1 {
             let _ = write!(
                 out,
-                r#"<span style="flex-shrink:0;padding:0 6px;border-radius:8px;background:#e9ecef;color:#495057">{}</span>"#,
+                r#"<span style="flex-shrink:0;padding:0 6px;border-radius:999px;background:#1e293b;color:#cbd5e1;font-size:11px">{}</span>"#,
                 entry.repeats
             );
         }

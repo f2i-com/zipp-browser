@@ -125,8 +125,11 @@ impl BaseDocument {
 
         // Resolve sub-documents (e.g. iframes)
         let mut subdoc_is_animating = false;
+        self.sub_document_nodes.retain(|id| self.nodes.contains(*id));
         for &node_id in &self.sub_document_nodes {
-            let node = &mut self.nodes[node_id];
+            let Some(node) = self.nodes.get_mut(node_id) else {
+                continue;
+            };
             let size = node.final_layout.size;
             if let Some(mut sub_doc) = node.subdoc_mut().map(|doc| doc.inner_mut()) {
                 // Set viewport
@@ -416,18 +419,21 @@ impl BaseDocument {
         let roots: Vec<usize> = self
             .nodes
             .iter()
-            .filter(|(_, node)| node.stacking_context.is_some())
+            .filter(|(_, node)| node.flags.is_in_document() && node.stacking_context.is_some())
             .map(|(id, _)| id)
             .collect();
         for root in roots {
             let Some(mut context) = self.nodes[root].stacking_context.take() else {
                 continue;
             };
+            context.children.retain(|h| self.nodes.contains(h.node_id));
             for hoisted in context.children.iter_mut() {
                 let mut position = taffy::Point::ZERO;
                 let mut ancestor = self.nodes.get(hoisted.node_id).and_then(|n| n.layout_parent.get());
                 while let Some(id) = ancestor.filter(|&id| id != root) {
-                    let node = &self.nodes[id];
+                    let Some(node) = self.nodes.get(id) else {
+                        break;
+                    };
                     position.x += node.final_layout.location.x - node.scroll_offset.x as f32;
                     position.y += node.final_layout.location.y - node.scroll_offset.y as f32;
                     ancestor = node.layout_parent.get();
@@ -481,61 +487,70 @@ impl BaseDocument {
 ///
 /// Returns the boxes that could not be placed at `node_id` and must be adopted
 /// by an ancestor.
-fn reparent_out_of_flow_children(doc: &mut BaseDocument, node_id: usize) -> Vec<usize> {
+fn reparent_out_of_flow_children(doc: &mut BaseDocument, node_id: usize) -> (Vec<usize>, Vec<usize>) {
     let is_root = doc.nodes[node_id].parent.is_none()
         || doc.nodes[node_id].id == doc.root_element().id;
 
-    // A box establishes a containing block for absolute descendants when it is
-    // itself positioned, or when it has a transform. The root always does.
-    //
-    // Inline roots are treated as containing blocks too, but for a different
-    // reason: inline layout positions the out-of-flow boxes embedded in its own
-    // line boxes (`layout/inline.rs`), so lifting them out from under it would
-    // strand geometry that code still expects to own. That leaves abspos inside
-    // a text-carrying block resolved against that block — the pre-existing
-    // behaviour, not a regression.
-    let is_containing_block = is_root
+    let has_transform = doc.nodes[node_id]
+        .primary_styles()
+        .map(|s| crate::stylo_to_kurbo::has_2d_transform(s.get_box()))
+        .unwrap_or(false);
+
+    // Per CSS Positioned Layout:
+    // - `position: absolute` attaches to the nearest positioned or transformed
+    //   ancestor (or root / inline root).
+    // - `position: fixed` attaches to the viewport/root UNLESS an ancestor has
+    //   a transform (or inline root).
+    let is_abs_containing_block = is_root
         || doc.nodes[node_id].flags.is_inline_root()
+        || has_transform
         || doc.nodes[node_id]
             .primary_styles()
-            .map(|s| {
-                !matches!(s.clone_position(), Position::Static)
-                    || crate::stylo_to_kurbo::has_2d_transform(s.get_box())
-            })
+            .map(|s| !matches!(s.clone_position(), Position::Static))
             .unwrap_or(false);
+    let is_fixed_containing_block =
+        is_root || doc.nodes[node_id].flags.is_inline_root() || has_transform;
 
     let children = doc.nodes[node_id].layout_children.borrow_mut().take();
     let Some(children) = children else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
 
     let mut kept = Vec::with_capacity(children.len());
-    let mut escaping = Vec::new();
+    let mut escaping_abs = Vec::new();
+    let mut escaping_fixed = Vec::new();
 
     for child_id in children {
         // Depth first: anything the child could not contain surfaces here.
-        let from_child = reparent_out_of_flow_children(doc, child_id);
+        let (from_child_abs, from_child_fixed) = reparent_out_of_flow_children(doc, child_id);
 
-        let child_is_abs = doc.nodes[child_id]
+        let child_pos = doc.nodes[child_id]
             .primary_styles()
-            .map(|s| matches!(s.clone_position(), Position::Absolute | Position::Fixed))
-            .unwrap_or(false);
+            .map(|s| s.clone_position())
+            .unwrap_or(Position::Static);
 
-        if child_is_abs {
-            escaping.push(child_id);
-        } else {
-            kept.push(child_id);
+        match child_pos {
+            Position::Absolute => escaping_abs.push(child_id),
+            Position::Fixed => escaping_fixed.push(child_id),
+            _ => kept.push(child_id),
         }
-        escaping.extend(from_child);
+        escaping_abs.extend(from_child_abs);
+        escaping_fixed.extend(from_child_fixed);
     }
 
-    if is_containing_block {
-        for &adopted in escaping.iter() {
+    if is_abs_containing_block {
+        for &adopted in escaping_abs.iter() {
             doc.nodes[adopted].layout_parent.set(Some(node_id));
         }
-        kept.append(&mut escaping);
+        kept.append(&mut escaping_abs);
+    }
+    if is_fixed_containing_block {
+        for &adopted in escaping_fixed.iter() {
+            doc.nodes[adopted].layout_parent.set(Some(node_id));
+        }
+        kept.append(&mut escaping_fixed);
     }
 
     *doc.nodes[node_id].layout_children.borrow_mut() = Some(kept);
-    escaping
+    (escaping_abs, escaping_fixed)
 }

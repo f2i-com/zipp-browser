@@ -187,7 +187,12 @@ impl<'dom> DocumentPainter<'dom> {
 
     #[inline]
     fn layout(&self, child: usize) -> Layout {
-        self.dom.as_ref().tree()[child].final_layout
+        self.dom
+            .as_ref()
+            .tree()
+            .get(child)
+            .map(|n| n.final_layout)
+            .unwrap_or_default()
     }
 
     /// Draw the current tree to current render surface
@@ -275,7 +280,9 @@ impl<'dom> DocumentPainter<'dom> {
             }
         }
 
-        let node = &self.dom.as_ref().tree()[node_id];
+        let Some(node) = self.dom.as_ref().tree().get(node_id) else {
+            return;
+        };
 
         // Early return if the element is hidden
         if matches!(node.style.display, taffy::Display::None) {
@@ -542,7 +549,9 @@ impl<'dom> DocumentPainter<'dom> {
         location: Point,
         ancestor_transform: Affine,
     ) {
-        let node = &self.dom.as_ref().tree()[node_id];
+        let Some(node) = self.dom.as_ref().tree().get(node_id) else {
+            return;
+        };
 
         match &node.data {
             NodeData::Element(_) | NodeData::AnonymousBlock(_) => {

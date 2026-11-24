@@ -551,12 +551,15 @@ pub(crate) fn handle_click(
                         tracing::info!("Clicked link without href: {:?}", el.attrs());
                     }
                 }
-                local_name!("input")
-                    if el.is_submit_button() || el.attr(local_name!("type")) == Some("submit") =>
+                local_name!("button") | local_name!("input")
+                    if el.is_submit_button()
+                        || (el.name.local == local_name!("input")
+                            && el.attr(local_name!("type")) == Some("submit")) =>
                 {
                     if let Some(form_owner) = doc.controls_to_form.get(&node_id) {
                         doc.submit_form(*form_owner, node_id);
                     }
+                    break 'matched true;
                 }
                 #[cfg(feature = "file_input")]
                 local_name!("input") if el.attr(local_name!("type")) == Some("file") => {

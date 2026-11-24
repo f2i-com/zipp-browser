@@ -524,29 +524,33 @@ impl FloatContext {
 pub struct FloatIntrinsicWidthCalculator {
     /// The available width of the container
     available_width: AvailableSpace,
-    /// The running total intrinsic width contribution
-    contribution: f32,
+    /// Minimum intrinsic contribution (widest individual float)
+    min_contribution: f32,
+    /// Maximum intrinsic contribution (sum of floats)
+    max_contribution: f32,
 }
 
 impl FloatIntrinsicWidthCalculator {
     /// Create a new `FloatIntrinsicWidthCalculator`
     pub fn new(available_width: AvailableSpace) -> Self {
-        Self { available_width, contribution: 0.0 }
+        Self { available_width, min_contribution: 0.0, max_contribution: 0.0 }
     }
 
     /// Add a float to the computation
     pub fn add_float(&mut self, width: f32, _direction: FloatDirection, _clear: Clear) {
-        match self.available_width {
-            AvailableSpace::Definite(_) => {
-                // We will never hit this code path with definite available space
-            }
-            AvailableSpace::MinContent => self.contribution = self.contribution.max(width),
-            AvailableSpace::MaxContent => self.contribution += width,
-        };
+        self.min_contribution = self.min_contribution.max(width);
+        self.max_contribution += width;
     }
 
     /// Get the computed float contribution to intrinsic width
     pub fn result(&self) -> f32 {
-        self.contribution
+        match self.available_width {
+            AvailableSpace::Definite(limit) => {
+                // CSS 2.1 §10.3.9 shrink-to-fit: min(max(preferred_min, available), preferred)
+                self.max_contribution.min(limit).max(self.min_contribution)
+            }
+            AvailableSpace::MinContent => self.min_contribution,
+            AvailableSpace::MaxContent => self.max_contribution,
+        }
     }
 }

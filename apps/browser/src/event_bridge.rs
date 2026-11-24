@@ -16,6 +16,7 @@
 //! `__eventHandlers[flid][eventType][0](event)` registry.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::console;
@@ -106,9 +107,7 @@ fn walk_node(
             && let Ok(flid) = val.parse::<u32>() {
                 map.insert(flid, node_id);
             }
-        // Visit children
-        let child_ids: Vec<usize> = node.children.clone();
-        for child_id in child_ids {
+        for &child_id in &node.children {
             walk_node(doc, child_id, flid_attr, map);
         }
     }
@@ -123,6 +122,8 @@ fn walk_node(
 pub struct JsEventBridge {
     /// blitz_node_id -> list of event type strings (e.g. "click", "mousedown")
     handler_map: HashMap<usize, Vec<String>>,
+    /// Forward map: JS flid -> blitz_node_id (O(1) layout/scroll/canvas lookup).
+    flid_to_dom: Arc<HashMap<u32, usize>>,
     /// Reverse map: blitz_node_id -> JS flid (node _id in the dom shim).
     reverse_flid: HashMap<usize, u32>,
     /// The live Zipp VM state.
@@ -174,6 +175,10 @@ pub struct JsEventBridge {
     console_shown: u64,
     console_refreshed: Instant,
     console_badge: String,
+    /// Active `<video>` players preserved across JS DOM re-renders, keyed by `flid`.
+    video_players: HashMap<u32, (String, Arc<dyn zipp_dom::traits_src::media::MediaPlayer>)>,
+    /// Last time video statuses were pushed to JS (`__zippVideoSync`).
+    video_synced: Instant,
 }
 
 /// The console panel refreshes at most this often, so a page logging every
@@ -200,6 +205,7 @@ impl JsEventBridge {
             .collect();
         let mut bridge = JsEventBridge {
             handler_map,
+            flid_to_dom: Arc::new(flid_map),
             reverse_flid,
             js_state,
             pending_rerender: None,
@@ -219,6 +225,8 @@ impl JsEventBridge {
             console_shown: 0,
             console_refreshed: Instant::now(),
             console_badge: String::new(),
+            video_players: HashMap::new(),
+            video_synced: Instant::now(),
         };
         bridge.note_rendered();
         bridge.refresh_next_timer();
@@ -281,6 +289,8 @@ impl JsEventBridge {
         let flid_map = build_flid_map(doc);
         self.handler_map = parse_event_map(&flid_map, &event_map_json);
         self.reverse_flid = flid_map.iter().map(|(&flid, &node)| (node, flid)).collect();
+        self.flid_to_dom = Arc::new(flid_map);
+        update_layout_flids(&self.flid_to_dom);
     }
 
     /// What the page changed since it was last drawn, ready for the shell:
@@ -413,7 +423,7 @@ impl JsEventBridge {
         {
             for (nid, to) in asked {
                 let Ok(flid) = nid.parse::<u32>() else { continue };
-                let Some((&node, _)) = self.reverse_flid.iter().find(|&(_, &f)| f == flid) else {
+                let Some(&node) = self.flid_to_dom.get(&flid) else {
                     continue;
                 };
                 let Some(node) = doc.get_node_mut(node) else { continue };
@@ -486,8 +496,8 @@ impl JsEventBridge {
             return;
         }
         let flid = n as u32;
-        match self.reverse_flid.iter().find(|&(_, &f)| f == flid) {
-            Some((&node, _)) => {
+        match self.flid_to_dom.get(&flid) {
+            Some(&node) => {
                 doc.set_focus_to(node);
                 self.pending_focus = None;
             }
@@ -608,11 +618,146 @@ impl JsEventBridge {
         }
         None
     }
+
+    fn sources_key(doc: &BaseDocument, node_id: usize) -> String {
+        doc.media_sources_for(node_id)
+            .into_iter()
+            .map(|s| s.url)
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    /// Snapshot any live `<video>` players attached to the DOM (e.g. started
+    /// by native controls click or autoplay) so JS DOM re-renders don't drop them.
+    fn capture_video_players(&mut self, doc: &BaseDocument) {
+        for (&flid, &node_id) in self.flid_to_dom.iter() {
+            if let Some(player) = doc.media_player(node_id) {
+                let key = Self::sources_key(doc, node_id);
+                self.video_players.insert(flid, (key, player));
+            }
+        }
+    }
+
+    /// Re-attach preserved `<video>` players after a DOM re-render if the
+    /// element's source URLs still match.
+    fn restore_video_players(&mut self, doc: &mut BaseDocument) {
+        let preserved = std::mem::take(&mut self.video_players);
+        for (flid, (old_key, player)) in preserved {
+            if let Some(&node_id) = self.flid_to_dom.get(&flid) {
+                let new_key = Self::sources_key(doc, node_id);
+                if !new_key.is_empty() && new_key == old_key {
+                    doc.attach_media_player(node_id, player.clone());
+                    self.video_players.insert(flid, (old_key, player));
+                }
+            }
+        }
+    }
+
+    /// Drain queued JS `<video>` commands (`play`, `pause`, `load`, `seek`, etc.).
+    fn apply_pending_video_ops(&mut self, doc: &mut BaseDocument) {
+        let ops = take_pending_video_ops();
+        if ops.is_empty() {
+            return;
+        }
+        for (flid, op) in ops {
+            let Some(&node_id) = self.flid_to_dom.get(&flid) else {
+                continue;
+            };
+            match op {
+                PendingVideoOp::Load => {
+                    let key = Self::sources_key(doc, node_id);
+                    if let Some(existing) = doc.media_player(node_id)
+                        && self.video_players.get(&flid).is_none_or(|(k, _)| k == &key)
+                        && !key.is_empty()
+                    {
+                        self.video_players.insert(flid, (key, existing));
+                    } else {
+                        self.video_players.remove(&flid);
+                        doc.reset_media_player(node_id);
+                        if let Some(player) = doc.start_media_player(node_id, false) {
+                            self.video_players.insert(flid, (key, player));
+                        }
+                    }
+                }
+                PendingVideoOp::Play => {
+                    if let Some(player) = doc.start_media_player(node_id, true) {
+                        player.play();
+                        let key = Self::sources_key(doc, node_id);
+                        self.video_players.insert(flid, (key, player));
+                    }
+                }
+                PendingVideoOp::Pause => {
+                    if let Some(player) = doc.media_player(node_id) {
+                        player.pause();
+                    }
+                }
+                PendingVideoOp::Seek(secs) => {
+                    if let Some(player) = doc.start_media_player(node_id, false) {
+                        player.seek(secs);
+                        let key = Self::sources_key(doc, node_id);
+                        self.video_players.insert(flid, (key, player));
+                    }
+                }
+                PendingVideoOp::Mute(m) => {
+                    if let Some(player) = doc.media_player(node_id) {
+                        player.set_muted(m);
+                    }
+                }
+                PendingVideoOp::Volume(v) => {
+                    if let Some(player) = doc.media_player(node_id) {
+                        player.set_volume(v);
+                    }
+                }
+                PendingVideoOp::Rate(r) => {
+                    if let Some(player) = doc.media_player(node_id) {
+                        player.set_playback_rate(r);
+                    }
+                }
+                PendingVideoOp::Loop(l) => {
+                    if let Some(player) = doc.media_player(node_id) {
+                        player.set_loop(l);
+                    }
+                }
+            }
+        }
+        doc.shell_provider.request_paint();
+    }
+
+    /// Push live native `<video>` status snapshots to JS so media events fire.
+    fn sync_videos(&mut self, doc: &BaseDocument, now: Instant) -> Option<Instant> {
+        self.capture_video_players(doc);
+        if self.video_players.is_empty() {
+            return None;
+        }
+        const VIDEO_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
+        if now.duration_since(self.video_synced) < VIDEO_SYNC_INTERVAL {
+            return Some(self.video_synced + VIDEO_SYNC_INTERVAL);
+        }
+        self.video_synced = now;
+
+        let mut map = serde_json::Map::new();
+        let mut any_active = false;
+        for (&flid, (_, player)) in &self.video_players {
+            let st = player.status();
+            if !st.paused && !st.ended {
+                any_active = true;
+            }
+            map.insert(flid.to_string(), media_status_json(&st));
+        }
+        if let Some(state) = self.js_state.as_mut() {
+            let json = serde_json::Value::Object(map).to_string();
+            let _ = state.call_global("__zippVideoSync", &[JsValue::String(json)]);
+            state.run_microtasks();
+        }
+        any_active.then(|| now + VIDEO_SYNC_INTERVAL)
+    }
 }
 
 impl Drop for JsEventBridge {
     /// The page is going, and its workers with it.
     fn drop(&mut self) {
+        self.video_players.clear();
+        let _ = take_pending_video_ops();
         crate::worker::terminate_page(self.page);
     }
 }
@@ -623,7 +768,7 @@ impl EventHandler for JsEventBridge {
     /// without one are not driven: their animation frames run while they
     /// settle and after events, as before.
     fn animation_frame(&mut self, doc: &mut BaseDocument) -> bool {
-        let _layout = LayoutScope::enter(doc);
+        let _layout = LayoutScope::enter(doc, &self.flid_to_dom);
         let Some(state) = self.js_state.as_mut() else {
             return false;
         };
@@ -642,7 +787,7 @@ impl EventHandler for JsEventBridge {
         };
         state.run_microtasks();
         print_console(state);
-        if crate::apply_canvas_frames(doc) {
+        if crate::apply_canvas_frames_with_map(doc, &self.flid_to_dom) {
             doc.shell_provider.request_paint();
         }
         // The frame changed the DOM as well: lay the page out again.
@@ -666,7 +811,7 @@ impl EventHandler for JsEventBridge {
         if matches!(event.data, DomEventData::Click(_) | DomEventData::KeyDown(_) | DomEventData::MouseDown(_)) {
             crate::note_user_gesture();
         }
-        let _layout = LayoutScope::enter(&_doc.inner());
+        let _layout = LayoutScope::enter(&_doc.inner(), &self.flid_to_dom);
         self.refresh_listeners(&_doc.inner());
         // Desktop <-> Mobile View toggle (toolbar phone icon or Ctrl+Shift+M).
         let mobile_key = crate::chrome_shown()
@@ -895,6 +1040,7 @@ impl EventHandler for JsEventBridge {
         }
         if ran_listener {
             let mut doc = _doc.inner_mut();
+            self.apply_pending_video_ops(&mut doc);
             self.apply_focus_request(&mut doc);
             self.sync_scrolls(&mut doc);
             // A listener asked for full screen (it takes a click).
@@ -903,7 +1049,7 @@ impl EventHandler for JsEventBridge {
     }
 
     fn run_tasks(&mut self, doc: &mut BaseDocument) -> Option<Instant> {
-        let _layout = LayoutScope::enter(doc);
+        let _layout = LayoutScope::enter(doc, &self.flid_to_dom);
         let now = Instant::now();
         self.refresh_listeners(doc);
         // The viewport changed size (the screen's new mode, a resized
@@ -982,7 +1128,7 @@ impl EventHandler for JsEventBridge {
                 for frame in frames {
                     crate::canvas::push_frame(frame);
                 }
-                if crate::apply_canvas_frames(doc) {
+                if crate::apply_canvas_frames_with_map(doc, &self.flid_to_dom) {
                     doc.shell_provider.request_paint();
                 }
             }
@@ -1036,15 +1182,17 @@ impl EventHandler for JsEventBridge {
             && matches!(state.call_global("__zippWebGLContexts", &[]), Ok(JsValue::Number(n)) if n > 0.0)
         {
             let _ = state.call_global("__zippPresentCanvases", &[]);
-            if crate::apply_canvas_frames(doc) {
+            if crate::apply_canvas_frames_with_map(doc, &self.flid_to_dom) {
                 doc.shell_provider.request_paint();
             }
         }
+        self.apply_pending_video_ops(doc);
         self.apply_focus_request(doc);
         self.sync_scrolls(doc);
+        let video_due = self.sync_videos(doc, now);
         crate::apply_window_requests(doc);
         let console_due = self.refresh_console(doc, now, false);
-        [self.next_timer, console_due].into_iter().flatten().min()
+        [self.next_timer, console_due, video_due].into_iter().flatten().min()
     }
 
     fn take_pending_rerender(&mut self) -> Option<String> {
@@ -1119,28 +1267,193 @@ impl EventHandler for JsEventBridge {
         {
             doc.set_focus_to(node);
         }
+        self.flid_to_dom = Arc::new(flid_map);
+        update_layout_flids(&self.flid_to_dom);
+        self.restore_video_players(doc);
+        self.apply_pending_video_ops(doc);
     }
+}
+
+#[derive(Clone, Debug)]
+enum PendingVideoOp {
+    Load,
+    Play,
+    Pause,
+    Seek(f64),
+    Mute(bool),
+    Volume(f64),
+    Rate(f64),
+    Loop(bool),
 }
 
 thread_local! {
     /// The document, laid out, while the page's script runs on its behalf --
     /// an event, a timer, a frame: what `getBoundingClientRect` reads.
     static LAYOUT_DOC: std::cell::Cell<*const BaseDocument> = const { std::cell::Cell::new(std::ptr::null()) };
+    /// O(1) flid -> blitz_dom node ID lookup matching `LAYOUT_DOC`.
+    static LAYOUT_FLIDS: std::cell::RefCell<Option<Arc<HashMap<u32, usize>>>> = const { std::cell::RefCell::new(None) };
+    /// Queued `<video>` commands requested by JS before the bridge has `&mut BaseDocument`.
+    static PENDING_VIDEO_OPS: std::cell::RefCell<Vec<(u32, PendingVideoOp)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn take_pending_video_ops() -> Vec<(u32, PendingVideoOp)> {
+    PENDING_VIDEO_OPS.with(|q| std::mem::take(&mut *q.borrow_mut()))
+}
+
+fn media_status_json(st: &zipp_dom::traits_src::media::MediaStatus) -> serde_json::Value {
+    let (vw, vh) = st.video_size.unwrap_or((0, 0));
+    serde_json::json!({
+        "hasPlayer": true,
+        "paused": st.paused,
+        "ended": st.ended,
+        "muted": st.muted,
+        "volume": st.volume,
+        "playbackRate": st.playback_rate,
+        "readyState": st.ready_state,
+        "currentTime": st.position,
+        "duration": st.duration,
+        "videoWidth": vw,
+        "videoHeight": vh,
+        "error": st.error,
+    })
+}
+
+/// Host call handler for `__zippHostCall("video", op, flid, [arg])`.
+pub(crate) fn video_host_call(args: &[String]) -> Result<String, String> {
+    let op = args.first().map(String::as_str).unwrap_or_default();
+    let Ok(flid) = args.get(1).map(String::as_str).unwrap_or_default().parse::<u32>() else {
+        return Ok(String::new());
+    };
+    let val = args.get(2).map(String::as_str).unwrap_or_default();
+
+    // Try direct read/control on an already-live player in `LAYOUT_DOC`.
+    let existing_player = LAYOUT_DOC.with(|d| {
+        let ptr = d.get();
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: `LAYOUT_DOC` is valid for the duration of the enclosing `LayoutScope`.
+        let doc = unsafe { &*ptr };
+        let node_id = lookup_layout_node(doc, flid)?;
+        doc.media_player(node_id)
+    });
+
+    if op == "status" {
+        return Ok(match existing_player {
+            Some(player) => media_status_json(&player.status()).to_string(),
+            None => r#"{"hasPlayer":false}"#.to_string(),
+        });
+    }
+
+    let queued = match op {
+        "load" => Some(PendingVideoOp::Load),
+        "play" => {
+            if let Some(player) = existing_player {
+                player.play();
+                None
+            } else {
+                Some(PendingVideoOp::Play)
+            }
+        }
+        "pause" => {
+            if let Some(player) = existing_player {
+                player.pause();
+                None
+            } else {
+                Some(PendingVideoOp::Pause)
+            }
+        }
+        "seek" => {
+            let secs = val.parse::<f64>().unwrap_or(0.0).max(0.0);
+            if let Some(player) = existing_player {
+                player.seek(secs);
+                None
+            } else {
+                Some(PendingVideoOp::Seek(secs))
+            }
+        }
+        "mute" => {
+            let m = val == "1" || val == "true";
+            if let Some(player) = existing_player {
+                player.set_muted(m);
+                None
+            } else {
+                Some(PendingVideoOp::Mute(m))
+            }
+        }
+        "volume" => {
+            let v = val.parse::<f64>().unwrap_or(1.0).clamp(0.0, 1.0);
+            if let Some(player) = existing_player {
+                player.set_volume(v);
+                None
+            } else {
+                Some(PendingVideoOp::Volume(v))
+            }
+        }
+        "rate" => {
+            let r = val.parse::<f64>().unwrap_or(1.0).clamp(0.25, 4.0);
+            if let Some(player) = existing_player {
+                player.set_playback_rate(r);
+                None
+            } else {
+                Some(PendingVideoOp::Rate(r))
+            }
+        }
+        "loop" => {
+            let l = val == "1" || val == "true";
+            if let Some(player) = existing_player {
+                player.set_loop(l);
+                None
+            } else {
+                Some(PendingVideoOp::Loop(l))
+            }
+        }
+        _ => None,
+    };
+    if let Some(pending) = queued {
+        PENDING_VIDEO_OPS.with(|q| q.borrow_mut().push((flid, pending)));
+    }
+    Ok(String::new())
+}
+
+fn update_layout_flids(map: &Arc<HashMap<u32, usize>>) {
+    LAYOUT_FLIDS.with(|f| {
+        let mut slot = f.borrow_mut();
+        if slot.is_some() {
+            *slot = Some(Arc::clone(map));
+        }
+    });
 }
 
 /// While alive, the page's script can read the document's layout.
-struct LayoutScope(*const BaseDocument);
+struct LayoutScope {
+    prev_doc: *const BaseDocument,
+    prev_flids: Option<Arc<HashMap<u32, usize>>>,
+}
 
 impl LayoutScope {
-    fn enter(doc: &BaseDocument) -> Self {
-        LayoutScope(LAYOUT_DOC.with(|d| d.replace(doc)))
+    fn enter(doc: &BaseDocument, flids: &Arc<HashMap<u32, usize>>) -> Self {
+        let prev_doc = LAYOUT_DOC.with(|d| d.replace(doc));
+        let prev_flids = LAYOUT_FLIDS.with(|f| f.borrow_mut().replace(Arc::clone(flids)));
+        LayoutScope { prev_doc, prev_flids }
     }
 }
 
 impl Drop for LayoutScope {
     fn drop(&mut self) {
-        LAYOUT_DOC.with(|d| d.set(self.0));
+        LAYOUT_DOC.with(|d| d.set(self.prev_doc));
+        LAYOUT_FLIDS.with(|f| *f.borrow_mut() = self.prev_flids.take());
     }
+}
+
+/// Look up a script node `nid` in `doc` in O(1) via `LAYOUT_FLIDS`, falling
+/// back to a selector query only if the map is absent or missed.
+fn lookup_layout_node(doc: &BaseDocument, nid: u32) -> Option<usize> {
+    let cached = LAYOUT_FLIDS.with(|f| f.borrow().as_ref().and_then(|m| m.get(&nid).copied()));
+    if cached.is_some() {
+        return cached;
+    }
+    doc.query_selector(&format!("[data-flid=\"{nid}\"]")).ok().flatten()
 }
 
 /// The border box of the script's node `nid` in the viewport, as JSON
@@ -1168,7 +1481,7 @@ pub(crate) fn layout_rect(nid: &str) -> String {
         // SAFETY: set only while a bridge method that has the document runs
         // the page's script, which reads the layout and cannot change it.
         let doc = unsafe { &*ptr };
-        let Ok(Some(id)) = doc.query_selector(&format!("[data-flid=\"{nid}\"]")) else {
+        let Some(id) = lookup_layout_node(doc, nid) else {
             return String::new();
         };
         let Some(node) = doc.get_node(id).filter(|n| laid_out(n)) else {
@@ -1221,7 +1534,7 @@ pub(crate) fn layout_box(nid: &str) -> String {
         }
         // SAFETY: as in `layout_rect`.
         let doc = unsafe { &*ptr };
-        let Ok(Some(id)) = doc.query_selector(&format!("[data-flid=\"{nid}\"]")) else {
+        let Some(id) = lookup_layout_node(doc, nid) else {
             return String::new();
         };
         let Some(node) = doc.get_node(id).filter(|n| laid_out(n)) else {
@@ -1250,7 +1563,7 @@ pub(crate) fn layout_style(nid: &str, name: &str) -> String {
         }
         // SAFETY: as in `layout_rect`.
         let doc = unsafe { &*ptr };
-        let Ok(Some(id)) = doc.query_selector(&format!("[data-flid=\"{nid}\"]")) else {
+        let Some(id) = lookup_layout_node(doc, nid) else {
             return String::new();
         };
         doc.get_node(id).and_then(|node| node.computed_style_value(name)).unwrap_or_default()

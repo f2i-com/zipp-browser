@@ -861,6 +861,21 @@ impl BaseDocument {
                     waiting.retain(|(id, _)| *id != node_id);
                 }
             }
+            self.sub_document_nodes.remove(&node_id);
+            self.changed_nodes.remove(&node_id);
+            if self.hover_node_id == Some(node_id) {
+                self.hover_node_id = None;
+                self.hover_node_is_text = false;
+            }
+            if self.focus_node_id == Some(node_id) {
+                self.focus_node_id = None;
+            }
+            if self.active_node_id == Some(node_id) {
+                self.active_node_id = None;
+            }
+            if self.mousedown_node_id == Some(node_id) {
+                self.mousedown_node_id = None;
+            }
 
             for &child in &node.children {
                 self.drop_node_ignoring_parent(child);
@@ -1094,6 +1109,7 @@ impl BaseDocument {
         }
     }
 
+    #[cfg(feature = "svg")]
     pub(crate) fn combined_svg_css(&self) -> String {
         if self.svg_css_by_node.is_empty() {
             return String::new();

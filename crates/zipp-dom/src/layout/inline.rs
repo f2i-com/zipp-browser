@@ -444,53 +444,34 @@ impl BaseDocument {
                 let max_content_width = content_sizes.max.max(inline_layout.layout.width());
 
                 #[cfg(feature = "floats")]
-                let float_width = match available_space.width {
-                    AvailableSpace::Definite(_) => 0.0,
-                    AvailableSpace::MinContent => {
-                        let mut width: f32 = 0.0;
-                        for ibox in inline_layout.layout.inline_boxes_mut() {
-                            let style = &self.nodes[ibox.id as usize].style;
-
-                            if style.float.is_floated() {
-                                let margin = style
-                                    .margin
-                                    .resolve_or_zero(inputs.parent_size, resolve_calc_value);
-                                let output =
-                                    self.compute_child_layout(NodeId::from(ibox.id), child_inputs);
-                                width = width.max(output.size.width + margin.left + margin.right);
-                            }
+                let (min_float_width, total_float_width) = {
+                    let mut min_w: f32 = 0.0;
+                    let mut sum_w: f32 = 0.0;
+                    for ibox in inline_layout.layout.inline_boxes_mut() {
+                        let style = &self.nodes[ibox.id as usize].style;
+                        if style.float.is_floated() {
+                            let margin = style
+                                .margin
+                                .resolve_or_zero(inputs.parent_size, resolve_calc_value);
+                            let output =
+                                self.compute_child_layout(NodeId::from(ibox.id), child_inputs);
+                            let w = output.size.width + margin.left + margin.right;
+                            min_w = min_w.max(w);
+                            sum_w += w;
                         }
-
-                        width * scale
                     }
-                    AvailableSpace::MaxContent => {
-                        let mut width: f32 = 0.0;
-                        for ibox in inline_layout.layout.inline_boxes_mut() {
-                            let style = &self.nodes[ibox.id as usize].style;
-
-                            if style.float.is_floated() {
-                                let margin = style
-                                    .margin
-                                    .resolve_or_zero(inputs.parent_size, resolve_calc_value);
-                                let output =
-                                    self.compute_child_layout(NodeId::from(ibox.id), child_inputs);
-                                width += output.size.width + margin.left + margin.right;
-                            }
-                        }
-
-                        width * scale
-                    }
+                    (min_w * scale, sum_w * scale)
                 };
 
                 #[cfg(not(feature = "floats"))]
-                let float_width = 0.0;
+                let (min_float_width, total_float_width) = (0.0f32, 0.0f32);
 
                 let computed_width = match available_space.width {
-                    AvailableSpace::MinContent => min_content_width.max(float_width),
-                    AvailableSpace::MaxContent => max_content_width + float_width,
+                    AvailableSpace::MinContent => min_content_width.max(min_float_width),
+                    AvailableSpace::MaxContent => max_content_width + total_float_width,
                     AvailableSpace::Definite(limit) => (limit * scale)
-                        .min(max_content_width + float_width)
-                        .max(min_content_width),
+                        .min(max_content_width + total_float_width)
+                        .max(min_content_width.max(min_float_width)),
                 }
                 .ceil();
 
@@ -697,8 +678,8 @@ impl BaseDocument {
 
                         let layout = &mut self.nodes[node_id].unrounded_layout;
                         layout.size = output.size;
-                        layout.location.x = pos.x + margin.left + container_pb.left;
-                        layout.location.y = pos.y + margin.top + container_pb.top;
+                        layout.location.x = pos.x + margin.left;
+                        layout.location.y = pos.y + margin.top;
 
                         // dbg!(&layout.size);
                         // dbg!(&layout.location);
@@ -728,8 +709,8 @@ impl BaseDocument {
                 pos.y += container_pb.top;
                 let layout = &mut self.nodes[f.node_id].unrounded_layout;
                 layout.size = f.size;
-                layout.location.x = pos.x + f.margin.left + container_pb.left;
-                layout.location.y = pos.y + f.margin.top + container_pb.top;
+                layout.location.x = pos.x + f.margin.left;
+                layout.location.y = pos.y + f.margin.top;
             }
             breaker.finish();
         }
@@ -803,12 +784,19 @@ impl BaseDocument {
             .maybe_clamp(node_min_size, node_max_size);
 
         // A button's content is centred in it, up and down, as browsers lay a
-        // button out: one taller than its text (`min-height: 44px`) had the
-        // text, and an icon beside it, at the top.
+        // button out: one taller than its text (`min-height: 44px` or
+        // `<input type="submit" style="height:36px">`) had the text at the top.
         let is_button = self.nodes[node_id]
             .data
             .downcast_element()
-            .is_some_and(|e| e.name.local == local_name!("button"));
+            .is_some_and(|e| {
+                e.name.local == local_name!("button")
+                    || (e.name.local == local_name!("input")
+                        && matches!(
+                            e.attr(local_name!("type")),
+                            Some("submit" | "button" | "reset")
+                        ))
+            });
         let v_center = if is_button {
             ((clamped_size.height - content_box_inset.vertical_axis_sum() - height / scale) / 2.0).max(0.0)
         } else {

@@ -104,6 +104,18 @@ pub struct View<Rend: WindowRenderer> {
     pub ios_request_redraw: std::cell::Cell<bool>,
 }
 
+fn format_window_title(title: &str) -> String {
+    if crate::profile::is_incognito() {
+        if title.is_empty() {
+            "[Incognito] Zipp Browser".to_string()
+        } else {
+            format!("[Incognito] {title}")
+        }
+    } else {
+        title.to_string()
+    }
+}
+
 impl<Rend: WindowRenderer> View<Rend> 
 where
     for<'a> Rend::ScenePainter<'a>: zipp_renderer::tinyskia::BlurLayer,
@@ -150,7 +162,10 @@ where
         // So we look for it here and set it if present.
         let title = inner.find_title_node().map(|node| node.text_content());
         if let Some(title) = title {
-            winit_window.set_title(&title);
+            let formatted = format_window_title(title.trim());
+            winit_window.set_title(&formatted);
+        } else if crate::profile::is_incognito() {
+            winit_window.set_title("[Incognito] Zipp Browser");
         }
 
         drop(inner);
@@ -195,7 +210,8 @@ where
         // the window keeps the first page's title for good.
         let title = inner.find_title_node().map(|node| node.text_content());
         drop(inner);
-        self.window.set_title(title.as_deref().map(str::trim).unwrap_or_default());
+        let formatted = format_window_title(title.as_deref().map(str::trim).unwrap_or_default());
+        self.window.set_title(&formatted);
 
         self.poll();
         self.request_redraw();
@@ -433,7 +449,7 @@ where
             return;
         };
         let inner = self.doc.inner();
-        let options = NavigationOptions::new(url, "text/plain".to_string(), inner.id());
+        let options = NavigationOptions::new(url, "application/x-zipp-shortcut".to_string(), inner.id());
         let provider = inner.navigation_provider.clone();
         drop(inner);
         provider.navigate_to(options);
@@ -492,14 +508,15 @@ where
                         let ctrl = self.keyboard_modifiers.state().control_key();
                         let meta = self.keyboard_modifiers.state().meta_key();
                         let alt = self.keyboard_modifiers.state().alt_key();
+                        let shift = self.keyboard_modifiers.state().shift_key();
                         // A kiosk's or an app's page is the whole program:
                         // the keys of a browser around it are its own (Ctrl+R
                         // in vim, in a terminal on ZIPP OS, reloaded the
                         // desktop and every window with it).
                         let browser = crate::browser_keys();
 
-                        // History and reload, as in any browser. Consumed here:
-                        // the page does not also see them.
+                        // History, reload and cache clear, as in any browser.
+                        // Consumed here: the page does not also see them.
                         let command = match key_code {
                             KeyCode::ArrowLeft if alt => Some("back"),
                             KeyCode::ArrowRight if alt => Some("forward"),
@@ -507,8 +524,14 @@ where
                             KeyCode::BrowserHome => Some("home"),
                             KeyCode::BrowserBack => Some("back"),
                             KeyCode::BrowserForward => Some("forward"),
+                            KeyCode::F5 | KeyCode::BrowserRefresh if browser && (ctrl | meta | shift) => Some("hard-reload"),
                             KeyCode::F5 | KeyCode::BrowserRefresh if browser => Some("reload"),
+                            KeyCode::KeyR if browser && (ctrl | meta) && shift => Some("hard-reload"),
                             KeyCode::KeyR if browser && (ctrl | meta) => Some("reload"),
+                            KeyCode::Delete if browser && (ctrl | meta) && shift => Some("clear-cache"),
+                            KeyCode::KeyN if browser && (ctrl | meta) && shift => Some("incognito"),
+                            KeyCode::Comma if browser && (ctrl | meta) && !shift => Some("settings"),
+                            KeyCode::KeyH if browser && (ctrl | meta) && !shift => Some("history"),
                             _ => None,
                         };
                         if let Some(command) = command {

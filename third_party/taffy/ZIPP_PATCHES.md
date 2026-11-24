@@ -46,3 +46,15 @@ subtracted `inner_flex_basis * margin` from its parent flex container and
 collapsed the container (and its sibling `.softn-frame-name`) to `0px`.
 Fixed the multiplier to match the divisor:
 `f32_max(1.0, item.flex_shrink * item.inner_flex_basis)`.
+
+## `compute/float.rs`: `FloatIntrinsicWidthCalculator` under `AvailableSpace::Definite`
+
+`FloatIntrinsicWidthCalculator::add_float` ignored floats when `available_width`
+was `AvailableSpace::Definite(_)` (assuming that path was unreachable). However,
+an `inline-block` or shrink-to-fit container laid out inside a definite parent
+width calls `determine_content_based_container_width(..., Definite(limit))` and
+collapsed to `0px` content width (plus padding), causing right-floated children
+like Google's top-right 9-dot app button (`.gb_D > a.gb_C { float: right }`) to
+overflow left on top of adjacent links. Now tracks both `min_contribution` (max
+float width) and `max_contribution` (sum of float widths) and resolves `Definite`
+using CSS 2.1 §10.3.9 shrink-to-fit (`max.min(limit).max(min)`).
