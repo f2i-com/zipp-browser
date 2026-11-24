@@ -1171,8 +1171,8 @@ impl ElementCx<'_> {
             let scale = self.scale;
             let width = self.frame.content_box.width() as u32;
             let height = self.frame.content_box.height() as u32;
-            let initial_x = self.pos.x + self.frame.content_box.origin().x;
-            let initial_y = self.pos.y + self.frame.content_box.origin().y;
+            let initial_x = self.pos.x + self.frame.content_box.origin().x / scale;
+            let initial_y = self.pos.y + self.frame.content_box.origin().y / scale;
 
             let painter =
                 DocumentPainter::new(&sub_doc, scale, width, height, initial_x, initial_y);

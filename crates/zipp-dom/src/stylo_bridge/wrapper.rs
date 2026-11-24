@@ -339,7 +339,16 @@ impl taffy::GenericRepetition for RepetitionWrapper<'_> {
 
     #[inline]
     fn tracks(&self) -> Self::RepetitionTrackList<'_> {
-        self.0.track_sizes.iter().map(convert::track_size)
+        let map_track: for<'c> fn(&'c stylo::TrackSize<LengthPercentage>) -> taffy::TrackSizingFunction =
+            if matches!(
+                self.0.count,
+                stylo::RepeatCount::AutoFill | stylo::RepeatCount::AutoFit
+            ) {
+                convert::auto_repeat_track_size
+            } else {
+                convert::track_size
+            };
+        self.0.track_sizes.iter().map(map_track)
     }
 
     #[inline]

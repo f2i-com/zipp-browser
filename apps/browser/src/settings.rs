@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-pub const DEFAULT_START_PAGE: &str = "https://lance.name";
+pub const DEFAULT_START_PAGE: &str = "zipp:newtab";
 pub const DEFAULT_CACHE_MAX_DISK_MB: u64 = 128;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

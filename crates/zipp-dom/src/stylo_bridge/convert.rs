@@ -440,9 +440,17 @@ pub fn grid_template_tracks(
                     taffy::GridTemplateComponent::Single(track_size(size))
                 }
                 stylo::TrackListValue::TrackRepeat(repeat) => {
+                    let map_track = if matches!(
+                        repeat.count,
+                        stylo::RepeatCount::AutoFill | stylo::RepeatCount::AutoFit
+                    ) {
+                        auto_repeat_track_size
+                    } else {
+                        track_size
+                    };
                     taffy::GridTemplateComponent::Repeat(taffy::GridTemplateRepetition {
                         count: track_repeat(repeat.count),
-                        tracks: repeat.track_sizes.iter().map(track_size).collect(),
+                        tracks: repeat.track_sizes.iter().map(map_track).collect(),
                         line_names: repeat
                             .line_names
                             .iter()
@@ -519,6 +527,102 @@ pub fn track_repeat(input: stylo::RepeatCount<i32>) -> taffy::RepetitionCount {
         stylo::RepeatCount::Number(val) => taffy::RepetitionCount::Count(val.try_into().unwrap()),
         stylo::RepeatCount::AutoFill => taffy::RepetitionCount::AutoFill,
         stylo::RepeatCount::AutoFit => taffy::RepetitionCount::AutoFit,
+    }
+}
+
+#[inline]
+#[cfg(feature = "grid")]
+fn auto_repeat_length_percentage(val: &stylo::LengthPercentage) -> taffy::LengthPercentage {
+    use style::values::computed::CSSPixelLength;
+    match val.unpack() {
+        stylo::UnpackedLengthPercentage::Calc(calc_ptr) => {
+            // Taffy's `TrackSizingFunction::has_fixed_component()` only accepts
+            // `LENGTH_TAG` or `PERCENT_TAG` (not `CALC_TAG`) inside `repeat(auto-fill/auto-fit, ...)`.
+            // Modern CSS/Tailwind routinely uses `minmax(min(100%, 17rem), 1fr)` or
+            // `minmax(calc(...), 1fr)`. Resolve bounded/constant expressions to a concrete
+            // length (and linear percentage expressions to a percentage) so Taffy keeps the
+            // responsive multi-column grid instead of discarding `grid-template-columns`.
+            let v1 = calc_ptr.resolve(CSSPixelLength::new(4096.0)).px();
+            let v2 = calc_ptr.resolve(CSSPixelLength::new(16384.0)).px();
+            let v3 = calc_ptr.resolve(CSSPixelLength::new(65536.0)).px();
+            if v1.is_finite()
+                && v2.is_finite()
+                && v3.is_finite()
+                && (v2 - v1).abs() < 0.01
+                && (v3 - v2).abs() < 0.01
+                && v2 >= 0.0
+            {
+                let v_mid = calc_ptr.resolve(CSSPixelLength::new(1024.0)).px();
+                if (v_mid - v2).abs() < 0.01 {
+                    return length(v2);
+                }
+                let v_zero = calc_ptr.resolve(CSSPixelLength::new(0.0)).px();
+                if v_zero.abs() < 0.01 {
+                    return length(v2);
+                }
+                if v_mid.is_finite() && v_mid >= 0.0 {
+                    return length(v_mid);
+                }
+                return length(v2);
+            }
+            let s12 = (v2 - v1) / (16384.0 - 4096.0);
+            let s23 = (v3 - v2) / (65536.0 - 16384.0);
+            if s12.is_finite()
+                && s23.is_finite()
+                && (s12 - s23).abs() < 1e-4
+                && s12 > 0.0
+                && s12 <= 1.0
+            {
+                return percent(s12);
+            }
+            length_percentage(val)
+        }
+        stylo::UnpackedLengthPercentage::Length(len) => length(len.px()),
+        stylo::UnpackedLengthPercentage::Percentage(percentage) => percent(percentage.0),
+    }
+}
+
+#[inline]
+#[cfg(feature = "grid")]
+pub fn auto_repeat_track_size(
+    input: &stylo::TrackSize<stylo::LengthPercentage>,
+) -> taffy::TrackSizingFunction {
+    use taffy::MaxTrackSizingFunction;
+
+    let min_auto = |breadth: &stylo::TrackBreadth<stylo::LengthPercentage>| match breadth {
+        stylo::TrackBreadth::Breadth(lp) => {
+            taffy::MinTrackSizingFunction::from(auto_repeat_length_percentage(lp))
+        }
+        _ => min_track(breadth),
+    };
+    let max_auto = |breadth: &stylo::TrackBreadth<stylo::LengthPercentage>| match breadth {
+        stylo::TrackBreadth::Breadth(lp) => {
+            taffy::MaxTrackSizingFunction::from(auto_repeat_length_percentage(lp))
+        }
+        _ => max_track(breadth),
+    };
+
+    match input {
+        stylo::TrackSize::Breadth(breadth) => taffy::MinMax {
+            min: min_auto(breadth),
+            max: max_auto(breadth),
+        },
+        stylo::TrackSize::Minmax(min, max) => taffy::MinMax {
+            min: min_auto(min),
+            max: max_auto(max),
+        },
+        stylo::TrackSize::FitContent(limit) => taffy::MinMax {
+            min: taffy::MinTrackSizingFunction::AUTO,
+            max: match limit {
+                stylo::TrackBreadth::Breadth(lp) => {
+                    MaxTrackSizingFunction::fit_content(auto_repeat_length_percentage(lp))
+                }
+                stylo::TrackBreadth::Fr(_) => unreachable!(),
+                stylo::TrackBreadth::Auto => unreachable!(),
+                stylo::TrackBreadth::MinContent => unreachable!(),
+                stylo::TrackBreadth::MaxContent => unreachable!(),
+            },
+        },
     }
 }
 

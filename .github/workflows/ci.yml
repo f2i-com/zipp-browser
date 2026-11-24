@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: '1.92.0'
+
+jobs:
+  check:
+    name: Clippy & Tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux build libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libx11-dev libxkbcommon-dev libwayland-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+          components: clippy
+      - name: Cache Cargo & compiled ZIPP artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: zipp-browser-ci-${{ runner.os }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            zipp-browser-ci-${{ runner.os }}-${{ env.RUSTUP_TOOLCHAIN }}-
+      - name: Clippy & feature checks
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo check -p zipp-dom --no-default-features
+          cargo check -p zipp-renderer --no-default-features
+      - name: Workspace unit tests
+        run: cargo test --workspace

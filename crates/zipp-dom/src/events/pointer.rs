@@ -436,6 +436,27 @@ pub(crate) fn handle_pointerup<F: FnMut(DomEvent)>(
         dispatch_event(DomEvent::new(target, DomEventData::Click(event.clone())));
     }
 
+    // Middle-click on an anchor opens the link in a new tab (or closes a tab
+    // when the embedder's tab strip handles it).
+    if do_click && event.button == MouseEventButton::Auxiliary {
+        let mut maybe_node_id = Some(target);
+        while let Some(node_id) = maybe_node_id {
+            if let Some(el) = doc.nodes[node_id].data.downcast_element()
+                && el.name.local == local_name!("a")
+                && let Some(href) = el.attr(local_name!("href"))
+            {
+                if let Some(url) = doc.url.resolve_relative(href) {
+                    let opts = NavigationOptions::new(url, "text/plain".to_owned(), doc.id())
+                        .set_new_tab(true)
+                        .set_background(!event.mods.contains(Modifiers::SHIFT));
+                    doc.navigation_provider.navigate_to(opts);
+                }
+                break;
+            }
+            maybe_node_id = doc.nodes[node_id].parent;
+        }
+    }
+
     // Dispatch a context menu event
     if do_click && event.button == MouseEventButton::Secondary {
         dispatch_event(DomEvent::new(
@@ -535,12 +556,25 @@ pub(crate) fn handle_click(
                 }
                 local_name!("a") => {
                     if let Some(href) = el.attr(local_name!("href")) {
+                        let modifier_new_tab = event.mods.contains(Modifiers::CONTROL)
+                            || event.mods.contains(Modifiers::META);
+                        let target_blank = el
+                            .attr(local_name!("target"))
+                            .is_some_and(|t| t.eq_ignore_ascii_case("_blank"));
                         if let Some(url) = doc.url.resolve_relative(href) {
-                            doc.navigation_provider.navigate_to(NavigationOptions::new(
+                            let mut opts = NavigationOptions::new(
                                 url,
                                 "text/plain".to_owned(),
                                 doc.id(),
-                            ));
+                            );
+                            if modifier_new_tab {
+                                opts = opts
+                                    .set_new_tab(true)
+                                    .set_background(!event.mods.contains(Modifiers::SHIFT));
+                            } else if target_blank {
+                                opts = opts.set_new_tab(true).set_background(false);
+                            }
+                            doc.navigation_provider.navigate_to(opts);
                         } else {
                             #[cfg(feature = "tracing")]
                             tracing::warn!("{href} is not parseable as a url. : {:?}", *doc.url);

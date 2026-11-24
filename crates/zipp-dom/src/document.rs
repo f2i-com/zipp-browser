@@ -365,6 +365,14 @@ pub struct BaseDocument {
     /// Tracks in-flight "critical" resources (e.g. stylesheets linked from the `<head>`).
     pub(crate) pending_critical_resources: HashSet<usize>,
 
+    /// `(url, family)` `@font-face` fonts already requested by this document (deduplicates
+    /// identical Google Fonts / multi-stylesheet declarations before hitting the network).
+    pub(crate) requested_fonts: HashSet<(String, Option<String>)>,
+
+    /// `(url, family)` `@font-face` fonts already registered into `font_ctx` (including fonts
+    /// inherited via `clone_config_for_navigation`), avoiding redundant registration and relayouts.
+    pub(crate) registered_fonts: HashSet<(String, Option<String>)>,
+
     // ----- Service providers -----
 
     /// Network provider for fetching remote assets.
@@ -534,6 +542,8 @@ impl BaseDocument {
             image_cache: HashMap::new(),
             pending_images: HashMap::new(),
             pending_critical_resources: HashSet::new(),
+            requested_fonts: config.preloaded_fonts.clone(),
+            registered_fonts: config.preloaded_fonts,
             controls_to_form: HashMap::new(),
             net_provider,
             navigation_provider,
@@ -607,6 +617,17 @@ impl BaseDocument {
     /// Set the base URL for resolving relative resource links.
     pub fn set_base_url(&mut self, url: &str) {
         self.url = DocumentUrl::from(Url::parse(url).unwrap());
+    }
+
+    /// Return the document's current base URL string.
+    pub fn base_url(&self) -> &str {
+        self.url.as_str()
+    }
+
+    /// Clone the document's Parley font context (sharing its font collection)
+    /// for creating child sub-documents such as `<iframe>`s.
+    pub fn clone_font_ctx(&self) -> parley::FontContext {
+        self.font_ctx.lock().unwrap().clone()
     }
 
     // -----------------------------------------------------------------------
@@ -1129,7 +1150,7 @@ impl BaseDocument {
             self.stylist.remove_stylesheet(old, &self.guard.read())
         }
 
-        // Fetch @font-face fonts
+        // Fetch @font-face fonts (deduplicated per (url, family) across the document)
         crate::net::fetch_font_face(
             self.tx.clone(),
             self.id,
@@ -1138,6 +1159,7 @@ impl BaseDocument {
             &self.net_provider,
             &self.shell_provider,
             &self.guard.read(),
+            Some(&mut self.requested_fonts),
         );
 
         // Store data on element
@@ -1163,12 +1185,18 @@ impl BaseDocument {
         }
     }
 
+    /// Clone the set of `(url, family)` web fonts already registered in `font_ctx`.
+    pub fn clone_registered_fonts(&self) -> HashSet<(String, Option<String>)> {
+        self.registered_fonts.clone()
+    }
+
     /// Clone the document's config for navigation (reuses fonts, net provider, etc.).
     pub fn clone_config_for_navigation(&self, new_url: String) -> DocumentConfig {
         let font_ctx = self.font_ctx.lock().unwrap().clone();
         DocumentConfig {
             base_url: Some(new_url),
             font_ctx: Some(font_ctx),
+            preloaded_fonts: self.registered_fonts.clone(),
             net_provider: Some(self.net_provider.clone()),
             navigation_provider: Some(self.navigation_provider.clone()),
             shell_provider: Some(self.shell_provider.clone()),
@@ -1186,17 +1214,20 @@ impl BaseDocument {
     ///
     /// Temporarily takes the [`Receiver`] out of `self` to avoid holding a mutable
     /// borrow while processing, then puts it back.
-    pub fn handle_messages(&mut self) {
+    pub fn handle_messages(&mut self) -> bool {
         // Remove event Receiver from the Document so that we can process events
         // without holding a borrow to the Document
         let rx = self.rx.take().unwrap();
+        let mut received = false;
 
         while let Ok(msg) = rx.try_recv() {
+            received = true;
             self.handle_message(msg);
         }
 
         // Put Receiver back
         self.rx = Some(rx);
+        received
     }
 
     /// Handle a single document event.
@@ -1352,6 +1383,11 @@ impl BaseDocument {
                 }
             }
             Resource::Font(bytes, family) => {
+                if let Some(url) = res.resolved_url.as_ref() {
+                    if !self.registered_fonts.insert((url.clone(), family.clone())) {
+                        return;
+                    }
+                }
                 let font = Blob::new(Arc::new(bytes));
                 // Under the family name its `@font-face` rule gives it, as a
                 // browser does: the name inside the file is often another
@@ -1589,8 +1625,14 @@ impl BaseDocument {
         let hover_node_id = hit.map(|hit| hit.node_id);
         let new_is_text = hit.map(|hit| hit.is_text).unwrap_or(false);
 
-        // Return early if the new node is the same as the already-hovered node
+        // If the hovered node did not change, still update the cursor when
+        // crossing between text glyphs and non-text padding within the same node.
         if hover_node_id == self.hover_node_id {
+            if new_is_text != self.hover_node_is_text {
+                self.hover_node_is_text = new_is_text;
+                let cursor = self.get_cursor().unwrap_or_default();
+                self.shell_provider.set_cursor(cursor);
+            }
             return false;
         }
 
@@ -1748,39 +1790,118 @@ impl BaseDocument {
 
     /// Determine the appropriate cursor icon for the currently hovered node.
     pub fn get_cursor(&self) -> Option<CursorIcon> {
-        let node = &self.nodes[self.get_hover_node_id()?];
+        use style::values::computed::ui::CursorKind as StyloCursorKind;
+
+        let node = self.nodes.get(self.get_hover_node_id()?)?;
 
         if let Some(subdoc) = node.subdoc().map(|doc| doc.inner()) {
             return subdoc.get_cursor();
         }
 
-        let style = node.primary_styles()?;
-        let keyword = stylo_to_cursor_icon(style.clone_cursor().keyword);
+        // Text nodes do not store their own computed styles; inherit from parent element.
+        let styled_node = if node.primary_styles().is_some() {
+            Some(node)
+        } else {
+            node.parent.and_then(|pid| self.nodes.get(pid))
+        };
 
-        // Return cursor from style if it is non-auto
-        if keyword != CursorIcon::Default {
-            return Some(keyword);
+        // Respect any explicit non-auto CSS `cursor` (including explicit `cursor: default`).
+        if let Some(style) = styled_node.and_then(|n| n.primary_styles()) {
+            let stylo_cursor = style.clone_cursor().keyword;
+            if stylo_cursor != StyloCursorKind::Auto {
+                return Some(stylo_to_cursor_icon(stylo_cursor));
+            }
         }
 
-        // Return text cursor for text inputs
-        if node
-            .element_data()
-            .is_some_and(|e| e.text_input_data().is_some())
-        {
-            return Some(CursorIcon::Text);
-        }
-
-        // Use "pointer" cursor if any ancestor is a link
+        // Walk DOM ancestors (not `layout_parent`) so text, spans, and SVGs inside
+        // links, buttons, and interactive controls inherit the right cursor handle.
         let mut maybe_node = Some(node);
-        while let Some(node) = maybe_node {
-            if node.is_link() {
-                return Some(CursorIcon::Pointer);
+        while let Some(cur) = maybe_node {
+            if let Some(el) = cur.element_data() {
+                let tag = el.name.local.as_ref();
+                let is_disabled = el.attr(local_name!("disabled")).is_some()
+                    || el
+                        .attr(local_name!("aria-disabled"))
+                        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+
+                if is_disabled
+                    && matches!(
+                        tag,
+                        "button" | "input" | "select" | "textarea" | "fieldset" | "option"
+                    )
+                {
+                    return Some(CursorIcon::NotAllowed);
+                }
+
+                if el.text_input_data().is_some() {
+                    return Some(CursorIcon::Text);
+                }
+
+                if cur.is_link() {
+                    return Some(CursorIcon::Pointer);
+                }
+
+                let is_interactive_input = tag == "input"
+                    && el.attr(local_name!("type")).is_some_and(|t| {
+                        matches!(
+                            t.to_ascii_lowercase().as_str(),
+                            "button"
+                                | "submit"
+                                | "reset"
+                                | "checkbox"
+                                | "radio"
+                                | "file"
+                                | "color"
+                                | "range"
+                                | "image"
+                        )
+                    });
+
+                let is_interactive_label = tag == "label"
+                    && (el.attr(local_name!("for")).is_some()
+                        || cur.children.iter().any(|&cid| {
+                            self.nodes
+                                .get(cid)
+                                .and_then(|c| c.element_data())
+                                .is_some_and(|ce| {
+                                    matches!(
+                                        ce.name.local.as_ref(),
+                                        "input" | "select" | "textarea" | "button"
+                                    )
+                                })
+                        }));
+
+                let has_interactive_role = el.attr(local_name!("role")).is_some_and(|role| {
+                    matches!(
+                        role.trim().to_ascii_lowercase().as_str(),
+                        "button"
+                            | "link"
+                            | "tab"
+                            | "menuitem"
+                            | "menuitemcheckbox"
+                            | "menuitemradio"
+                            | "option"
+                            | "switch"
+                            | "checkbox"
+                            | "radio"
+                            | "treeitem"
+                    )
+                });
+
+                if matches!(tag, "button" | "summary" | "select" | "option")
+                    || is_interactive_input
+                    || is_interactive_label
+                    || has_interactive_role
+                    || el.attr(local_name!("onclick")).is_some()
+                {
+                    return Some(CursorIcon::Pointer);
+                }
             }
 
-            maybe_node = node.layout_parent.get().map(|node_id| node.with(node_id));
+            maybe_node = cur.parent.and_then(|pid| self.nodes.get(pid));
         }
 
-        // Return text cursor for text nodes
+        // Return text cursor for selectable text nodes
         if self.hover_node_is_text {
             return Some(CursorIcon::Text);
         }

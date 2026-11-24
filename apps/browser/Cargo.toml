@@ -1,7 +1,8 @@
 [package]
 name = "zipp-browser"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
+license.workspace = true
 rust-version.workspace = true
 publish = false
 
@@ -57,15 +58,13 @@ zipp-shell = { workspace = true, features = ["default", "http2", "cookies"] }
 # The window's icon (`app_icon`). Already in the tree through zipp-shell.
 winit = { workspace = true }
 
-# Zipp JS engine — ZIPP's register VM + x86-64/ARM64 JIT, consumed through
-# its `embed` module (persistent VM: compile once, keep alive, eval + dispatch
-# event handlers into the same global context). ZIPP's `dev` branch, which has
-# the WebAssembly JS API (vm/webassembly); Cargo.lock pins the commit, and
-# `cargo update -p zipp-vm` moves to the newest. To build against a local
-# zipp.org checkout instead, see the README. WebAssembly compiled to machine
-# code (`wasm-jit`, Wasmtime) rather than interpreted: the zipp.org
-# playground's engine runs some ten times faster.
-zipp-vm = { git = "https://github.com/f2i-com/zipp.org", branch = "dev", features = ["wasm-jit"] }
+# Zipp JS engine — pinned to the latest published ZIPP GitHub Release tag
+# (`tools/release/sync-zipp-release.mjs` checks/updates this against
+# `f2i-com/zipp.org/releases/latest` automatically during release builds).
+# Consumed through its `embed` module (persistent VM + native JIT + Wasmtime
+# `wasm-jit`). CI caches compiled `zipp-vm` artifacts keyed by ZIPP release tag
+# so `zipp-browser` builds do not rebuild ZIPP when the ZIPP tag is unchanged.
+zipp-vm = { git = "https://github.com/f2i-com/zipp.org", tag = "v0.0.40", features = ["wasm-jit"] }
 
 # Linebender
 linebender_resource_handle = { workspace = true }

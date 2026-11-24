@@ -6,19 +6,25 @@ members = [
     "crates/zipp-kms",
     "apps/browser",
 ]
+# Android WebView / SoftN Mobile runtime uses its own zipp-vm feature set
+# (php/python/rust/typescript without wasmtime) and builds separately into
+# prebuilt Android `.so` release artifacts (`zipp-browser-<tag>-android-webview.zip`).
+exclude = [
+    "crates/zipp-android-webview",
+]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.1"
-license = "MIT OR Apache-2.0"
+version = "0.1.2"
+license = "Apache-2.0"
 edition = "2024"
 rust-version = "1.92.0"
 
 [workspace.dependencies]
 # In-repo crates
-zipp-dom = { version = "0.1.1", path = "./crates/zipp-dom", default-features = false }
-zipp-renderer = { version = "0.1.1", path = "./crates/zipp-renderer", default-features = false }
-zipp-shell = { version = "0.1.1", path = "./crates/zipp-shell", default-features = false }
+zipp-dom = { version = "0.1.2", path = "./crates/zipp-dom", default-features = false }
+zipp-renderer = { version = "0.1.2", path = "./crates/zipp-renderer", default-features = false }
+zipp-shell = { version = "0.1.2", path = "./crates/zipp-shell", default-features = false }
 
 # Servo dependencies
 style = { version = "0.14.0", package = "stylo" }
@@ -124,8 +130,12 @@ thread_local = "1"
 # adopted mimalloc for the same code.
 [profile.release]
 opt-level = 3
-lto = "fat"
+# ThinLTO preserves cross-crate inlining into zipp-vm while allowing Cargo/LLVM
+# to cache compiled zipp-vm / wasmtime / stylo units across incremental browser
+# builds instead of re-optimizing the entire VM on every edit.
+lto = "thin"
 codegen-units = 1
+strip = true
 
 [profile.profile]
 inherits = "release"

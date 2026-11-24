@@ -53,7 +53,7 @@ struct Log {
 
 const LIMIT: usize = 1000;
 /// The height of the open panel, in CSS pixels.
-pub(crate) const PANEL_HEIGHT: u32 = 260;
+pub(crate) const PANEL_HEIGHT: u32 = crate::devtools::PANEL_HEIGHT;
 
 static LOG: Mutex<Log> = Mutex::new(Log { entries: VecDeque::new(), errors: 0, warnings: 0, generation: 0 });
 static OPEN: AtomicBool = AtomicBool::new(false);
@@ -133,9 +133,9 @@ pub(crate) fn is_open() -> bool {
     OPEN.load(Ordering::Relaxed)
 }
 
-/// Open or close the panel; whether it is now open.
-pub(crate) fn toggle() -> bool {
-    !OPEN.fetch_xor(true, Ordering::Relaxed)
+/// Explicitly set whether the DevTools/console panel is open.
+pub(crate) fn set_open(open: bool) {
+    OPEN.store(open, Ordering::Relaxed);
 }
 
 /// Code to run in the page, from the console's input line.
@@ -214,6 +214,33 @@ pub(crate) fn lines_html() -> String {
     out
 }
 
+/// Format all console entries as plain text (oldest first) for copying to the clipboard.
+pub(crate) fn plain_text() -> String {
+    let log = LOG.lock().unwrap();
+    if log.entries.is_empty() {
+        return String::new();
+    }
+    let mut out = String::with_capacity(log.entries.len() * 64);
+    for (i, entry) in log.entries.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let prefix = match entry.level {
+            Level::Error => "[ERROR] ",
+            Level::Warn => "[WARN] ",
+            Level::Input => "> ",
+            Level::Result => "< ",
+            Level::Log => "[LOG] ",
+        };
+        out.push_str(prefix);
+        out.push_str(&entry.text);
+        if entry.repeats > 1 {
+            let _ = write!(out, " (x{})", entry.repeats);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,5 +258,6 @@ mod tests {
         assert!(html.find("boom").unwrap() < html.find("a &lt;b&gt;").unwrap(), "newest first");
         assert_eq!(badge_text(), "2");
         assert_eq!(counts_text(), "2 errors · 0 warnings");
+        assert_eq!(plain_text(), "[LOG] a <b>\n[ERROR] boom (x2)");
     }
 }

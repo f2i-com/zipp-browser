@@ -79,11 +79,17 @@ impl Document for HtmlDocument {
             let now = self.inner.animation_time;
             self.inner.resolve(now);
         }
-        let Some(handler) = self.event_handler.as_mut() else {
-            return false;
-        };
-        let wants_more = handler.animation_frame(&mut self.inner);
-        self.apply_pending_rerender();
+        let mut wants_more = false;
+        if let Some(handler) = self.event_handler.as_mut() {
+            wants_more |= handler.animation_frame(&mut self.inner);
+            self.apply_pending_rerender();
+        }
+        let sub_ids: Vec<usize> = self.inner.sub_document_nodes.iter().copied().collect();
+        for id in sub_ids {
+            if let Some(sub_doc) = self.inner.get_node_mut(id).and_then(|n| n.subdoc_mut()) {
+                wants_more |= sub_doc.animation_frame();
+            }
+        }
         wants_more
     }
 
@@ -92,21 +98,35 @@ impl Document for HtmlDocument {
             let now = self.inner.animation_time;
             self.inner.resolve(now);
         }
-        let handler = self.event_handler.as_mut()?;
-        let next = handler.run_tasks(&mut self.inner);
-        self.apply_pending_rerender();
+        let mut next = None;
+        if let Some(handler) = self.event_handler.as_mut() {
+            next = handler.run_tasks(&mut self.inner);
+            self.apply_pending_rerender();
+        }
+        let sub_ids: Vec<usize> = self.inner.sub_document_nodes.iter().copied().collect();
+        for id in sub_ids {
+            if let Some(sub_doc) = self.inner.get_node_mut(id).and_then(|n| n.subdoc_mut())
+                && let Some(due) = sub_doc.run_tasks()
+            {
+                next = Some(next.map_or(due, |n| n.min(due)));
+            }
+        }
         next
     }
 
     fn poll(&mut self, _task_context: Option<std::task::Context>) -> bool {
-        let pending_before = self.inner.pending_images.len();
-        self.inner.handle_messages();
-        let pending_after = self.inner.pending_images.len();
-        // Request redraw whenever any image finishes loading
-        if pending_before != pending_after {
-            self.inner.shell_provider.request_redraw();
+        // Only signal a redraw when resource messages actually arrived.
+        // Returning `pending_images.len() > 0` previously caused the shell to
+        // re-layout and repaint on every single window event (including every
+        // WM_MOVE drag tick) whenever any image remained in-flight or failed.
+        let mut changed = self.inner.handle_messages();
+        let sub_ids: Vec<usize> = self.inner.sub_document_nodes.iter().copied().collect();
+        for id in sub_ids {
+            if let Some(sub_doc) = self.inner.get_node_mut(id).and_then(|n| n.subdoc_mut()) {
+                changed |= sub_doc.poll(None);
+            }
         }
-        pending_after > 0
+        changed
     }
 }
 
@@ -312,6 +332,32 @@ fn replace_children(doc: &mut BaseDocument, node_id: usize, html: &str) {
             }
         }
     });
+    // Preserve mounted iframe sub-documents inside the replaced subtree whose
+    // `src`/`srcdoc` did not change so embedded interactive apps keep their
+    // live state across parent React/JS re-renders and partial DOM patches.
+    let mut saved_subdocs: Vec<(String, Box<dyn Document>)> = Vec::new();
+    let replaced_subs: Vec<usize> = doc
+        .sub_document_nodes
+        .iter()
+        .copied()
+        .filter(|&sid| is_replaced(doc, sid))
+        .collect();
+    for sid in replaced_subs {
+        doc.sub_document_nodes.remove(&sid);
+        let key = doc.get_node(sid).and_then(|n| {
+            let el = n.element_data()?;
+            el.attr(markup5ever::local_name!("src"))
+                .or_else(|| el.attr(markup5ever::local_name!("srcdoc")))
+                .map(str::to_string)
+        });
+        if let Some(key) = key
+            && let Some(el) = doc.get_node_mut(sid).and_then(|n| n.element_data_mut())
+            && let crate::node::SpecialElementData::SubDocument(doc_box) =
+                std::mem::replace(&mut el.special_data, crate::node::SpecialElementData::None)
+        {
+            saved_subdocs.push((key, doc_box));
+        }
+    }
     let flid_attr = markup5ever::LocalName::from("data-flid");
     let scrolled: Vec<(String, crate::Point<f64>)> = doc
         .nodes
@@ -322,6 +368,27 @@ fn replace_children(doc: &mut BaseDocument, node_id: usize, html: &str) {
     let mut mutator = crate::DocumentMutator::new(doc);
     mutator.set_inner_html(node_id, html);
     drop(mutator);
+    if !saved_subdocs.is_empty()
+        && let Ok(iframes) = doc.query_selector_all("iframe")
+    {
+        for iframe_id in iframes {
+            if !is_replaced(doc, iframe_id) {
+                continue;
+            }
+            let key = doc.get_node(iframe_id).and_then(|n| {
+                let el = n.element_data()?;
+                el.attr(markup5ever::local_name!("src"))
+                    .or_else(|| el.attr(markup5ever::local_name!("srcdoc")))
+                    .map(str::to_string)
+            });
+            if let Some(key) = key
+                && let Some(pos) = saved_subdocs.iter().position(|(k, _)| k == &key)
+            {
+                let (_, doc_box) = saved_subdocs.remove(pos);
+                doc.set_sub_document(iframe_id, doc_box);
+            }
+        }
+    }
     for (flid, offset) in scrolled {
         if let Ok(Some(node)) = doc.query_selector(&format!("[data-flid=\"{flid}\"]")) {
             doc.nodes[node].scroll_offset = offset;

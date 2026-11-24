@@ -15,11 +15,11 @@
 //! `eval_in_context` to invoke the actual JS handler function via the
 //! `__eventHandlers[flid][eventType][0](event)` registry.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::console;
+use crate::{console, devtools};
 
 use zipp_vm::embed::{JsValue, ScriptState};
 use zipp_dom::traits_events::{DomEvent, DomEventData, EventState, PointerCoords, PointerId, WheelDelta};
@@ -64,11 +64,39 @@ pub(crate) fn deliver_worker_messages(state: &mut ScriptState) -> usize {
     count
 }
 
+/// Deliver any completed background `window.fetch()` responses for the active document scope.
+pub(crate) fn deliver_async_fetches(state: &mut ScriptState) -> usize {
+    let scope = crate::async_fetch::current_scope();
+    let completed = crate::async_fetch::take_completed(scope);
+    let count = completed.len();
+    for (req_id, res) in completed {
+        let (ok, payload) = match res {
+            Ok(json) => (true, json),
+            Err(err) => (false, err),
+        };
+        let args = [
+            JsValue::Number(req_id as f64),
+            JsValue::Bool(ok),
+            JsValue::String(payload),
+        ];
+        if let Err(e) = state.call_global("__zippFetchComplete", &args) {
+            eprintln!("[FETCH] delivering response #{req_id} failed: {e}");
+        }
+        state.run_microtasks();
+    }
+    count
+}
+
 pub(crate) fn run_page_tasks(state: &mut ScriptState, max_tasks: usize, mut frames: u32, budget: std::time::Duration) -> usize {
     let start = Instant::now();
     state.run_microtasks();
     let mut ran = 0;
     while ran < max_tasks && start.elapsed() < budget {
+        let fetched = deliver_async_fetches(state);
+        if fetched > 0 {
+            ran += fetched;
+            continue;
+        }
         let delivered = deliver_worker_messages(state);
         if delivered > 0 {
             ran += delivered;
@@ -77,7 +105,15 @@ pub(crate) fn run_page_tasks(state: &mut ScriptState, max_tasks: usize, mut fram
         match state.call_global("__zippRunTask", &[JsValue::Bool(frames > 0)]) {
             Ok(JsValue::Number(1.0)) => ran += 1,
             Ok(JsValue::Number(2.0)) => frames = frames.saturating_sub(1),
-            _ => break,
+            _ => {
+                if crate::async_fetch::has_pending(crate::async_fetch::current_scope())
+                    && start.elapsed() < budget
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(8));
+                    continue;
+                }
+                break;
+            }
         }
         state.run_microtasks();
     }
@@ -175,10 +211,24 @@ pub struct JsEventBridge {
     console_shown: u64,
     console_refreshed: Instant,
     console_badge: String,
+    /// When the console Copy button's temporary "Copied!" label should revert to "Copy".
+    console_copied_until: Option<Instant>,
+    /// Last tab-strip state generation rendered into `#__zipp_tabbar`.
+    tabbar_shown: u64,
     /// Active `<video>` players preserved across JS DOM re-renders, keyed by `flid`.
     video_players: HashMap<u32, (String, Arc<dyn zipp_dom::traits_src::media::MediaPlayer>)>,
     /// Last time video statuses were pushed to JS (`__zippVideoSync`).
     video_synced: Instant,
+    /// True when this bridge drives an embedded `<iframe>` sub-document (no chrome).
+    is_subdocument: bool,
+    /// Nesting depth of this document (0 = top-level page, 1+ = iframe).
+    iframe_depth: u8,
+    /// Last `__getHeadVersion()` synced from JS `document.head` into `BaseDocument`.
+    head_version_seen: f64,
+    /// Stylesheet links / `<style>` bodies already injected into `<head>`.
+    head_extras_seen: HashSet<String>,
+    /// Async `window.fetch()` scope ID owned by this document bridge.
+    fetch_scope: u64,
 }
 
 /// The console panel refreshes at most this often, so a page logging every
@@ -225,11 +275,35 @@ impl JsEventBridge {
             console_shown: 0,
             console_refreshed: Instant::now(),
             console_badge: String::new(),
+            console_copied_until: None,
+            tabbar_shown: crate::tabs::generation(),
             video_players: HashMap::new(),
             video_synced: Instant::now(),
+            is_subdocument: false,
+            iframe_depth: 0,
+            head_version_seen: -1.0,
+            head_extras_seen: HashSet::new(),
+            fetch_scope: crate::async_fetch::take_last_scope(),
         };
         bridge.note_rendered();
         bridge.refresh_next_timer();
+        bridge
+    }
+
+    /// Build an event bridge for an embedded `<iframe>` sub-document.
+    ///
+    /// Runs JS events, timers, and DOM patches scoped to the iframe's own URL
+    /// without interfering with top-level browser chrome, DevTools, or tabs.
+    pub fn new_subdocument(
+        flid_map: HashMap<u32, usize>,
+        event_map_json: &str,
+        js_state: Option<ScriptState>,
+        iframe_url: &str,
+        iframe_depth: u8,
+    ) -> Self {
+        let mut bridge = Self::new(flid_map, event_map_json, js_state, iframe_url);
+        bridge.is_subdocument = true;
+        bridge.iframe_depth = iframe_depth;
         bridge
     }
 
@@ -369,6 +443,9 @@ impl JsEventBridge {
         // absolute as the first render's were. The <html> attributes (the
         // theme) travel separately (`document_element_attributes`).
         let rebuilt = crate::rerender_body(&out, &self.page_url);
+        if !self.is_subdocument {
+            devtools::set_rendered_html(&out);
+        }
         if let Ok(path) = std::env::var("ZIPP_DUMP_RERENDER") {
             let _ = std::fs::write(&path, &rebuilt);
         }
@@ -569,8 +646,11 @@ impl JsEventBridge {
         self.run_due_work();
     }
 
-    /// Open or close the console panel as `console::is_open` says, and fill it.
+    /// Open or close the DevTools/console panel as `console::is_open` says, and fill it.
     fn show_console(&mut self, doc: &mut BaseDocument) {
+        if self.is_subdocument {
+            return;
+        }
         if let Ok(Some(style)) = doc.query_selector("#__zipp_chrome_css") {
             doc.mutate().set_inner_html(
                 style,
@@ -582,10 +662,13 @@ impl JsEventBridge {
         doc.shell_provider.request_redraw();
     }
 
-    /// Bring the toolbar's badge, and the panel when open, up to date with
-    /// the console; when it next should, if it is behind and too soon.
+    /// Bring the toolbar's badge, and the DevTools panel when open, up to date;
+    /// when it next should, if it is behind and too soon.
     fn refresh_console(&mut self, doc: &mut BaseDocument, now: Instant, force: bool) -> Option<Instant> {
-        let generation = console::generation();
+        if self.is_subdocument {
+            return None;
+        }
+        let generation = devtools::generation();
         if generation == self.console_shown {
             return None;
         }
@@ -605,11 +688,14 @@ impl JsEventBridge {
             changed = true;
         }
         if console::is_open() {
-            if let Ok(Some(node)) = doc.query_selector("#__zipp_console_counts") {
-                doc.mutate().set_inner_html(node, &console::counts_text());
+            let copied = self.console_copied_until.is_some();
+            if let Ok(Some(hdr)) = doc.query_selector("#__zipp_dt_header") {
+                doc.mutate()
+                    .set_inner_html(hdr, &devtools::header_html(crate::chrome_token(), copied));
             }
             if let Ok(Some(node)) = doc.query_selector("#__zipp_console_lines") {
-                doc.mutate().set_inner_html(node, &console::lines_html());
+                let body = devtools::body_html(Some(doc));
+                doc.mutate().set_inner_html(node, &body);
             }
             changed = true;
         }
@@ -617,6 +703,149 @@ impl JsEventBridge {
             doc.shell_provider.request_redraw();
         }
         None
+    }
+
+    /// Inject any newly added `<link rel="stylesheet">` or `<style>` elements
+    /// from the JS shim's `document.head` into the live `BaseDocument`'s `<head>`
+    /// (handles Vite lazy route CSS loaded during SPA client-side navigation).
+    fn sync_head_extras(&mut self, doc: &mut BaseDocument) {
+        let Some(state) = self.js_state.as_mut() else {
+            return;
+        };
+        let version = match state.call_global("__getHeadVersion", &[]) {
+            Ok(JsValue::Number(v)) => v,
+            _ => return,
+        };
+        if version == self.head_version_seen {
+            return;
+        }
+        self.head_version_seen = version;
+        let Ok(JsValue::String(json)) = state.call_global("__getHeadExtras", &[]) else {
+            return;
+        };
+        let Ok(items) = serde_json::from_str::<Vec<(String, String)>>(&json) else {
+            return;
+        };
+        let Ok(Some(head_id)) = doc.query_selector("head") else {
+            return;
+        };
+        let mut added = false;
+        let attr_qual = |name: &str| {
+            zipp_dom::QualName::new(None, zipp_dom::Namespace::from(""), LocalName::from(name))
+        };
+        let html_qual = |name: &str| {
+            zipp_dom::QualName::new(
+                None,
+                zipp_dom::Namespace::from("http://www.w3.org/1999/xhtml"),
+                LocalName::from(name),
+            )
+        };
+        for (kind, val) in items {
+            if kind == "link" {
+                let abs = crate::resolve(&self.page_url, val.trim());
+                if abs.is_empty() || !self.head_extras_seen.insert(format!("L:{abs}")) {
+                    continue;
+                }
+                let already = doc.query_selector_all("head link").ok().is_some_and(|ids| {
+                    ids.into_iter().any(|id| {
+                        doc.get_node(id)
+                            .and_then(|n| n.element_data())
+                            .is_some_and(|el| {
+                                el.attr(LocalName::from("rel")).is_some_and(|r| {
+                                    r.split_ascii_whitespace()
+                                        .any(|t| t.eq_ignore_ascii_case("stylesheet"))
+                                }) && el.attr(LocalName::from("href")) == Some(abs.as_str())
+                            })
+                    })
+                });
+                if already {
+                    continue;
+                }
+                let attrs = vec![
+                    zipp_dom::Attribute {
+                        name: attr_qual("rel"),
+                        value: "stylesheet".into(),
+                    },
+                    zipp_dom::Attribute {
+                        name: attr_qual("href"),
+                        value: abs,
+                    },
+                ];
+                let mut m = doc.mutate();
+                let node_id = m.create_element(html_qual("link"), attrs);
+                m.append_children(head_id, &[node_id]);
+                added = true;
+            } else if kind == "style" {
+                let trimmed = val.trim();
+                if trimmed.is_empty() || !self.head_extras_seen.insert(format!("S:{trimmed}")) {
+                    continue;
+                }
+                let mut m = doc.mutate();
+                let style_id = m.create_element(html_qual("style"), Vec::new());
+                let txt_id = m.create_text_node(trimmed);
+                m.append_children(style_id, &[txt_id]);
+                m.append_children(head_id, &[style_id]);
+                added = true;
+            }
+        }
+        if added {
+            doc.shell_provider.request_redraw();
+        }
+    }
+
+    /// Sync SPA `history.pushState` / `replaceState` URL changes into the browser
+    /// address bar (`#__zipp_url_input`) and active tab state.
+    fn sync_location_url(&mut self, doc: &mut BaseDocument) {
+        if self.is_subdocument {
+            return;
+        }
+        let Some(state) = self.js_state.as_mut() else {
+            return;
+        };
+        let Ok(JsValue::String(href)) = state.call_global("__getLocationHref", &[]) else {
+            return;
+        };
+        if href.is_empty() || href == self.page_url || href.starts_with("about:") {
+            return;
+        }
+        self.page_url = href.clone();
+        crate::tabs::sync_active_spa_url(&href);
+        if !crate::chrome_shown() {
+            return;
+        }
+        if let Ok(Some(input_id)) = doc.query_selector("#__zipp_url_input") {
+            // Do not overwrite while the user is actively typing in the address bar.
+            if doc.get_focussed_node_id() != Some(input_id) {
+                doc.mutate().set_attribute(
+                    input_id,
+                    zipp_dom::QualName::new(None, zipp_dom::ns!(), zipp_dom::local_name!("value")),
+                    &href,
+                );
+            }
+        }
+        if let Ok(Some(form_id)) = doc.query_selector("#__zipp_navbar") {
+            doc.mutate().set_attribute(
+                form_id,
+                zipp_dom::QualName::new(None, zipp_dom::ns!(), zipp_dom::local_name!("action")),
+                &href,
+            );
+        }
+        doc.shell_provider.request_redraw();
+    }
+
+    /// Refresh `#__zipp_tabbar` in-place whenever tabs are opened/closed in the
+    /// background or a tab's title/loading state changes without a full page reload.
+    fn refresh_tabbar(&mut self, doc: &mut BaseDocument) {
+        let generation = crate::tabs::generation();
+        if generation == self.tabbar_shown {
+            return;
+        }
+        self.tabbar_shown = generation;
+        if let Ok(Some(tabbar)) = doc.query_selector("#__zipp_tabbar") {
+            doc.mutate()
+                .set_inner_html(tabbar, &crate::tabbar_inner_html(&self.page_url));
+            doc.shell_provider.request_redraw();
+        }
     }
 
     fn sources_key(doc: &BaseDocument, node_id: usize) -> String {
@@ -757,8 +986,11 @@ impl Drop for JsEventBridge {
     /// The page is going, and its workers with it.
     fn drop(&mut self) {
         self.video_players.clear();
-        let _ = take_pending_video_ops();
-        crate::worker::terminate_page(self.page);
+        crate::async_fetch::drop_scope(self.fetch_scope);
+        if !self.is_subdocument {
+            let _ = take_pending_video_ops();
+            crate::worker::terminate_page(self.page);
+        }
     }
 }
 
@@ -768,7 +1000,7 @@ impl EventHandler for JsEventBridge {
     /// without one are not driven: their animation frames run while they
     /// settle and after events, as before.
     fn animation_frame(&mut self, doc: &mut BaseDocument) -> bool {
-        let _layout = LayoutScope::enter(doc, &self.flid_to_dom);
+        let _layout = LayoutScope::enter(doc, &self.flid_to_dom, &self.page_url, self.fetch_scope);
         let Some(state) = self.js_state.as_mut() else {
             return false;
         };
@@ -811,10 +1043,11 @@ impl EventHandler for JsEventBridge {
         if matches!(event.data, DomEventData::Click(_) | DomEventData::KeyDown(_) | DomEventData::MouseDown(_)) {
             crate::note_user_gesture();
         }
-        let _layout = LayoutScope::enter(&_doc.inner(), &self.flid_to_dom);
+        let _layout = LayoutScope::enter(&_doc.inner(), &self.flid_to_dom, &self.page_url, self.fetch_scope);
         self.refresh_listeners(&_doc.inner());
+        let has_chrome = !self.is_subdocument && crate::chrome_shown();
         // Desktop <-> Mobile View toggle (toolbar phone icon or Ctrl+Shift+M).
-        let mobile_key = crate::chrome_shown()
+        let mobile_key = has_chrome
             && matches!(
                 &event.data,
                 DomEventData::KeyDown(k)
@@ -823,7 +1056,8 @@ impl EventHandler for JsEventBridge {
                         && (k.modifiers.contains(keyboard_types::Modifiers::CONTROL)
                             || k.modifiers.contains(keyboard_types::Modifiers::META))
             );
-        let mobile_link = matches!(event.data, DomEventData::Click(_))
+        let mobile_link = has_chrome
+            && matches!(event.data, DomEventData::Click(_))
             && chain_element_id(_doc, chain, &["__zipp_mobile_button"]).is_some();
         if mobile_key || mobile_link {
             event_state.prevent_default();
@@ -849,29 +1083,214 @@ impl EventHandler for JsEventBridge {
             }
             return;
         }
-        // The console's button and links, and F12, are the browser's -- when
-        // it shows its toolbar: without one (a kiosk, an app) there is no
-        // console to open, and F12 is the page's, as ZIPP OS's windows need.
-        let console_key = crate::chrome_shown()
-            && matches!(&event.data, DomEventData::KeyDown(k) if k.code == keyboard_types::Code::F12);
-        let console_link = matches!(event.data, DomEventData::Click(_))
-            .then(|| chain_element_id(_doc, chain, &["__zipp_console_button", "__zipp_console_close", "__zipp_console_clear"]))
-            .flatten();
-        if console_key || console_link.is_some() {
-            event_state.prevent_default();
-            let opened = if console_link.as_deref() == Some("__zipp_console_clear") {
-                console::clear();
-                false
-            } else {
-                console::toggle()
-            };
-            let mut inner = _doc.inner_mut();
-            self.show_console(&mut inner);
-            // Opened, its input line takes the keys, as a browser's console's does.
-            if opened && let Ok(Some(input)) = inner.query_selector("#__zipp_console_input") {
-                inner.set_focus_to(input);
+        // Chrome-style DevTools / Inspect controls, shortcuts, and Element Picker.
+        if has_chrome {
+            // Escape cancels active Element Picker mode cleanly.
+            if devtools::is_picking()
+                && matches!(&event.data, DomEventData::KeyDown(k) if k.code == keyboard_types::Code::Escape)
+            {
+                event_state.prevent_default();
+                event_state.stop_propagation();
+                devtools::set_picking(false);
+                let mut inner = _doc.inner_mut();
+                let cursor = inner.get_cursor().unwrap_or_default();
+                inner.shell_provider.set_cursor(cursor);
+                self.show_console(&mut inner);
+                return;
             }
-            return;
+            // Element Picker mode: show crosshair cursor over page content and inspect on click.
+            if devtools::is_picking() && !in_chrome(_doc, chain) {
+                if matches!(event.data, DomEventData::PointerMove(_) | DomEventData::MouseMove(_)) {
+                    _doc.inner()
+                        .shell_provider
+                        .set_cursor(zipp_dom::CursorIcon::Crosshair);
+                    return;
+                }
+                if matches!(event.data, DomEventData::MouseDown(_)) {
+                    event_state.prevent_default();
+                    event_state.stop_propagation();
+                    return;
+                }
+                if matches!(event.data, DomEventData::Click(_)) {
+                    event_state.prevent_default();
+                    event_state.stop_propagation();
+                    let mut inner = _doc.inner_mut();
+                    devtools::inspect_node(&inner, event.target);
+                    let cursor = inner.get_cursor().unwrap_or_default();
+                    inner.shell_provider.set_cursor(cursor);
+                    self.show_console(&mut inner);
+                    return;
+                }
+            }
+
+            // DevTools keyboard shortcuts:
+            //   F12            -> Toggle DevTools (Console)
+            //   Ctrl+Shift+I   -> Inspect / Elements tab
+            //   Ctrl+Shift+C   -> Toggle Element Picker
+            //   Ctrl+U         -> View Page Source tab
+            let dt_key_action = if let DomEventData::KeyDown(k) = &event.data {
+                let accel = k.modifiers.contains(keyboard_types::Modifiers::CONTROL)
+                    || k.modifiers.contains(keyboard_types::Modifiers::META);
+                let shift = k.modifiers.contains(keyboard_types::Modifiers::SHIFT);
+                if k.code == keyboard_types::Code::F12 {
+                    Some("f12")
+                } else if accel && shift && k.code == keyboard_types::Code::KeyI {
+                    Some("inspect")
+                } else if accel && shift && k.code == keyboard_types::Code::KeyC {
+                    Some("pick")
+                } else if accel
+                    && !shift
+                    && k.code == keyboard_types::Code::KeyU
+                    && !is_text_field(_doc, event.target)
+                {
+                    Some("source")
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let static_dt_click = matches!(event.data, DomEventData::Click(_))
+                .then(|| {
+                    chain_element_id(
+                        _doc,
+                        chain,
+                        &[
+                            "__zipp_inspect_button",
+                            "__zipp_console_button",
+                            "__zipp_console_close",
+                            "__zipp_console_clear",
+                            "__zipp_console_copy",
+                            "__zipp_dt_pick",
+                            "__zipp_dt_tab_elements",
+                            "__zipp_dt_tab_source",
+                            "__zipp_dt_tab_scripts",
+                            "__zipp_dt_tab_console",
+                            "__zipp_dt_src_orig",
+                            "__zipp_dt_src_live",
+                        ],
+                    )
+                })
+                .flatten();
+
+            let dynamic_script_click = if static_dt_click.is_none()
+                && matches!(event.data, DomEventData::Click(_))
+            {
+                chain_element_id_with_prefix(_doc, chain, "__zipp_dt_script_")
+            } else {
+                None
+            };
+            let dynamic_node_click = if static_dt_click.is_none()
+                && dynamic_script_click.is_none()
+                && matches!(event.data, DomEventData::Click(_))
+            {
+                chain_element_id_with_prefix(_doc, chain, "__zipp_dt_node_")
+            } else {
+                None
+            };
+
+            if dt_key_action.is_some()
+                || static_dt_click.is_some()
+                || dynamic_script_click.is_some()
+                || dynamic_node_click.is_some()
+            {
+                event_state.prevent_default();
+                event_state.stop_propagation();
+
+                if static_dt_click.as_deref() == Some("__zipp_console_copy") {
+                    let text = devtools::copy_text();
+                    let mut inner = _doc.inner_mut();
+                    let _ = inner.shell_provider.set_clipboard_text(text);
+                    if let Ok(Some(btn)) = inner.query_selector("#__zipp_console_copy") {
+                        inner
+                            .mutate()
+                            .set_inner_html(btn, &crate::console_copy_button_inner(true));
+                    }
+                    self.console_copied_until =
+                        Some(Instant::now() + std::time::Duration::from_millis(1800));
+                    inner.shell_provider.request_redraw();
+                    return;
+                }
+
+                let mut focus_console_input = false;
+                if let Some(script_id) = dynamic_script_click {
+                    if let Ok(idx) = script_id
+                        .trim_start_matches("__zipp_dt_script_")
+                        .parse::<usize>()
+                    {
+                        devtools::select_script(idx);
+                    }
+                } else if let Some(node_dom_id) = dynamic_node_click {
+                    if let Ok(nid) = node_dom_id
+                        .trim_start_matches("__zipp_dt_node_")
+                        .parse::<usize>()
+                    {
+                        let inner = _doc.inner();
+                        devtools::inspect_node(&inner, nid);
+                    }
+                } else {
+                    match dt_key_action
+                        .or(static_dt_click.as_deref())
+                        .unwrap_or_default()
+                    {
+                        "f12" => {
+                            if console::is_open() {
+                                console::set_open(false);
+                                devtools::set_picking(false);
+                            } else {
+                                devtools::set_tab(devtools::Tab::Console);
+                                focus_console_input = true;
+                            }
+                        }
+                        "inspect" | "__zipp_inspect_button" => {
+                            devtools::toggle_tab(devtools::Tab::Elements);
+                        }
+                        "pick" | "__zipp_dt_pick" => {
+                            devtools::toggle_picking();
+                        }
+                        "source" | "__zipp_dt_tab_source" => {
+                            devtools::set_tab(devtools::Tab::Source);
+                        }
+                        "__zipp_dt_tab_elements" => {
+                            devtools::set_tab(devtools::Tab::Elements);
+                        }
+                        "__zipp_dt_tab_scripts" => {
+                            devtools::set_tab(devtools::Tab::Scripts);
+                        }
+                        "__zipp_dt_tab_console" => {
+                            devtools::set_tab(devtools::Tab::Console);
+                            focus_console_input = true;
+                        }
+                        "__zipp_console_button" => {
+                            focus_console_input = devtools::toggle_tab(devtools::Tab::Console);
+                        }
+                        "__zipp_console_close" => {
+                            console::set_open(false);
+                            devtools::set_picking(false);
+                        }
+                        "__zipp_console_clear" => {
+                            console::clear();
+                        }
+                        "__zipp_dt_src_orig" => {
+                            devtools::set_source_mode(devtools::SourceMode::Original);
+                        }
+                        "__zipp_dt_src_live" => {
+                            devtools::set_source_mode(devtools::SourceMode::Rendered);
+                        }
+                        _ => {}
+                    }
+                }
+                let mut inner = _doc.inner_mut();
+                self.show_console(&mut inner);
+                if focus_console_input
+                    && devtools::active_tab() == devtools::Tab::Console
+                    && let Ok(Some(input)) = inner.query_selector("#__zipp_console_input")
+                {
+                    inner.set_focus_to(input);
+                }
+                return;
+            }
         }
         // A file dialog closed on a choice: the page gets the files.
         if let DomEventData::Input(input) = &event.data
@@ -1049,9 +1468,14 @@ impl EventHandler for JsEventBridge {
     }
 
     fn run_tasks(&mut self, doc: &mut BaseDocument) -> Option<Instant> {
-        let _layout = LayoutScope::enter(doc, &self.flid_to_dom);
+        let _layout = LayoutScope::enter(doc, &self.flid_to_dom, &self.page_url, self.fetch_scope);
         let now = Instant::now();
         self.refresh_listeners(doc);
+        // Deliver any background `window.fetch()` responses that arrived for this document.
+        let fetched = self.js_state.as_mut().map_or(0, deliver_async_fetches);
+        if fetched > 0 {
+            self.run_due_work();
+        }
         // The viewport changed size (the screen's new mode, a resized
         // window): the script's innerWidth and innerHeight follow, and it
         // hears `resize`.
@@ -1071,106 +1495,108 @@ impl EventHandler for JsEventBridge {
             self.run_due_work();
         }
         self.viewport_told = Some(size);
-        // What the page's workers sent: each message is a task of its own.
-        let messages = crate::worker::take_messages();
-        if !messages.is_empty() {
-            if let Some(state) = self.js_state.as_mut() {
-                for (id, message) in messages {
-                    let (kind, payload) = match message {
-                        crate::worker::FromWorker::Message(data) => ("message", data),
-                        crate::worker::FromWorker::Error(error) => ("error", error),
-                    };
-                    let args = [JsValue::Number(f64::from(id)), JsValue::String(kind.into()), JsValue::String(payload)];
-                    if let Err(e) = state.call_global("__zippWorkerDeliver", &args) {
-                        eprintln!("[WORKER] delivering a {kind} failed: {e}");
-                    }
-                    state.run_microtasks();
-                }
-            }
-            self.run_due_work();
-        }
-        // What programs on the page's terminals printed, and their ends (pty.rs).
-        #[cfg(target_os = "linux")]
-        {
-            let events = crate::pty::take_events();
-            if !events.is_empty() {
+        if !self.is_subdocument {
+            // What the page's workers sent: each message is a task of its own.
+            let messages = crate::worker::take_messages();
+            if !messages.is_empty() {
                 if let Some(state) = self.js_state.as_mut() {
-                    for (id, kind, data) in events {
-                        let args = [JsValue::Number(id as f64), JsValue::String(kind.into()), JsValue::String(data)];
-                        if let Err(e) = state.call_global("__zippPtyEvent", &args) {
-                            eprintln!("[ZIPP] delivering a terminal's output failed: {e}");
+                    for (id, message) in messages {
+                        let (kind, payload) = match message {
+                            crate::worker::FromWorker::Message(data) => ("message", data),
+                            crate::worker::FromWorker::Error(error) => ("error", error),
+                        };
+                        let args = [JsValue::Number(f64::from(id)), JsValue::String(kind.into()), JsValue::String(payload)];
+                        if let Err(e) = state.call_global("__zippWorkerDeliver", &args) {
+                            eprintln!("[WORKER] delivering a {kind} failed: {e}");
                         }
                         state.run_microtasks();
                     }
                 }
                 self.run_due_work();
             }
-        }
-        // Linux apps' windows (wayland.rs): what became of them, then their
-        // new frames, into the canvases the page shows them in.
-        #[cfg(target_os = "linux")]
-        {
-            let events = crate::wayland::take_events();
-            if !events.is_empty() {
-                if let Some(state) = self.js_state.as_mut() {
-                    for (kind, id, json) in events {
-                        let args = [JsValue::String(kind.into()), JsValue::Number(id as f64), JsValue::String(json)];
-                        if let Err(e) = state.call_global("__zippWaylandEvent", &args) {
-                            eprintln!("[ZIPP] delivering a Linux app's window failed: {e}");
+            // What programs on the page's terminals printed, and their ends (pty.rs).
+            #[cfg(target_os = "linux")]
+            {
+                let events = crate::pty::take_events();
+                if !events.is_empty() {
+                    if let Some(state) = self.js_state.as_mut() {
+                        for (id, kind, data) in events {
+                            let args = [JsValue::Number(id as f64), JsValue::String(kind.into()), JsValue::String(data)];
+                            if let Err(e) = state.call_global("__zippPtyEvent", &args) {
+                                eprintln!("[ZIPP] delivering a terminal's output failed: {e}");
+                            }
+                            state.run_microtasks();
                         }
-                        state.run_microtasks();
+                    }
+                    self.run_due_work();
+                }
+            }
+            // Linux apps' windows (wayland.rs): what became of them, then their
+            // new frames, into the canvases the page shows them in.
+            #[cfg(target_os = "linux")]
+            {
+                let events = crate::wayland::take_events();
+                if !events.is_empty() {
+                    if let Some(state) = self.js_state.as_mut() {
+                        for (kind, id, json) in events {
+                            let args = [JsValue::String(kind.into()), JsValue::Number(id as f64), JsValue::String(json)];
+                            if let Err(e) = state.call_global("__zippWaylandEvent", &args) {
+                                eprintln!("[ZIPP] delivering a Linux app's window failed: {e}");
+                            }
+                            state.run_microtasks();
+                        }
+                    }
+                    self.run_due_work();
+                }
+                let frames = crate::wayland::take_frames();
+                if !frames.is_empty() {
+                    for frame in frames {
+                        crate::canvas::push_frame(frame);
+                    }
+                    if crate::apply_canvas_frames_with_map(doc, &self.flid_to_dom) {
+                        doc.shell_provider.request_paint();
                     }
                 }
-                self.run_due_work();
             }
-            let frames = crate::wayland::take_frames();
-            if !frames.is_empty() {
-                for frame in frames {
-                    crate::canvas::push_frame(frame);
-                }
-                if crate::apply_canvas_frames_with_map(doc, &self.flid_to_dom) {
-                    doc.shell_provider.request_paint();
-                }
-            }
-        }
-        // Programs a page ran that finished (system.rs): each settles its promise.
-        let done = crate::system::take_completions();
-        if !done.is_empty() {
-            if let Some(state) = self.js_state.as_mut() {
-                for (id, result) in done {
-                    let args = [JsValue::Number(id as f64), JsValue::String(result)];
-                    if let Err(e) = state.call_global("__zippSystemComplete", &args) {
-                        eprintln!("[ZIPP] delivering a program's result failed: {e}");
-                    }
-                    state.run_microtasks();
-                }
-            }
-            self.run_due_work();
-        }
-        // USB transfers that finished (usb.rs): each settles its promise.
-        #[cfg(target_os = "linux")]
-        {
-            let done = crate::usb::take_completions();
+            // Programs a page ran that finished (system.rs): each settles its promise.
+            let done = crate::system::take_completions();
             if !done.is_empty() {
                 if let Some(state) = self.js_state.as_mut() {
                     for (id, result) in done {
                         let args = [JsValue::Number(id as f64), JsValue::String(result)];
-                        if let Err(e) = state.call_global("__zippUsbComplete", &args) {
-                            eprintln!("[USB] delivering a transfer failed: {e}");
+                        if let Err(e) = state.call_global("__zippSystemComplete", &args) {
+                            eprintln!("[ZIPP] delivering a program's result failed: {e}");
                         }
                         state.run_microtasks();
                     }
                 }
                 self.run_due_work();
             }
-        }
-        if console::has_submitted() {
-            self.run_console_input();
-            // An empty line again, still focused, for the next.
-            if let Ok(Some(form)) = doc.query_selector("#__zipp_console_form") {
-                doc.mutate().set_inner_html(form, &crate::console_input());
-                if let Ok(Some(input)) = doc.query_selector("#__zipp_console_input") {
-                    doc.set_focus_to(input);
+            // USB transfers that finished (usb.rs): each settles its promise.
+            #[cfg(target_os = "linux")]
+            {
+                let done = crate::usb::take_completions();
+                if !done.is_empty() {
+                    if let Some(state) = self.js_state.as_mut() {
+                        for (id, result) in done {
+                            let args = [JsValue::Number(id as f64), JsValue::String(result)];
+                            if let Err(e) = state.call_global("__zippUsbComplete", &args) {
+                                eprintln!("[USB] delivering a transfer failed: {e}");
+                            }
+                            state.run_microtasks();
+                        }
+                    }
+                    self.run_due_work();
+                }
+            }
+            if console::has_submitted() {
+                self.run_console_input();
+                // An empty line again, still focused, for the next.
+                if let Ok(Some(form)) = doc.query_selector("#__zipp_console_form") {
+                    doc.mutate().set_inner_html(form, &crate::console_input());
+                    if let Ok(Some(input)) = doc.query_selector("#__zipp_console_input") {
+                        doc.set_focus_to(input);
+                    }
                 }
             }
         }
@@ -1189,10 +1615,30 @@ impl EventHandler for JsEventBridge {
         self.apply_pending_video_ops(doc);
         self.apply_focus_request(doc);
         self.sync_scrolls(doc);
+        self.sync_head_extras(doc);
+        self.sync_location_url(doc);
+        crate::sync_iframes(doc, &self.page_url, self.iframe_depth);
         let video_due = self.sync_videos(doc, now);
+        let fetch_due = crate::async_fetch::has_pending(self.fetch_scope)
+            .then(|| now + std::time::Duration::from_millis(30));
+        if self.is_subdocument {
+            return [self.next_timer, video_due, fetch_due].into_iter().flatten().min();
+        }
         crate::apply_window_requests(doc);
+        self.refresh_tabbar(doc);
+        if self.console_copied_until.is_some_and(|until| now >= until) {
+            self.console_copied_until = None;
+            if let Ok(Some(btn)) = doc.query_selector("#__zipp_console_copy") {
+                doc.mutate()
+                    .set_inner_html(btn, &crate::console_copy_button_inner(false));
+                doc.shell_provider.request_redraw();
+            }
+        }
         let console_due = self.refresh_console(doc, now, false);
-        [self.next_timer, console_due, video_due].into_iter().flatten().min()
+        [self.next_timer, console_due, video_due, fetch_due, self.console_copied_until]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     fn take_pending_rerender(&mut self) -> Option<String> {
@@ -1271,6 +1717,9 @@ impl EventHandler for JsEventBridge {
         update_layout_flids(&self.flid_to_dom);
         self.restore_video_players(doc);
         self.apply_pending_video_ops(doc);
+        self.sync_head_extras(doc);
+        self.sync_location_url(doc);
+        crate::sync_iframes(doc, &self.page_url, self.iframe_depth);
     }
 }
 
@@ -1425,17 +1874,27 @@ fn update_layout_flids(map: &Arc<HashMap<u32, usize>>) {
     });
 }
 
-/// While alive, the page's script can read the document's layout.
+/// While alive, the page's script can read the document's layout and its host
+/// calls (`fetch`, cookies, `Origin`) resolve against `page_url`.
 struct LayoutScope {
     prev_doc: *const BaseDocument,
     prev_flids: Option<Arc<HashMap<u32, usize>>>,
+    _page_guard: crate::ThreadPageGuard,
+    _fetch_guard: crate::async_fetch::ScopeGuard,
 }
 
 impl LayoutScope {
-    fn enter(doc: &BaseDocument, flids: &Arc<HashMap<u32, usize>>) -> Self {
+    fn enter(
+        doc: &BaseDocument,
+        flids: &Arc<HashMap<u32, usize>>,
+        page_url: &str,
+        fetch_scope: u64,
+    ) -> Self {
         let prev_doc = LAYOUT_DOC.with(|d| d.replace(doc));
         let prev_flids = LAYOUT_FLIDS.with(|f| f.borrow_mut().replace(Arc::clone(flids)));
-        LayoutScope { prev_doc, prev_flids }
+        let _page_guard = crate::ThreadPageGuard::enter(page_url);
+        let _fetch_guard = crate::async_fetch::ScopeGuard::enter(fetch_scope);
+        LayoutScope { prev_doc, prev_flids, _page_guard, _fetch_guard }
     }
 }
 
@@ -1588,13 +2047,17 @@ fn is_file_input(doc: &dyn Document, node: usize) -> bool {
         })
 }
 
-/// Whether an event happened in the browser's toolbar rather than the page.
+/// Whether an event happened in the browser's toolbar or console rather than the page.
 fn in_chrome(doc: &dyn Document, chain: &[usize]) -> bool {
     let doc = doc.inner();
     chain.iter().any(|&id| {
         doc.get_node(id)
             .and_then(|n| n.element_data())
-            .is_some_and(|el| el.id.as_ref().is_some_and(|id| &**id == "__zipp_chrome"))
+            .is_some_and(|el| {
+                el.id
+                    .as_ref()
+                    .is_some_and(|id| &**id == "__zipp_chrome" || &**id == "__zipp_console")
+            })
     })
 }
 
@@ -1723,6 +2186,16 @@ fn chain_element_id(doc: &dyn Document, chain: &[usize], ids: &[&str]) -> Option
         let el = doc.get_node(id)?.element_data()?;
         let found = el.id.as_ref()?;
         ids.iter().find(|&&want| &**found == want).map(|s| s.to_string())
+    })
+}
+
+/// The first element id on the event's path starting with `prefix`.
+fn chain_element_id_with_prefix(doc: &dyn Document, chain: &[usize], prefix: &str) -> Option<String> {
+    let doc = doc.inner();
+    chain.iter().find_map(|&id| {
+        let el = doc.get_node(id)?.element_data()?;
+        let found = el.id.as_ref()?;
+        found.starts_with(prefix).then(|| found.to_string())
     })
 }
 

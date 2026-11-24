@@ -154,7 +154,7 @@ pub fn render(
                     <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
                 </div>
                 <div class="zp-empty-title">No browsing history yet</div>
-                <div class="zp-empty-sub">Pages you visit in Zipp Browser will appear here for quick access.</div>
+                <div class="zp-empty-sub">Pages you visit in ZIPP Browser will appear here for quick access.</div>
             </div>"#.to_string()
         } else {
             format!(
@@ -205,9 +205,9 @@ pub fn render(
     };
 
     let title = if focus_history {
-        "History — Zipp Browser"
+        "History — ZIPP Browser"
     } else {
-        "Properties — Zipp Browser"
+        "Properties — ZIPP Browser"
     };
     let page_heading = if focus_history {
         "Browsing History"
@@ -220,7 +220,7 @@ pub fn render(
         "Configure your start page, HTTP cache & storage quotas, media audio, and privacy."
     };
 
-    // Refined obsidian-slate (normal) and obsidian-amethyst (incognito) color tokens.
+    // Official ZIPP obsidian-violet-cyan (normal) and deep amethyst (incognito) color tokens.
     let (bg, rail_bg, card_bg, inset_bg, border, border_strong, accent, accent_soft, primary_grad, primary_hover) = if incognito {
         (
             "#0c0916",
@@ -236,16 +236,16 @@ pub fn render(
         )
     } else {
         (
-            "#0a0e17",
-            "#0e1421",
-            "#131b2c",
-            "#0c111d",
-            "#1f2a40",
-            "#2d3d5c",
-            "#60a5fa",
-            "rgba(59, 130, 246, 0.15)",
-            "linear-gradient(180deg, #3b82f6 0%, #2563eb 100%)",
-            "#2563eb",
+            "#0b1020",
+            "#10142a",
+            "#151933",
+            "#0d1124",
+            "#262b4d",
+            "#3a3f6e",
+            "#c4b5fd",
+            "rgba(124, 58, 237, 0.18)",
+            "linear-gradient(135deg, #7c3aed 0%, #0891b2 100%)",
+            "#6d28d9",
         )
     };
 
@@ -315,8 +315,10 @@ pub fn render(
             <div class="zp-quick-row">
                 <span class="zp-quick-label">Quick presets</span>
                 {use_current_btn}
-                <a class="{preset_default}" href="zipp-settings:set-start?__zipp_chrome={token}&amp;url=https%3A%2F%2Flance.name">Default (lance.name)</a>
-                <a class="{preset_softn}" href="zipp-settings:set-start?__zipp_chrome={token}&amp;url=https%3A%2F%2Fsoftn.com">SoftN Home</a>
+                <a class="{preset_newtab}" href="zipp-settings:set-start?__zipp_chrome={token}&amp;url=zipp%3Anewtab">New Tab Page (Default)</a>
+                <a class="{preset_zipp}" href="zipp-settings:set-start?__zipp_chrome={token}&amp;url=https%3A%2F%2Fwww.zipp.org">ZIPP</a>
+                <a class="{preset_softn}" href="zipp-settings:set-start?__zipp_chrome={token}&amp;url=https%3A%2F%2Fsoftn.com">SoftN</a>
+                <a class="{preset_search}" href="zipp-settings:set-start?__zipp_chrome={token}&amp;url=https%3A%2F%2Fhtml.duckduckgo.com">DuckDuckGo</a>
                 <a class="{preset_props}" href="zipp-settings:set-start?__zipp_chrome={token}&amp;url=zipp%3Asettings">Properties Page</a>
             </div>
         </section>
@@ -412,8 +414,10 @@ pub fn render(
             </div>
         </section>"#,
         start_page = escape_html(&cfg.start_page),
-        preset_default = preset_cls("https://lance.name"),
+        preset_newtab = preset_cls("zipp:newtab"),
+        preset_zipp = preset_cls("https://www.zipp.org"),
         preset_softn = preset_cls("https://softn.com"),
+        preset_search = preset_cls("https://html.duckduckgo.com"),
         preset_props = preset_cls("zipp:settings"),
         disk_mb = mb(cache_stats.disk_bytes),
         disk_entries = cache_stats.disk_entries,
@@ -432,7 +436,7 @@ pub fn render(
     };
 
     format!(
-        r#"<!DOCTYPE html>
+        r##"<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
@@ -474,9 +478,8 @@ pub fn render(
   .zp-brand-mark {{
     width: 34px;
     height: 34px;
-    border-radius: 10px;
-    background: {primary_grad};
-    color: #ffffff;
+    border-radius: 9px;
+    background: transparent;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1131,10 +1134,10 @@ pub fn render(
     <aside class="zp-rail">
       <div class="zp-brand">
         <div class="zp-brand-mark">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+          <svg width="34" height="34" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="zb_bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0b1020"/><stop offset="0.55" stop-color="#24124d"/><stop offset="1" stop-color="#083b4c"/></linearGradient><linearGradient id="zb_bolt" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#c4b5fd"/><stop offset="0.5" stop-color="#7c3aed"/><stop offset="1" stop-color="#22d3ee"/></linearGradient></defs><rect width="256" height="256" rx="56" fill="url(#zb_bg)"/><path d="M92 0 0 122h58l-25 86L142 69h-62z" transform="translate(57 24)" fill="url(#zb_bolt)"/></svg>
         </div>
         <div>
-          <div class="zp-brand-name">Zipp Browser</div>
+          <div class="zp-brand-name">ZIPP Browser</div>
           <div class="zp-brand-profile"><span class="{profile_dot_cls}"></span><span>{profile_label}</span></div>
         </div>
       </div>
@@ -1182,9 +1185,17 @@ pub fn render(
 
       <div class="zp-shortcuts">
         <div class="zp-shortcuts-title">Shortcuts</div>
+        <div class="zp-sc-row"><span>New Tab</span><span class="zp-nav-kbd">Ctrl+T</span></div>
+        <div class="zp-sc-row"><span>Close Tab</span><span class="zp-nav-kbd">Ctrl+W</span></div>
+        <div class="zp-sc-row"><span>Reopen Tab</span><span class="zp-nav-kbd">Ctrl+Shift+T</span></div>
+        <div class="zp-sc-row"><span>Switch Tabs</span><span class="zp-nav-kbd">Ctrl+Tab</span></div>
+        <div class="zp-sc-row"><span>Tab 1&ndash;9</span><span class="zp-nav-kbd">Ctrl+1..9</span></div>
         <div class="zp-sc-row"><span>Properties</span><span class="zp-nav-kbd">Ctrl+,</span></div>
         <div class="zp-sc-row"><span>History</span><span class="zp-nav-kbd">Ctrl+H</span></div>
         <div class="zp-sc-row"><span>Mobile View</span><span class="zp-nav-kbd">Ctrl+Shift+M</span></div>
+        <div class="zp-sc-row"><span>Inspect</span><span class="zp-nav-kbd">Ctrl+Shift+I</span></div>
+        <div class="zp-sc-row"><span>Pick Element</span><span class="zp-nav-kbd">Ctrl+Shift+C</span></div>
+        <div class="zp-sc-row"><span>View Source</span><span class="zp-nav-kbd">Ctrl+U</span></div>
         <div class="zp-sc-row"><span>Dev Console</span><span class="zp-nav-kbd">F12</span></div>
       </div>
     </aside>
@@ -1208,6 +1219,496 @@ pub fn render(
     </main>
   </div>
 </body>
-</html>"#
+</html>"##
+    )
+}
+
+/// Render the built-in New Tab start page (`zipp:newtab` / `about:newtab`).
+pub fn render_newtab(token: &str) -> String {
+    let cfg = settings::get();
+    let incognito = zipp_shell::profile::is_incognito();
+    let (home_url, home_title, home_display) = if cfg.start_page == "zipp:newtab" {
+        (
+            "zipp:settings".to_string(),
+            "Start Page",
+            "Choose your home page".to_string(),
+        )
+    } else if cfg.start_page.starts_with("zipp:") {
+        (cfg.start_page.clone(), "Home", "Start Page".to_string())
+    } else {
+        (
+            cfg.start_page.clone(),
+            "Home",
+            host_monogram(&cfg.start_page).1,
+        )
+    };
+
+    let (bg, glow, card_bg, inset_bg, border, border_strong, accent, accent_soft, primary_grad, badge_html, subtitle) = if incognito {
+        (
+            "#0c0916",
+            "radial-gradient(ellipse at 50% 0%, rgba(139, 92, 246, 0.22) 0%, rgba(12, 9, 22, 0) 65%)",
+            "#161128",
+            "#100c1e",
+            "#2a2145",
+            "#3f3168",
+            "#c4b5fd",
+            "rgba(139, 92, 246, 0.18)",
+            "linear-gradient(180deg, #8b5cf6 0%, #6d28d9 100%)",
+            r#"<span class="nt-pill"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/><path d="m3 3 18 18"/></svg>Incognito Window</span>"#,
+            "Private session — cookies, cache, and storage stay strictly in memory and vanish when closed.",
+        )
+    } else {
+        (
+            "#0b1020",
+            "radial-gradient(ellipse at 50% 0%, rgba(124, 58, 237, 0.24) 0%, rgba(8, 59, 76, 0.14) 38%, rgba(11, 16, 32, 0) 70%)",
+            "#151933",
+            "#0d1124",
+            "#262b4d",
+            "#3a3f6e",
+            "#c4b5fd",
+            "rgba(124, 58, 237, 0.18)",
+            "linear-gradient(135deg, #7c3aed 0%, #0891b2 100%)",
+            r#"<span class="nt-pill">Part of the ZIPP Project &middot; Native Web &amp; SoftN Browser</span>"#,
+            "Powered by ZIPP — search the web, launch a SoftN app, or jump into a site below.",
+        )
+    };
+
+    let recent_section = if incognito {
+        r#"<section class="nt-section">
+            <div class="nt-incog-card">
+                <div class="nt-incog-ico">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                </div>
+                <div>
+                    <div class="nt-incog-title">You&rsquo;re browsing privately</div>
+                    <div class="nt-incog-desc">History is paused and nothing from this window is written to disk.</div>
+                </div>
+            </div>
+        </section>"#.to_string()
+    } else {
+        let entries = history::list(None);
+        let recent: Vec<_> = entries
+            .into_iter()
+            .filter(|e| !e.url.starts_with("zipp:") && !e.url.starts_with("about:"))
+            .take(6)
+            .collect();
+        if recent.is_empty() {
+            String::new()
+        } else {
+            let mut items = String::with_capacity(recent.len() * 260);
+            for item in recent {
+                let (mono, host) = host_monogram(&item.url);
+                let raw_label = if item.title.is_empty() { host.as_str() } else { item.title.as_str() };
+                let label: String = if raw_label.chars().count() > 36 {
+                    let mut s: String = raw_label.chars().take(35).collect();
+                    s.push('…');
+                    s
+                } else {
+                    raw_label.to_string()
+                };
+                items.push_str(&format!(
+                    r#"<a class="nt-recent-card" href="{url}">
+                        <span class="nt-recent-mono">{mono}</span>
+                        <span class="nt-recent-copy">
+                            <span class="nt-recent-title">{label}</span>
+                            <span class="nt-recent-host">{host}</span>
+                        </span>
+                    </a>"#,
+                    url = escape_html(&item.url),
+                    mono = escape_html(&mono),
+                    label = escape_html(&label),
+                    host = escape_html(&host),
+                ));
+            }
+            format!(
+                r#"<section class="nt-section">
+                    <div class="nt-sec-head">
+                        <span class="nt-sec-title">Recently Visited</span>
+                        <a class="nt-sec-link" href="zipp:history">All history &rarr;</a>
+                    </div>
+                    <div class="nt-recent-grid">{items}</div>
+                </section>"#
+            )
+        }
+    };
+
+    let home_href = escape_html(&home_url);
+    let home_label = escape_html(&home_display);
+
+    format!(
+        r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>New Tab — ZIPP Browser</title>
+<style>
+  * {{ box-sizing: border-box; }}
+  html, body {{
+    margin: 0;
+    padding: 0;
+    min-height: 100%;
+    background: {bg};
+    color: #e2e8f0;
+    font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Arial, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+  }}
+  .nt-page {{
+    min-height: 100vh;
+    background: {glow};
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 52px 20px 44px;
+  }}
+  .nt-wrap {{
+    width: 100%;
+    max-width: 740px;
+    display: flex;
+    flex-direction: column;
+    gap: 28px;
+  }}
+  .nt-hero {{
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    gap: 12px;
+  }}
+  .nt-brand-row {{
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }}
+  .nt-logo {{
+    width: 44px;
+    height: 44px;
+    border-radius: 11px;
+    background: transparent;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 8px 24px rgba(124, 58, 237, 0.32);
+  }}
+  .nt-title {{
+    margin: 0;
+    font-size: 28px;
+    font-weight: 700;
+    letter-spacing: -0.025em;
+    color: #f8fafc;
+  }}
+  .nt-pill {{
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 11px;
+    border-radius: 999px;
+    background: {accent_soft};
+    border: 1px solid {border_strong};
+    color: {accent};
+    font-size: 12px;
+    font-weight: 600;
+  }}
+  .nt-sub {{
+    margin: 0;
+    font-size: 13.5px;
+    color: #94a3b8;
+    max-width: 520px;
+  }}
+  .nt-search {{
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 8px 6px 16px;
+    background: {card_bg};
+    border: 1px solid {border_strong};
+    border-radius: 14px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
+  }}
+  .nt-search-ico {{
+    color: {accent};
+    flex-shrink: 0;
+  }}
+  .nt-search-input {{
+    flex: 1;
+    min-width: 0;
+    height: 36px;
+    border: 0;
+    outline: none;
+    background: transparent;
+    color: #f8fafc;
+    font-family: inherit;
+    font-size: 14.5px;
+  }}
+  .nt-search-btn {{
+    height: 36px;
+    padding: 0 18px;
+    border-radius: 10px;
+    border: 0;
+    background: {primary_grad};
+    color: #ffffff;
+    font-family: inherit;
+    font-size: 13.5px;
+    font-weight: 600;
+    cursor: pointer;
+    flex-shrink: 0;
+  }}
+  .nt-section {{
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }}
+  .nt-sec-head {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }}
+  .nt-sec-title {{
+    font-size: 11.5px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #64748b;
+  }}
+  .nt-sec-link {{
+    font-size: 12.5px;
+    font-weight: 600;
+    color: {accent};
+    text-decoration: none;
+  }}
+  .nt-tiles {{
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 10px;
+  }}
+  .nt-tile {{
+    display: flex;
+    align-items: center;
+    gap: 11px;
+    padding: 13px 14px;
+    border-radius: 12px;
+    background: {card_bg};
+    border: 1px solid {border};
+    text-decoration: none;
+    color: #e2e8f0;
+  }}
+  .nt-tile:hover {{
+    border-color: {border_strong};
+    background: {inset_bg};
+  }}
+  .nt-tile-ico {{
+    width: 34px;
+    height: 34px;
+    border-radius: 10px;
+    background: {accent_soft};
+    color: {accent};
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }}
+  .nt-tile-text {{
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+  }}
+  .nt-tile-name {{
+    font-size: 13.5px;
+    font-weight: 600;
+    color: #f8fafc;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }}
+  .nt-tile-sub {{
+    font-size: 11.5px;
+    color: #94a3b8;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }}
+  .nt-recent-grid {{
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 9px;
+  }}
+  .nt-recent-card {{
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    border-radius: 11px;
+    background: {card_bg};
+    border: 1px solid {border};
+    text-decoration: none;
+    color: #e2e8f0;
+    min-width: 0;
+  }}
+  .nt-recent-card:hover {{
+    border-color: {border_strong};
+  }}
+  .nt-recent-mono {{
+    width: 30px;
+    height: 30px;
+    border-radius: 8px;
+    background: {inset_bg};
+    border: 1px solid {border};
+    color: {accent};
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 700;
+    font-size: 12.5px;
+    flex-shrink: 0;
+  }}
+  .nt-recent-copy {{
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }}
+  .nt-recent-title {{
+    font-size: 13px;
+    font-weight: 600;
+    color: #f1f5f9;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }}
+  .nt-recent-host {{
+    font-size: 11.5px;
+    color: #64748b;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }}
+  .nt-incog-card {{
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 16px 18px;
+    border-radius: 12px;
+    background: {card_bg};
+    border: 1px solid {border_strong};
+  }}
+  .nt-incog-ico {{
+    width: 38px;
+    height: 38px;
+    border-radius: 10px;
+    background: {accent_soft};
+    color: {accent};
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }}
+  .nt-incog-title {{
+    font-size: 14px;
+    font-weight: 700;
+    color: #f5f3ff;
+  }}
+  .nt-incog-desc {{
+    font-size: 12.5px;
+    color: #c4b5fd;
+  }}
+  .nt-keys {{
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 8px;
+    padding-top: 8px;
+  }}
+  .nt-key-pill {{
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: {inset_bg};
+    border: 1px solid {border};
+    color: #94a3b8;
+    font-size: 11.5px;
+  }}
+  .nt-kbd {{
+    font-family: Consolas, 'Liberation Mono', monospace;
+    font-size: 11px;
+    font-weight: 700;
+    color: #e2e8f0;
+  }}
+  @media (max-width: 640px) {{
+    .nt-page {{ padding: 28px 14px 32px; }}
+    .nt-tiles {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+    .nt-recent-grid {{ grid-template-columns: 1fr; }}
+  }}
+</style>
+</head>
+<body>
+  <main class="nt-page">
+    <div class="nt-wrap">
+      <header class="nt-hero">
+        <div class="nt-brand-row">
+          <div class="nt-logo">
+            <svg width="44" height="44" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="nt_bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0b1020"/><stop offset="0.55" stop-color="#24124d"/><stop offset="1" stop-color="#083b4c"/></linearGradient><linearGradient id="nt_bolt" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#c4b5fd"/><stop offset="0.5" stop-color="#7c3aed"/><stop offset="1" stop-color="#22d3ee"/></linearGradient></defs><rect width="256" height="256" rx="56" fill="url(#nt_bg)" stroke="#a78bfa" stroke-opacity="0.35" stroke-width="6"/><path d="M92 0 0 122h58l-25 86L142 69h-62z" transform="translate(57 24)" fill="url(#nt_bolt)"/></svg>
+          </div>
+          <h1 class="nt-title">ZIPP Browser</h1>
+        </div>
+        {badge_html}
+        <p class="nt-sub">{subtitle}</p>
+      </header>
+
+      <form class="nt-search" action="zipp:newtab" method="GET">
+        <input type="hidden" name="__zipp_chrome" value="{token}" />
+        <svg class="nt-search-ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+        <input class="nt-search-input" type="text" name="__nav_url" placeholder="Search the web or enter a URL..." />
+        <button class="nt-search-btn" type="submit">Go</button>
+      </form>
+
+      <section class="nt-section">
+        <div class="nt-sec-head">
+          <span class="nt-sec-title">Quick Access</span>
+        </div>
+        <div class="nt-tiles">
+          <a class="nt-tile" href="{home_href}">
+            <span class="nt-tile-ico"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg></span>
+            <span class="nt-tile-text"><span class="nt-tile-name">{home_title}</span><span class="nt-tile-sub">{home_label}</span></span>
+          </a>
+          <a class="nt-tile" href="https://softn.com">
+            <span class="nt-tile-ico"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg></span>
+            <span class="nt-tile-text"><span class="nt-tile-name">SoftN</span><span class="nt-tile-sub">softn.com</span></span>
+          </a>
+          <a class="nt-tile" href="https://www.zipp.org">
+            <span class="nt-tile-ico"><svg width="16" height="16" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg"><path d="M92 0 0 122h58l-25 86L142 69h-62z" transform="translate(57 24)" fill="currentColor"/></svg></span>
+            <span class="nt-tile-text"><span class="nt-tile-name">ZIPP Project</span><span class="nt-tile-sub">zipp.org</span></span>
+          </a>
+          <a class="nt-tile" href="zipp:settings">
+            <span class="nt-tile-ico"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.604.852.997 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></span>
+            <span class="nt-tile-text"><span class="nt-tile-name">Properties</span><span class="nt-tile-sub">Cache &amp; start page</span></span>
+          </a>
+          <a class="nt-tile" href="zipp:history">
+            <span class="nt-tile-ico"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></span>
+            <span class="nt-tile-text"><span class="nt-tile-name">History</span><span class="nt-tile-sub">Visited pages</span></span>
+          </a>
+          <a class="nt-tile" href="zipp-nav:incognito?__zipp_chrome={token}">
+            <span class="nt-tile-ico"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/><path d="m3 3 18 18"/></svg></span>
+            <span class="nt-tile-text"><span class="nt-tile-name">Incognito</span><span class="nt-tile-sub">Private window</span></span>
+          </a>
+        </div>
+      </section>
+
+      {recent_section}
+
+      <footer class="nt-keys">
+        <span class="nt-key-pill"><span class="nt-kbd">Ctrl+T</span> New Tab</span>
+        <span class="nt-key-pill"><span class="nt-kbd">Ctrl+W</span> Close Tab</span>
+        <span class="nt-key-pill"><span class="nt-kbd">Ctrl+Tab</span> Switch Tab</span>
+        <span class="nt-key-pill"><span class="nt-kbd">Ctrl+Shift+T</span> Reopen Closed</span>
+        <span class="nt-key-pill"><span class="nt-kbd">Ctrl+L</span> Address Bar</span>
+      </footer>
+    </div>
+  </main>
+</body>
+</html>"##
     )
 }

@@ -14,6 +14,7 @@ use crate::event::{ShellProxy, create_waker};
 use anyrender::WindowRenderer;
 use zipp_dom::Document;
 use zipp_renderer::paint_scene;
+use zipp_renderer::tinyskia::CachedFramePresenter;
 use zipp_dom::traits_src::events::{
     PointerEvent, PointerId, WheelDelta, WheelEvent, MouseEventButton,
     MouseEventButtons, PointerCoords, PointerDetails, UiEvent,
@@ -89,6 +90,10 @@ pub struct View<Rend: WindowRenderer> {
     /// Whether the next redraw must restyle and lay out the document first.
     /// Set by every redraw request except a paint-only one (see `redraw`).
     pub needs_resolve: Arc<AtomicBool>,
+    /// Whether the next redraw must re-rasterize the scene. Cleared after
+    /// painting so pure OS move/expose `WM_PAINT` events can blit the cached
+    /// framebuffer in under a millisecond.
+    pub needs_paint: Arc<AtomicBool>,
     /// When the page's next animation frame is due, while it wants frames.
     pub next_animation_frame: Option<Instant>,
 
@@ -107,7 +112,7 @@ pub struct View<Rend: WindowRenderer> {
 fn format_window_title(title: &str) -> String {
     if crate::profile::is_incognito() {
         if title.is_empty() {
-            "[Incognito] Zipp Browser".to_string()
+            "[Incognito] ZIPP Browser".to_string()
         } else {
             format!("[Incognito] {title}")
         }
@@ -116,7 +121,7 @@ fn format_window_title(title: &str) -> String {
     }
 }
 
-impl<Rend: WindowRenderer> View<Rend> 
+impl<Rend: WindowRenderer + CachedFramePresenter> View<Rend> 
 where
     for<'a> Rend::ScenePainter<'a>: zipp_renderer::tinyskia::BlurLayer,
 {
@@ -149,13 +154,23 @@ where
 
         // Create shell provider
         let needs_resolve = Arc::new(AtomicBool::new(true));
-        let shell_provider =
-            WindowShellProvider::with_resolve_flag(winit_window.clone(), needs_resolve.clone());
+        let needs_paint = Arc::new(AtomicBool::new(true));
+        let shell_provider = WindowShellProvider::with_flags(
+            winit_window.clone(),
+            needs_resolve.clone(),
+            needs_paint.clone(),
+        );
 
         let mut doc = config.doc;
         let mut inner = doc.inner_mut();
         inner.set_viewport(viewport);
         inner.set_shell_provider(Arc::new(shell_provider));
+        let has_focused_input = inner
+            .get_focussed_node_id()
+            .and_then(|id| inner.get_node(id))
+            .and_then(|n| n.element_data())
+            .is_some_and(|el| el.text_input_data().is_some());
+        inner.shell_provider.set_ime_enabled(has_focused_input);
 
         // If the document title is set prior to the window being created then it will
         // have been sent to a dummy ShellProvider and won't get picked up.
@@ -182,6 +197,7 @@ where
             buttons: MouseEventButtons::None,
             safe_area_insets,
             needs_resolve,
+            needs_paint,
             next_animation_frame: None,
             pointer_pos: Default::default(),
             is_visible: winit_window.is_visible().unwrap_or(true),
@@ -205,6 +221,12 @@ where
         let mut inner = self.doc.inner_mut();
         inner.set_viewport(viewport);
         inner.set_shell_provider(shell_provider);
+        let has_focused_input = inner
+            .get_focussed_node_id()
+            .and_then(|id| inner.get_node(id))
+            .and_then(|n| n.element_data())
+            .is_some_and(|el| el.text_input_data().is_some());
+        inner.shell_provider.set_ime_enabled(has_focused_input);
         // The new document set its title while it was parsed, before it had this
         // window's shell provider -- so, as in `init`, find it and set it here, or
         // the window keeps the first page's title for good.
@@ -257,7 +279,7 @@ where
 
 // `paint_scene` needs a painter that can blur (`filter: blur()`), which is a
 // capability beyond `PaintScene`.
-impl<Rend: WindowRenderer> View<Rend>
+impl<Rend: WindowRenderer + CachedFramePresenter> View<Rend>
 where
     for<'a> Rend::ScenePainter<'a>: zipp_renderer::tinyskia::BlurLayer,
 {
@@ -284,6 +306,8 @@ where
         self.renderer.render(|scene| {
             paint_scene(scene, &inner, scale, width, height, insets.left, insets.top)
         });
+        self.needs_resolve.store(false, Ordering::Release);
+        self.needs_paint.store(false, Ordering::Release);
 
         // Set waker
         self.waker = Some(create_waker(&self.proxy, window_id));
@@ -317,6 +341,18 @@ where
     #[inline]
     pub fn request_redraw(&self) {
         self.needs_resolve.store(true, Ordering::Release);
+        self.needs_paint.store(true, Ordering::Release);
+        if self.renderer.is_active() {
+            self.window.request_redraw();
+            #[cfg(target_os = "ios")]
+            self.ios_request_redraw.set(true);
+        }
+    }
+
+    /// Ask for a repaint without forcing a full Stylo/Taffy layout resolve.
+    #[inline]
+    pub fn request_paint_only(&self) {
+        self.needs_paint.store(true, Ordering::Release);
         if self.renderer.is_active() {
             self.window.request_redraw();
             #[cfg(target_os = "ios")]
@@ -336,10 +372,12 @@ where
         // asks for a full redraw itself.
         const FRAME: std::time::Duration = std::time::Duration::from_millis(16);
         let now = Instant::now();
+        let mut ran_anim_frame = false;
         let animating = match self.next_animation_frame {
             Some(due) if now < due => true,
             _ => {
                 let wants_more = self.doc.animation_frame();
+                ran_anim_frame = wants_more;
                 self.next_animation_frame = wants_more.then(|| now + FRAME);
                 wants_more
             }
@@ -353,9 +391,11 @@ where
         // asking for the window to be drawn again. Every ordinary redraw request
         // (input, resize, a loaded resource, a DOM change) sets the flag; a
         // running CSS animation resolves every frame as before.
-        if self.needs_resolve.swap(false, Ordering::AcqRel) || inner.is_animating() {
+        let need_resolve = self.needs_resolve.swap(false, Ordering::AcqRel) || inner.is_animating();
+        if need_resolve {
             inner.resolve(animation_time);
         }
+        let need_paint = self.needs_paint.swap(false, Ordering::AcqRel) || need_resolve || ran_anim_frame;
 
         let (width, height) = inner.viewport().window_size;
         let scale = inner.viewport().scale_f64();
@@ -364,27 +404,23 @@ where
         let insets = self.safe_area_insets.to_logical(scale);
 
         if !is_blocked && is_visible {
-            self.renderer.render(|scene| {
-                paint_scene(scene, &inner, scale, width, height, insets.left, insets.top)
-            });
+            if !need_paint && self.renderer.present_cached() {
+                // Fast cached framebuffer blit for OS expose / window-move repaints.
+            } else {
+                self.renderer.render(|scene| {
+                    paint_scene(scene, &inner, scale, width, height, insets.left, insets.top)
+                });
+            }
         }
 
         drop(inner);
 
+        // Schedule continuous animation frames via `about_to_wait` (`ControlFlow::WaitUntil`)
+        // instead of sleeping on the UI thread, keeping window movement responsive.
         if !is_blocked && is_visible && is_animating {
             self.request_redraw();
-        } else if animating && is_visible {
-            // Wait out the rest of the frame, then come back for the next one
-            // (a repaint, not a resolve).
-            if let Some(due) = self.next_animation_frame {
-                let left = due.saturating_duration_since(Instant::now());
-                if !left.is_zero() {
-                    std::thread::sleep(left.min(FRAME));
-                }
-            }
-            if self.renderer.is_active() {
-                self.window.request_redraw();
-            }
+        } else if !animating {
+            self.next_animation_frame = None;
         }
     }
 
@@ -480,10 +516,12 @@ where
             WindowEvent::SurfaceResized(physical_size) => {
                 self.safe_area_insets = self.window.safe_area();
                 let insets = self.safe_area_insets;
-                let width = physical_size.width - insets.left - insets.right;
-                let height = physical_size.height - insets.top - insets.bottom;
-                self.with_viewport(|v| v.window_size = (width, height));
-                self.request_redraw();
+                let width = physical_size.width.saturating_sub(insets.left + insets.right);
+                let height = physical_size.height.saturating_sub(insets.top + insets.bottom);
+                let unchanged = self.doc.inner().viewport().window_size == (width, height);
+                if !unchanged {
+                    self.with_viewport(|v| v.window_size = (width, height));
+                }
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.with_viewport(|v| v.set_hidpi_scale(scale_factor as f32));
@@ -532,6 +570,22 @@ where
                             KeyCode::KeyN if browser && (ctrl | meta) && shift => Some("incognito"),
                             KeyCode::Comma if browser && (ctrl | meta) && !shift => Some("settings"),
                             KeyCode::KeyH if browser && (ctrl | meta) && !shift => Some("history"),
+                            KeyCode::KeyT if browser && (ctrl | meta) && shift => Some("reopen-tab"),
+                            KeyCode::KeyT if browser && (ctrl | meta) && !shift => Some("new-tab"),
+                            KeyCode::KeyW if browser && (ctrl | meta) && !shift => Some("close-tab"),
+                            KeyCode::Tab if browser && ctrl && shift => Some("prev-tab"),
+                            KeyCode::Tab if browser && ctrl && !shift => Some("next-tab"),
+                            KeyCode::PageDown if browser && ctrl && !shift => Some("next-tab"),
+                            KeyCode::PageUp if browser && ctrl && !shift => Some("prev-tab"),
+                            KeyCode::Digit1 if browser && (ctrl | meta) && !shift => Some("tab-1"),
+                            KeyCode::Digit2 if browser && (ctrl | meta) && !shift => Some("tab-2"),
+                            KeyCode::Digit3 if browser && (ctrl | meta) && !shift => Some("tab-3"),
+                            KeyCode::Digit4 if browser && (ctrl | meta) && !shift => Some("tab-4"),
+                            KeyCode::Digit5 if browser && (ctrl | meta) && !shift => Some("tab-5"),
+                            KeyCode::Digit6 if browser && (ctrl | meta) && !shift => Some("tab-6"),
+                            KeyCode::Digit7 if browser && (ctrl | meta) && !shift => Some("tab-7"),
+                            KeyCode::Digit8 if browser && (ctrl | meta) && !shift => Some("tab-8"),
+                            KeyCode::Digit9 if browser && (ctrl | meta) && !shift => Some("tab-9"),
                             _ => None,
                         };
                         if let Some(command) = command {
@@ -540,11 +594,16 @@ where
                         }
 
                         // Ctrl+L / F6: into the address bar, its text selected. The
-                        // browser's address bar is `input[name=__nav_url]`, the same
-                        // embedder convention as `zipp-nav:` above.
+                        // browser's address bar is `#__zipp_url_input` (with fallback to
+                        // `input[name=__nav_url]`), avoiding any page search box.
                         if browser && ((key_code == KeyCode::KeyL && (ctrl | meta)) || key_code == KeyCode::F6) {
                             let mut inner = self.doc.inner_mut();
-                            if let Ok(Some(address_bar)) = inner.query_selector("input[name=__nav_url]") {
+                            let address_bar = inner
+                                .query_selector("#__zipp_url_input")
+                                .ok()
+                                .flatten()
+                                .or_else(|| inner.query_selector("input[name=__nav_url]").ok().flatten());
+                            if let Some(address_bar) = address_bar {
                                 inner.focus_and_select_all(address_bar);
                             }
                             drop(inner);
@@ -688,9 +747,14 @@ where
                 // (a search, another site) rather than going on the end of it.
                 let mut inner = self.doc.inner_mut();
                 let focused = inner.get_focussed_node_id();
+                let address_bar = inner
+                    .query_selector("#__zipp_url_input")
+                    .ok()
+                    .flatten()
+                    .or_else(|| inner.query_selector("input[name=__nav_url]").ok().flatten());
                 if focused != focused_before
                     && let Some(node) = focused
-                    && inner.query_selector("input[name=__nav_url]").ok().flatten() == Some(node)
+                    && address_bar == Some(node)
                 {
                     inner.focus_and_select_all(node);
                 }

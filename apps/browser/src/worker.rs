@@ -187,6 +187,7 @@ pub(crate) fn take_messages() -> Vec<(u32, FromWorker)> {
 fn run(url: &str, module: bool, inbox: Receiver<ToWorker>, outbox: Sender<FromWorker>) {
     console::record_this_thread();
     console::label_this_thread("worker");
+    crate::devtools::record_this_thread();
     OUTBOX.with(|o| *o.borrow_mut() = Some(outbox.clone()));
     let report = |message: String| {
         console::push(Level::Error, message.clone());
@@ -263,14 +264,19 @@ fn program(url: &str, module: bool) -> Result<String, String> {
     );
     if !module {
         let source = crate::fetch(url).map_err(|e| format!("worker script {url} failed to load: {e}"))?;
+        crate::devtools::record_script(crate::devtools::ScriptKind::Worker, url, source.clone(), None);
         return Ok(format!("{prelude}\n;\n{source}"));
     }
     let import_map = crate::esm::ImportMap::default();
     let resolve_module = |base: &str, spec: &str| import_map.resolve_specifier(base, spec, &crate::resolve);
     let linked = crate::esm::link_graph(&[url.to_string()], &crate::fetch, &resolve_module);
+    for (mod_url, mod_src) in &linked.loaded_modules {
+        crate::devtools::record_script(crate::devtools::ScriptKind::Worker, mod_url, mod_src.clone(), None);
+    }
     for (failed, e) in &linked.failures {
         eprintln!("[ESM] FAILED {failed}: {e}");
         console::push(Level::Error, format!("module {failed} failed to load: {e}"));
+        crate::devtools::record_script(crate::devtools::ScriptKind::Worker, failed, String::new(), Some(e.clone()));
     }
     if linked.module_count == 0 {
         return Err(format!("worker module {url} failed to load"));

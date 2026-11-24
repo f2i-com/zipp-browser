@@ -939,7 +939,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2606,7 +2606,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3933,7 +3933,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4439,6 +4439,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
+ "windows-sys 0.52.0",
  "windows-sys 0.59.0",
 ]
 
@@ -6854,7 +6855,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d6f32a0ff4a9f6f01231eb2059cc85479330739333e0e58cadf03b6af2cca10"
 dependencies = [
  "cfg-if",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7171,7 +7172,7 @@ dependencies = [
 
 [[package]]
 name = "zipp-browser"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alsa",
  "base64 0.22.1",
@@ -7221,7 +7222,7 @@ dependencies = [
 
 [[package]]
 name = "zipp-dom"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "app_units",
  "atomic_refcell",
@@ -7268,7 +7269,7 @@ dependencies = [
 
 [[package]]
 name = "zipp-kms"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dpi",
  "drm",
@@ -7281,8 +7282,8 @@ dependencies = [
 
 [[package]]
 name = "zipp-numparse"
-version = "0.0.39"
-source = "git+https://github.com/f2i-com/zipp.org?branch=dev#94711dd3e894121ec9ef84fb7e52f5ad76cb00b6"
+version = "0.0.40"
+source = "git+https://github.com/f2i-com/zipp.org?tag=v0.0.40#0cd3eab8bec16d9ac5ea3d1204cd287640143c0b"
 dependencies = [
  "num-bigint 0.5.1",
  "num-traits",
@@ -7291,7 +7292,7 @@ dependencies = [
 [[package]]
 name = "zipp-regress"
 version = "0.11.1"
-source = "git+https://github.com/f2i-com/zipp.org?branch=dev#94711dd3e894121ec9ef84fb7e52f5ad76cb00b6"
+source = "git+https://github.com/f2i-com/zipp.org?tag=v0.0.40#0cd3eab8bec16d9ac5ea3d1204cd287640143c0b"
 dependencies = [
  "dynasm",
  "dynasmrt",
@@ -7301,7 +7302,7 @@ dependencies = [
 
 [[package]]
 name = "zipp-renderer"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyrender",
  "anyrender_svg",
@@ -7325,7 +7326,7 @@ dependencies = [
 
 [[package]]
 name = "zipp-shell"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "android-activity",
  "anyrender",
@@ -7350,8 +7351,8 @@ dependencies = [
 
 [[package]]
 name = "zipp-vm"
-version = "0.0.39"
-source = "git+https://github.com/f2i-com/zipp.org?branch=dev#94711dd3e894121ec9ef84fb7e52f5ad76cb00b6"
+version = "0.0.40"
+source = "git+https://github.com/f2i-com/zipp.org?tag=v0.0.40#0cd3eab8bec16d9ac5ea3d1204cd287640143c0b"
 dependencies = [
  "dynasm",
  "dynasmrt",

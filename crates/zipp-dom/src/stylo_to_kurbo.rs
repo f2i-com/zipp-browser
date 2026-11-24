@@ -52,16 +52,18 @@ pub fn resolve_2d_transform(
 
     let rotate = match &box_styles.rotate {
         Rotate::None => None,
-        Rotate::Rotate(angle) => Some(angle.degrees() as f64),
+        // `kurbo::Affine::rotate` takes radians, not degrees!
+        Rotate::Rotate(angle) => Some(angle.radians() as f64),
         // TODO: support 3D transforms
         Rotate::Rotate3D(_, _, _, _) => None,
     };
 
     let scale_transform = match &box_styles.scale {
         Scale::None => None,
+        // CSS `scale` is a dimensionless ratio — do not multiply by HiDPI `scale`.
         Scale::Scale(x, y, _z) => Some(Vec2 {
-            x: *x as f64 * scale,
-            y: *y as f64 * scale,
+            x: *x as f64,
+            y: *y as f64,
         }),
     };
 
@@ -124,18 +126,20 @@ pub fn resolve_2d_transform(
             .px() as f64,
     });
 
+    // CSS Transforms Level 2 CTM order:
+    //   Origin * Translate * Rotate * Scale * Transform * Origin^-1
     let mut resolved = Affine::IDENTITY;
 
     if let Some(translation) = translate {
-        resolved = resolved.then_translate(translation)
+        resolved *= Affine::translate(translation);
     }
 
     if let Some(rotation) = rotate {
-        resolved = resolved.then_rotate(rotation)
+        resolved *= Affine::rotate(rotation);
     }
 
     if let Some(scale_transform) = scale_transform {
-        resolved = resolved.then_scale_non_uniform(scale_transform.x, scale_transform.y)
+        resolved *= Affine::scale_non_uniform(scale_transform.x, scale_transform.y);
     }
 
     if let Some(transform) = transform {

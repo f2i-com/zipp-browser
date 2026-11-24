@@ -97,6 +97,9 @@ pub struct WindowShellProvider {
     /// Shared with the window's [`View`]: set by every request that needs the
     /// document restyled and laid out before it is painted again.
     needs_resolve: Arc<std::sync::atomic::AtomicBool>,
+    /// Shared with the window's [`View`]: set by any request that changes
+    /// pixels on screen (full redraw or paint-only frame update).
+    needs_paint: Arc<std::sync::atomic::AtomicBool>,
 }
 /// What was last copied in this program: the clipboard where the machine has
 /// none of its own.
@@ -128,24 +131,31 @@ pub fn give_keys_to_page() {
 impl WindowShellProvider {
     /// Wraps an existing window handle.
     pub fn new(window: Arc<dyn Window>) -> Self {
-        Self::with_resolve_flag(window, Arc::new(std::sync::atomic::AtomicBool::new(true)))
+        Self::with_flags(
+            window,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        )
     }
 
-    /// Wraps a window handle, sharing the view's "needs resolve" flag.
-    pub fn with_resolve_flag(
+    /// Wraps a window handle, sharing the view's resolve and paint dirty flags.
+    pub fn with_flags(
         window: Arc<dyn Window>,
         needs_resolve: Arc<std::sync::atomic::AtomicBool>,
+        needs_paint: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
-        Self { window, needs_resolve }
+        Self { window, needs_resolve, needs_paint }
     }
 }
 
 impl ShellProvider for WindowShellProvider {
     fn request_redraw(&self) {
         self.needs_resolve.store(true, std::sync::atomic::Ordering::Release);
+        self.needs_paint.store(true, std::sync::atomic::Ordering::Release);
         self.window.request_redraw();
     }
     fn request_paint(&self) {
+        self.needs_paint.store(true, std::sync::atomic::Ordering::Release);
         self.window.request_redraw();
     }
     fn set_cursor(&self, icon: CursorIcon) {

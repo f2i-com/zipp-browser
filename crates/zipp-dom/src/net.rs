@@ -11,10 +11,11 @@
 //! - **Fonts** -- optionally decompressed from WOFF/WOFF2 via [`FontFaceHandler`].
 
 use selectors::context::QuirksMode;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::{
     io::Cursor,
-    sync::{Arc, atomic::AtomicUsize, mpsc::Sender},
+    sync::{Arc, Mutex, OnceLock, atomic::AtomicUsize, mpsc::Sender},
 };
 use style::{
     font_face::{FontFaceSourceFormat, FontFaceSourceFormatKeyword, Source},
@@ -299,6 +300,7 @@ impl NetHandler for ResourceHandler<NestedStylesheetHandler> {
             &self.data.net_provider,
             &self.shell_provider,
             &self.data.lock.read(),
+            None,
         );
 
         let mut guard = self.data.lock.write();
@@ -313,6 +315,16 @@ impl NetHandler for ResourceHandler<NestedStylesheetHandler> {
 // Font handling
 // ---------------------------------------------------------------------------
 
+/// Bounded global cache of decompressed font bytes keyed by resolved font URL.
+/// Prevents repeated WOFF/WOFF2 decompression across navigations, tabs, and
+/// duplicate `@font-face` blocks pointing at the same variable font file.
+fn decoded_font_cache() -> &'static Mutex<HashMap<String, Bytes>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Bytes>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+const MAX_DECODED_FONTS: usize = 128;
+
 /// Handler-specific data for fetching a `@font-face` font.
 ///
 /// Stores the font format hint (if known) so the handler can attempt WOFF
@@ -322,7 +334,21 @@ struct FontFaceHandler(FontFaceSourceFormatKeyword, Option<String>);
 
 impl NetHandler for ResourceHandler<FontFaceHandler> {
     fn bytes(mut self: Box<Self>, resolved_url: String, bytes: Bytes) {
+        if let Ok(cache) = decoded_font_cache().lock() {
+            if let Some(cached) = cache.get(&resolved_url) {
+                let family = self.data.1.clone();
+                return self.respond(resolved_url, Ok(Resource::Font(cached.clone(), family)));
+            }
+        }
         let result = self.data.parse(bytes);
+        if let Ok(Resource::Font(ref decoded, _)) = result {
+            if let Ok(mut cache) = decoded_font_cache().lock() {
+                if cache.len() >= MAX_DECODED_FONTS && !cache.contains_key(&resolved_url) {
+                    cache.clear();
+                }
+                cache.insert(resolved_url.clone(), decoded.clone());
+            }
+        }
         self.respond(resolved_url, result)
     }
 }
@@ -414,6 +440,7 @@ impl FontFaceHandler {
 ///
 /// For each `@font-face` rule, the first source with a supported format is selected
 /// and a network fetch is initiated.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fetch_font_face(
     tx: Sender<DocumentEvent>,
     doc_id: usize,
@@ -422,7 +449,9 @@ pub(crate) fn fetch_font_face(
     network_provider: &Arc<dyn NetProvider>,
     shell_provider: &Arc<dyn ShellProvider>,
     read_guard: &SharedRwLockReadGuard,
+    mut seen_fonts: Option<&mut HashSet<(String, Option<String>)>>,
 ) {
+    let mut local_seen = HashSet::new();
     sheet
         .contents(read_guard)
         .rules(read_guard)
@@ -490,11 +519,37 @@ pub(crate) fn fetch_font_face(
                         return None;
                     }
 
-                    let url = url_source.url.url().unwrap().as_ref().clone();
+                    let url = url_source.url.url()?.as_ref().clone();
                     Some((url, format))
                 });
 
             if let Some((url, format)) = preferred_source {
+                let url_str = url.as_str().to_string();
+                let key = (url_str.clone(), family.clone());
+                let is_new = match seen_fonts.as_deref_mut() {
+                    Some(seen) => seen.insert(key),
+                    None => local_seen.insert(key),
+                };
+                if !is_new {
+                    return;
+                }
+
+                // Serve already-decompressed font bytes straight from memory
+                // without hitting the network or re-running WOFF2 decompression.
+                if let Ok(cache) = decoded_font_cache().lock() {
+                    if let Some(cached) = cache.get(&url_str) {
+                        let handler = ResourceHandler::new(
+                            tx.clone(),
+                            doc_id,
+                            node_id,
+                            shell_provider.clone(),
+                            FontFaceHandler(format, family.clone()),
+                        );
+                        handler.respond(url_str, Ok(Resource::Font(cached.clone(), family)));
+                        return;
+                    }
+                }
+
                 network_provider.fetch(
                     doc_id,
                     Request::get(url),

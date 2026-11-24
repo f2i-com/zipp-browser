@@ -19,6 +19,7 @@ use winit::platform::macos::ApplicationHandlerExtMacOS;
 
 use crate::{View, WindowConfig};
 use zipp_dom::{Document, DocumentConfig};
+use zipp_renderer::tinyskia::CachedFramePresenter;
 
 /// Builds the document for a navigation, on the main thread: `(url, contents,
 /// config, viewport)`, the viewport in CSS pixels.
@@ -34,9 +35,15 @@ pub struct ZippApp<Rend: WindowRenderer> {
     pub proxy: ShellProxy,
     pub event_queue: Receiver<ShellEvent>,
     document_builder: Option<DocumentBuilder>,
+    /// Whether `about_to_wait` should invoke `doc.run_tasks()` immediately.
+    /// Passive OS events like `WindowEvent::Moved` leave this false so dragging
+    /// the window across the screen never stalls on JS task polling.
+    needs_tasks: bool,
+    /// Earliest scheduled task deadline returned by `doc.run_tasks()`.
+    next_task_due: Option<std::time::Instant>,
 }
 
-impl<Rend: WindowRenderer> ZippApp<Rend> 
+impl<Rend: WindowRenderer + CachedFramePresenter> ZippApp<Rend> 
 where
     for<'a> Rend::ScenePainter<'a>: zipp_renderer::tinyskia::BlurLayer,
 {
@@ -47,6 +54,8 @@ where
             proxy,
             event_queue,
             document_builder: None,
+            needs_tasks: true,
+            next_task_due: None,
         }
     }
 
@@ -166,7 +175,7 @@ where
     }
 }
 
-impl<Rend: WindowRenderer> ApplicationHandler for ZippApp<Rend> 
+impl<Rend: WindowRenderer + CachedFramePresenter> ApplicationHandler for ZippApp<Rend> 
 where
     for<'a> Rend::ScenePainter<'a>: zipp_renderer::tinyskia::BlurLayer,
 {
@@ -219,16 +228,49 @@ where
             return;
         }
 
+        // Fast path for high-frequency window-drag move notifications: never
+        // queue a redundant `ShellEvent::Poll` or wake JS task polling on every
+        // pixel the window moves across the desktop.
+        if matches!(event, WindowEvent::Moved(_)) {
+            if let Some(window) = self.windows.get_mut(&window_id) {
+                window.handle_winit_event(event);
+            }
+            return;
+        }
+
+        let is_passive = matches!(
+            event,
+            WindowEvent::RedrawRequested
+                | WindowEvent::Focused(_)
+                | WindowEvent::Occluded(_)
+                | WindowEvent::ModifiersChanged(_)
+                | WindowEvent::PointerEntered { .. }
+                | WindowEvent::PointerLeft { .. }
+                | WindowEvent::ActivationTokenDone { .. }
+                | WindowEvent::Destroyed
+        );
+        let skip_poll = is_passive || matches!(event, WindowEvent::PointerMoved { .. });
+
         if let Some(window) = self.windows.get_mut(&window_id) {
             window.handle_winit_event(event);
         }
 
-        self.proxy.send_event(ShellEvent::Poll { window_id });
+        if !is_passive {
+            self.needs_tasks = true;
+        }
+        if !skip_poll {
+            self.proxy.send_event(ShellEvent::Poll { window_id });
+        }
     }
 
     fn proxy_wake_up(&mut self, event_loop: &dyn ActiveEventLoop) {
+        let mut handled_any = false;
         while let Ok(event) = self.event_queue.try_recv() {
+            handled_any = true;
             self.handle_shell_event(event_loop, event);
+        }
+        if handled_any {
+            self.needs_tasks = true;
         }
     }
 
@@ -238,18 +280,43 @@ where
     }
 
     /// Before waiting for input: run each page's background work that is due
-    /// (timers, its workers' messages), and wake again when the next is.
+    /// (timers, its workers' messages), pace animation frames without blocking
+    /// the UI thread, and wake again when the next deadline arrives.
     fn about_to_wait(&mut self, event_loop: &dyn ActiveEventLoop) {
+        let now = std::time::Instant::now();
         let mut next: Option<std::time::Instant> = None;
+
+        let run_tasks_now = self.needs_tasks || self.next_task_due.is_some_and(|due| now >= due);
+        if run_tasks_now {
+            self.needs_tasks = false;
+            let mut task_due: Option<std::time::Instant> = None;
+            for view in self.windows.values_mut() {
+                if let Some(due) = view.doc.run_tasks() {
+                    task_due = Some(task_due.map_or(due, |n| n.min(due)));
+                }
+            }
+            self.next_task_due = task_due;
+        }
+        if let Some(due) = self.next_task_due {
+            next = Some(next.map_or(due, |n| n.min(due)));
+        }
+
         for view in self.windows.values_mut() {
-            if let Some(due) = view.doc.run_tasks() {
-                next = Some(next.map_or(due, |n| n.min(due)));
+            if let Some(anim_due) = view.next_animation_frame
+                && view.is_visible
+            {
+                if now >= anim_due {
+                    view.request_paint_only();
+                } else {
+                    next = Some(next.map_or(anim_due, |n| n.min(anim_due)));
+                }
             }
             #[cfg(target_os = "ios")]
             if view.ios_request_redraw.get() {
                 view.window.request_redraw();
             }
         }
+
         event_loop.set_control_flow(match next {
             Some(due) => winit::event_loop::ControlFlow::WaitUntil(due),
             None => winit::event_loop::ControlFlow::Wait,
@@ -258,7 +325,7 @@ where
 }
 
 #[cfg(target_os = "macos")]
-impl<Rend: WindowRenderer> ApplicationHandlerExtMacOS for ZippApp<Rend> 
+impl<Rend: WindowRenderer + CachedFramePresenter> ApplicationHandlerExtMacOS for ZippApp<Rend> 
 where
     for<'a> Rend::ScenePainter<'a>: zipp_renderer::tinyskia::BlurLayer,
 {

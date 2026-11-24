@@ -101,6 +101,7 @@ mod accessibility;
 // -----------------------------------------------
 
 pub use config::DocumentConfig;
+pub use cursor_icon::CursorIcon;
 pub use document::{BaseDocument, DocGuard, DocGuardMut, Document, PlainDocument};
 pub use markup5ever::{
     LocalName, Namespace, NamespaceStaticSet, Prefix, PrefixStaticSet, QualName, local_name,

@@ -390,6 +390,27 @@ impl BaseDocument {
 
             node.style = crate::stylo_bridge::to_taffy_style(style);
             node.display_constructed_as = style.clone_display();
+            // Native `<select>` draws its dropdown chevron in the right 24px gutter
+            // (`draw_select_arrow`). Reserve at least 24px of right padding when no
+            // custom background-image replaces the native arrow, so narrow author
+            // padding (e.g. Tailwind `px-2.5`) never clips option text under the chevron.
+            if let Some(elem) = node.data.downcast_element() {
+                if elem.name.local.as_ref() == "select"
+                    && !style
+                        .get_background()
+                        .background_image
+                        .0
+                        .iter()
+                        .any(|img| !matches!(img, StyloImage::None))
+                {
+                    let pr = node.style.padding.right.into_raw();
+                    if (pr.tag() == taffy::CompactLength::LENGTH_TAG && pr.value() < 24.0)
+                        || pr.is_zero()
+                    {
+                        node.style.padding.right = taffy::style_helpers::length(24.0);
+                    }
+                }
+            }
             // A table construction built as a block (no rows or cells, see
             // `has_table_parts`) is laid out as one. It keeps `item_is_table`, so
             // a block parent still sizes it to fit rather than stretching it.

@@ -1,7 +1,7 @@
 [package]
 name = "zipp-renderer"
-description = "Paint engine and TinySkia software renderer for Zipp Browser"
-version = "0.1.1"
+description = "Paint engine and TinySkia software renderer for ZIPP Browser"
+version = "0.1.2"
 license.workspace = true
 edition.workspace = true
 rust-version.workspace = true

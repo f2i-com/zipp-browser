@@ -148,6 +148,53 @@ pub struct Node {
 unsafe impl Send for Node {}
 unsafe impl Sync for Node {}
 
+/// Convert any Stylo `AbsoluteColor` (including CSS Color 4 `color-mix()`,
+/// `oklab()`, `oklch()`, `color(srgb ...)`) into SVG 1.1-compatible `rgb(...)`
+/// or `rgba(...)` syntax so `usvg` parses it cleanly instead of dropping it.
+pub(crate) fn color_to_svg_rgb(color: &style::color::AbsoluteColor) -> String {
+    let [r, g, b, a] = *color
+        .to_color_space(style::color::ColorSpace::Srgb)
+        .raw_components();
+    let r = (r.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let g = (g.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let b = (b.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let a = a.clamp(0.0, 1.0);
+    if a >= 0.999 {
+        format!("rgb({r}, {g}, {b})")
+    } else {
+        format!("rgba({r}, {g}, {b}, {a:.3})")
+    }
+}
+
+/// Normalize CSS Color 4 `color(srgb r g b [/ a])` strings inside SVG attributes
+/// into `rgb(...)` / `rgba(...)` for `usvg`.
+fn normalize_svg_color_func(val: &str) -> Option<String> {
+    let rest = val.trim().strip_prefix("color(srgb ")?.strip_suffix(')')?;
+    let (rgb_part, alpha_part) = match rest.split_once('/') {
+        Some((c, a)) => (c.trim(), Some(a.trim())),
+        None => (rest.trim(), None),
+    };
+    let mut parts = rgb_part.split_whitespace();
+    let r: f32 = parts.next()?.parse().ok()?;
+    let g: f32 = parts.next()?.parse().ok()?;
+    let b: f32 = parts.next()?.parse().ok()?;
+    let r = (r.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let g = (g.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let b = (b.clamp(0.0, 1.0) * 255.0).round() as u8;
+    if let Some(a_str) = alpha_part {
+        let a: f32 = if let Some(pct) = a_str.strip_suffix('%') {
+            pct.parse::<f32>().ok()? / 100.0
+        } else {
+            a_str.parse().ok()?
+        };
+        let a = a.clamp(0.0, 1.0);
+        if a < 0.999 {
+            return Some(format!("rgba({r}, {g}, {b}, {a:.3})"));
+        }
+    }
+    Some(format!("rgb({r}, {g}, {b})"))
+}
+
 impl Node {
     pub(crate) fn new(
         tree: *mut Slab<Node>,
@@ -836,7 +883,7 @@ impl Node {
         let own_styles = self.primary_styles();
         let own_color = own_styles
             .as_deref()
-            .map(|style| style.clone_color().to_css_string());
+            .map(|style| color_to_svg_rgb(&style.clone_color()));
         let effective_color = own_color.as_deref().or(inherited_color);
         let effective_styles: Option<&ComputedValues> =
             own_styles.as_deref().map(|s| &**s).or(inherited_styles);
@@ -864,6 +911,8 @@ impl Node {
                         }
                     }
                     let val_ref = resolved.as_deref().unwrap_or(&attr.value);
+                    let normalized = normalize_svg_color_func(val_ref);
+                    let val_ref = normalized.as_deref().unwrap_or(val_ref);
                     if let Some(color) = effective_color {
                         if val_ref.contains("currentColor") {
                             let replaced = val_ref.replace("currentColor", color);
@@ -1015,9 +1064,13 @@ impl Node {
     /// TODO: z-index
     /// (If multiple children are positioned at the position then a random one will be recursed into)
     pub fn hit(&self, x: f32, y: f32) -> Option<HitResult> {
+        use style::computed_values::pointer_events::T as PointerEvents;
         use style::computed_values::visibility::T as Visibility;
 
-        // Don't hit on visbility:hidden elements
+        let mut self_pointer_events_none = false;
+        // Don't hit on visibility:hidden elements; track pointer-events:none so
+        // descendants with pointer-events:auto remain hittable while this node
+        // itself lets hits pass through to underlying elements.
         if let Some(style) = self.primary_styles() {
             if matches!(
                 style.clone_visibility(),
@@ -1025,6 +1078,7 @@ impl Node {
             ) {
                 return None;
             }
+            self_pointer_events_none = style.clone_pointer_events() == PointerEvents::None;
         }
 
         let mut x = x - self.final_layout.location.x + self.scroll_offset.x as f32;
@@ -1153,18 +1207,30 @@ impl Node {
                 {
                     let style_index = cluster.glyphs().next()?.style_index();
                     let node_id = layout.styles()[style_index].brush.id;
-                    return Some(HitResult {
-                        node_id,
-                        x,
-                        y,
-                        is_text: true,
+                    let inline_pointer_none = self.try_with(node_id).is_some_and(|n| {
+                        let styled = if n.primary_styles().is_some() {
+                            Some(n)
+                        } else {
+                            n.parent.and_then(|pid| self.try_with(pid))
+                        };
+                        styled
+                            .and_then(|s| s.primary_styles())
+                            .is_some_and(|st| st.clone_pointer_events() == PointerEvents::None)
                     });
+                    if !inline_pointer_none {
+                        return Some(HitResult {
+                            node_id,
+                            x,
+                            y,
+                            is_text: true,
+                        });
+                    }
                 }
             }
         }
 
         // Self (this node)
-        if matches_self {
+        if matches_self && !self_pointer_events_none {
             return Some(HitResult {
                 node_id: self.id,
                 x,
@@ -1572,5 +1638,176 @@ mod test {
         assert!((y - 55.0).abs() < 0.5, "expected y≈55, got {y}");
         assert!((w - 40.0).abs() < 0.5, "expected w≈40, got {w}");
         assert!((h - 30.0).abs() < 0.5, "expected h≈30, got {h}");
+    }
+
+    #[test]
+    fn pointer_events_none_overlay_allows_passthrough_and_auto_descendant() {
+        use crate::html_parser::HtmlDocument;
+        use crate::traits_src::shell::Viewport;
+
+        let html = r#"<!doctype html><html><body style="margin:0;height:600px">
+            <a id="card" href="/packs/ai-toolkit" style="display:block;position:absolute;left:300px;top:100px;width:240px;height:140px">AI Toolkit</a>
+            <div id="overlay" style="position:fixed;inset:0;z-index:40;pointer-events:none">
+                <div id="float" style="position:absolute;inset:0;pointer-events:none">
+                    <div id="sidebar" style="pointer-events:auto;position:absolute;left:10px;top:100px;width:160px;height:200px">Sidebar</div>
+                </div>
+            </div>
+        </body></html>"#;
+        let mut doc = HtmlDocument::from_html(
+            html,
+            DocumentConfig {
+                viewport: Some(Viewport::new(900, 600, 1.0, Default::default())),
+                ..Default::default()
+            },
+        );
+        doc.resolve(0.0);
+
+        let overlay_id = doc.query_selector("#overlay").unwrap().unwrap();
+        let card_id = doc.query_selector("#card").unwrap().unwrap();
+        let sidebar_id = doc.query_selector("#sidebar").unwrap().unwrap();
+
+        let overlay_rect = doc.get_node(overlay_id).unwrap().transformed_border_rect();
+        assert!(
+            overlay_rect.2 >= 899.0 && overlay_rect.3 >= 599.0,
+            "overlay should actually span the viewport over #card (got {overlay_rect:?})"
+        );
+
+        let hit_card = doc.hit(400.0, 160.0).expect("card should be hit through overlay");
+        let card_chain = doc.node_chain(hit_card.node_id);
+        assert!(
+            card_chain.contains(&card_id),
+            "expected click through pointer-events:none overlay to hit #card, got node {} (chain {:?})",
+            hit_card.node_id,
+            card_chain
+        );
+
+        let hit_sidebar = doc.hit(80.0, 160.0).expect("pointer-events:auto child should be hit");
+        let sidebar_chain = doc.node_chain(hit_sidebar.node_id);
+        assert!(
+            sidebar_chain.contains(&sidebar_id),
+            "expected pointer-events:auto descendant #sidebar to remain hittable, got node {} (chain {:?})",
+            hit_sidebar.node_id,
+            sidebar_chain
+        );
+    }
+
+    #[test]
+    fn grid_auto_fill_minmax_min_percent_rem_produces_multi_column_layout() {
+        use crate::html_parser::HtmlDocument;
+        use crate::traits_src::shell::Viewport;
+
+        let html = r#"<!doctype html><html><body style="margin:0;font-size:16px">
+            <div style="display:grid;width:960px;gap:16px;grid-template-columns:repeat(auto-fill,minmax(min(100%,17rem),1fr))">
+                <div id="c1" style="height:80px">One</div>
+                <div id="c2" style="height:80px">Two</div>
+                <div id="c3" style="height:80px">Three</div>
+            </div>
+        </body></html>"#;
+        let mut doc = HtmlDocument::from_html(
+            html,
+            DocumentConfig {
+                viewport: Some(Viewport::new(1000, 600, 1.0, Default::default())),
+                ..Default::default()
+            },
+        );
+        doc.resolve(0.0);
+
+        let c1 = doc.get_node(doc.query_selector("#c1").unwrap().unwrap()).unwrap().transformed_border_rect();
+        let c2 = doc.get_node(doc.query_selector("#c2").unwrap().unwrap()).unwrap().transformed_border_rect();
+        let c3 = doc.get_node(doc.query_selector("#c3").unwrap().unwrap()).unwrap().transformed_border_rect();
+
+        assert!((c1.1 - c2.1).abs() < 1.0 && (c2.1 - c3.1).abs() < 1.0, "expected 3 cards on same row: c1={c1:?} c2={c2:?} c3={c3:?}");
+        assert!(c2.0 > c1.0 + 250.0 && c3.0 > c2.0 + 250.0, "expected 3 horizontal columns: c1={c1:?} c2={c2:?} c3={c3:?}");
+        assert!(c1.2 < 350.0, "expected card width ~309px instead of full-width single column, got {}", c1.2);
+    }
+
+    #[test]
+    fn cursor_handles_links_buttons_inputs_explicit_default_and_none() {
+        use crate::CursorIcon;
+        use crate::html_parser::HtmlDocument;
+        use crate::traits_src::shell::Viewport;
+
+        let html = r#"<!doctype html><html><body style="margin:0">
+            <a id="lnk" href="/packs" style="display:block;position:absolute;left:10px;top:10px;width:120px;height:36px"><span id="lnk-span">Marketplace</span></a>
+            <button id="btn" style="position:absolute;left:10px;top:60px;width:120px;height:36px">Action</button>
+            <button id="dis" disabled style="position:absolute;left:10px;top:110px;width:120px;height:36px">Disabled</button>
+            <input id="txt" type="text" value="abc" style="position:absolute;left:10px;top:160px;width:120px;height:36px" />
+            <a id="def" href="/y" style="display:block;position:absolute;left:10px;top:210px;width:120px;height:36px;cursor:default">Plain</a>
+            <div id="none" style="position:absolute;left:10px;top:260px;width:120px;height:36px;cursor:none">NoCursor</div>
+        </body></html>"#;
+        let mut doc = HtmlDocument::from_html(
+            html,
+            DocumentConfig {
+                viewport: Some(Viewport::new(600, 400, 1.0, Default::default())),
+                ..Default::default()
+            },
+        );
+        doc.resolve(0.0);
+
+        doc.set_hover_to(40.0, 25.0);
+        assert_eq!(doc.get_cursor(), Some(CursorIcon::Pointer), "link + child span should show Pointer");
+
+        doc.set_hover_to(40.0, 75.0);
+        assert_eq!(doc.get_cursor(), Some(CursorIcon::Pointer), "button should show Pointer");
+
+        doc.set_hover_to(40.0, 125.0);
+        assert_eq!(doc.get_cursor(), Some(CursorIcon::NotAllowed), "disabled button should show NotAllowed");
+
+        doc.set_hover_to(40.0, 175.0);
+        assert_eq!(doc.get_cursor(), Some(CursorIcon::Text), "text input should show Text");
+
+        doc.set_hover_to(40.0, 225.0);
+        assert_eq!(doc.get_cursor(), Some(CursorIcon::Default), "explicit cursor:default should override link pointer");
+
+        doc.set_hover_to(40.0, 275.0);
+        assert_eq!(doc.get_cursor(), Some(CursorIcon::Default), "cursor:none should not panic");
+    }
+
+    #[test]
+    fn css_rotate_and_scale_properties_use_radians_and_preserve_hidpi() {
+        use crate::html_parser::HtmlDocument;
+        use crate::traits_src::shell::Viewport;
+
+        let html = r#"<!doctype html><html><body style="margin:0">
+            <div id="rot" style="width:20px;height:20px;rotate:180deg"></div>
+            <div id="sc" style="width:20px;height:20px;scale:1.5"></div>
+            <select id="sel" style="padding:4px 8px;height:36px"><option>Normal</option></select>
+        </body></html>"#;
+        let mut doc = HtmlDocument::from_html(
+            html,
+            DocumentConfig {
+                viewport: Some(Viewport::new(600, 400, 1.0, Default::default())),
+                ..Default::default()
+            },
+        );
+        doc.resolve(0.0);
+
+        let ref_box = euclid::Rect::new(
+            euclid::Point2D::new(style::values::computed::CSSPixelLength::new(0.0), style::values::computed::CSSPixelLength::new(0.0)),
+            euclid::Size2D::new(style::values::computed::CSSPixelLength::new(20.0), style::values::computed::CSSPixelLength::new(20.0)),
+        );
+
+        let rot_node = doc.get_node(doc.query_selector("#rot").unwrap().unwrap()).unwrap();
+        let rot_m = crate::resolve_2d_transform(rot_node.primary_styles().unwrap().get_box(), ref_box, 1.0)
+            .expect("rotate:180deg should produce transform");
+        let c = rot_m.as_coeffs();
+        // cos(pi) = -1, sin(pi) = 0
+        assert!((c[0] + 1.0).abs() < 1e-4 && c[1].abs() < 1e-4 && c[2].abs() < 1e-4 && (c[3] + 1.0).abs() < 1e-4,
+            "rotate:180deg should rotate by pi radians, got {c:?}");
+
+        let sc_node = doc.get_node(doc.query_selector("#sc").unwrap().unwrap()).unwrap();
+        // Passing HiDPI scale=2.0 must NOT double CSS `scale: 1.5` to 3.0.
+        let sc_m = crate::resolve_2d_transform(sc_node.primary_styles().unwrap().get_box(), ref_box, 2.0)
+            .expect("scale:1.5 should produce transform");
+        let sc_c = sc_m.as_coeffs();
+        assert!((sc_c[0] - 1.5).abs() < 1e-4 && (sc_c[3] - 1.5).abs() < 1e-4,
+            "scale:1.5 must remain 1.5 even at scale=2.0, got {sc_c:?}");
+
+        let sel_node = doc.get_node(doc.query_selector("#sel").unwrap().unwrap()).unwrap();
+        assert!(
+            sel_node.final_layout.padding.right >= 23.9,
+            "native <select> should reserve >=24px right padding for chevron, got {}",
+            sel_node.final_layout.padding.right
+        );
     }
 }

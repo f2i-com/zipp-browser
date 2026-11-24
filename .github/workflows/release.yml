@@ -1,0 +1,234 @@
+name: Release ZIPP Browser
+
+# Publishes a Zipp Browser release containing:
+#   - zipp-browser-<tag>-windows-x86_64-portable.zip  (self-contained portable Windows folder with portable.txt)
+#   - zipp-browser-<tag>-windows-x86_64-portable.exe  (standalone single-file portable Windows binary, no installer)
+#   - zipp-browser-<tag>-linux-x86_64.tar.gz          (portable Linux x86_64 binary)
+#   - zipp-browser-<tag>-android-webview.zip          (prebuilt arm64-v8a + x86_64 libsoftn_mobile.so for SoftN Android)
+#   - SHA256SUMS.txt
+#
+# Uses the latest published ZIPP release (f2i-com/zipp.org/releases/latest) and caches
+# compiled ZIPP / dependency artifacts keyed by ZIPP release tag so repeat browser
+# builds do not rebuild ZIPP from scratch when the ZIPP version is unchanged.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (e.g. v0.1.2)
+        required: true
+        type: string
+      allow-older-zipp:
+        description: Allow building against a pinned ZIPP release older than f2i-com/zipp.org latest
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: '1.92.0'
+
+jobs:
+  gate:
+    name: Verify latest ZIPP release pin
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      zipp-release: ${{ steps.zipp.outputs.zipp-release }}
+      zipp-latest: ${{ steps.zipp.outputs.zipp-latest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          fetch-depth: 1
+      - id: meta
+        shell: bash
+        run: echo "tag=${{ inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - id: zipp
+        name: Check zipp-vm against latest ZIPP release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ALLOW_OLDER_ZIPP: ${{ inputs.allow-older-zipp }}
+        run: node tools/release/sync-zipp-release.mjs --check
+
+  build-windows:
+    name: Build Windows Portable (x86_64)
+    needs: gate
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.gate.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+          components: clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # Reuse compiled zipp-vm + dependency artifacts across browser builds for the same ZIPP release.
+      - name: Cache Cargo & compiled ZIPP artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: zipp-browser-win-zipp-${{ needs.gate.outputs.zipp-release }}-rust-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            zipp-browser-win-zipp-${{ needs.gate.outputs.zipp-release }}-rust-${{ env.RUSTUP_TOOLCHAIN }}-
+            zipp-browser-win-zipp-${{ needs.gate.outputs.zipp-release }}-
+      - name: Lint & unit tests
+        shell: pwsh
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+      - name: Build portable Windows release binary
+        shell: pwsh
+        run: |
+          cargo build --release --bin zipp-browser
+          .\target\release\zipp-browser.exe --test-vm
+          .\target\release\zipp-browser.exe --test-js
+          .\target\release\zipp-browser.exe --test-compat
+      - name: Package portable Windows artifacts (no installer)
+        shell: pwsh
+        run: node tools/release/package-release.mjs --windows --tag "${{ needs.gate.outputs.tag }}" --out dist-release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: |
+            dist-release/zipp-browser-*-windows-x86_64-portable.exe
+            dist-release/zipp-browser-*-windows-x86_64-portable.zip
+          if-no-files-found: error
+
+  build-linux:
+    name: Build Linux Portable (x86_64)
+    needs: gate
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.gate.outputs.tag }}
+      - name: Install Linux build libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libx11-dev libxkbcommon-dev libwayland-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Cache Cargo & compiled ZIPP artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: zipp-browser-linux-zipp-${{ needs.gate.outputs.zipp-release }}-rust-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            zipp-browser-linux-zipp-${{ needs.gate.outputs.zipp-release }}-rust-${{ env.RUSTUP_TOOLCHAIN }}-
+            zipp-browser-linux-zipp-${{ needs.gate.outputs.zipp-release }}-
+      - name: Build & verify Linux release binary
+        run: |
+          cargo build --release --bin zipp-browser
+          ./target/release/zipp-browser --test-vm
+          ./target/release/zipp-browser --test-js
+          ./target/release/zipp-browser --test-compat
+      - name: Package Linux archive
+        run: node tools/release/package-release.mjs --linux --tag "${{ needs.gate.outputs.tag }}" --out dist-release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: dist-release/zipp-browser-*-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  build-android-webview:
+    name: Build Android WebView (arm64-v8a + x86_64)
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.gate.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+          targets: aarch64-linux-android,x86_64-linux-android
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Locate Android NDK
+        id: ndk
+        run: |
+          NDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}/ndk"
+          VER="$(ls -1 "$NDK_ROOT" | sort -V | grep '^27\.' | tail -n 1 || ls -1 "$NDK_ROOT" | sort -V | tail -n 1)"
+          echo "ANDROID_NDK_HOME=$NDK_ROOT/$VER" >> "$GITHUB_ENV"
+          echo "Using Android NDK: $NDK_ROOT/$VER"
+      # Reuse compiled zipp-vm + stylo + rusqlite across Android WebView builds for the same ZIPP release.
+      - name: Cache Cargo & compiled Android ZIPP artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            crates/zipp-android-webview/target/
+          key: zipp-browser-android-zipp-${{ needs.gate.outputs.zipp-release }}-rust-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('crates/zipp-android-webview/Cargo.lock') }}
+          restore-keys: |
+            zipp-browser-android-zipp-${{ needs.gate.outputs.zipp-release }}-rust-${{ env.RUSTUP_TOOLCHAIN }}-
+            zipp-browser-android-zipp-${{ needs.gate.outputs.zipp-release }}-
+      - name: Run host unit tests for Android WebView engine
+        run: cargo test --manifest-path crates/zipp-android-webview/Cargo.toml
+      - name: Cross-compile & package Android WebView bundle
+        run: node tools/release/package-release.mjs --android --build-android --abi all --tag "${{ needs.gate.outputs.tag }}" --out dist-release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-android-webview
+          path: dist-release/zipp-browser-*-android-webview.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: [gate, build-windows, build-linux, build-android-webview]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.gate.outputs.tag }}
+          fetch-depth: 1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist-release
+          merge-multiple: true
+      - name: Generate SHA256SUMS.txt
+        run: node tools/release/package-release.mjs --sums --out dist-release
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.gate.outputs.tag }}
+          ZIPP_REL: ${{ needs.gate.outputs.zipp-release }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist-release/* --clobber
+          else
+            gh release create "$TAG" dist-release/* \
+              --title "ZIPP Browser $TAG" \
+              --notes "Part of the ZIPP Project (Apache-2.0). Portable desktop binaries (Windows portable .zip & standalone .exe, Linux .tar.gz) and prebuilt Android WebView native libraries (arm64-v8a + x86_64) built with ZIPP $ZIPP_REL."
+          fi

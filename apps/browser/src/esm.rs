@@ -17,7 +17,9 @@
 //! `export` appear inside strings, regex literals and identifiers constantly;
 //! anything textual would corrupt them.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::sync::{LazyLock, Mutex};
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast as ox;
@@ -38,11 +40,33 @@ pub struct Linked {
     pub source: String,
     /// How many modules were fetched and linked.
     pub module_count: usize,
+    /// The fetched `(url, raw_source)` for each linked module (for DevTools).
+    pub loaded_modules: Vec<(String, String)>,
     /// Modules that could not be fetched or parsed, with the reason. These are
     /// reported rather than swallowed: a missing chunk means some route of the
     /// app will fail at runtime, and silently emitting a graph with a hole in
     /// it turns that into an inscrutable "undefined is not a function".
     pub failures: Vec<(String, String)>,
+}
+
+/// Cache key for rewritten ES modules: `(url, eager_dynamic, import_map_fp, source_hash, source_len)`.
+type RewriteCacheKey = (String, bool, u64, u64, usize);
+const MAX_REWRITE_CACHE: usize = 512;
+
+static REWRITE_CACHE: LazyLock<Mutex<HashMap<RewriteCacheKey, Rewritten>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Drop all cached rewritten ES modules (called when the user clears browser cache).
+pub fn clear_cache() {
+    if let Ok(mut cache) = REWRITE_CACHE.lock() {
+        cache.clear();
+    }
+}
+
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
 }
 
 /// A page's `<script type="importmap">`: what `import "three"` means.
@@ -119,6 +143,16 @@ impl ImportMap {
         let entries: serde_json::Map<String, serde_json::Value> =
             self.imports.iter().map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone()))).collect();
         serde_json::Value::Object(entries).to_string()
+    }
+
+    /// Stable fingerprint of this map's entries for module rewrite caching.
+    pub fn fingerprint(&self) -> u64 {
+        if self.imports.is_empty() {
+            return 0;
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.imports.hash(&mut h);
+        h.finish()
     }
 }
 
@@ -219,6 +253,7 @@ impl<'a> Visit<'a> for DynamicScan {
 }
 
 /// A module's static dependencies and the edits that turn it into a plain body.
+#[derive(Clone)]
 struct Rewritten {
     body: String,
     /// Specifiers this module imports, already resolved to absolute URLs.
@@ -243,9 +278,15 @@ fn js_string(s: &str) -> String {
 }
 
 /// Rewrite one module's source into a body suitable for the registry wrapper.
+///
+/// When `eager_dynamic` is `true`, literal dynamic `import('./chunk.js')`
+/// specifiers are added to `deps` so they are linked up front. When `false`,
+/// they are rewritten to `__dyn("...")` so `__zippImportModule` fetches and
+/// links them on demand via `__zippHostCall('esm_link', ...)`.
 fn rewrite_module(
     url: &str,
     source: &str,
+    eager_dynamic: bool,
     resolve: &dyn Fn(&str, &str) -> String,
 ) -> Result<Rewritten, String> {
     let allocator = Allocator::default();
@@ -438,8 +479,13 @@ fn rewrite_module(
                 let abs = resolve(url, &spec);
                 // A bare name nothing maps (or a Node builtin like `node:fs`) is
                 // not fetched: the import fails when it runs, which a page that
-                // tries it is ready for.
-                if url_like(&abs) && !abs.starts_with("node:") && !deps.contains(&abs) {
+                // tries it is ready for. In lazy mode, literal dynamic imports
+                // are deferred until `__dyn(abs)` executes at runtime.
+                if eager_dynamic
+                    && url_like(&abs)
+                    && !abs.starts_with("node:")
+                    && !deps.contains(&abs)
+                {
                     deps.push(abs.clone());
                 }
                 format!("__dyn({})", js_string(&abs))
@@ -566,24 +612,34 @@ fn collect_pattern_names<'a>(kind: &ox::BindingPattern<'a>, out: &mut Vec<String
 /// Maximum parallel HTTP fetches per dependency wave when linking an ES module graph.
 const MAX_PARALLEL_FETCHES: usize = 8;
 
-/// Fetch and link the whole graph reachable from `entries`.
-///
-/// Dynamic-import targets with literal specifiers are pulled in too, so a
-/// lazily-routed app has every chunk present before it runs. Our host HTTP is
-/// synchronous and there is no way to fetch from inside the VM mid-execution,
-/// so a chunk that is not linked up front could never be loaded at all.
+/// Fetch and link the whole graph reachable from `entries` (including literal
+/// dynamic `import(...)` chunks). Used by Web Workers and tests.
 pub fn link_graph(
     entries: &[String],
     fetch: &(dyn Fn(&str) -> Result<String, String> + Sync),
     resolve: &dyn Fn(&str, &str) -> String,
 ) -> Linked {
-    link_more(entries, &HashSet::new(), true, fetch, resolve)
+    link_impl(entries, &HashSet::new(), true, true, None, fetch, resolve)
+}
+
+/// Fetch and link only static dependencies reachable from `entries`, deferring
+/// dynamic `import(...)` chunks to on-demand runtime linking (`esm_link`).
+///
+/// Modern Vite/Webpack SPAs often reference hundreds of code-split route chunks
+/// via literal `import("./Route.js")`. Deferring them avoids downloading and
+/// compiling megabytes of unused routes on initial page load.
+pub fn link_graph_lazy(
+    entries: &[String],
+    import_map_fp: u64,
+    fetch: &(dyn Fn(&str) -> Result<String, String> + Sync),
+    resolve: &dyn Fn(&str, &str) -> String,
+) -> Linked {
+    link_impl(entries, &HashSet::new(), true, false, Some(import_map_fp), fetch, resolve)
 }
 
 /// [`link_graph`], leaving out the modules in `linked` (the page has them),
-/// and running the entries only if `run`. A page links more this way when it
-/// imports a module whose URL it computes as it runs -- a code-split chunk --
-/// which no reading of the source could have found up front.
+/// and running the entries only if `run`.
+#[allow(dead_code)]
 pub fn link_more(
     entries: &[String],
     linked: &HashSet<String>,
@@ -591,9 +647,36 @@ pub fn link_more(
     fetch: &(dyn Fn(&str) -> Result<String, String> + Sync),
     resolve: &dyn Fn(&str, &str) -> String,
 ) -> Linked {
+    link_impl(entries, linked, run, true, None, fetch, resolve)
+}
+
+/// Lazy counterpart to [`link_more`]: links only static dependencies of
+/// `entries` (excluding `linked`), deferring further dynamic imports and using
+/// the in-memory module rewrite cache keyed by `import_map_fp`.
+pub fn link_more_lazy(
+    entries: &[String],
+    linked: &HashSet<String>,
+    run: bool,
+    import_map_fp: u64,
+    fetch: &(dyn Fn(&str) -> Result<String, String> + Sync),
+    resolve: &dyn Fn(&str, &str) -> String,
+) -> Linked {
+    link_impl(entries, linked, run, false, Some(import_map_fp), fetch, resolve)
+}
+
+fn link_impl(
+    entries: &[String],
+    linked: &HashSet<String>,
+    run: bool,
+    eager_dynamic: bool,
+    cache_map_fp: Option<u64>,
+    fetch: &(dyn Fn(&str) -> Result<String, String> + Sync),
+    resolve: &dyn Fn(&str, &str) -> String,
+) -> Linked {
     let mut wave: Vec<String> = entries.iter().filter(|e| !linked.contains(*e)).cloned().collect();
     let mut seen: HashSet<String> = entries.iter().chain(linked.iter()).cloned().collect();
     let mut modules: Vec<(String, Rewritten)> = Vec::new();
+    let mut loaded_modules: Vec<(String, String)> = Vec::new();
     let mut failures: Vec<(String, String)> = Vec::new();
     let js_from = std::env::var("ZIPP_JS_FROM").ok();
     let js_to = std::env::var("ZIPP_JS_TO").ok();
@@ -664,13 +747,35 @@ pub fn link_more(
                 }
                 _ => source,
             };
-            match rewrite_module(&url, &source, resolve) {
+            let cache_key = cache_map_fp.map(|fp| {
+                (url.clone(), eager_dynamic, fp, hash_bytes(source.as_bytes()), source.len())
+            });
+            let cached = cache_key.as_ref().and_then(|k| {
+                REWRITE_CACHE.lock().ok().and_then(|c| c.get(k).cloned())
+            });
+            let rw_res = match cached {
+                Some(rw) => Ok(rw),
+                None => {
+                    let r = rewrite_module(&url, &source, eager_dynamic, resolve);
+                    if let (Ok(rw), Some(key)) = (&r, cache_key)
+                        && let Ok(mut cache) = REWRITE_CACHE.lock()
+                    {
+                        if cache.len() >= MAX_REWRITE_CACHE {
+                            cache.clear();
+                        }
+                        cache.insert(key, rw.clone());
+                    }
+                    r
+                }
+            };
+            match rw_res {
                 Ok(rw) => {
                     for d in &rw.deps {
                         if seen.insert(d.clone()) {
                             wave.push(d.clone());
                         }
                     }
+                    loaded_modules.push((url.clone(), source));
                     modules.push((url, rw));
                 }
                 Err(e) => failures.push((url, format!("parse failed: {e}"))),
@@ -700,7 +805,7 @@ pub fn link_more(
     }
     out.push_str("})();\n");
 
-    Linked { source: out, module_count: modules.len(), failures }
+    Linked { source: out, module_count: modules.len(), loaded_modules, failures }
 }
 
 /// Registry + instantiation, injected once alongside the linked graph.
@@ -711,6 +816,7 @@ pub const MODULE_RUNTIME_JS: &str = r#"
 // binding rather than an empty object â€” the same shape real ESM has.
 var __zippModuleDefs = {};
 var __zippModuleNs = {};
+var __zippModulePromises = {};
 function __zippDefine(url, fn) { __zippModuleDefs[url] = fn; }
 // The page's import map, if it has one (`ImportMap::resolve` at runtime).
 function __zippResolveModuleUrl(base, spec) {
@@ -749,7 +855,11 @@ function __zippImportModule(u) {
             return Promise.reject(new TypeError('Failed to fetch dynamically imported module: ' + u));
         }
     }
-    return Promise.resolve(__zippRunModule(u));
+    var ns = __zippRunModule(u);
+    if (Object.prototype.hasOwnProperty.call(__zippModulePromises, u)) {
+        return __zippModulePromises[u];
+    }
+    return Promise.resolve(ns);
 }
 function __zippRunModule(url) {
     if (Object.prototype.hasOwnProperty.call(__zippModuleNs, url)) {
@@ -802,7 +912,9 @@ function __zippRunModule(url) {
         // A module that awaits at top level is an async function: its
         // exports are there once it settles, and a rejection is its throw.
         var done = fn(imp, exp, expAll, dyn, dynRel, meta);
-        if (done && typeof done.then === 'function') done.then(null, threw);
+        if (done && typeof done.then === 'function') {
+            __zippModulePromises[url] = done.then(function () { return ns; }, function (e) { threw(e); return ns; });
+        }
     } catch (e) {
         threw(e);
     }
@@ -827,7 +939,7 @@ mod tests {
     }
 
     fn rw(src: &str) -> Rewritten {
-        rewrite_module("http://x/a.js", src, &res).expect("parses")
+        rewrite_module("http://x/a.js", src, true, &res).expect("parses")
     }
 
     #[test]
@@ -858,7 +970,7 @@ mod tests {
         assert_eq!(r("esbuild"), "esbuild");
         // Nor is it fetched for `import()`, which fails when it runs.
         let resolve = |base: &str, spec: &str| map.resolve_specifier(base, spec, &res);
-        let rw = rewrite_module("http://x/a.js", "try { await import('esbuild'); } catch {}", &resolve).expect("parses");
+        let rw = rewrite_module("http://x/a.js", "try { await import('esbuild'); } catch {}", true, &resolve).expect("parses");
         assert!(rw.deps.is_empty(), "{:?}", rw.deps);
         assert!(rw.body.contains(r#"__dyn("esbuild")"#), "{}", rw.body);
     }
@@ -972,6 +1084,34 @@ mod tests {
         assert_eq!(r.body, src, "no edit should have been made");
         assert!(r.deps.is_empty());
         assert!(r.export_calls.is_empty());
+    }
+
+    #[test]
+    fn lazy_graph_defers_dynamic_imports_to_runtime() {
+        let fetch = |url: &str| -> Result<String, String> {
+            match url {
+                "http://x/entry.js" => Ok(
+                    "import { a } from './static.js'; export const load = () => import('./lazy.js'); console.log(a);"
+                        .to_string(),
+                ),
+                "http://x/static.js" => Ok("export const a = 42;".to_string()),
+                "http://x/lazy.js" => Ok("export const b = 99;".to_string()),
+                other => Err(format!("unexpected fetch {other}")),
+            }
+        };
+        let linked = link_graph_lazy(&["http://x/entry.js".to_string()], 0, &fetch, &res);
+        assert_eq!(linked.module_count, 2, "only entry + static should be linked");
+        assert_eq!(linked.loaded_modules.len(), 2);
+        assert!(linked.failures.is_empty(), "{:?}", linked.failures);
+        assert!(linked.source.contains(r#"__dyn("http://x/lazy.js")"#));
+        assert!(!linked.source.contains("export const b = 99") && !linked.source.contains("const b = 99"));
+
+        // Now link the lazy chunk on demand, excluding already linked modules.
+        let already: HashSet<String> =
+            ["http://x/entry.js".to_string(), "http://x/static.js".to_string()].into_iter().collect();
+        let more = link_more_lazy(&["http://x/lazy.js".to_string()], &already, false, 0, &fetch, &res);
+        assert_eq!(more.module_count, 1);
+        assert!(more.source.contains("const b = 99;"));
     }
 }
 

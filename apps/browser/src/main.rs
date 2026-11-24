@@ -38,6 +38,7 @@ use zipp_dom::{BaseDocument, DocumentConfig, FontContext};
 use zipp_renderer::tinyskia::TinySkiaWindowRenderer;
 use zipp_shell::{create_default_event_loop, ZippApp, ShellProxy, WindowConfig};
 
+mod async_fetch;
 mod esm;
 mod event_bridge;
 mod js_opt;
@@ -56,9 +57,11 @@ mod system;
 mod usb;
 mod canvas2d;
 mod console;
+mod devtools;
 mod history;
 mod properties_page;
 mod settings;
+mod tabs;
 mod worker;
 #[cfg(any(windows, target_os = "linux"))]
 mod webgl;
@@ -218,6 +221,9 @@ fn page_cache_clear() {
 /// Clear all HTTP/asset/page/decoded-image caches (memory + persistent disk).
 pub(crate) fn clear_browser_cache() -> (usize, u64) {
     page_cache_clear();
+    esm::clear_cache();
+    clear_failed_iframes();
+    tabs::clear_cached_html();
     canvas2d::clear_image_cache();
     let (entries, bytes) = zipp_shell::cache::clear();
     let mb = bytes as f64 / (1024.0 * 1024.0);
@@ -313,6 +319,10 @@ fn parse_cli_args(args: &[String]) -> Result<CliAction, String> {
                 incognito = true;
                 i += 1;
             }
+            "--portable" => {
+                zipp_shell::profile::set_portable(true);
+                i += 1;
+            }
             "--viewport" => {
                 let spec = args.get(i + 1).ok_or("--viewport requires WxH (e.g. --viewport 412x915)")?;
                 custom_viewport = Some(parse_viewport(spec).ok_or_else(|| format!("invalid --viewport {spec:?}, expected WxH"))?);
@@ -400,7 +410,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliAction, String> {
 
 fn print_usage() {
     println!(
-        "Zipp Browser v{} (zipp-vm 0.0.39 + Stylo + Taffy + TinySkia)\n\
+        "ZIPP Browser v{} (Part of the ZIPP Project · zipp-vm 0.0.40 + Stylo + Taffy + TinySkia)\n\
          \n\
          USAGE:\n\
          \x20 zipp-browser [OPTIONS] [URL]\n\
@@ -409,6 +419,7 @@ fn print_usage() {
          \n\
          OPTIONS:\n\
          \x20 --incognito           Private window: in-memory cookies/cache/storage only, zero history saved\n\
+         \x20 --portable            Store settings, cookies, history, and cache in ./data next to the executable\n\
          \x20 --mobile              Open in Mobile View (412x915 Pixel 9a logical viewport + mobile UA/touch)\n\
          \x20 --viewport <WxH>      Set initial logical viewport size (e.g. 390x844, 1440x900)\n\
          \x20 --app                 Chromeless application window (restricted local file access)\n\
@@ -510,7 +521,7 @@ fn main() {
             return;
         }
         CliAction::Version => {
-            println!("zipp-browser {} (zipp-vm 0.0.39)", env!("CARGO_PKG_VERSION"));
+            println!("zipp-browser {} (ZIPP v0.0.40 · Apache-2.0)", env!("CARGO_PKG_VERSION"));
             return;
         }
         CliAction::ClearCacheOnly => {
@@ -630,13 +641,16 @@ fn main() {
         viewport.0,
         viewport.1,
     );
-    // The window's page runs on this thread: its console is the one shown,
+    // The window's page runs on this thread: its console & DevTools are shown,
     // and it may start workers.
     console::record_this_thread();
+    devtools::record_this_thread();
+    async_fetch::allow_on_this_thread();
     worker::allow_on_this_thread();
 
     // 1-3. Fetch, run the page's JS, post-process. The ScriptState is !Send, so
     //      this stays on the main thread to keep it alive for event dispatch.
+    let initial_tab_id = tabs::init(&url);
     let t_fetch = std::time::Instant::now();
     let html = if let Some(internal) = internal_page_html(&url, None, None, None) {
         internal
@@ -660,6 +674,7 @@ fn main() {
         }
     };
     let fetch_ms = t_fetch.elapsed().as_millis();
+    tabs::store_tab_html(initial_tab_id, &url, html.clone(), history::extract_html_title(&html).as_deref());
     let (final_html, event_map_json, js_state) =
         render_page(&url, &html, viewport, Some(fetch_ms));
     eprintln!("[BROWSER] Ready ({} bytes)", final_html.len());
@@ -697,12 +712,8 @@ fn main() {
     ))));
 
     // 7. Create Zipp document with fonts + networking + navigation
-    let initial_web = (!url.starts_with("zipp:") && !url.starts_with("about:")).then(|| url.clone());
     let nav_provider = Arc::new(BrowserNavProvider {
         proxy: proxy.clone(),
-        current_url: std::sync::Mutex::new(url.clone()),
-        last_web_url: std::sync::Mutex::new(initial_web),
-        history: std::sync::Mutex::new(History::new(&url)),
     });
     // Published so `browser_host_call` can drive a navigation the PAGE asked
     // for (`window.open`, `location.assign`) -- it is a free function with no
@@ -726,6 +737,8 @@ fn main() {
     };
     let mut doc = build_document(&final_html, config);
     attach_event_bridge(&mut doc, event_map_json, js_state, &url);
+    sync_iframes(doc.as_mut(), &url, 0);
+    focus_newtab_address_bar(&mut doc, &url);
 
     // Pre-render linked pages in background for instant navigation
     let prerender_url = url.clone();
@@ -750,6 +763,8 @@ fn main() {
         let (final_html, event_map_json, js_state) = render_page(&url, &html, viewport, None);
         let mut doc = build_document(&final_html, config);
         attach_event_bridge(&mut doc, event_map_json, js_state, &url);
+        sync_iframes(doc.as_mut(), &url, 0);
+        focus_newtab_address_bar(&mut doc, &url);
         Box::new(doc)
     }));
     let renderer = TinySkiaWindowRenderer::new();
@@ -1672,6 +1687,31 @@ pub(crate) fn set_thread_page(page: String) {
     THREAD_PAGE.with(|p| *p.borrow_mut() = Some(page));
 }
 
+/// RAII guard that temporarily binds `THREAD_PAGE` and `DOC_URL` to a specific
+/// document URL (e.g. an embedded `<iframe>` sub-document) and restores both on
+/// drop so iframe `fetch()`/origin/cookie checks resolve against the iframe's
+/// own URL without clobbering the parent page.
+pub(crate) struct ThreadPageGuard {
+    prev_page: Option<String>,
+    prev_doc: Option<url::Url>,
+}
+
+impl ThreadPageGuard {
+    pub(crate) fn enter(page_url: &str) -> Self {
+        let prev_page = THREAD_PAGE.with(|p| p.borrow_mut().replace(page_url.to_string()));
+        let parsed = url::Url::parse(page_url).ok();
+        let prev_doc = DOC_URL.with(|d| std::mem::replace(&mut *d.borrow_mut(), parsed));
+        Self { prev_page, prev_doc }
+    }
+}
+
+impl Drop for ThreadPageGuard {
+    fn drop(&mut self) {
+        THREAD_PAGE.with(|p| *p.borrow_mut() = self.prev_page.take());
+        DOC_URL.with(|d| *d.borrow_mut() = self.prev_doc.take());
+    }
+}
+
 /// The page asking: a worker's own, or the one showing. Rights go by this, not
 /// by what is showing now: a worker in a loop outlives its page, and when the
 /// window went on to a page on disk it would have had that page's rights.
@@ -1731,7 +1771,7 @@ pub(crate) fn page_may_read(path: &std::path::Path) -> bool {
 /// used to be told apart by a field's name alone, which a link could carry
 /// too: `?__nav_url=file:///...` went where the address bar goes, and
 /// `?__js=...`, on any link on a page, ran as what was typed into the console.
-fn chrome_token() -> &'static str {
+pub(crate) fn chrome_token() -> &'static str {
     static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     TOKEN.get_or_init(|| {
         let mut bytes = [0u8; 16];
@@ -2033,6 +2073,7 @@ fn cors_allows(resp: &reqwest::blocking::Response, origin: &str, creds: Credenti
 /// A request a form could not make (a PUT, a JSON POST) asks first, so that
 /// a site that never heard of CORS is not sent one by a page elsewhere.
 fn cors_preflight(
+    client: &'static reqwest::blocking::Client,
     method: &str,
     url: &str,
     origin: &str,
@@ -2047,7 +2088,7 @@ fn cors_preflight(
             req_headers.push(low);
         }
     }
-    let resp = client_for_page(url, creds)
+    let resp = client
         .request(reqwest::Method::OPTIONS, url)
         .header("Origin", origin)
         .header("Access-Control-Request-Method", method)
@@ -2175,11 +2216,20 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
                 serde_json::from_str(args.get(1).map(String::as_str).unwrap_or("[]")).unwrap_or_default();
             let map = IMPORT_MAP.with(|m| m.borrow().clone());
             let resolve_module = |base: &str, spec: &str| map.resolve_specifier(base, spec, &resolve);
-            let out = esm::link_more(&[url], &linked, false, &fetch, &resolve_module);
-            for (url, err) in &out.failures {
-                console::push(console::Level::Error, format!("module {url} failed to load: {err}"));
+            let out = esm::link_more_lazy(&[url], &linked, false, map.fingerprint(), &fetch, &resolve_module);
+            for (mod_url, mod_src) in &out.loaded_modules {
+                devtools::record_script(devtools::ScriptKind::Module, mod_url, mod_src.clone(), None);
             }
-            Ok(out.source)
+            for (failed_url, err) in &out.failures {
+                console::push(console::Level::Error, format!("module {failed_url} failed to load: {err}"));
+                devtools::record_script(
+                    devtools::ScriptKind::Module,
+                    failed_url,
+                    String::new(),
+                    Some(err.clone()),
+                );
+            }
+            Ok(js_opt::prepare_script(&out.source))
         }
         // `new URL(input, base)`, for a page or a worker.
         "url" => worker::url_parts(
@@ -2292,9 +2342,11 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
             zipp_shell::set_clipboard_text(args.first().cloned().unwrap_or_default());
             Ok(String::new())
         }
-        // `document.title = ...`: the window's title.
+        // `document.title = ...`: update both the active tab label and OS window title.
         "window_title" => {
-            push_window_request(WindowRequest::Title(args.first().cloned().unwrap_or_default()));
+            let title = args.first().cloned().unwrap_or_default();
+            tabs::update_active_title(&title);
+            push_window_request(WindowRequest::Title(title));
             Ok(String::new())
         }
         // `requestFullscreen()` ("1") and `exitFullscreen()` ("0").
@@ -2401,164 +2453,23 @@ fn browser_host_call(kind: &str, args: &[String]) -> Result<String, String> {
             console::push(console::Level::from_name(level), message);
             Ok(String::new())
         }
-        "http" => {
-            let method = args.first().map(String::as_str).unwrap_or("GET");
-            let url = args.get(1).map(String::as_str).unwrap_or_default();
-            let body = args.get(2).cloned().unwrap_or_default();
-            let content_type = args.get(3).map(String::as_str).unwrap_or("");
-            let content_type =
-                if content_type.is_empty() { "application/json" } else { content_type };
-
-            // Relative to the page, as fetch resolves it; a page opened from
-            // disk reads its neighbours.
-            let resolved = resolve_page_url(url);
-            let url = resolved.as_str();
-            let creds = CredentialsMode::from_arg(args.get(4).map(String::as_str).unwrap_or_default());
-            if method == "GET" && (url.starts_with("file:") || url.starts_with("blob:") || url.starts_with("data:")) {
-                let (status, mime, bytes) = fetch_bytes_with_mime(url, creds)?;
-                return Ok(format!(
-                    "{{\"status\":{status},\"ok\":{},\"contentType\":{},\"headers\":{{\"content-type\":{}}},\"body\":{}}}",
-                    (200..300).contains(&status),
-                    json_quote(&mime),
-                    json_quote(&mime),
-                    json_quote(&String::from_utf8_lossy(&bytes))
-                ));
-            }
-
-            let extra_headers: Vec<(String, String)> = args
-                .get(5)
-                .filter(|s| !s.is_empty())
-                .and_then(|s| serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(s).ok())
-                .map(|m| {
-                    m.into_iter()
-                        .filter_map(|(k, v)| {
-                            if is_forbidden_request_header(&k) {
-                                return None;
-                            }
-                            Some((k, v.as_str()?.to_string()))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let has_auth_header = extra_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("authorization"));
-
-            let origin = web_origin(&page_url()).map(|o| o.ascii_serialization());
-            let foreign = origin.filter(|_| !same_origin(url));
-            if let Some(origin) = &foreign {
-                let has_non_simple_header = extra_headers.iter().any(|(k, _)| {
-                    !matches!(
-                        k.to_ascii_lowercase().as_str(),
-                        "accept" | "accept-language" | "content-language" | "content-type"
-                    )
-                });
-                let simple = !has_non_simple_header && match method {
-                    "GET" | "HEAD" => true,
-                    "POST" => matches!(
-                        content_type.split(';').next().unwrap_or("").trim(),
-                        "text/plain" | "application/x-www-form-urlencoded" | "multipart/form-data"
-                    ),
-                    _ => false,
-                };
-                if !simple {
-                    let names: Vec<String> = extra_headers.iter().map(|(k, _)| k.clone()).collect();
-                    cors_preflight(method, url, origin, content_type, &names, creds)?;
+        "http" => match prepare_http_request(args)? {
+            PreparedHttp::Immediate(json) => Ok(json),
+            PreparedHttp::Network(req) => execute_network_http(*req),
+        },
+        "http_async" => match prepare_http_request(args)? {
+            PreparedHttp::Immediate(json) => Ok(format!("SYNC:{json}")),
+            PreparedHttp::Network(req) => {
+                if async_fetch::is_enabled() {
+                    let req_id = async_fetch::enqueue(move || execute_network_http(*req))
+                        .ok_or_else(|| "Error: async fetch queue unavailable".to_string())?;
+                    Ok(format!("ASYNC:{req_id}"))
+                } else {
+                    let json = execute_network_http(*req)?;
+                    Ok(format!("SYNC:{json}"))
                 }
             }
-
-            let cache = zipp_shell::cache::global();
-            let cacheable_get = method == "GET" && foreign.is_none() && !has_auth_header && creds != CredentialsMode::Omit;
-            let revalidate = if cacheable_get {
-                match cache.lookup("sub", url) {
-                    zipp_shell::cache::Lookup::Fresh(entry) => {
-                        let body = String::from_utf8_lossy(&entry.body).into_owned();
-                        return Ok(format!(
-                            "{{\"status\":{},\"ok\":{},\"contentType\":{},\"headers\":{{\"content-type\":{}}},\"body\":{}}}",
-                            entry.status,
-                            (200..300).contains(&entry.status),
-                            json_quote(&entry.content_type),
-                            json_quote(&entry.content_type),
-                            json_quote(&body)
-                        ));
-                    }
-                    zipp_shell::cache::Lookup::Revalidate(entry) => Some(entry),
-                    zipp_shell::cache::Lookup::Miss => None,
-                }
-            } else {
-                None
-            };
-
-            let client = client_for_page(url, creds);
-            let mut req = match method {
-                "POST" => client.post(url).header("Content-Type", content_type).body(body),
-                "PUT" => client.put(url).header("Content-Type", content_type).body(body),
-                "PATCH" => client.patch(url).header("Content-Type", content_type).body(body),
-                "DELETE" => client.delete(url),
-                "HEAD" => client.head(url),
-                _ => client.get(url),
-            };
-            for (k, v) in &extra_headers {
-                if !k.eq_ignore_ascii_case("content-type") {
-                    req = req.header(k.as_str(), v.as_str());
-                }
-            }
-            if let Some(origin) = &foreign {
-                req = req.header("Origin", origin.as_str());
-            }
-            if let Some(ref prev) = revalidate {
-                if let Some(ref etag) = prev.etag {
-                    req = req.header(reqwest::header::IF_NONE_MATCH, etag.as_str());
-                }
-                if let Some(ref lm) = prev.last_modified {
-                    req = req.header(reqwest::header::IF_MODIFIED_SINCE, lm.as_str());
-                }
-            }
-            // Errors carry the `Error: ` prefix so the script sees an ordinary
-            // JS error rather than a bare string.
-            let resp = req.send().map_err(|e| format!("Error: {method} {url}: {e}"))?;
-            if let Some(origin) = &foreign
-                && !cors_allows(&resp, origin, creds)
-            {
-                return Err(format!("TypeError: Failed to fetch: {url} does not allow {origin} to read it"));
-            }
-            let status = resp.status().as_u16();
-            if status == 304
-                && let Some(prev) = revalidate
-            {
-                let refreshed = cache.revalidate_304("sub", url, prev, resp.headers());
-                let body = String::from_utf8_lossy(&refreshed.body).into_owned();
-                let headers_json = safe_response_headers_json(resp.headers());
-                return Ok(format!(
-                    "{{\"status\":{},\"ok\":{},\"contentType\":{},\"headers\":{},\"body\":{}}}",
-                    refreshed.status,
-                    (200..300).contains(&refreshed.status),
-                    json_quote(&refreshed.content_type),
-                    headers_json,
-                    json_quote(&body)
-                ));
-            }
-            let ok = resp.status().is_success();
-            let resp_headers = resp.headers().clone();
-            let mime = resp_headers
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-            let headers_json = safe_response_headers_json(&resp_headers);
-            let raw_bytes = resp.bytes().map_err(|e| format!("Error: reading {url}: {e}"))?.to_vec();
-            if cacheable_get {
-                cache.store("sub", url, status, &resp_headers, raw_bytes.clone());
-            } else if matches!(method, "POST" | "PUT" | "PATCH" | "DELETE") {
-                cache.invalidate_url(url);
-                page_cache_clear();
-            }
-            let body = String::from_utf8_lossy(&raw_bytes);
-            Ok(format!(
-                "{{\"status\":{status},\"ok\":{ok},\"contentType\":{},\"headers\":{},\"body\":{}}}",
-                json_quote(&mime),
-                headers_json,
-                json_quote(&body)
-            ))
-        }
+        },
         // `window.open` and `location.assign`/`replace`. Both were inert: `open`
         // returned null and did nothing, and `assign` only wrote to a plain
         // `href` property that nothing observed. A page whose call to action is
@@ -2599,8 +2510,297 @@ fn browser_host_call(kind: &str, args: &[String]) -> Result<String, String> {
                 Err(e) => Err(format!("Error: bad navigate url {full:?}: {e}")),
             }
         }
+        // `window.open(url, target)` when opening a new tab (requires a recent user gesture).
+        "open_tab" => {
+            let raw = args.first().cloned().unwrap_or_default();
+            if raw.is_empty() {
+                return Ok(String::new());
+            }
+            if !user_just_acted() {
+                eprintln!("[NAV] blocked unprompted window.open popup: {raw}");
+                return Ok(String::new());
+            }
+            let base = CURRENT_URL.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let full = resolve(&base, &raw);
+            match full.parse::<url::Url>() {
+                Ok(parsed) => {
+                    if !matches!(parsed.scheme(), "http" | "https" | "file" | "about") {
+                        eprintln!("[NAV] refused script window.open to internal scheme: {full}");
+                        return Ok(String::new());
+                    }
+                    eprintln!("[NAV] page opened new tab {full}");
+                    if let Some(provider) = NAV_PROVIDER.get() {
+                        provider.navigate_to(
+                            NavigationOptions::new(parsed, String::from("text/html"), 0)
+                                .set_new_tab(true)
+                                .set_background(false),
+                        );
+                    }
+                    Ok(String::new())
+                }
+                Err(e) => Err(format!("Error: bad window.open url {full:?}: {e}")),
+            }
+        }
         other => Err(format!("Error: unknown host call {other:?}")),
     }
+}
+
+struct PreparedHttpRequest {
+    client: &'static reqwest::blocking::Client,
+    method: String,
+    url: String,
+    body: String,
+    content_type: String,
+    creds: CredentialsMode,
+    extra_headers: Vec<(String, String)>,
+    page_href: String,
+    page_origin: Option<String>,
+    foreign: Option<String>,
+    cacheable_get: bool,
+    revalidate: Option<zipp_shell::cache::CachedEntry>,
+}
+
+enum PreparedHttp {
+    Immediate(String),
+    Network(Box<PreparedHttpRequest>),
+}
+
+fn prepare_http_request(args: &[String]) -> Result<PreparedHttp, String> {
+    let method = args.first().map(String::as_str).unwrap_or("GET").to_string();
+    let url = args.get(1).map(String::as_str).unwrap_or_default();
+    let body = args.get(2).cloned().unwrap_or_default();
+    let content_type = args.get(3).map(String::as_str).unwrap_or("");
+    let content_type = if content_type.is_empty() {
+        "application/json".to_string()
+    } else {
+        content_type.to_string()
+    };
+
+    let resolved = resolve_page_url(url);
+    let creds = CredentialsMode::from_arg(args.get(4).map(String::as_str).unwrap_or_default());
+    if method == "GET"
+        && (resolved.starts_with("file:")
+            || resolved.starts_with("blob:")
+            || resolved.starts_with("data:"))
+    {
+        let (status, mime, bytes) = fetch_bytes_with_mime(&resolved, creds)?;
+        return Ok(PreparedHttp::Immediate(format!(
+            "{{\"status\":{status},\"ok\":{},\"contentType\":{},\"headers\":{{\"content-type\":{}}},\"body\":{}}}",
+            (200..300).contains(&status),
+            json_quote(&mime),
+            json_quote(&mime),
+            json_quote(&String::from_utf8_lossy(&bytes))
+        )));
+    }
+
+    let extra_headers: Vec<(String, String)> = args
+        .get(5)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(s).ok())
+        .map(|m| {
+            m.into_iter()
+                .filter_map(|(k, v)| {
+                    if is_forbidden_request_header(&k) {
+                        return None;
+                    }
+                    Some((k, v.as_str()?.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let has_auth_header = extra_headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("authorization"));
+
+    let page_href = page_url();
+    let page_origin = web_origin(&page_href).map(|o| o.ascii_serialization());
+    let foreign = page_origin
+        .as_ref()
+        .filter(|_| !same_origin(&resolved))
+        .cloned();
+
+    let cache = zipp_shell::cache::global();
+    let cacheable_get =
+        method == "GET" && foreign.is_none() && !has_auth_header && creds != CredentialsMode::Omit;
+    let revalidate = if cacheable_get {
+        match cache.lookup("sub", &resolved) {
+            zipp_shell::cache::Lookup::Fresh(entry) => {
+                let body = String::from_utf8_lossy(&entry.body).into_owned();
+                return Ok(PreparedHttp::Immediate(format!(
+                    "{{\"status\":{},\"ok\":{},\"contentType\":{},\"headers\":{{\"content-type\":{}}},\"body\":{}}}",
+                    entry.status,
+                    (200..300).contains(&entry.status),
+                    json_quote(&entry.content_type),
+                    json_quote(&entry.content_type),
+                    json_quote(&body)
+                )));
+            }
+            zipp_shell::cache::Lookup::Revalidate(entry) => Some(entry),
+            zipp_shell::cache::Lookup::Miss => None,
+        }
+    } else {
+        None
+    };
+
+    let client = client_for_page(&resolved, creds);
+    Ok(PreparedHttp::Network(Box::new(PreparedHttpRequest {
+        client,
+        method,
+        url: resolved,
+        body,
+        content_type,
+        creds,
+        extra_headers,
+        page_href,
+        page_origin,
+        foreign,
+        cacheable_get,
+        revalidate,
+    })))
+}
+
+fn execute_network_http(p: PreparedHttpRequest) -> Result<String, String> {
+    let PreparedHttpRequest {
+        client,
+        method,
+        url,
+        body,
+        content_type,
+        creds,
+        extra_headers,
+        page_href,
+        page_origin,
+        foreign,
+        cacheable_get,
+        revalidate,
+    } = p;
+    let method_str = method.as_str();
+    let url_str = url.as_str();
+    let ct_str = content_type.as_str();
+
+    if let Some(origin) = &foreign {
+        let has_non_simple_header = extra_headers.iter().any(|(k, _)| {
+            !matches!(
+                k.to_ascii_lowercase().as_str(),
+                "accept" | "accept-language" | "content-language" | "content-type"
+            )
+        });
+        let simple = !has_non_simple_header
+            && match method_str {
+                "GET" | "HEAD" => true,
+                "POST" => matches!(
+                    ct_str.split(';').next().unwrap_or("").trim(),
+                    "text/plain" | "application/x-www-form-urlencoded" | "multipart/form-data"
+                ),
+                _ => false,
+            };
+        if !simple {
+            let names: Vec<String> = extra_headers.iter().map(|(k, _)| k.clone()).collect();
+            cors_preflight(client, method_str, url_str, origin, ct_str, &names, creds)?;
+        }
+    }
+
+    let mut req = match method_str {
+        "POST" => client.post(url_str).header("Content-Type", ct_str).body(body),
+        "PUT" => client.put(url_str).header("Content-Type", ct_str).body(body),
+        "PATCH" => client.patch(url_str).header("Content-Type", ct_str).body(body),
+        "DELETE" => {
+            if body.is_empty() {
+                client.delete(url_str)
+            } else {
+                client.delete(url_str).header("Content-Type", ct_str).body(body)
+            }
+        }
+        "HEAD" => client.head(url_str),
+        _ => client.get(url_str),
+    };
+    for (k, v) in &extra_headers {
+        if !k.eq_ignore_ascii_case("content-type") {
+            req = req.header(k.as_str(), v.as_str());
+        }
+    }
+    if let Some(origin) = &foreign {
+        req = req.header("Origin", origin.as_str());
+    } else if matches!(method_str, "POST" | "PUT" | "PATCH" | "DELETE")
+        && let Some(origin) = &page_origin
+    {
+        req = req.header("Origin", origin.as_str());
+    }
+    if page_href.starts_with("http://") || page_href.starts_with("https://") {
+        req = req.header("Referer", page_href.as_str());
+    }
+    req = req
+        .header("Sec-Fetch-Mode", "cors")
+        .header("Sec-Fetch-Dest", "empty")
+        .header(
+            "Sec-Fetch-Site",
+            if foreign.is_none() {
+                "same-origin"
+            } else {
+                "cross-site"
+            },
+        );
+    if let Some(ref prev) = revalidate {
+        if let Some(ref etag) = prev.etag {
+            req = req.header(reqwest::header::IF_NONE_MATCH, etag.as_str());
+        }
+        if let Some(ref lm) = prev.last_modified {
+            req = req.header(reqwest::header::IF_MODIFIED_SINCE, lm.as_str());
+        }
+    }
+
+    let resp = req
+        .send()
+        .map_err(|e| format!("Error: {method_str} {url_str}: {e}"))?;
+    if let Some(origin) = &foreign
+        && !cors_allows(&resp, origin, creds)
+    {
+        return Err(format!(
+            "TypeError: Failed to fetch: {url_str} does not allow {origin} to read it"
+        ));
+    }
+    let cache = zipp_shell::cache::global();
+    let status = resp.status().as_u16();
+    if status == 304
+        && let Some(prev) = revalidate
+    {
+        let refreshed = cache.revalidate_304("sub", url_str, prev, resp.headers());
+        let body = String::from_utf8_lossy(&refreshed.body).into_owned();
+        let headers_json = safe_response_headers_json(resp.headers());
+        return Ok(format!(
+            "{{\"status\":{},\"ok\":{},\"contentType\":{},\"headers\":{},\"body\":{}}}",
+            refreshed.status,
+            (200..300).contains(&refreshed.status),
+            json_quote(&refreshed.content_type),
+            headers_json,
+            json_quote(&body)
+        ));
+    }
+    let ok = resp.status().is_success();
+    let resp_headers = resp.headers().clone();
+    let mime = resp_headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let headers_json = safe_response_headers_json(&resp_headers);
+    let raw_bytes = resp
+        .bytes()
+        .map_err(|e| format!("Error: reading {url_str}: {e}"))?
+        .to_vec();
+    if cacheable_get {
+        cache.store("sub", url_str, status, &resp_headers, raw_bytes.clone());
+    } else if matches!(method_str, "POST" | "PUT" | "PATCH" | "DELETE") {
+        cache.invalidate_url(url_str);
+        page_cache_clear();
+    }
+    let body = String::from_utf8_lossy(&raw_bytes);
+    Ok(format!(
+        "{{\"status\":{status},\"ok\":{ok},\"contentType\":{},\"headers\":{},\"body\":{}}}",
+        json_quote(&mime),
+        headers_json,
+        json_quote(&body)
+    ))
 }
 
 /// Minimal JSON string literal encoder — enough to carry an arbitrary response
@@ -2650,6 +2850,9 @@ fn internal_page_html(
 ) -> Option<String> {
     let base = url.split(['?', '#']).next().unwrap_or(url).trim().to_ascii_lowercase();
     match base.as_str() {
+        "zipp:newtab" | "about:newtab" | "about:blank" => Some(
+            properties_page::render_newtab(chrome_token()),
+        ),
         "zipp:settings" | "zipp:properties" | "about:settings" | "about:properties" => Some(
             properties_page::render(chrome_token(), notice, history_filter, last_web_url, false),
         ),
@@ -2703,6 +2906,8 @@ fn render_page(
     fetch_ms: Option<u128>,
 ) -> (String, Option<String>, Option<ScriptState>) {
     *CURRENT_URL.lock().unwrap() = url.to_string();
+    clear_failed_iframes();
+    devtools::new_page(url, html);
     let html = html.to_string();
     let t_js = std::time::Instant::now();
     let (rendered, event_map_json, js_state) = if html.contains("<script") {
@@ -2713,6 +2918,7 @@ fn render_page(
     } else {
         (html, None, None)
     };
+    devtools::set_rendered_html(&rendered);
     let js_ms = t_js.elapsed().as_millis();
 
     let t_post = std::time::Instant::now();
@@ -2723,7 +2929,21 @@ fn render_page(
         .replace("class=\"no-js", "class=\"js")
         .replace("class=\"client-nojs", "class=\"client-js");
     let out = inline_images(&out, url);
-    history::record(url, history::extract_html_title(&out).as_deref());
+    let page_title = history::extract_html_title(&out);
+    history::record(url, page_title.as_deref());
+    tabs::ensure_initialized(url);
+    if let Some(ref title) = page_title {
+        tabs::update_active_title(title);
+    } else {
+        tabs::update_active_title(&tabs::default_title_for_url(url));
+    }
+    let active_title = tabs::active_title();
+    let window_title = if zipp_shell::profile::is_incognito() {
+        format!("{active_title} — Zipp Browser (Incognito)")
+    } else {
+        format!("{active_title} — Zipp Browser")
+    };
+    push_window_request(WindowRequest::Title(window_title));
     let out = wrap_with_toolbar(&out, url);
     let post_ms = t_post.elapsed().as_millis();
 
@@ -2987,9 +3207,19 @@ fn render_rgba(url: &str, rt: &tokio::runtime::Runtime, net_provider: &Arc<zipp_
 fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
     use zipp_dom::traits_src::shell::{ColorScheme, Viewport};
 
+    console::record_this_thread();
+    devtools::record_this_thread();
+    async_fetch::allow_on_this_thread();
     worker::allow_on_this_thread();
     worker::new_page();
     let shot_page = worker::current_page();
+    tabs::init(url);
+    if let Ok(extra) = std::env::var("ZIPP_EXTRA_TABS") {
+        for raw in extra.split('|').filter(|s| !s.trim().is_empty()) {
+            let extra_url = normalize_url(raw.trim());
+            tabs::open_new_tab(Some(extra_url), false, false);
+        }
+    }
     eprintln!("[SHOT] {url} -> {out_path} ({width}x{height})");
     let (mut final_html, event_map, mut js_state) = prepare_page(url, (width, height));
 
@@ -3108,6 +3338,7 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
             doc.set_event_handler(Box::new(bridge));
         }
     }
+    sync_iframes(doc.as_mut(), url, 0);
     let parse_ms = t_parse.elapsed().as_millis();
 
     // Let linked stylesheets, webfonts and images arrive before layout.
@@ -3417,6 +3648,45 @@ fn screenshot(url: &str, out_path: &str, width: u32, height: u32) -> bool {
         eprintln!("[SCROLL] requested {dy}px -> viewport_scroll.y={}", vs.y);
     }
 
+    // `ZIPP_DEVTOOLS=elements|source|scripts|console` opens the Chrome-style
+    // DevTools drawer before painting so headless screenshots can verify every tab.
+    if let Ok(tab_name) = std::env::var("ZIPP_DEVTOOLS") {
+        let tab = match tab_name.trim().to_ascii_lowercase().as_str() {
+            "elements" | "inspect" => devtools::Tab::Elements,
+            "source" => devtools::Tab::Source,
+            "scripts" => devtools::Tab::Scripts,
+            _ => devtools::Tab::Console,
+        };
+        if let Ok(src_mode) = std::env::var("ZIPP_DEVTOOLS_SOURCE")
+            && src_mode.eq_ignore_ascii_case("rendered")
+        {
+            devtools::set_source_mode(devtools::SourceMode::Rendered);
+        }
+        if let Ok(sel) = std::env::var("ZIPP_DEVTOOLS_INSPECT")
+            && let Ok(Some(node_id)) = doc.as_ref().query_selector(sel.trim())
+        {
+            devtools::inspect_node(doc.as_ref(), node_id);
+        }
+        devtools::set_tab(tab);
+        let token = chrome_token();
+        if let Ok(Some(style)) = doc.as_ref().query_selector("#__zipp_chrome_css") {
+            doc.as_mut().mutate().set_inner_html(
+                style,
+                &chrome_css(console::is_open(), is_mobile_view()),
+            );
+        }
+        if let Ok(Some(hdr)) = doc.as_ref().query_selector("#__zipp_dt_header") {
+            doc.as_mut()
+                .mutate()
+                .set_inner_html(hdr, &devtools::header_html(token, false));
+        }
+        if let Ok(Some(body)) = doc.as_ref().query_selector("#__zipp_console_lines") {
+            let html = devtools::body_html(Some(doc.as_ref()));
+            doc.as_mut().mutate().set_inner_html(body, &html);
+        }
+        doc.as_mut().resolve(ANIMATION_SETTLE_SECS * 2.0);
+    }
+
     // `ZIPP_DUMP_TREE=1` prints the resolved Taffy layout tree — the fastest way
     // to tell a cascade problem (wrong computed style) from a layout problem
     // (right style, wrong box).
@@ -3485,6 +3755,9 @@ fn run_zipp_js_inner(
     viewport: (u32, u32),
 ) -> Option<(String, String, ScriptState)> {
     DOC_URL.with(|d| *d.borrow_mut() = url::Url::parse(page_url).ok());
+    let fetch_scope = async_fetch::new_scope();
+    let _fetch_guard = async_fetch::ScopeGuard::enter(fetch_scope);
+    let base_url = extract_base_url(html, page_url);
     let mut external_scripts = Vec::new();
     // `<script type="module">` entries are linked separately: their source is ES
     // module syntax, which is a syntax error in the classic program the rest of
@@ -3509,13 +3782,30 @@ fn run_zipp_js_inner(
             || ty == "text/javascript"
             || ty == "application/javascript";
         if let Some(src) = attr(tag, "src") {
-            let full = resolve(page_url, &src);
+            let full = resolve(&base_url, &src);
             if ty == "module" {
                 module_entries.push(full);
-            } else if is_js
-                && let Ok(source) = fetch(&full) {
-                    external_scripts.push((full, source));
+            } else if is_js {
+                match fetch(&full) {
+                    Ok(source) => {
+                        devtools::record_script(
+                            devtools::ScriptKind::Classic,
+                            &full,
+                            source.clone(),
+                            None,
+                        );
+                        external_scripts.push((full, source));
+                    }
+                    Err(err) => {
+                        devtools::record_script(
+                            devtools::ScriptKind::Classic,
+                            &full,
+                            String::new(),
+                            Some(err),
+                        );
+                    }
                 }
+            }
         } else if is_js || ty == "importmap" {
             // INLINE script. These were skipped entirely, so a page whose
             // behaviour lives in a `<script>` block ran none of it — the tag was
@@ -3524,17 +3814,29 @@ fn run_zipp_js_inner(
             if let Some(close) = html[body_start..].find("</script") {
                 let code = &html[body_start..body_start + close];
                 if ty == "importmap" {
-                    import_map.add(code, page_url, &resolve);
+                    import_map.add(code, &base_url, &resolve);
+                    devtools::record_script(
+                        devtools::ScriptKind::ImportMap,
+                        &format!("{page_url}#importmap{abs}"),
+                        code.to_string(),
+                        None,
+                    );
                 } else if !code.trim().is_empty() {
                     if ty == "module" {
                         // An inline module still needs linking; give it a URL of
                         // its own so relative specifiers resolve against the page.
-                        let url = format!("{page_url}#inline-module-{}", inline_modules.len());
+                        let url = format!("{base_url}#inline-module-{}", inline_modules.len());
                         inline_modules.insert(url.clone(), code.to_string());
                         module_entries.push(url);
                     } else {
-                        external_scripts
-                            .push((format!("{page_url}#inline{abs}"), code.to_string()));
+                        let inline_url = format!("{page_url}#inline{abs}");
+                        devtools::record_script(
+                            devtools::ScriptKind::Inline,
+                            &inline_url,
+                            code.to_string(),
+                            None,
+                        );
+                        external_scripts.push((inline_url, code.to_string()));
                     }
                 }
                 pos = body_start + close;
@@ -3629,18 +3931,32 @@ fn run_zipp_js_inner(
             None => fetch(url),
         };
         let resolve_module = |base: &str, spec: &str| import_map.resolve_specifier(base, spec, &resolve);
-        let linked = esm::link_graph(&module_entries, &fetch_module, &resolve_module);
+        let linked = esm::link_graph_lazy(
+            &module_entries,
+            import_map.fingerprint(),
+            &fetch_module,
+            &resolve_module,
+        );
         IMPORT_MAP.with(|m| *m.borrow_mut() = import_map.clone());
         eprintln!(
-            "[ESM] Linked {} modules from {} entr{} in {}ms",
+            "[ESM] Linked {} modules from {} entr{} in {}ms (lazy dynamic imports)",
             linked.module_count,
             module_entries.len(),
             if module_entries.len() == 1 { "y" } else { "ies" },
             t_link.elapsed().as_millis(),
         );
+        for (mod_url, mod_src) in &linked.loaded_modules {
+            let kind = if mod_url.contains("#inline-module-") {
+                devtools::ScriptKind::Inline
+            } else {
+                devtools::ScriptKind::Module
+            };
+            devtools::record_script(kind, mod_url, mod_src.clone(), None);
+        }
         for (url, err) in &linked.failures {
             eprintln!("[ESM] FAILED {url}: {err}");
             console::push(console::Level::Error, format!("module {url} failed to load: {err}"));
+            devtools::record_script(devtools::ScriptKind::Module, url, String::new(), Some(err.clone()));
         }
         let mut mod_src = String::with_capacity(linked.source.len() + esm::MODULE_RUNTIME_JS.len() + 256);
         if std::env::var_os("ZIPP_DEBUG_ESM").is_some() {
@@ -3801,13 +4117,18 @@ fn run_zipp_js_inner(
             };
 
             let (body_attrs, inner) = split_body_element(&rendered);
-            let inner = make_urls_absolute(inner, page_url);
+            let inner = make_urls_absolute(inner, &base_url);
             let inner = inner
                 .replace("\\xa9", "\u{00A9}")
                 .replace("\\u2019", "\u{2019}")
                 .replace("\\u2018", "\u{2018}")
                 .replace("\\u2014", "\u{2014}");
-            let head = make_urls_absolute(&head_content(html), page_url);
+            let static_head = make_urls_absolute(&head_content(html), &base_url);
+            let head_extras = match state.eval_in_context("__getHeadExtras()") {
+                Ok(JsValue::String(s)) => s,
+                _ => "[]".to_string(),
+            };
+            let head = merge_head_extras(&static_head, &head_extras, &base_url);
             eprintln!("[JS] Rendered {} bytes", inner.len());
             // `ZIPP_DUMP_ROOT=<path>` writes what the page's JS actually built.
             // For a client-rendered app this IS the page; without it a short
@@ -3837,55 +4158,9 @@ fn run_zipp_js_inner(
 // Navigation provider
 // ---------------------------------------------------------------------------
 
-/// Handles link clicks by loading pages internally.
+/// Handles link clicks, tab commands, and form submissions internally.
 struct BrowserNavProvider {
     proxy: ShellProxy,
-    /// The page the window is showing. Every navigation passes through this
-    /// provider, so it is the one place that always knows.
-    current_url: std::sync::Mutex<String>,
-    /// Last non-internal web/file URL visited, offered as "Use Current Page" in Properties.
-    last_web_url: std::sync::Mutex<Option<String>>,
-    /// Back/forward history, for the same reason.
-    history: std::sync::Mutex<History>,
-}
-
-/// The pages visited in this window, and which one is showing.
-struct History {
-    entries: Vec<String>,
-    index: usize,
-}
-
-impl History {
-    fn new(first: &str) -> Self {
-        History { entries: vec![first.to_string()], index: 0 }
-    }
-
-    /// A new page: anything ahead of the current one is dropped, as a browser
-    /// does when you go back and then follow a different link.
-    fn push(&mut self, url: &str) {
-        if self.entries[self.index] == url {
-            return;
-        }
-        self.entries.truncate(self.index + 1);
-        self.entries.push(url.to_string());
-        self.index += 1;
-    }
-
-    fn back(&mut self) -> Option<String> {
-        self.index = self.index.checked_sub(1)?;
-        Some(self.entries[self.index].clone())
-    }
-
-    fn forward(&mut self) -> Option<String> {
-        let next = self.index + 1;
-        let url = self.entries.get(next)?.clone();
-        self.index = next;
-        Some(url)
-    }
-
-    fn current(&self) -> String {
-        self.entries[self.index].clone()
-    }
 }
 
 /// Records navigations instead of performing them, for `--screenshot`.
@@ -3908,71 +4183,142 @@ impl NavigationProvider for BrowserNavProvider {
         let mut url = options.url.to_string();
         eprintln!("[NAV] {url}");
 
-        // Back, forward, reload, home, settings, history, and incognito.
+        // Back, forward, reload, home, settings, history, incognito, and tab controls.
         // Every `zipp-nav:` action requires either a native keyboard shortcut
         // (`application/x-zipp-shortcut`) or our unforgeable `__zipp_chrome`
-        // token so untrusted web pages cannot spawn windows or clear user data.
+        // token so untrusted web pages cannot hijack tabs, spawn windows, or clear data.
         if let Some(rest) = url.strip_prefix("zipp-nav:") {
             let trusted = options.content_type == "application/x-zipp-shortcut" || from_chrome(&url);
             if !trusted {
                 eprintln!("[NAV] refused unauthenticated zipp-nav action: {url}");
                 return;
             }
-            let command = rest.split('?').next().unwrap_or(rest);
-            if command == "incognito" {
-                launch_incognito_window();
-                return;
-            }
-            let target = {
-                let mut history = self.history.lock().unwrap_or_else(|e| e.into_inner());
-                match command {
-                    "back" => history.back(),
-                    "forward" => history.forward(),
-                    "home" => {
-                        let home = normalize_url(&settings::start_page());
-                        if home != history.current() {
-                            history.push(&home);
-                        }
-                        Some(home)
-                    }
-                    "settings" => {
-                        let dest = "zipp:settings".to_string();
-                        if dest != history.current() {
-                            history.push(&dest);
-                        }
-                        Some(dest)
-                    }
-                    "history" => {
-                        let dest = "zipp:history".to_string();
-                        if dest != history.current() {
-                            history.push(&dest);
-                        }
-                        Some(dest)
-                    }
-                    "reload" => {
-                        let current = history.current();
-                        PAGE_CACHE.lock().unwrap_or_else(|e| e.into_inner()).remove(&current);
-                        zipp_shell::cache::invalidate(&current);
-                        Some(current)
-                    }
-                    "hard-reload" | "clear-cache" => {
-                        let current = history.current();
-                        clear_browser_cache();
-                        Some(current)
-                    }
-                    "clear-data" => {
-                        let current = history.current();
-                        clear_all_site_data();
-                        Some(current)
-                    }
-                    _ => None,
-                }
+            let (command, query) = rest.split_once('?').unwrap_or((rest, ""));
+            let param_u64 = |key: &str| -> Option<u64> {
+                url::form_urlencoded::parse(query.as_bytes())
+                    .find(|(k, _)| k == key)
+                    .and_then(|(_, v)| v.parse::<u64>().ok())
             };
-            match target {
-                Some(target) => self.load(target),
-                None => eprintln!("[NAV] nothing to go {command} to"),
+            match command {
+                "incognito" => {
+                    launch_incognito_window();
+                    return;
+                }
+                "new-tab" => {
+                    let (_, target) = tabs::open_new_tab(None, true, false);
+                    if let Some(target) = target {
+                        self.load_target(target);
+                    }
+                    return;
+                }
+                "close-tab" => {
+                    let id = param_u64("id");
+                    match tabs::close_tab(id) {
+                        tabs::CloseResult::Switched(target) => self.load_target(target),
+                        tabs::CloseResult::ClosedBackground => self.wake_tabbar(),
+                        tabs::CloseResult::NotFound => {}
+                    }
+                    return;
+                }
+                "reopen-tab" => {
+                    if let Some(target) = tabs::reopen_closed_tab() {
+                        self.load_target(target);
+                    }
+                    return;
+                }
+                "switch-tab" => {
+                    let Some(id) = param_u64("id") else {
+                        return;
+                    };
+                    // Middle-clicking a tab in the tab strip closes that tab, just like Chrome/Firefox.
+                    if options.new_tab {
+                        match tabs::close_tab(Some(id)) {
+                            tabs::CloseResult::Switched(target) => self.load_target(target),
+                            tabs::CloseResult::ClosedBackground => self.wake_tabbar(),
+                            tabs::CloseResult::NotFound => {}
+                        }
+                        return;
+                    }
+                    if let Some(target) = tabs::switch_to_id(id) {
+                        self.load_target(target);
+                    }
+                    return;
+                }
+                "next-tab" => {
+                    if let Some(target) = tabs::switch_by_offset(1) {
+                        self.load_target(target);
+                    }
+                    return;
+                }
+                "prev-tab" => {
+                    if let Some(target) = tabs::switch_by_offset(-1) {
+                        self.load_target(target);
+                    }
+                    return;
+                }
+                cmd if cmd.starts_with("tab-") => {
+                    if let Some(slot) = cmd.strip_prefix("tab-").and_then(|s| s.parse::<usize>().ok())
+                        && let Some(target) = tabs::switch_to_slot(slot)
+                    {
+                        self.load_target(target);
+                    }
+                    return;
+                }
+                "back" => {
+                    match tabs::active_back() {
+                        Some(target) => self.load_target(target),
+                        None => eprintln!("[NAV] nothing to go back to"),
+                    }
+                    return;
+                }
+                "forward" => {
+                    match tabs::active_forward() {
+                        Some(target) => self.load_target(target),
+                        None => eprintln!("[NAV] nothing to go forward to"),
+                    }
+                    return;
+                }
+                "home" => {
+                    let home = normalize_url(&settings::start_page());
+                    let target = tabs::navigate_active(home);
+                    self.load_target(target);
+                    return;
+                }
+                "settings" => {
+                    let target = tabs::navigate_active("zipp:settings".to_string());
+                    self.load_target(target);
+                    return;
+                }
+                "history" => {
+                    let target = tabs::navigate_active("zipp:history".to_string());
+                    self.load_target(target);
+                    return;
+                }
+                "reload" => {
+                    let current = tabs::active_url();
+                    PAGE_CACHE.lock().unwrap_or_else(|e| e.into_inner()).remove(&current);
+                    zipp_shell::cache::invalidate(&current);
+                    let target = tabs::active_reload();
+                    self.load_target(target);
+                    return;
+                }
+                "hard-reload" | "clear-cache" => {
+                    clear_browser_cache();
+                    let target = tabs::active_reload();
+                    self.load_target(target);
+                    return;
+                }
+                "clear-data" => {
+                    clear_all_site_data();
+                    let target = tabs::active_reload();
+                    self.load_target(target);
+                    return;
+                }
+                _ => {
+                    eprintln!("[NAV] unknown zipp-nav command: {command}");
+                    return;
+                }
             }
-            return;
         }
 
         // Properties panel actions (`zipp-settings:<action>?__zipp_chrome=<token>&...`).
@@ -3987,7 +4333,7 @@ impl NavigationProvider for BrowserNavProvider {
             let params: HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes())
                 .map(|(k, v)| (k.into_owned(), v.into_owned()))
                 .collect();
-            let last_web = self.last_web_url.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let last_web = tabs::last_web_url();
             let (page_url, notice, filter): (&str, Option<String>, Option<String>) = match action {
                 "save-start" | "set-start" => {
                     let raw = params
@@ -4090,7 +4436,8 @@ impl NavigationProvider for BrowserNavProvider {
                 last_web.as_deref(),
                 page_url == "zipp:history",
             );
-            *self.current_url.lock().unwrap_or_else(|e| e.into_inner()) = page_url.to_string();
+            let title = if page_url == "zipp:history" { "History" } else { "Properties" };
+            tabs::set_active_internal(page_url, title);
             self.proxy.send_event(zipp_shell::ShellEvent::NavigationLoad {
                 url: page_url.to_string(),
                 contents: html,
@@ -4101,7 +4448,10 @@ impl NavigationProvider for BrowserNavProvider {
         }
 
         // The console's and viewport toggle's own links: handled directly by the event bridge.
-        if url.starts_with("zipp-console:") || url.starts_with("zipp-view:") {
+        if url.starts_with("zipp-console:")
+            || url.starts_with("zipp-devtools:")
+            || url.starts_with("zipp-view:")
+        {
             return;
         }
         // Code typed into the console. Its line is a form posting back to the
@@ -4121,7 +4471,7 @@ impl NavigationProvider for BrowserNavProvider {
             let target = target.to_string();
             // The file showing, and no other: a page's link could otherwise
             // copy any file to Downloads.
-            if target != *self.current_url.lock().unwrap() {
+            if target != tabs::active_url() {
                 eprintln!("[NAV] refused to save {target}: it is not the page showing");
                 return;
             }
@@ -4139,14 +4489,11 @@ impl NavigationProvider for BrowserNavProvider {
         }
 
         // A link to a fragment of the page already showing is a scroll, not a
-        // navigation. This compared the fragment-less URL against the render
-        // cache, keyed `https://lance.name` while the link resolved to
-        // `https://lance.name/#about`, so it never matched: every in-page nav
-        // link reloaded the page, which left it with no live JS and nothing
-        // on it responding. Parsed URLs compare equal across that slash.
-        if let Ok(target) = url::Url::parse(&url)
+        // navigation (unless the user asked to open it in a new tab).
+        if !options.new_tab
+            && let Ok(target) = url::Url::parse(&url)
             && let Some(fragment) = target.fragment() {
-                let current = self.current_url.lock().unwrap().clone();
+                let current = tabs::active_url();
                 let same_document = url::Url::parse(&current).is_ok_and(|mut current| {
                     let mut target = target.clone();
                     current.set_fragment(None);
@@ -4168,16 +4515,18 @@ impl NavigationProvider for BrowserNavProvider {
             url = base.to_string();
         }
 
-        // Check if this is an address bar form submission
+        // Check if this is an address bar or New Tab search form submission.
         if chrome && url.contains("__nav_url=") {
-            if let Some(pos) = url.find("__nav_url=") {
-                let typed = &url[pos + 10..];
-                let typed = typed.split('&').next().unwrap_or(typed);
-                let typed = urlencoding::decode(typed).unwrap_or_else(|_| typed.into());
+            if let Ok(parsed) = url::Url::parse(&url)
+                && let Some((_, typed)) = parsed.query_pairs().find(|(k, _)| k == "__nav_url")
+            {
+                if typed.trim().is_empty() {
+                    return;
+                }
                 url = normalize_url(&typed);
                 eprintln!("[NAV] Address bar -> {url}");
             }
-        } else if url.starts_with("file:") && !self.current_url.lock().unwrap().starts_with("file:") {
+        } else if url.starts_with("file:") && !tabs::active_url().starts_with("file:") {
             // A page on the web does not open the machine's files, by a link
             // or by script. The person can, by typing the address.
             eprintln!("[NAV] refused: a page on the web may not open {url}");
@@ -4185,30 +4534,91 @@ impl NavigationProvider for BrowserNavProvider {
             return;
         }
 
-        self.history.lock().unwrap().push(&url);
-        self.load(url);
+        if options.new_tab {
+            if options.background {
+                let (tab_id, _) = tabs::open_new_tab(Some(url.clone()), false, true);
+                self.wake_tabbar();
+                self.prefetch_background_tab(tab_id, url);
+            } else {
+                let (_, target) = tabs::open_new_tab(Some(url), true, true);
+                if let Some(target) = target {
+                    self.load_target(target);
+                }
+            }
+            return;
+        }
+
+        let target = tabs::navigate_active(url);
+        self.load_target(target);
     }
 }
 
 impl BrowserNavProvider {
-    /// Show `url`: fetch it on a worker thread (or take it from the cache), then
-    /// hand it to the window, whose document builder runs its JS.
-    fn load(&self, url: String) {
-        *self.current_url.lock().unwrap_or_else(|e| e.into_inner()) = url.clone();
-        if !url.starts_with("zipp:") && !url.starts_with("about:") {
-            *self.last_web_url.lock().unwrap_or_else(|e| e.into_inner()) = Some(url.clone());
+    /// Wake the window event loop so `JsEventBridge::run_tasks` updates the tab strip
+    /// in-place without reloading the active document.
+    fn wake_tabbar(&self) {
+        self.proxy
+            .send_event(zipp_shell::ShellEvent::Embedder(Arc::new(())));
+    }
+
+    /// Fetch a background tab asynchronously to populate its title & cached HTML
+    /// without disturbing the active tab.
+    fn prefetch_background_tab(&self, tab_id: u64, url: String) {
+        if tabs::is_internal_url(&url) {
+            return;
         }
-        let last_web = self.last_web_url.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if let Some(html) = internal_page_html(&url, None, None, last_web.as_deref()) {
+        let proxy = self.proxy.clone();
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                let contents = match page_cache_get(&url) {
+                    Some(html) => html,
+                    None => match viewers::fetch_document(&url, true) {
+                        Ok(html) => {
+                            page_cache_put(url.clone(), html.clone());
+                            html
+                        }
+                        Err(e) => error_page(&url, &e),
+                    },
+                };
+                let title = history::extract_html_title(&contents);
+                tabs::store_tab_html(tab_id, &url, contents, title.as_deref());
+                proxy.send_event(zipp_shell::ShellEvent::Embedder(Arc::new(())));
+            })
+            .ok();
+    }
+
+    /// Show `target`: serve internal pages and cached tab switches immediately,
+    /// or fetch on a worker thread guarded by `(tab_id, nav_gen)` so late
+    /// responses never clobber a tab the user has already switched away from.
+    fn load_target(&self, target: tabs::TabTarget) {
+        let last_web = tabs::last_web_url();
+        if let Some(html) = internal_page_html(&target.url, None, None, last_web.as_deref()) {
             self.proxy.send_event(zipp_shell::ShellEvent::NavigationLoad {
-                url,
+                url: target.url,
                 contents: html,
                 retain_scroll_position: false,
                 is_md: false,
             });
             return;
         }
+        if let Some(cached_html) = target.cached_html {
+            eprintln!("[NAV] Instant tab switch -> {}", target.url);
+            self.proxy.send_event(zipp_shell::ShellEvent::NavigationLoad {
+                url: target.url,
+                contents: cached_html,
+                retain_scroll_position: false,
+                is_md: false,
+            });
+            return;
+        }
         let proxy = self.proxy.clone();
+        let tab_id = target.id;
+        let nav_gen = target.nav_gen;
+        let url = target.url;
+
+        // Immediately reflect loading indicator on the tab bar if it takes a moment.
+        self.wake_tabbar();
 
         std::thread::Builder::new()
             .stack_size(64 * 1024 * 1024)
@@ -4236,12 +4646,20 @@ impl BrowserNavProvider {
                         }
                     }
                 };
-                proxy.send_event(zipp_shell::ShellEvent::NavigationLoad {
-                    url,
-                    contents,
-                    retain_scroll_position: false,
-                    is_md: false,
-                });
+                let title = history::extract_html_title(&contents);
+                tabs::store_tab_html(tab_id, &url, contents.clone(), title.as_deref());
+                if tabs::is_active_nav_gen(tab_id, nav_gen) {
+                    proxy.send_event(zipp_shell::ShellEvent::NavigationLoad {
+                        url,
+                        contents,
+                        retain_scroll_position: false,
+                        is_md: false,
+                    });
+                } else {
+                    // User moved on to another tab while this fetch was in flight:
+                    // update the background tab's title without clobbering the active tab.
+                    proxy.send_event(zipp_shell::ShellEvent::Embedder(Arc::new(())));
+                }
             })
             .ok();
     }
@@ -4271,7 +4689,9 @@ impl BrowserNavProvider {
 /// a page's own `html` padding still applies. With the console open the band
 /// grows to hold it too, under the toolbar; opening and closing it rewrites
 /// this stylesheet (`JsEventBridge::show_console`).
-const TOOLBAR_HEIGHT: u32 = 46;
+const TAB_BAR_HEIGHT: u32 = 36;
+const NAV_BAR_HEIGHT: u32 = 44;
+const TOOLBAR_HEIGHT: u32 = TAB_BAR_HEIGHT + NAV_BAR_HEIGHT;
 
 pub(crate) fn chrome_css(console_open: bool, mobile_open: bool) -> String {
     let panel = console::PANEL_HEIGHT;
@@ -4279,16 +4699,37 @@ pub(crate) fn chrome_css(console_open: bool, mobile_open: bool) -> String {
     let incognito = zipp_shell::profile::is_incognito();
     let active_bg = if incognito { "rgba(167, 139, 250, 0.22)" } else { "#dbeafe" };
     let hover_bg = if incognito { "rgba(167, 139, 250, 0.14)" } else { "rgba(15, 23, 42, 0.07)" };
-    let (display, button) = if console_open { ("flex", active_bg) } else { ("none", "transparent") };
+    let tab_hover_bg = if incognito { "rgba(139, 92, 246, 0.16)" } else { "rgba(255, 255, 255, 0.62)" };
+    let close_hover_bg = if incognito { "rgba(167, 139, 250, 0.28)" } else { "rgba(15, 23, 42, 0.12)" };
+    let close_hover_fg = if incognito { "#ffffff" } else { "#0f172a" };
+    let (display, console_bg, inspect_bg, form_display) = if console_open {
+        let on_console = devtools::active_tab() == devtools::Tab::Console;
+        (
+            "flex",
+            if on_console { active_bg } else { "transparent" },
+            if on_console { "transparent" } else { active_bg },
+            if on_console { "flex" } else { "none" },
+        )
+    } else {
+        ("none", "transparent", "transparent", "none")
+    };
     let mobile_bg = if mobile_open { active_bg } else { "transparent" };
     format!(
         "html {{ border-top:{band}px solid transparent !important; box-sizing:border-box !important; margin:0 !important; max-width:none !important; }}\n\
          #__zipp_chrome {{ top:-{band}px; }}\n\
-         #__zipp_chrome a:hover {{ background:{hover_bg}; }}\n\
+         #__zipp_navbar a:hover {{ background:{hover_bg}; }}\n\
+         #__zipp_tabbar .__zt_inactive:hover {{ background:{tab_hover_bg} !important; }}\n\
+         #__zipp_tabbar .__zt_close:hover {{ background:{close_hover_bg} !important; color:{close_hover_fg} !important; }}\n\
+         #__zipp_tabbar #__zipp_new_tab_btn:hover {{ background:{hover_bg} !important; }}\n\
          #__zipp_console {{ display:{display}; top:-{panel}px; height:{panel}px; }}\n\
-         #__zipp_console_button {{ background:{button}; }}\n\
+         #__zipp_console_form {{ display:{form_display} !important; }}\n\
+         #__zipp_console_copy:hover {{ background:rgba(96,165,250,0.24) !important; }}\n\
+         #__zipp_dt_header a:hover {{ background:rgba(148,163,184,0.16); }}\n\
+         #__zipp_console_lines a:hover {{ background:rgba(148,163,184,0.12); }}\n\
+         #__zipp_inspect_button {{ background:{inspect_bg}; }}\n\
+         #__zipp_console_button {{ background:{console_bg}; }}\n\
          #__zipp_mobile_button {{ background:{mobile_bg}; }}\n\
-         @media (max-width: 520px) {{ #__zipp_chrome {{ padding:0 6px !important; gap:2px !important; }} #__zipp_chrome a {{ width:26px !important; height:26px !important; }} #__zipp_chrome > span {{ display:none !important; }} }}\n"
+         @media (max-width: 520px) {{ #__zipp_tabbar {{ padding:4px 4px 0 4px !important; gap:3px !important; }} #__zipp_navbar {{ padding:0 6px !important; gap:2px !important; }} #__zipp_navbar a {{ width:26px !important; height:26px !important; }} #__zipp_navbar > span {{ display:none !important; }} }}\n"
     )
 }
 
@@ -4365,6 +4806,327 @@ fn build_document(final_html: &str, config: DocumentConfig) -> HtmlDocument {
     canvas::forget_shown();
     apply_canvas_frames(&mut doc);
     doc
+}
+
+/// Auto-focus the address bar on the New Tab page so the user can type a URL immediately.
+fn focus_newtab_address_bar(doc: &mut HtmlDocument, url: &str) {
+    if url == tabs::NEW_TAB_URL
+        && chrome_shown()
+        && let Ok(Some(input_id)) = doc.as_ref().query_selector("#__zipp_url_input")
+    {
+        doc.as_mut().set_focus_to(input_id);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic <head> merging + live <iframe> sub-document mounting
+// ---------------------------------------------------------------------------
+
+/// Resolve `<base href="...">` inside `<head>` if present, otherwise `page_url`.
+fn extract_base_url(html: &str, page_url: &str) -> String {
+    let head = head_content(html);
+    let lower = head.to_ascii_lowercase();
+    let mut pos = 0;
+    while let Some(rel) = lower[pos..].find("<base") {
+        let abs = pos + rel;
+        let next = lower.as_bytes().get(abs + 5).copied();
+        if matches!(next, Some(b' ' | b'\t' | b'\n' | b'\r' | b'>' | b'/'))
+            && let Some(end_rel) = head[abs..].find('>')
+        {
+            let tag = &head[abs..abs + end_rel + 1];
+            if let Some(href) = attr(tag, "href")
+                && !href.trim().is_empty()
+            {
+                return resolve(page_url, href.trim());
+            }
+            pos = abs + end_rel + 1;
+            continue;
+        }
+        pos = abs + 5;
+    }
+    page_url.to_string()
+}
+
+/// Check whether `head` already contains a `<link rel="...stylesheet..." href="<url>">`.
+fn head_has_stylesheet_link(head: &str, abs_href: &str) -> bool {
+    let lower = head.to_ascii_lowercase();
+    let mut pos = 0;
+    while let Some(rel) = lower[pos..].find("<link") {
+        let abs = pos + rel;
+        let Some(end_rel) = head[abs..].find('>') else {
+            break;
+        };
+        let tag = &head[abs..abs + end_rel + 1];
+        if let Some(r) = attr(tag, "rel")
+            && r.split_ascii_whitespace().any(|t| t.eq_ignore_ascii_case("stylesheet"))
+            && let Some(h) = attr(tag, "href")
+            && h == abs_href
+        {
+            return true;
+        }
+        pos = abs + end_rel + 1;
+    }
+    false
+}
+
+/// Merge dynamically promoted/injected `<link rel="stylesheet">` and `<style>`
+/// elements reported by `__getHeadExtras()` into the static `<head>` markup.
+pub(crate) fn merge_head_extras(static_head: &str, extras_json: &str, base_url: &str) -> String {
+    let Ok(items) = serde_json::from_str::<Vec<(String, String)>>(extras_json) else {
+        return static_head.to_string();
+    };
+    if items.is_empty() {
+        return static_head.to_string();
+    }
+    let mut out = static_head.to_string();
+    let mut added_links = std::collections::HashSet::new();
+    for (kind, val) in items {
+        if kind == "link" {
+            let abs = resolve(base_url, val.trim());
+            if abs.is_empty() || !added_links.insert(abs.clone()) {
+                continue;
+            }
+            if !head_has_stylesheet_link(&out, &abs) {
+                let esc = escape_html_attr(&abs);
+                out.push_str(&format!(r#"<link rel="stylesheet" href="{esc}" />"#));
+            }
+        } else if kind == "style" {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() && !out.contains(trimmed) {
+                out.push_str("<style>");
+                out.push_str(trimmed);
+                out.push_str("</style>");
+            }
+        }
+    }
+    out
+}
+
+/// Failed iframe URLs on the current page so we don't retry broken frames every tick.
+static FAILED_IFRAMES: std::sync::LazyLock<Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+fn clear_failed_iframes() {
+    if let Ok(mut set) = FAILED_IFRAMES.lock() {
+        set.clear();
+    }
+}
+
+/// Fetch an embedded `<iframe>` document with standard browser navigation headers
+/// (`Sec-Fetch-Dest: iframe`, `Sec-Fetch-Mode: navigate`, `Sec-Fetch-Site`).
+fn fetch_iframe_document(url: &str, parent_url: &str, no_referrer: bool) -> Result<String, String> {
+    if url.starts_with("data:") || url.starts_with("blob:") || url.starts_with("file:") {
+        return fetch(url);
+    }
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err(format!("unsupported iframe scheme: {url}"));
+    }
+    let client = client_for_page(url, CredentialsMode::Include);
+    let same = web_origin(parent_url).is_some()
+        && web_origin(parent_url) == web_origin(url);
+    let mut req = client
+        .get(url)
+        .header(
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+        .header("Sec-Fetch-Dest", "iframe")
+        .header("Sec-Fetch-Mode", "navigate")
+        .header("Sec-Fetch-Site", if same { "same-origin" } else { "cross-site" });
+    if !no_referrer && (parent_url.starts_with("http://") || parent_url.starts_with("https://")) {
+        req = req.header("Referer", parent_url);
+    }
+    let resp = req.send().map_err(|e| format!("iframe fetch {url}: {e}"))?;
+    let status = resp.status().as_u16();
+    let bytes = resp
+        .bytes()
+        .map_err(|e| format!("iframe body {url}: {e}"))?
+        .to_vec();
+    eprintln!("[IFRAME] GET {url} -> {status} ({} bytes)", bytes.len());
+    if status >= 400 && bytes.is_empty() {
+        return Err(format!("HTTP {status}"));
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Build a live, interactive `HtmlDocument` for an `<iframe>` without browser
+/// chrome or mutating top-level page state (`CURRENT_URL`, history, tabs, etc.).
+fn build_iframe_document(
+    parent: &BaseDocument,
+    iframe_url: &str,
+    html: &str,
+    iframe_size: (u32, u32),
+    depth: u8,
+) -> HtmlDocument {
+    use zipp_dom::traits_src::shell::Viewport;
+
+    let _page_guard = ThreadPageGuard::enter(iframe_url);
+    let _iframe_guard = devtools::IframeScope::enter();
+    let saved_import_map = IMPORT_MAP.with(|m| m.borrow().clone());
+
+    devtools::record_script(
+        devtools::ScriptKind::Iframe,
+        iframe_url,
+        html.to_string(),
+        None,
+    );
+
+    let (rendered, event_map_json, js_state) = if html.contains("<script") {
+        match run_zipp_js(html, iframe_url, iframe_size) {
+            Some((r, emap, state)) => (r, Some(emap), Some(state)),
+            None => (html.to_string(), None, None),
+        }
+    } else {
+        (html.to_string(), None, None)
+    };
+
+    // Restore parent page's import map immediately after iframe script init.
+    IMPORT_MAP.with(|m| *m.borrow_mut() = saved_import_map);
+
+    let out = strip_noscript(&rendered);
+    let out = out
+        .replace("class=\"no-js", "class=\"js")
+        .replace("class=\"client-nojs", "class=\"client-js");
+    let out = inline_images(&out, iframe_url);
+
+    let pvp = parent.viewport();
+    let scale = pvp.scale();
+    let vp = Viewport::new(
+        ((iframe_size.0 as f32) * scale).round().max(1.0) as u32,
+        ((iframe_size.1 as f32) * scale).round().max(1.0) as u32,
+        scale,
+        pvp.color_scheme,
+    );
+    let config = DocumentConfig {
+        font_ctx: Some(parent.clone_font_ctx()),
+        preloaded_fonts: parent.clone_registered_fonts(),
+        base_url: Some(iframe_url.to_string()),
+        net_provider: Some(parent.net_provider.clone()),
+        navigation_provider: Some(parent.navigation_provider.clone()),
+        shell_provider: Some(parent.shell_provider.clone()),
+        html_parser_provider: Some(parent.html_parser_provider.clone()),
+        media_provider: parent.media_provider.clone(),
+        viewport: Some(vp),
+        ..Default::default()
+    };
+
+    let mut sub_doc = HtmlDocument::from_html(&out, config);
+    apply_canvas_frames(&mut sub_doc);
+
+    let emap_json = event_map_json.unwrap_or_else(|| "{}".to_string());
+    let flid_map = event_bridge::build_flid_map(sub_doc.as_ref());
+    let bridge = event_bridge::JsEventBridge::new_subdocument(
+        flid_map,
+        &emap_json,
+        js_state,
+        iframe_url,
+        depth + 1,
+    );
+    sub_doc.set_event_handler(Box::new(bridge));
+    sync_iframes(sub_doc.as_mut(), iframe_url, depth + 1);
+    sub_doc.as_mut().resolve(0.0);
+    sub_doc
+}
+
+/// Mount or update live `SubDocument`s for all `<iframe>` elements in `doc`.
+///
+/// Safe to call repeatedly (after initial parse, after JS re-renders, and in
+/// `run_tasks`): already-mounted iframes whose `src`/`srcdoc` matches are
+/// skipped in O(1), while newly-added or `src`-changed iframes (e.g. clicking
+/// "Reset" on a live sandbox demo) are fetched and mounted immediately.
+pub(crate) fn sync_iframes(doc: &mut BaseDocument, parent_url: &str, depth: u8) -> bool {
+    const MAX_IFRAME_DEPTH: u8 = 2;
+    if depth >= MAX_IFRAME_DEPTH {
+        return false;
+    }
+    let Ok(iframe_ids) = doc.query_selector_all("iframe") else {
+        return false;
+    };
+    if iframe_ids.is_empty() {
+        return false;
+    }
+
+    let mut mounted_any = false;
+    let src_attr = zipp_dom::LocalName::from("src");
+    let srcdoc_attr = zipp_dom::LocalName::from("srcdoc");
+    let refpol_attr = zipp_dom::LocalName::from("referrerpolicy");
+
+    for iframe_id in iframe_ids {
+        let Some(node) = doc.get_node(iframe_id) else {
+            continue;
+        };
+        let Some(el) = node.element_data() else {
+            continue;
+        };
+        let raw_src = el.attr(src_attr.clone()).map(str::trim).unwrap_or("");
+        let raw_srcdoc = el.attr(srcdoc_attr.clone()).map(str::to_string);
+        let no_referrer = el
+            .attr(refpol_attr.clone())
+            .is_some_and(|v| v.eq_ignore_ascii_case("no-referrer"));
+
+        let target_url = if let Some(ref sd) = raw_srcdoc {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            sd.hash(&mut h);
+            format!("about:srcdoc#{}", h.finish())
+        } else if !raw_src.is_empty()
+            && !raw_src.eq_ignore_ascii_case("about:blank")
+            && !raw_src.to_ascii_lowercase().starts_with("javascript:")
+        {
+            resolve(parent_url, raw_src)
+        } else {
+            continue;
+        };
+
+        // Guard against recursive self-embedding loops.
+        if target_url == parent_url {
+            continue;
+        }
+
+        // Skip if already mounted for this exact target URL.
+        if let zipp_dom::node::SpecialElementData::SubDocument(ref existing) = el.special_data
+            && existing.inner().base_url() == target_url
+        {
+            continue;
+        }
+
+        // Skip previously failed iframe fetches on this page so we don't spin.
+        if FAILED_IFRAMES
+            .lock()
+            .is_ok_and(|set| set.contains(&target_url))
+        {
+            continue;
+        }
+
+        // Estimate the iframe's CSS viewport size from its layout box (or sensible default).
+        let (_, _, bw, bh) = node.transformed_border_rect();
+        let iframe_w = if bw >= 64.0 { bw.round() as u32 } else { 800 };
+        let iframe_h = if bh >= 64.0 { bh.round() as u32 } else { 560 };
+
+        let html = match raw_srcdoc {
+            Some(sd) => sd,
+            None => match fetch_iframe_document(&target_url, parent_url, no_referrer) {
+                Ok(h) => h,
+                Err(e) => {
+                    eprintln!("[IFRAME] failed to load {target_url}: {e}");
+                    console::push(console::Level::Warn, format!("iframe {target_url}: {e}"));
+                    if let Ok(mut set) = FAILED_IFRAMES.lock() {
+                        set.insert(target_url);
+                    }
+                    continue;
+                }
+            },
+        };
+
+        let sub_doc = build_iframe_document(doc, &target_url, &html, (iframe_w, iframe_h), depth);
+        doc.set_sub_document(iframe_id, Box::new(sub_doc));
+        mounted_any = true;
+    }
+
+    if mounted_any {
+        doc.shell_provider.request_redraw();
+    }
+    mounted_any
 }
 
 /// Show the WebGL and WebGPU frames presented since the last call: each becomes the
@@ -4476,18 +5238,161 @@ pub(crate) fn console_button_inner(badge: &str) -> String {
     )
 }
 
+/// Inner markup for the DevTools panel's Copy button (`Copy` / `Copied!`).
+pub(crate) fn console_copy_button_inner(copied: bool) -> String {
+    devtools::copy_button_inner(copied)
+}
+
+/// Render the inner HTML of `#__zipp_tabbar` (all open tabs + the `+` New Tab button).
+/// Called both during initial chrome injection and in-place by `JsEventBridge`
+/// whenever background tabs open/close or `document.title` changes.
+pub(crate) fn tabbar_inner_html(fallback_url: &str) -> String {
+    let token = chrome_token();
+    let incognito = zipp_shell::profile::is_incognito();
+    let items = tabs::chrome_items(fallback_url);
+
+    let (
+        active_bg,
+        active_fg,
+        active_border,
+        active_bottom,
+        active_top_accent,
+        inactive_fg,
+        inactive_divider,
+        close_color,
+        new_btn_color,
+        mono_bg_active,
+        mono_fg_active,
+        mono_bg_inactive,
+        mono_fg_inactive,
+    ) = if incognito {
+        (
+            "#1b162e",
+            "#f8fafc",
+            "#35285c",
+            "#1b162e",
+            "2px solid #8b5cf6",
+            "#a799cc",
+            "rgba(167, 139, 250, 0.18)",
+            "#9b8ec4",
+            "#c4b5fd",
+            "rgba(139, 92, 246, 0.28)",
+            "#ddd6fe",
+            "rgba(139, 92, 246, 0.14)",
+            "#a78bfa",
+        )
+    } else {
+        (
+            "#ffffff",
+            "#0f172a",
+            "#cbd5e1",
+            "#ffffff",
+            "2px solid #7c3aed",
+            "#475569",
+            "rgba(100, 116, 139, 0.24)",
+            "#64748b",
+            "#475569",
+            "#ede9fe",
+            "#6d28d9",
+            "rgba(15, 23, 42, 0.08)",
+            "#475569",
+        )
+    };
+
+    let mut html = String::with_capacity(items.len() * 640 + 512);
+    for item in &items {
+        let title_esc = escape_html_attr(&item.title);
+        let url_esc = escape_html_attr(&item.url);
+        let icon_bg = if item.active { mono_bg_active } else { mono_bg_inactive };
+        let icon_fg = if item.active { mono_fg_active } else { mono_fg_inactive };
+
+        let tab_icon = if item.loading {
+            format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="{icon_fg}" stroke-width="2.4" stroke-linecap="round" style="flex-shrink:0"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>"#
+            )
+        } else if item.url.starts_with("zipp:newtab") || item.url.starts_with("about:newtab") {
+            format!(
+                r#"<span style="width:16px;height:16px;border-radius:5px;background:{icon_bg};color:{icon_fg};display:inline-flex;align-items:center;justify-content:center;flex-shrink:0"><svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 256 256"><path d="M92 0 0 122h58l-25 86L142 69h-62z" transform="translate(57 24)" fill="currentColor"/></svg></span>"#
+            )
+        } else if item.url.starts_with("zipp:settings") || item.url.starts_with("zipp:properties") {
+            format!(
+                r#"<span style="width:16px;height:16px;border-radius:5px;background:{icon_bg};color:{icon_fg};display:inline-flex;align-items:center;justify-content:center;flex-shrink:0"><svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 1v4"/><path d="M12 19v4"/><path d="M4.22 4.22l2.83 2.83"/><path d="M16.95 16.95l2.83 2.83"/><path d="M1 12h4"/><path d="M19 12h4"/></svg></span>"#
+            )
+        } else if item.url.starts_with("zipp:history") {
+            format!(
+                r#"<span style="width:16px;height:16px;border-radius:5px;background:{icon_bg};color:{icon_fg};display:inline-flex;align-items:center;justify-content:center;flex-shrink:0"><svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg></span>"#
+            )
+        } else {
+            let letter = url::Url::parse(&item.url)
+                .ok()
+                .and_then(|u| u.host_str().map(|h| h.strip_prefix("www.").unwrap_or(h).to_string()))
+                .and_then(|h| h.chars().find(|c| c.is_ascii_alphanumeric()))
+                .or_else(|| item.title.chars().find(|c| c.is_ascii_alphanumeric()))
+                .unwrap_or('W')
+                .to_ascii_uppercase();
+            format!(
+                r#"<span style="width:16px;height:16px;border-radius:5px;background:{icon_bg};color:{icon_fg};display:inline-flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;flex-shrink:0">{letter}</span>"#
+            )
+        };
+
+        let (cls, box_style, weight) = if item.active {
+            (
+                "__zt_tab __zt_active",
+                format!(
+                    "flex:1 1 170px;max-width:228px;min-width:74px;height:31px;margin-bottom:-1px;display:flex;align-items:center;border-radius:9px 9px 0 0;background:{active_bg};color:{active_fg};border-left:1px solid {active_border};border-right:1px solid {active_border};border-top:{active_top_accent};border-bottom:1px solid {active_bottom};box-sizing:border-box;overflow:hidden"
+                ),
+                "600",
+            )
+        } else {
+            (
+                "__zt_tab __zt_inactive",
+                format!(
+                    "flex:1 1 160px;max-width:216px;min-width:68px;height:28px;margin-bottom:2px;display:flex;align-items:center;border-radius:8px;background:transparent;color:{inactive_fg};border-right:1px solid {inactive_divider};box-sizing:border-box;overflow:hidden"
+                ),
+                "500",
+            )
+        };
+
+        html.push_str(&format!(
+            r#"<div class="{cls}" data-tab-id="{id}" style="{box_style}"><a class="__zt_switch" href="zipp-nav:switch-tab?id={id}&amp;__zipp_chrome={token}" title="{url_esc}" style="flex:1;min-width:0;height:100%;display:flex;align-items:center;gap:7px;padding:0 4px 0 9px;text-decoration:none;color:inherit;overflow:hidden">{tab_icon}<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;font-weight:{weight}">{title_esc}</span></a><a class="__zt_close" href="zipp-nav:close-tab?id={id}&amp;__zipp_chrome={token}" title="Close Tab (Ctrl+W)" style="width:18px;height:18px;margin-right:5px;border-radius:999px;display:flex;align-items:center;justify-content:center;text-decoration:none;color:{close_color};font-size:14px;line-height:1;flex-shrink:0">&times;</a></div>"#,
+            id = item.id,
+        ));
+    }
+
+    html.push_str(&format!(
+        r#"<a id="__zipp_new_tab_btn" href="zipp-nav:new-tab?__zipp_chrome={token}" title="New Tab (Ctrl+T)" style="width:28px;height:28px;margin:0 0 2px 2px;border-radius:8px;display:flex;align-items:center;justify-content:center;text-decoration:none;color:{new_btn_color};flex-shrink:0"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></a>"#
+    ));
+    html
+}
+
 fn toolbar_markup(current_url: &str) -> String {
     let css = chrome_css(console::is_open(), is_mobile_view());
     let token = chrome_token();
     let console_line = console_input();
     let button = console_button_inner(&console::badge_text());
-    let counts = console::counts_text();
-    let lines = console::lines_html();
+    let dt_header = devtools::header_html(token, false);
+    let lines = devtools::body_html(None);
+    let tabs_html = tabbar_inner_html(current_url);
+    let (can_back, can_forward) = tabs::active_nav_state();
     let incognito = zipp_shell::profile::is_incognito();
     let on_settings = current_url == "zipp:settings" || current_url == "zipp:properties";
     let on_history = current_url == "zipp:history";
-    let (bar_bg, bar_border, icon_color, divider_color, omni_bg, omni_border, input_fg, active_pill, incog_pill) = if incognito {
+    let (
+        strip_bg,
+        strip_border,
+        bar_bg,
+        bar_border,
+        icon_color,
+        divider_color,
+        omni_bg,
+        omni_border,
+        input_fg,
+        active_pill,
+        incog_pill,
+    ) = if incognito {
         (
+            "linear-gradient(180deg, #100c1e 0%, #0d0a18 100%)",
+            "#2d234a",
             "linear-gradient(180deg, #1b162e 0%, #151026 100%)",
             "#2d234a",
             "#c4b5fd",
@@ -4500,6 +5405,8 @@ fn toolbar_markup(current_url: &str) -> String {
         )
     } else {
         (
+            "linear-gradient(180deg, #e2e8f0 0%, #dbe3ee 100%)",
+            "#cbd5e1",
             "linear-gradient(180deg, #ffffff 0%, #f4f6fa 100%)",
             "#dde3ec",
             "#475569",
@@ -4507,7 +5414,7 @@ fn toolbar_markup(current_url: &str) -> String {
             "#eef2f7",
             "#d5dde8",
             "#0f172a",
-            "#dbeafe",
+            "#ede9fe",
             "",
         )
     };
@@ -4515,58 +5422,65 @@ fn toolbar_markup(current_url: &str) -> String {
         r##"<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>"##
     } else if current_url.starts_with("zipp:") || current_url.starts_with("about:") {
         if incognito {
-            r##"<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#a78bfa" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>"##
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 256 256" style="flex-shrink:0"><path d="M92 0 0 122h58l-25 86L142 69h-62z" transform="translate(57 24)" fill="#c4b5fd"/></svg>"##
         } else {
-            r##"<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#2563eb" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>"##
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 256 256" style="flex-shrink:0"><path d="M92 0 0 122h58l-25 86L142 69h-62z" transform="translate(57 24)" fill="#7c3aed"/></svg>"##
         }
     } else {
         r##"<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#64748b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>"##
     };
     let settings_bg = if on_settings { active_pill } else { "transparent" };
     let history_bg = if on_history { active_pill } else { "transparent" };
+    let back_extra = if can_back { "opacity:1" } else { "opacity:0.38;cursor:default" };
+    let fwd_extra = if can_forward { "opacity:1" } else { "opacity:0.38;cursor:default" };
+    let is_newtab = current_url == tabs::NEW_TAB_URL
+        || current_url.eq_ignore_ascii_case("about:newtab")
+        || current_url.eq_ignore_ascii_case("about:blank");
     let form_action = if current_url.starts_with("zipp:") || current_url.starts_with("about:") {
-        "https://lance.name"
+        tabs::NEW_TAB_URL
     } else {
         current_url
     };
     let form_action_esc = escape_html_attr(form_action);
-    let current_url_esc = escape_html_attr(current_url);
+    // Keep the omnibox empty on New Tab so the user can type a URL immediately
+    // without clearing "zipp:newtab" first.
+    let omnibox_value_esc = if is_newtab {
+        String::new()
+    } else {
+        escape_html_attr(current_url)
+    };
     let btn_style = format!(
         "display:flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:8px;text-decoration:none;color:{icon_color};flex-shrink:0"
     );
     format!(
-        r#"<form id="__zipp_chrome" action="{form_action_esc}" method="GET" style="position:absolute;left:0;right:0;z-index:2147483647;color:{input_fg};height:{TOOLBAR_HEIGHT}px;background:{bar_bg};border-bottom:1px solid {bar_border};display:flex;align-items:center;padding:0 10px;gap:4px;font-family:'Segoe UI',Arial,sans-serif;font-size:13px;line-height:normal;text-align:left;box-sizing:border-box;margin:0">
+        r#"<div id="__zipp_chrome" style="position:absolute;left:0;right:0;z-index:2147483647;height:{TOOLBAR_HEIGHT}px;display:flex;flex-direction:column;font-family:'Segoe UI',Arial,sans-serif;font-size:13px;line-height:normal;text-align:left;box-sizing:border-box;margin:0">
     <style id="__zipp_chrome_css">{css}</style>
-    <input type="hidden" name="__zipp_chrome" value="{token}" />
-    <a href="zipp-nav:back?__zipp_chrome={token}" title="Back (Alt+Left)" style="{btn_style}"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg></a>
-    <a href="zipp-nav:forward?__zipp_chrome={token}" title="Forward (Alt+Right)" style="{btn_style}"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg></a>
-    <a href="zipp-nav:reload?__zipp_chrome={token}" title="Reload (F5)" style="{btn_style}"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg></a>
-    <a id="__zipp_home_button" href="zipp-nav:home?__zipp_chrome={token}" title="Home / Start Page (Alt+Home)" style="{btn_style}"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg></a>
-    <span style="width:1px;height:18px;background:{divider_color};margin:0 3px;flex-shrink:0"></span>
-    {incog_pill}
-    <div style="flex:1;min-width:0;height:32px;display:flex;align-items:center;gap:8px;padding:0 12px;background:{omni_bg};border:1px solid {omni_border};border-radius:10px;box-sizing:border-box">
-      {proto_icon}
-      <input type="text" name="__nav_url" value="{current_url_esc}" style="flex:1;min-width:0;height:28px;padding:0;border:0;font-family:'Segoe UI',Arial,sans-serif;font-size:13px;font-weight:normal;font-style:normal;letter-spacing:normal;background:transparent;color:{input_fg};outline:none;box-sizing:border-box" />
-    </div>
-    <span style="width:1px;height:18px;background:{divider_color};margin:0 3px;flex-shrink:0"></span>
-    <a id="__zipp_incognito_button" href="zipp-nav:incognito?__zipp_chrome={token}" title="New Incognito Window (Ctrl+Shift+N)" style="{btn_style}"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/><path d="m3 3 18 18"/></svg></a>
-    <a id="__zipp_history_button" href="zipp-nav:history?__zipp_chrome={token}" title="Browsing History (Ctrl+H)" style="{btn_style};background:{history_bg}"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></a>
-    <a id="__zipp_cache_button" href="zipp-nav:clear-cache?__zipp_chrome={token}" title="Clear Cache &amp; Reload (Ctrl+Shift+Delete)" style="{btn_style}"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg></a>
-    <a id="__zipp_settings_button" href="zipp-nav:settings?__zipp_chrome={token}" title="Properties, Cache &amp; History (Ctrl+,)" style="{btn_style};background:{settings_bg}"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.604.852.997 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></a>
-    <a id="__zipp_mobile_button" href="zipp-view:mobile" title="Toggle Mobile View (Ctrl+Shift+M)" style="{btn_style}"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><path d="M12 18h.01"/></svg></a>
-    <a id="__zipp_console_button" href="zipp-console:toggle" title="Console (F12)" style="display:flex;align-items:center;justify-content:center;gap:4px;min-width:30px;height:30px;padding:0 6px;border-radius:8px;text-decoration:none;color:{icon_color};flex-shrink:0">{button}</a>
-  </form>
+    <div id="__zipp_tabbar" style="height:{TAB_BAR_HEIGHT}px;background:{strip_bg};border-bottom:1px solid {strip_border};display:flex;align-items:flex-end;gap:4px;padding:4px 8px 0 8px;box-sizing:border-box;overflow:hidden;flex-shrink:0">{tabs_html}</div>
+    <form id="__zipp_navbar" action="{form_action_esc}" method="GET" style="height:{NAV_BAR_HEIGHT}px;color:{input_fg};background:{bar_bg};border-bottom:1px solid {bar_border};display:flex;align-items:center;padding:0 10px;gap:4px;box-sizing:border-box;margin:0;flex-shrink:0">
+      <input type="hidden" name="__zipp_chrome" value="{token}" />
+      <a href="zipp-nav:back?__zipp_chrome={token}" title="Back (Alt+Left)" style="{btn_style};{back_extra}"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg></a>
+      <a href="zipp-nav:forward?__zipp_chrome={token}" title="Forward (Alt+Right)" style="{btn_style};{fwd_extra}"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg></a>
+      <a href="zipp-nav:reload?__zipp_chrome={token}" title="Reload (F5)" style="{btn_style}"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg></a>
+      <a id="__zipp_home_button" href="zipp-nav:home?__zipp_chrome={token}" title="Home / Start Page (Alt+Home)" style="{btn_style}"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg></a>
+      <span style="width:1px;height:18px;background:{divider_color};margin:0 3px;flex-shrink:0"></span>
+      {incog_pill}
+      <div style="flex:1;min-width:0;height:31px;display:flex;align-items:center;gap:8px;padding:0 12px;background:{omni_bg};border:1px solid {omni_border};border-radius:10px;box-sizing:border-box;cursor:text">
+        {proto_icon}
+        <input id="__zipp_url_input" type="text" name="__nav_url" value="{omnibox_value_esc}" placeholder="Search or enter URL..." style="flex:1;min-width:0;height:27px;padding:0;border:0;font-family:'Segoe UI',Arial,sans-serif;font-size:13px;font-weight:normal;font-style:normal;letter-spacing:normal;background:transparent;color:{input_fg};outline:none;box-sizing:border-box" />
+      </div>
+      <span style="width:1px;height:18px;background:{divider_color};margin:0 3px;flex-shrink:0"></span>
+      <a id="__zipp_incognito_button" href="zipp-nav:incognito?__zipp_chrome={token}" title="New Incognito Window (Ctrl+Shift+N)" style="{btn_style}"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/><path d="m3 3 18 18"/></svg></a>
+      <a id="__zipp_history_button" href="zipp-nav:history?__zipp_chrome={token}" title="Browsing History (Ctrl+H)" style="{btn_style};background:{history_bg}"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></a>
+      <a id="__zipp_cache_button" href="zipp-nav:clear-cache?__zipp_chrome={token}" title="Clear Cache &amp; Reload (Ctrl+Shift+Delete)" style="{btn_style}"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg></a>
+      <a id="__zipp_settings_button" href="zipp-nav:settings?__zipp_chrome={token}" title="Properties, Cache &amp; History (Ctrl+,)" style="{btn_style};background:{settings_bg}"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.604.852.997 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></a>
+      <a id="__zipp_mobile_button" href="zipp-view:mobile" title="Toggle Mobile View (Ctrl+Shift+M)" style="{btn_style}"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><path d="M12 18h.01"/></svg></a>
+      <a id="__zipp_inspect_button" href="zipp-devtools:inspect" title="Inspect Page, Source &amp; Scripts (Ctrl+Shift+I)" style="{btn_style}"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg></a>
+      <a id="__zipp_console_button" href="zipp-console:toggle" title="Console (F12)" style="display:flex;align-items:center;justify-content:center;gap:4px;min-width:30px;height:30px;padding:0 6px;border-radius:8px;text-decoration:none;color:{icon_color};flex-shrink:0">{button}</a>
+    </form>
+  </div>
   <div id="__zipp_console" style="position:absolute;left:0;right:0;z-index:2147483646;flex-direction:column;background:#0f172a;border-bottom:1px solid #1e293b;font-family:Consolas,'Liberation Mono',monospace;font-size:12px;line-height:17px;color:#e2e8f0;text-align:left;box-sizing:border-box;margin:0">
-    <div style="display:flex;align-items:center;gap:12px;padding:6px 12px;background:#131b2c;border-bottom:1px solid #1f2a40;font-family:'Segoe UI',Arial,sans-serif;font-size:12px;flex-shrink:0">
-      <b style="color:#f8fafc">Console</b><span id="__zipp_console_counts" style="color:#94a3b8">{counts}</span><span style="flex:1"></span>
-      <a href="zipp-nav:settings?__zipp_chrome={token}" style="color:#60a5fa;text-decoration:none;font-weight:500">Properties</a>
-      <a href="zipp-nav:history?__zipp_chrome={token}" style="color:#60a5fa;text-decoration:none;font-weight:500">History</a>
-      <a href="zipp-nav:clear-cache?__zipp_chrome={token}" style="color:#60a5fa;text-decoration:none;font-weight:500">Clear Cache</a>
-      <a href="zipp-nav:clear-data?__zipp_chrome={token}" style="color:#f87171;text-decoration:none;font-weight:500">Clear Site Data</a>
-      <a href="zipp-console:clear" id="__zipp_console_clear" style="color:#cbd5e1;text-decoration:none;font-weight:500">Clear</a>
-      <a href="zipp-console:toggle" id="__zipp_console_close" style="color:#cbd5e1;text-decoration:none;font-weight:500">Close</a>
-    </div>
-    <div id="__zipp_console_lines" style="flex:1;overflow:auto;min-height:0;padding:4px 8px">{lines}</div>
+    <div id="__zipp_dt_header" style="display:flex;align-items:center;gap:8px;padding:5px 12px;background:#131b2c;border-bottom:1px solid #1f2a40;font-family:'Segoe UI',Arial,sans-serif;font-size:12px;flex-shrink:0;overflow:hidden">{dt_header}</div>
+    <div id="__zipp_console_lines" style="flex:1;overflow:auto;min-height:0;padding:0">{lines}</div>
     <form id="__zipp_console_form" action="{form_action_esc}" method="GET" style="display:flex;align-items:center;gap:8px;margin:0;padding:4px 12px;background:#0a0e17;border-top:1px solid #1f2a40;flex-shrink:0">{console_line}</form>
   </div>"#
     )
@@ -4747,6 +5661,9 @@ fn normalize_url(s: &str) -> String {
         return "https://html.duckduckgo.com".to_string();
     }
     let lower = s.to_ascii_lowercase();
+    if matches!(lower.as_str(), "zipp:newtab" | "about:newtab" | "about:blank") {
+        return tabs::NEW_TAB_URL.to_string();
+    }
     if matches!(
         lower.as_str(),
         "zipp:settings" | "zipp:properties" | "about:settings" | "about:properties"
@@ -4930,7 +5847,9 @@ mod tests {
         let page = r#"<!doctype html><html lang=en><head><style>body{margin:auto}</style></head><body class="home" style="padding:20px"><p>Hi</p></body></html>"#;
         let out = wrap_with_toolbar(page, "https://example.com/");
         assert!(out.starts_with("<!doctype html><html lang=en>"));
-        assert!(out.contains(r#"<body class="home" style="padding:20px"><p>Hi</p><form id="__zipp_chrome""#));
+        assert!(out.contains(r#"<body class="home" style="padding:20px"><p>Hi</p><div id="__zipp_chrome""#));
+        assert!(out.contains(r#"<div id="__zipp_tabbar""#));
+        assert!(out.contains(r#"<form id="__zipp_navbar""#));
         // The console panel follows the toolbar, closed.
         assert!(out.contains(r#"<div id="__zipp_console""#));
         assert!(out.ends_with("</div></body></html>"));
@@ -4938,7 +5857,7 @@ mod tests {
         // A page with no doctype still gets standards mode, and one with no
         // closing body tag still gets its toolbar.
         let out = wrap_with_toolbar("<p>bare", "https://example.com/");
-        assert!(out.starts_with("<!DOCTYPE html><p>bare<form id=\"__zipp_chrome\""));
+        assert!(out.starts_with("<!DOCTYPE html><p>bare<div id=\"__zipp_chrome\""));
     }
 
     #[test]
@@ -4979,13 +5898,13 @@ mod tests {
 
     #[test]
     fn prerender_only_follows_page_links() {
-        assert!(looks_like_page("https://lance.name"));
-        assert!(looks_like_page("https://lance.name/about/"));
+        assert!(looks_like_page("https://example.com"));
+        assert!(looks_like_page("https://example.com/about/"));
         assert!(looks_like_page("https://example.com/post.html"));
         assert!(looks_like_page("https://example.com/v1.2/notes"));
-        assert!(!looks_like_page("https://lance.name/assets/index-Car7W7dH.css"));
-        assert!(!looks_like_page("https://lance.name/favicon.svg"));
-        assert!(!looks_like_page("https://lance.name/downloads/Lance-Baker-Resume.pdf"));
+        assert!(!looks_like_page("https://example.com/assets/index-Car7W7dH.css"));
+        assert!(!looks_like_page("https://example.com/favicon.svg"));
+        assert!(!looks_like_page("https://example.com/downloads/guide.pdf"));
         assert!(!looks_like_page("not a url"));
     }
 
@@ -5091,7 +6010,13 @@ mod tests {
 
     #[test]
     fn toolbar_includes_mobile_view_and_clear_cache_controls() {
+        tabs::init("https://example.com/");
         let out = wrap_with_toolbar("<p>hi</p>", "https://example.com/");
+        assert!(out.contains(r#"id="__zipp_tabbar""#));
+        assert!(out.contains(r#"id="__zipp_new_tab_btn""#));
+        assert!(out.contains(r#"href="zipp-nav:new-tab?__zipp_chrome="#));
+        assert!(out.contains(r#"href="zipp-nav:switch-tab?id="#));
+        assert!(out.contains(r#"href="zipp-nav:close-tab?id="#));
         assert!(out.contains(r#"id="__zipp_home_button""#));
         assert!(out.contains(r#"id="__zipp_incognito_button""#));
         assert!(out.contains(r#"id="__zipp_settings_button""#));
@@ -5101,14 +6026,34 @@ mod tests {
         assert!(out.contains(r#"href="zipp-nav:clear-cache?__zipp_chrome="#));
         assert!(out.contains(r#"href="zipp-nav:clear-data?__zipp_chrome="#));
         assert!(out.contains(r#"href="zipp-nav:settings?__zipp_chrome="#));
+        assert!(out.contains(r#"id="__zipp_console_copy""#));
+        assert!(out.contains(r#"href="zipp-console:copy""#));
         assert!(out.contains(r#"href="zipp-nav:incognito?__zipp_chrome="#));
+        assert!(out.contains(r#"id="__zipp_url_input""#));
+        assert!(out.contains(r#"value="https://example.com/""#));
+
+        // New Tab keeps the address bar blank (no "zipp:newtab" prefilled) with a placeholder.
+        let newtab_bar = toolbar_markup(tabs::NEW_TAB_URL);
+        assert!(newtab_bar.contains(r#"id="__zipp_url_input" type="text" name="__nav_url" value="" placeholder="Search or enter URL...""#));
+        assert!(!newtab_bar.contains(r#"value="zipp:newtab""#));
     }
 
     #[test]
     fn properties_page_and_internal_url_normalization() {
+        assert_eq!(normalize_url("about:newtab"), "zipp:newtab");
+        assert_eq!(normalize_url("about:blank"), "zipp:newtab");
         assert_eq!(normalize_url("about:settings"), "zipp:settings");
         assert_eq!(normalize_url("about:history"), "zipp:history");
         assert_eq!(normalize_url("zipp:properties"), "zipp:settings");
+        let newtab = internal_page_html("zipp:newtab", None, None, None).expect("newtab page html");
+        assert!(newtab.contains("ZIPP Browser"));
+        assert!(newtab.contains("Part of the ZIPP Project"));
+        assert!(newtab.contains("Quick Access"));
+        assert!(newtab.contains(r#"name="__nav_url""#));
+        assert!(newtab.contains("Ctrl+T"));
+        assert!(newtab.contains(r#"action="zipp:newtab""#));
+        assert!(!newtab.contains(r#"action="https://lance.name""#));
+        assert_eq!(settings::DEFAULT_START_PAGE, "zipp:newtab");
         let html = internal_page_html("zipp:settings", Some("Start page saved"), None, Some("https://softn.com"))
             .expect("properties page html");
         assert!(html.contains("Start Page"));
@@ -5117,6 +6062,7 @@ mod tests {
         assert!(html.contains("New Incognito Window"));
         assert!(html.contains("Start page saved"));
         assert!(html.contains("Use Current Page"));
+        assert!(!html.contains("Default (lance.name)"));
     }
 
     #[test]

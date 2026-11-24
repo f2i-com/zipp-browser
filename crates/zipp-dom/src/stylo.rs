@@ -160,6 +160,13 @@ impl crate::document::BaseDocument {
         let token = RecalcStyle::pre_traverse(root, &context);
 
         if token.should_traverse() {
+            // `STYLE_THREAD_POOL` is a single process-wide Rayon pool whose worker
+            // threads keep a thread-local `AtomicRefCell<ThreadLocalStyleContext>`.
+            // Serialize concurrent callers (e.g. parallel tests or multiple embedded
+            // documents) so two traversals never work-steal onto the same worker and
+            // trip `AtomicRefCell: already mutably borrowed`.
+            static STYLO_TRAVERSE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _traverse_guard = STYLO_TRAVERSE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             // Style the elements, resolving their data
             let traverser = RecalcStyle::new(context);
             let rayon_pool = STYLE_THREAD_POOL.pool();

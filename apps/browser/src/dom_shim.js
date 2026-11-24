@@ -452,6 +452,34 @@ function __rawRemoveChild(parent, child) {
     if (was) __ceDisconnected(child);
     return child;
 }
+var __headVersion = 0;
+function __inHead(node) {
+    for (var p = node; p; p = p._parentNode) {
+        if (p.nodeType === 1 && p.tagName === "HEAD") return true;
+    }
+    return false;
+}
+function __maybeFireLinkLoad(node) {
+    if (!node || node.nodeType !== 1 || node.tagName !== "LINK") return;
+    if (!node.isConnected) return;
+    var rel = (node.getAttribute("rel") || "").toLowerCase();
+    var tokens = rel.split(/\s+/);
+    var isStyleOrPreload = tokens.indexOf("stylesheet") >= 0 || tokens.indexOf("preload") >= 0 || tokens.indexOf("modulepreload") >= 0;
+    if (!isStyleOrPreload) return;
+    var href = node.getAttribute("href") || "";
+    if (!href) return;
+    var key = rel + "|" + href;
+    if (node._zippLinkLoadedKey === key) return;
+    node._zippLinkLoadedKey = key;
+    if (tokens.indexOf("stylesheet") >= 0) __headVersion++;
+    __zippMicrotask(function () {
+        var ev = new Event("load");
+        try { node.dispatchEvent(ev); } catch (e) {}
+        if (typeof node.onload === "function") {
+            try { node.onload.call(node, ev); } catch (e) {}
+        }
+    });
+}
 function __rawAppendChild(parent, child) {
     if (!child) return child;
     if (child.nodeType === 11) {
@@ -464,8 +492,10 @@ function __rawAppendChild(parent, child) {
     child.ownerDocument = parent.ownerDocument || parent;
     parent._childNodes.push(child);
     __markMut(parent);
+    if (__inHead(parent)) __headVersion++;
     if (__moCount) __moNotify(parent, "childList", null, null, [child], []);
     __ceConnected(child);
+    __maybeFireLinkLoad(child);
     return child;
 }
 function __rawInsertBefore(parent, n, ref) {
@@ -483,8 +513,10 @@ function __rawInsertBefore(parent, n, ref) {
     else parent._childNodes.push(n);
     n._parentNode = parent;
     n.ownerDocument = parent.ownerDocument || parent;
+    if (__inHead(parent)) __headVersion++;
     if (__moCount) __moNotify(parent, "childList", null, null, [n], []);
     __ceConnected(n);
+    __maybeFireLinkLoad(n);
     return n;
 }
 
@@ -772,6 +804,7 @@ var Element = class Element extends DOMNode {
         n=String(n); v=String(v);
         var old = (__ceCount > 0 || __moCount > 0) ? this.getAttribute(n) : null;
         if(this.attributes[n]!==v) __markMut(this); this.attributes[n]=v; if(n==="class")this._className=v; if(n==="id")this._domId=v; if(n==="style"){__clearStyle(this.style);this._ps(v);}
+        if (this.tagName === "LINK" && (n === "rel" || n === "href")) __maybeFireLinkLoad(this);
         if (__moCount > 0) __moNotify(this, "attributes", n, old, null, null);
         if (__ceCount > 0) __ceAttributeChanged(this, n, old, v);
     }
@@ -847,6 +880,166 @@ var Element = class Element extends DOMNode {
     insertAdjacentHTML(pos,html) { this.insertAdjacentElement(pos,__markupText(String(html))); }
     getAttributeNames() { return __attrNames(this.attributes); }
     toggleAttribute(name,force) { if(force!==undefined){if(force)this.setAttribute(name,"");else this.removeAttribute(name);return force;} if(this.hasAttribute(name)){this.removeAttribute(name);return false;} this.setAttribute(name,""); return true; }
+    animate(keyframes, options) {
+        var effect = new KeyframeEffect(this, keyframes, options);
+        var anim = new Animation(effect, (this.ownerDocument && this.ownerDocument.timeline) || doc.timeline);
+        if (options && typeof options === "object" && options.id !== undefined) anim.id = String(options.id);
+        if (!this._animations) this._animations = [];
+        this._animations.push(anim);
+        anim.play();
+        return anim;
+    }
+    getAnimations() {
+        return this._animations ? this._animations.filter(function (a) { return a.playState !== "idle" && a.playState !== "finished"; }) : [];
+    }
+};
+
+function __applyKeyframeStyles(target, keyframes) {
+    if (!target || !target.style || !keyframes) return;
+    var finalFrame = null;
+    if (Array.isArray(keyframes)) {
+        if (keyframes.length > 0) finalFrame = keyframes[keyframes.length - 1];
+    } else if (typeof keyframes === "object") {
+        finalFrame = {};
+        for (var pk in keyframes) {
+            if (pk === "offset" || pk === "easing" || pk === "composite") continue;
+            var pv = keyframes[pk];
+            finalFrame[pk] = Array.isArray(pv) ? pv[pv.length - 1] : pv;
+        }
+    }
+    if (!finalFrame || typeof finalFrame !== "object") return;
+    for (var prop in finalFrame) {
+        if (prop === "offset" || prop === "easing" || prop === "composite") continue;
+        var val = finalFrame[prop];
+        if (val !== undefined && val !== null) {
+            try { target.style[prop] = String(val); } catch (e) {}
+        }
+    }
+}
+
+function DocumentTimeline(options) {
+    this.originTime = (options && Number(options.originTime)) || 0;
+}
+Object.defineProperty(DocumentTimeline.prototype, "currentTime", {
+    configurable: true,
+    get: function () { return (typeof performance !== "undefined" && performance.now ? performance.now() : Date.now()) - this.originTime; }
+});
+
+function KeyframeEffect(target, keyframes, options) {
+    this.target = target || null;
+    this._keyframes = keyframes || [];
+    this.pseudoElement = (options && typeof options === "object" && options.pseudoElement) || null;
+    this.composite = (options && typeof options === "object" && options.composite) || "replace";
+    var dur = typeof options === "number" ? options : (options && typeof options === "object" && options.duration !== undefined ? options.duration : 0);
+    this._timing = {
+        delay: (options && typeof options === "object" && Number(options.delay)) || 0,
+        endDelay: (options && typeof options === "object" && Number(options.endDelay)) || 0,
+        fill: (options && typeof options === "object" && options.fill) || "none",
+        iterationStart: (options && typeof options === "object" && Number(options.iterationStart)) || 0,
+        iterations: (options && typeof options === "object" && options.iterations !== undefined) ? Number(options.iterations) : 1,
+        duration: dur,
+        direction: (options && typeof options === "object" && options.direction) || "normal",
+        easing: (options && typeof options === "object" && options.easing) || "linear"
+    };
+}
+KeyframeEffect.prototype.getKeyframes = function () { return Array.isArray(this._keyframes) ? this._keyframes.slice() : []; };
+KeyframeEffect.prototype.setKeyframes = function (kf) { this._keyframes = kf || []; };
+KeyframeEffect.prototype.getTiming = function () { return Object.assign({}, this._timing); };
+KeyframeEffect.prototype.getComputedTiming = function () {
+    var d = typeof this._timing.duration === "number" ? this._timing.duration : 0;
+    return Object.assign({}, this._timing, { activeDuration: d * (isFinite(this._timing.iterations) ? this._timing.iterations : 1), endTime: this._timing.delay + d, localTime: d, progress: 1, currentIteration: 0 });
+};
+KeyframeEffect.prototype.updateTiming = function (t) { if (t && typeof t === "object") Object.assign(this._timing, t); };
+
+function Animation(effect, timeline) {
+    this.id = "";
+    this.effect = effect || null;
+    this.timeline = timeline || null;
+    this.startTime = 0;
+    this.currentTime = 0;
+    this.playbackRate = 1;
+    this.playState = "idle";
+    this.replaceState = "active";
+    this.pending = false;
+    this.onfinish = null;
+    this.oncancel = null;
+    this.onremove = null;
+    this._listeners = {};
+    this._resolveFinished = null;
+    var self = this;
+    this.ready = Promise.resolve(this);
+    this.finished = new Promise(function (res) { self._resolveFinished = res; });
+}
+Animation.prototype.addEventListener = function (type, fn) {
+    if (typeof fn !== "function") return;
+    if (!this._listeners[type]) this._listeners[type] = [];
+    if (this._listeners[type].indexOf(fn) < 0) this._listeners[type].push(fn);
+};
+Animation.prototype.removeEventListener = function (type, fn) {
+    var list = this._listeners[type];
+    if (!list) return;
+    var i = list.indexOf(fn);
+    if (i >= 0) list.splice(i, 1);
+};
+Animation.prototype.dispatchEvent = function (ev) {
+    var list = (this._listeners[ev.type] || []).slice();
+    for (var i = 0; i < list.length; i++) { try { list[i].call(this, ev); } catch (e) {} }
+    return true;
+};
+Animation.prototype._emit = function (type) {
+    var ev = { type: type, target: this, currentTarget: this, currentTime: this.currentTime, timelineTime: this.timeline ? this.timeline.currentTime : 0 };
+    var prop = this["on" + type];
+    if (typeof prop === "function") { try { prop.call(this, ev); } catch (e) {} }
+    this.dispatchEvent(ev);
+};
+Animation.prototype.commitStyles = function () {
+    if (this.effect) __applyKeyframeStyles(this.effect.target, this.effect._keyframes);
+};
+Animation.prototype.persist = function () { this.replaceState = "persisted"; };
+Animation.prototype.updatePlaybackRate = function (r) { this.playbackRate = Number(r) || 1; };
+Animation.prototype.finish = function () {
+    if (this.playState === "finished") return;
+    this.playState = "finished";
+    if (this.effect) {
+        var fill = this.effect._timing && this.effect._timing.fill;
+        if (fill === "forwards" || fill === "both") {
+            __applyKeyframeStyles(this.effect.target, this.effect._keyframes);
+        }
+        var d = this.effect._timing && typeof this.effect._timing.duration === "number" ? this.effect._timing.duration : 0;
+        this.currentTime = d;
+    }
+    this._emit("finish");
+    if (this._resolveFinished) {
+        var fn = this._resolveFinished;
+        this._resolveFinished = null;
+        fn(this);
+    }
+};
+Animation.prototype.play = function () {
+    var self = this;
+    this.playState = "running";
+    if (this.effect && this.effect._timing && (this.effect._timing.fill === "forwards" || this.effect._timing.fill === "both")) {
+        __applyKeyframeStyles(this.effect.target, this.effect._keyframes);
+    }
+    if (typeof __zippMicrotask === "function") {
+        __zippMicrotask(function () { if (self.playState === "running") self.finish(); });
+    } else {
+        this.finish();
+    }
+};
+Animation.prototype.pause = function () { this.playState = "paused"; };
+Animation.prototype.reverse = function () { this.playbackRate = -this.playbackRate; this.play(); };
+Animation.prototype.cancel = function () {
+    if (this.playState === "idle") return;
+    this.playState = "idle";
+    this.startTime = null;
+    this.currentTime = null;
+    if (this._resolveFinished) {
+        var fn = this._resolveFinished;
+        this._resolveFinished = null;
+        fn(this);
+    }
+    this._emit("cancel");
 };
 
 var CharacterData = class CharacterData extends DOMNode {
@@ -1244,6 +1437,19 @@ function __absoluteAttr(el, attr) {
         get: function () { return __absoluteAttr(this, "href"); },
         set: function (v) { this.setAttribute("href", String(v)); }
     });
+});
+Object.defineProperty(HTMLIFrameElement.prototype, "src", {
+    configurable: true, enumerable: true,
+    get: function () { return __absoluteAttr(this, "src"); },
+    set: function (v) { this.setAttribute("src", String(v)); }
+});
+Object.defineProperty(HTMLIFrameElement.prototype, "contentWindow", {
+    configurable: true,
+    get: function () { return null; }
+});
+Object.defineProperty(HTMLIFrameElement.prototype, "contentDocument", {
+    configurable: true,
+    get: function () { return null; }
 });
 Object.defineProperty(HTMLFormElement.prototype, "action", {
     configurable: true, enumerable: true,
@@ -1945,7 +2151,7 @@ function __reflectLater() {
     __reflectAttr([HTMLMediaElement], "muted", "muted", "bool"); __reflectAttr([HTMLMediaElement], "controls", "controls", "bool");
     __reflectAttr([HTMLMediaElement], "preload", "preload", "", "auto"); __reflectAttr([HTMLVideoElement], "poster", "poster");
     __reflectAttr([HTMLVideoElement], "playsInline", "playsinline", "bool");
-    __reflectAttr([HTMLIFrameElement], "allow", "allow"); __reflectAttr([HTMLIFrameElement], "sandbox", "sandbox");
+    __reflectAttr([HTMLIFrameElement], "allow", "allow"); __reflectAttr([HTMLIFrameElement], "sandbox", "sandbox"); __reflectAttr([HTMLIFrameElement], "srcdoc", "srcdoc");
     __reflectAttr([HTMLTimeElement], "dateTime", "datetime");
     __reflectAttr([HTMLDetailsElement, HTMLDialogElement], "open", "open", "bool");
     __reflectAttr([HTMLOListElement], "reversed", "reversed", "bool"); __reflectAttr([HTMLOListElement], "start", "start", "int", 1);
@@ -2827,6 +3033,7 @@ var Document = class Document extends DOMNode {
         return cloned;
     }
     hasFocus() { return true; }
+    getAnimations() { return []; }
 };
 var doc = new Document(9, "#document");
 doc.implementation = new DOMImplementation();
@@ -2846,6 +3053,7 @@ doc.compatMode = "CSS1Compat";
 doc.characterSet = "UTF-8";
 doc.contentType = "text/html";
 doc.fonts = new FontFaceSet();
+doc.timeline = new DocumentTimeline();
 
 // --- document.cookie ---
 //
@@ -3482,6 +3690,7 @@ function __historyMove(u) {
     try { p = JSON.parse(__zippHostCall("url", String(u), String(loc.href))); } catch (e) { return; }
     loc._href = p.href; loc.pathname = p.pathname; loc.search = p.search; loc.hash = p.hash;
 }
+function __getLocationHref() { return String(loc.href || ""); }
 
 var _rafId=0, _tid=1000;
 // Animation-frame callbacks, `[id, fn]`, waiting for the next frame. A frame
@@ -4474,16 +4683,30 @@ var window = {
         __zippMicrotask(function(){ try{ fn(); }catch(e){ console.error("Uncaught (in queueMicrotask) "+((e&&(e.stack||e.message))||e)); } });
     },
     btoa:__btoa, atob:__atob,
-    // Was `function(){return null;}` -- a page whose call to action is "opens
-    // in a new tab" had a button that did nothing at all. There are no tabs
-    // yet, so this navigates the current window.
-    open:function(url){ if(url) { try { __zippHostCall("navigate", String(url)); } catch(e) {} } return null; },
+    // Open in a new tab by default (requires user gesture in the host);
+    // `_self`/`_top`/`_parent` navigate the current tab.
+    open:function(url, target){
+        if(url) {
+            try {
+                var t = target == null ? "" : String(target).toLowerCase();
+                if (t === "_self" || t === "_top" || t === "_parent") {
+                    __zippHostCall("navigate", String(url));
+                } else {
+                    __zippHostCall("open_tab", String(url));
+                }
+            } catch(e) {}
+        }
+        return null;
+    },
     close:function(){},
     postMessage:function(){},
     alert:function(){}, confirm:function(){return false;}, prompt:function(){return null;},
     focus:function(){}, blur:function(){}, print:function(){},
-    requestIdleCallback:function(fn){fn({timeRemaining:function(){return 50;},didTimeout:false});return ++_tid;},
-    cancelIdleCallback:function(){},
+    requestIdleCallback:function(fn, opts){
+        var ms = (opts && typeof opts.timeout === "number" && opts.timeout >= 0) ? Math.min(opts.timeout, 16) : 16;
+        return setTimeout(function(){ fn({timeRemaining:function(){return 50;},didTimeout:false}); }, ms);
+    },
+    cancelIdleCallback:function(id){ clearTimeout(id); },
     crypto:{
         getRandomValues:__randomFill,
         randomUUID:__randomUUID
@@ -4517,8 +4740,13 @@ var window = {
         var contentType = __headerNamed(headers, "content-type") || "text/plain;charset=UTF-8";
         var creds = opts.credentials || (isReq ? input.credentials : "");
         var credentials = creds === "omit" ? "omit" : (creds === "include" ? "include" : "same-origin");
+        var signal = opts.signal || (isReq ? input.signal : null);
         return new Promise(function(resolve, reject) {
             try {
+                if (signal && signal.aborted) {
+                    reject(new DOMException("The operation was aborted.", "AbortError"));
+                    return;
+                }
                 // Fast binary path for blob: and data: URLs (e.g. Three.js GLB/HDR
                 // assets extracted from .softn bundles or in-memory Blobs).
                 if (method === "GET" && (url.indexOf("blob:") === 0 || url.indexOf("data:") === 0)) {
@@ -4534,63 +4762,46 @@ var window = {
                     resolve(resp);
                     return;
                 }
+                var hdrJson = JSON.stringify(hdrObj);
+                var bodyStr = body == null ? "" : String(body);
+                if (typeof __zippHostCall === "function") {
+                    var asyncRes = __zippHostCall("http_async", method, String(url), bodyStr, contentType, credentials, hdrJson);
+                    if (asyncRes && asyncRes.indexOf("ASYNC:") === 0) {
+                        var rid = asyncRes.slice(6);
+                        __zippPendingFetches[rid] = { resolve: resolve, reject: reject, url: String(url), credentials: credentials, signal: signal };
+                        if (signal && typeof signal.addEventListener === "function") {
+                            signal.addEventListener("abort", function () {
+                                var p = __zippPendingFetches[rid];
+                                if (p) {
+                                    delete __zippPendingFetches[rid];
+                                    p.reject(new DOMException("The operation was aborted.", "AbortError"));
+                                }
+                            });
+                        }
+                        return;
+                    }
+                    if (asyncRes && asyncRes.indexOf("SYNC:") === 0) {
+                        resolve(__zippBuildFetchResponse(JSON.parse(asyncRes.slice(5)), String(url), credentials));
+                        return;
+                    }
+                }
                 var r;
                 __zippCredentials = credentials;
                 if (typeof __zippRequestHeaders !== "undefined") {
-                    __zippRequestHeaders = JSON.stringify(hdrObj);
+                    __zippRequestHeaders = hdrJson;
                 }
                 if (typeof http.request === "function") {
-                    r = http.request(method, String(url), body == null ? "" : String(body), contentType);
+                    r = http.request(method, String(url), bodyStr, contentType);
                 } else if (method === "POST") {
-                    r = http.post(String(url), String(body || ""), contentType);
+                    r = http.post(String(url), bodyStr, contentType);
                 } else if (method === "PUT") {
-                    r = http.put(String(url), String(body || ""), contentType);
+                    r = http.put(String(url), bodyStr, contentType);
                 } else if (method === "DELETE") {
                     r = http.delete(String(url));
                 } else {
                     r = http.get(String(url));
                 }
-                var responseBody = r.body;
-                var respHeaders = new Headers(r.headers || (r.contentType ? { "content-type": r.contentType } : {}));
-                var respType = r.contentType || respHeaders.get("content-type") || "";
-                resolve(__asResponse({
-                    ok: r.ok,
-                    status: r.status,
-                    statusText: r.ok ? "OK" : "Error",
-                    url: String(url),
-                    headers: respHeaders,
-                    text: function() { return Promise.resolve(responseBody); },
-                    json: function() { return Promise.resolve(JSON.parse(responseBody)); },
-                    // Preserve raw binary bytes for images, GLBs, HDRs, and Wasm.
-                    blob: function() {
-                        return new Promise(function(res, rej) {
-                            try {
-                                var ab = __zippFetchBytes(String(url), credentials);
-                                var b = new Blob([new Uint8Array(ab)], { type: respType });
-                                b._url = __zippAbsoluteUrl(String(url));
-                                res(b);
-                            } catch (e) {
-                                var fb = new Blob([responseBody], { type: respType });
-                                fb._url = __zippAbsoluteUrl(String(url));
-                                res(fb);
-                            }
-                        });
-                    },
-                    // The body as bytes, fetched again as such: the text above
-                    // went through UTF-8 and cannot give them back. What
-                    // `WebAssembly.instantiateStreaming(fetch(url))` reads.
-                    arrayBuffer: function() {
-                        return new Promise(function(res, rej) {
-                            try { res(__zippFetchBytes(String(url), credentials)); } catch (e) { rej(e); }
-                        });
-                    },
-                    bytes: function() {
-                        return this.arrayBuffer().then(function(ab) { return new Uint8Array(ab); });
-                    },
-                    clone: function() { return this; },
-                    redirected: false,
-                    type: "basic"
-                }));
+                resolve(__zippBuildFetchResponse(r, String(url), credentials));
             } catch(e) {
                 reject(e);
             }
@@ -4604,6 +4815,68 @@ var window = {
 window.self=window; window.top=window; window.parent=window;
 window.origin = loc.origin;
 window.URL = URL;
+
+var __zippPendingFetches = {};
+function __zippBuildFetchResponse(r, url, credentials) {
+    var responseBody = r.body;
+    var respHeaders = new Headers(r.headers || (r.contentType ? { "content-type": r.contentType } : {}));
+    var respType = r.contentType || respHeaders.get("content-type") || "";
+    return __asResponse({
+        ok: r.ok,
+        status: r.status,
+        statusText: r.ok ? "OK" : "Error",
+        url: String(url),
+        headers: respHeaders,
+        text: function() { return Promise.resolve(responseBody); },
+        json: function() { return Promise.resolve(JSON.parse(responseBody)); },
+        // Preserve raw binary bytes for images, GLBs, HDRs, and Wasm.
+        blob: function() {
+            return new Promise(function(res, rej) {
+                try {
+                    var ab = __zippFetchBytes(String(url), credentials);
+                    var b = new Blob([new Uint8Array(ab)], { type: respType });
+                    b._url = __zippAbsoluteUrl(String(url));
+                    res(b);
+                } catch (e) {
+                    var fb = new Blob([responseBody], { type: respType });
+                    fb._url = __zippAbsoluteUrl(String(url));
+                    res(fb);
+                }
+            });
+        },
+        // The body as bytes, fetched again as such: the text above
+        // went through UTF-8 and cannot give them back. What
+        // `WebAssembly.instantiateStreaming(fetch(url))` reads.
+        arrayBuffer: function() {
+            return new Promise(function(res, rej) {
+                try { res(__zippFetchBytes(String(url), credentials)); } catch (e) { rej(e); }
+            });
+        },
+        bytes: function() {
+            return this.arrayBuffer().then(function(ab) { return new Uint8Array(ab); });
+        },
+        clone: function() { return this; },
+        redirected: false,
+        type: "basic"
+    });
+}
+function __zippFetchComplete(reqId, ok, payload) {
+    var key = String(reqId);
+    var p = __zippPendingFetches[key];
+    if (!p) return;
+    delete __zippPendingFetches[key];
+    if (p.signal && p.signal.aborted) return;
+    if (!ok) {
+        p.reject(new TypeError(String(payload || "Failed to fetch")));
+        return;
+    }
+    try {
+        var r = JSON.parse(payload);
+        p.resolve(__zippBuildFetchResponse(r, p.url, p.credentials));
+    } catch (e) {
+        p.reject(e);
+    }
+}
 
 // `window` is the global object, as in a browser, so that `window.$ = jQuery`
 // -- or `globalThis.X`, `self.X`, how every UMD bundle registers itself --
@@ -4644,7 +4917,7 @@ if (typeof window.addEventListener !== "function") {
 var __domInterfaces = { Window: Window, EventTarget: EventTarget, Node: DOMNode, Element: Element, CharacterData: CharacterData, Text: Text, CDATASection: CDATASection, Comment: Comment, ProcessingInstruction: ProcessingInstruction, DocumentType: DocumentType, Document: Document, HTMLDocument: Document, DOMImplementation: DOMImplementation, DOMTokenList: ClassList, DOMParser: DOMParser, XMLSerializer: XMLSerializer, AbortSignal: AbortSignal,
     AbortController: AbortController, BroadcastChannel: BroadcastChannel, CustomElementRegistry: CustomElementRegistry,
     customElements: customElements, SVGElement: SVGElement, ShadowRoot: ShadowRoot, ElementInternals: ElementInternals,
-    CustomStateSet: CustomStateSet, FontFace: FontFace, FontFaceSet: FontFaceSet, CSS: CSS, PerformanceObserver: PerformanceObserver, HTMLElement: HTMLElement, HTMLAnchorElement: HTMLAnchorElement, HTMLAreaElement: HTMLAreaElement, HTMLMediaElement: HTMLMediaElement, HTMLAudioElement: HTMLAudioElement, HTMLVideoElement: HTMLVideoElement, HTMLBRElement: HTMLBRElement, HTMLBaseElement: HTMLBaseElement, HTMLBodyElement: HTMLBodyElement, HTMLButtonElement: HTMLButtonElement, HTMLCanvasElement: HTMLCanvasElement, HTMLDListElement: HTMLDListElement, HTMLDataElement: HTMLDataElement, HTMLDataListElement: HTMLDataListElement, HTMLDetailsElement: HTMLDetailsElement, HTMLDivElement: HTMLDivElement, HTMLEmbedElement: HTMLEmbedElement, HTMLFieldSetElement: HTMLFieldSetElement, HTMLHRElement: HTMLHRElement, HTMLHeadElement: HTMLHeadElement, HTMLHeadingElement: HTMLHeadingElement, HTMLHtmlElement: HTMLHtmlElement, HTMLIFrameElement: HTMLIFrameElement, HTMLImageElement: HTMLImageElement, HTMLInputElement: HTMLInputElement, HTMLLIElement: HTMLLIElement, HTMLLabelElement: HTMLLabelElement, HTMLLegendElement: HTMLLegendElement, HTMLLinkElement: HTMLLinkElement, HTMLMapElement: HTMLMapElement, HTMLMenuElement: HTMLMenuElement, HTMLMetaElement: HTMLMetaElement, HTMLMeterElement: HTMLMeterElement, HTMLModElement: HTMLModElement, HTMLOListElement: HTMLOListElement, HTMLObjectElement: HTMLObjectElement, HTMLOptGroupElement: HTMLOptGroupElement, HTMLOptionElement: HTMLOptionElement, HTMLOutputElement: HTMLOutputElement, HTMLParagraphElement: HTMLParagraphElement, HTMLPictureElement: HTMLPictureElement, HTMLPreElement: HTMLPreElement, HTMLProgressElement: HTMLProgressElement, HTMLQuoteElement: HTMLQuoteElement, HTMLScriptElement: HTMLScriptElement, HTMLSelectElement: HTMLSelectElement, HTMLSlotElement: HTMLSlotElement, HTMLSourceElement: HTMLSourceElement, HTMLSpanElement: HTMLSpanElement, HTMLStyleElement: HTMLStyleElement, HTMLTableCaptionElement: HTMLTableCaptionElement, HTMLTableCellElement: HTMLTableCellElement, HTMLTableColElement: HTMLTableColElement, HTMLTableElement: HTMLTableElement, HTMLTableRowElement: HTMLTableRowElement, HTMLTableSectionElement: HTMLTableSectionElement, HTMLTemplateElement: HTMLTemplateElement, HTMLTextAreaElement: HTMLTextAreaElement, HTMLTimeElement: HTMLTimeElement, HTMLTitleElement: HTMLTitleElement, HTMLTrackElement: HTMLTrackElement, HTMLUListElement: HTMLUListElement, HTMLUnknownElement: HTMLUnknownElement, HTMLDialogElement: HTMLDialogElement, HTMLFormElement: HTMLFormElement };
+    CustomStateSet: CustomStateSet, FontFace: FontFace, FontFaceSet: FontFaceSet, Animation: Animation, KeyframeEffect: KeyframeEffect, DocumentTimeline: DocumentTimeline, CSS: CSS, PerformanceObserver: PerformanceObserver, HTMLElement: HTMLElement, HTMLAnchorElement: HTMLAnchorElement, HTMLAreaElement: HTMLAreaElement, HTMLMediaElement: HTMLMediaElement, HTMLAudioElement: HTMLAudioElement, HTMLVideoElement: HTMLVideoElement, HTMLBRElement: HTMLBRElement, HTMLBaseElement: HTMLBaseElement, HTMLBodyElement: HTMLBodyElement, HTMLButtonElement: HTMLButtonElement, HTMLCanvasElement: HTMLCanvasElement, HTMLDListElement: HTMLDListElement, HTMLDataElement: HTMLDataElement, HTMLDataListElement: HTMLDataListElement, HTMLDetailsElement: HTMLDetailsElement, HTMLDivElement: HTMLDivElement, HTMLEmbedElement: HTMLEmbedElement, HTMLFieldSetElement: HTMLFieldSetElement, HTMLHRElement: HTMLHRElement, HTMLHeadElement: HTMLHeadElement, HTMLHeadingElement: HTMLHeadingElement, HTMLHtmlElement: HTMLHtmlElement, HTMLIFrameElement: HTMLIFrameElement, HTMLImageElement: HTMLImageElement, HTMLInputElement: HTMLInputElement, HTMLLIElement: HTMLLIElement, HTMLLabelElement: HTMLLabelElement, HTMLLegendElement: HTMLLegendElement, HTMLLinkElement: HTMLLinkElement, HTMLMapElement: HTMLMapElement, HTMLMenuElement: HTMLMenuElement, HTMLMetaElement: HTMLMetaElement, HTMLMeterElement: HTMLMeterElement, HTMLModElement: HTMLModElement, HTMLOListElement: HTMLOListElement, HTMLObjectElement: HTMLObjectElement, HTMLOptGroupElement: HTMLOptGroupElement, HTMLOptionElement: HTMLOptionElement, HTMLOutputElement: HTMLOutputElement, HTMLParagraphElement: HTMLParagraphElement, HTMLPictureElement: HTMLPictureElement, HTMLPreElement: HTMLPreElement, HTMLProgressElement: HTMLProgressElement, HTMLQuoteElement: HTMLQuoteElement, HTMLScriptElement: HTMLScriptElement, HTMLSelectElement: HTMLSelectElement, HTMLSlotElement: HTMLSlotElement, HTMLSourceElement: HTMLSourceElement, HTMLSpanElement: HTMLSpanElement, HTMLStyleElement: HTMLStyleElement, HTMLTableCaptionElement: HTMLTableCaptionElement, HTMLTableCellElement: HTMLTableCellElement, HTMLTableColElement: HTMLTableColElement, HTMLTableElement: HTMLTableElement, HTMLTableRowElement: HTMLTableRowElement, HTMLTableSectionElement: HTMLTableSectionElement, HTMLTemplateElement: HTMLTemplateElement, HTMLTextAreaElement: HTMLTextAreaElement, HTMLTimeElement: HTMLTimeElement, HTMLTitleElement: HTMLTitleElement, HTMLTrackElement: HTMLTrackElement, HTMLUListElement: HTMLUListElement, HTMLUnknownElement: HTMLUnknownElement, HTMLDialogElement: HTMLDialogElement, HTMLFormElement: HTMLFormElement };
 for (var __k in __domInterfaces) window[__k] = __domInterfaces[__k];
 doc.defaultView=window;
 
@@ -5127,6 +5400,32 @@ function __drawnFromScript() {
 // The page as script left it, when that is what to show.
 function __getRenderedHTML() {
     return __drawnFromScript() ? __renderWhole() : null;
+}
+
+// Dynamic <link rel="stylesheet"> and <style> elements currently in <head>,
+// returned as JSON [["link", href], ["style", cssText], ...] so promoted fonts
+// and Vite code-split route CSS reach Stylo both on initial load and after SPA
+// client-side navigation.
+function __getHeadVersion() { return __headVersion; }
+function __getHeadExtras() {
+    var out = [];
+    if (!doc.head) return "[]";
+    var kids = doc.head.childNodes || [];
+    for (var i = 0; i < kids.length; i++) {
+        var c = kids[i];
+        if (!c || c.nodeType !== 1) continue;
+        if (c.tagName === "LINK") {
+            var rel = (c.getAttribute("rel") || "").toLowerCase();
+            if (rel.split(/\s+/).indexOf("stylesheet") >= 0) {
+                var href = c.getAttribute("href") || "";
+                if (href) out.push(["link", href]);
+            }
+        } else if (c.tagName === "STYLE") {
+            var css = c.textContent || "";
+            if (css.trim()) out.push(["style", css]);
+        }
+    }
+    return JSON.stringify(out);
 }
 
 // ---- Drawing the page in pieces -------------------------------------------

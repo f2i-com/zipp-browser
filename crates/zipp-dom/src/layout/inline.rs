@@ -783,21 +783,23 @@ impl BaseDocument {
             .unwrap_or(final_size + content_box_inset.sum_axes())
             .maybe_clamp(node_min_size, node_max_size);
 
-        // A button's content is centred in it, up and down, as browsers lay a
-        // button out: one taller than its text (`min-height: 44px` or
-        // `<input type="submit" style="height:36px">`) had the text at the top.
-        let is_button = self.nodes[node_id]
+        // A button or `<select>`'s content is centred vertically, as browsers lay
+        // form controls out: one taller than its text (`min-height: 44px`,
+        // `<input type="submit" style="height:36px">`, or `<select class="h-9">`)
+        // otherwise pins its label to the top edge.
+        let is_centered_control = self.nodes[node_id]
             .data
             .downcast_element()
             .is_some_and(|e| {
                 e.name.local == local_name!("button")
+                    || e.name.local == local_name!("select")
                     || (e.name.local == local_name!("input")
                         && matches!(
                             e.attr(local_name!("type")),
                             Some("submit" | "button" | "reset")
                         ))
             });
-        let v_center = if is_button {
+        let v_center = if is_centered_control {
             ((clamped_size.height - content_box_inset.vertical_axis_sum() - height / scale) / 2.0).max(0.0)
         } else {
             0.0

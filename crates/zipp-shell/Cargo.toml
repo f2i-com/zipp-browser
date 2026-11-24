@@ -1,7 +1,7 @@
 [package]
 name = "zipp-shell"
-description = "Application shell, windowing, and networking for Zipp Browser"
-version = "0.1.1"
+description = "Application shell, windowing, and networking for ZIPP Browser"
+version = "0.1.2"
 license.workspace = true
 edition.workspace = true
 rust-version.workspace = true

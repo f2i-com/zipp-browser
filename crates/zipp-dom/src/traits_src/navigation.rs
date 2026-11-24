@@ -33,6 +33,14 @@ pub struct NavigationOptions {
     pub method: Method,
 
     pub document_resource: Body,
+
+    /// Whether the navigation should open in a new tab (e.g. `target="_blank"`,
+    /// middle-click, or Ctrl/Cmd+click).
+    pub new_tab: bool,
+
+    /// When `new_tab` is true, whether the new tab should open in the background
+    /// without switching focus away from the active tab.
+    pub background: bool,
 }
 
 impl NavigationOptions {
@@ -43,6 +51,8 @@ impl NavigationOptions {
             source_document,
             method: Method::GET,
             document_resource: Body::Empty,
+            new_tab: false,
+            background: false,
         }
     }
     pub fn set_document_resource(mut self, document_resource: Body) -> Self {
@@ -52,6 +62,16 @@ impl NavigationOptions {
 
     pub fn set_method(mut self, method: Method) -> Self {
         self.method = method;
+        self
+    }
+
+    pub fn set_new_tab(mut self, new_tab: bool) -> Self {
+        self.new_tab = new_tab;
+        self
+    }
+
+    pub fn set_background(mut self, background: bool) -> Self {
+        self.background = background;
         self
     }
 

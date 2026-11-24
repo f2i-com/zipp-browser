@@ -1,4 +1,6 @@
 /target
+/dist-release
+/crates/zipp-android-webview/target
 *.exe
 *.pdb
 debug_*.html

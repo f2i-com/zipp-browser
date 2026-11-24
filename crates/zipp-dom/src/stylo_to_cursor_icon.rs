@@ -4,7 +4,8 @@ use style::values::computed::ui::CursorKind as StyloCursorKind;
 #[inline]
 pub(crate) fn stylo_to_cursor_icon(cursor: StyloCursorKind) -> CursorIcon {
     match cursor {
-        StyloCursorKind::None => todo!("set the cursor to none"),
+        // winit cursor_icon has no "hidden" variant; avoid panicking on `cursor: none`.
+        StyloCursorKind::None => CursorIcon::Default,
         StyloCursorKind::Default => CursorIcon::Default,
         StyloCursorKind::Pointer => CursorIcon::Pointer,
         StyloCursorKind::ContextMenu => CursorIcon::ContextMenu,

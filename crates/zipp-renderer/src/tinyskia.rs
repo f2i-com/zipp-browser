@@ -2587,6 +2587,17 @@ fn surface_size(width: u32, height: u32) -> (NonZeroU32, NonZeroU32) {
     (NonZeroU32::new(w.max(1)).unwrap(), NonZeroU32::new(h.max(1)).unwrap())
 }
 
+/// Fast cached-frame presentation for renderers that retain their last rendered
+/// framebuffer, allowing OS expose/move repaints to blit without re-running
+/// scene rasterization.
+pub trait CachedFramePresenter {
+    /// Re-present the last rasterized frame if one is cached for the current
+    /// surface size. Returns `true` if presented, `false` if a full render is needed.
+    fn present_cached(&mut self) -> bool {
+        false
+    }
+}
+
 /// Window renderer that uses [`TinySkiaPainter`] for CPU rasterization and
 /// [`softbuffer`] for presenting the framebuffer to the OS window surface.
 ///
@@ -2603,6 +2614,8 @@ pub struct TinySkiaWindowRenderer {
     surface: Option<softbuffer::Surface<Arc<dyn WindowHandle>, Arc<dyn WindowHandle>>>,
     width: u32,
     height: u32,
+    cached_bgr0: Vec<u32>,
+    has_cached_frame: bool,
 }
 
 impl Default for TinySkiaWindowRenderer {
@@ -2619,7 +2632,27 @@ impl TinySkiaWindowRenderer {
             surface: None,
             width: 1,
             height: 1,
+            cached_bgr0: Vec::new(),
+            has_cached_frame: false,
         }
+    }
+}
+
+impl CachedFramePresenter for TinySkiaWindowRenderer {
+    fn present_cached(&mut self) -> bool {
+        if !self.has_cached_frame || self.cached_bgr0.is_empty() {
+            return false;
+        }
+        let Some(ref mut surface) = self.surface else {
+            return false;
+        };
+        let Ok(mut buffer) = surface.buffer_mut() else {
+            return false;
+        };
+        let len = buffer.len().min(self.cached_bgr0.len());
+        buffer[..len].copy_from_slice(&self.cached_bgr0[..len]);
+        let _ = buffer.present();
+        true
     }
 }
 
@@ -2630,6 +2663,7 @@ impl WindowRenderer for TinySkiaWindowRenderer {
     fn resume(&mut self, window: Arc<dyn WindowHandle>, width: u32, height: u32) {
         self.width = width;
         self.height = height;
+        self.has_cached_frame = false;
         self.painter.resize(width, height);
 
         let ctx = softbuffer::Context::new(window.clone()).unwrap();
@@ -2645,6 +2679,7 @@ impl WindowRenderer for TinySkiaWindowRenderer {
     fn suspend(&mut self) {
         self.surface = None;
         self.context = None;
+        self.has_cached_frame = false;
     }
 
     /// Returns `true` if the renderer has an active surface.
@@ -2654,8 +2689,12 @@ impl WindowRenderer for TinySkiaWindowRenderer {
 
     /// Resize the framebuffer and surface to new dimensions.
     fn set_size(&mut self, width: u32, height: u32) {
+        if self.width == width && self.height == height {
+            return;
+        }
         self.width = width;
         self.height = height;
+        self.has_cached_frame = false;
         self.painter.resize(width, height);
 
         if let Some(ref mut surface) = self.surface {
@@ -2679,18 +2718,28 @@ impl WindowRenderer for TinySkiaWindowRenderer {
             return;
         };
 
-        // Convert RGBA (tiny-skia) to BGR0 (softbuffer)
+        // Convert RGBA (tiny-skia) to BGR0 (softbuffer) into our reusable cache
+        // buffer, then memcpy into the OS surface so subsequent expose/move
+        // repaints can re-present without re-rasterizing the DOM scene.
         let rgba_pixels = self.painter.pixmap.data();
-        let pixel_count = buffer.len().min((self.width * self.height) as usize);
         let (rotation, buffer_width, _) = screen_transform();
 
         if rotation == 0 {
-            for (i, chunk) in rgba_pixels.chunks_exact(4).enumerate().take(pixel_count) {
+            let pixel_count = buffer.len().min((self.width * self.height) as usize);
+            if self.cached_bgr0.len() != buffer.len() {
+                self.cached_bgr0.resize(buffer.len(), 0);
+            }
+            for (dst, chunk) in self.cached_bgr0[..pixel_count]
+                .iter_mut()
+                .zip(rgba_pixels.chunks_exact(4))
+            {
                 // Pack as 0x00RRGGBB (red in bits 16-23, green in 8-15, blue in 0-7)
-                buffer[i] = ((chunk[0] as u32) << 16)
+                *dst = ((chunk[0] as u32) << 16)
                     | ((chunk[1] as u32) << 8)
                     | (chunk[2] as u32);
             }
+            buffer[..pixel_count].copy_from_slice(&self.cached_bgr0[..pixel_count]);
+            self.has_cached_frame = true;
         } else {
             // Turned onto the panel as it copies: the picture's (x, y) is the
             // panel's (px, py), the panel's own size being the picture's turned.
@@ -2698,6 +2747,9 @@ impl WindowRenderer for TinySkiaWindowRenderer {
             let (pw, ph) = if rotation % 2 == 1 { (lh, lw) } else { (lw, lh) };
             let stride = buffer_width as usize;
             let len = buffer.len();
+            if self.cached_bgr0.len() != len {
+                self.cached_bgr0.resize(len, 0);
+            }
             for (i, chunk) in rgba_pixels.chunks_exact(4).enumerate().take(lw * lh) {
                 let (x, y) = (i % lw, i / lw);
                 let (px, py) = match rotation {
@@ -2707,9 +2759,13 @@ impl WindowRenderer for TinySkiaWindowRenderer {
                 };
                 let at = py * stride + px;
                 if at < len {
-                    buffer[at] = ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | (chunk[2] as u32);
+                    self.cached_bgr0[at] = ((chunk[0] as u32) << 16)
+                        | ((chunk[1] as u32) << 8)
+                        | (chunk[2] as u32);
                 }
             }
+            buffer[..len].copy_from_slice(&self.cached_bgr0[..len]);
+            self.has_cached_frame = true;
         }
 
         let _ = buffer.present();
@@ -2718,4 +2774,4 @@ impl WindowRenderer for TinySkiaWindowRenderer {
 }
 
 #[cfg(feature = "window-renderer")]
-pub use window_renderer::{TinySkiaWindowRenderer, set_screen_transform};
+pub use window_renderer::{CachedFramePresenter, TinySkiaWindowRenderer, set_screen_transform};

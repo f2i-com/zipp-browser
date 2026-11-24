@@ -346,6 +346,47 @@ T("DOMImplementation, TreeWalker, Node interfaces, NamedNodeMap[i], ClassList it
     return resolvedOk && attrOk && clsOk && twOk && protoOk;
 });
 
+A("Web Animations API (Element.prototype.animate, finished, fill forwards, getAnimations)", async function() {
+    var box = document.createElement("div");
+    document.body.appendChild(box);
+    var finishedFired = false;
+    var anim = box.animate([{ opacity: "0" }, { opacity: "0.75" }], { duration: 150, fill: "forwards", id: "fade" });
+    anim.onfinish = function () { finishedFired = true; };
+    var settled = await anim.finished;
+    var ok = settled === anim
+        && anim.id === "fade"
+        && anim.playState === "finished"
+        && finishedFired
+        && box.style.opacity === "0.75"
+        && Array.isArray(box.getAnimations())
+        && Array.isArray(document.getAnimations())
+        && typeof document.timeline.currentTime === "number";
+    document.body.removeChild(box);
+    return ok;
+});
+
+A("Dynamic <link rel=stylesheet> fires load event, updates head extras, and HTMLIFrameElement reflects src", async function() {
+    var lnk = document.createElement("link");
+    lnk.rel = "stylesheet";
+    lnk.href = "/assets/route-chunk.css";
+    var loaded = new Promise(function (resolve) {
+        lnk.addEventListener("load", function () { resolve(true); });
+    });
+    document.head.appendChild(lnk);
+    var didLoad = await loaded;
+    var extras = JSON.parse(__getHeadExtras());
+    var hasCss = extras.some(function (e) { return e[0] === "link" && e[1].indexOf("route-chunk.css") >= 0; });
+    var ifr = document.createElement("iframe");
+    ifr.src = "/demo/frame/";
+    ifr.srcdoc = "<p>ok</p>";
+    var ifrOk = ifr.src.indexOf("/demo/frame/") >= 0
+        && ifr.srcdoc === "<p>ok</p>"
+        && ifr.contentWindow === null
+        && ifr.contentDocument === null;
+    document.head.removeChild(lnk);
+    return didLoad && hasCss && ifrOk;
+});
+
 env.log("info", "");
 env.log("info", "=== JS TEST RESULTS: " + _p + "/" + (_p + _f) + " passed ===");
 if (_f > 0) { env.log("warn", _f + " failures:"); for (var i = 0; i < _e.length; i++) env.log("warn", "  " + _e[i]); }

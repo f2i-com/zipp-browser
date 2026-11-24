@@ -42,6 +42,11 @@ a {
     text-decoration: underline;
 }
 
+a:any-link,
+area:any-link {
+    cursor: pointer;
+}
+
 /* https://html.spec.whatwg.org/#bidi-rendering */
 input[type=tel]:dir(ltr) {
     direction: ltr;

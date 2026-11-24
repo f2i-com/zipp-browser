@@ -148,8 +148,7 @@ pub(crate) fn collect_layout_children(
                 let resolved_css = if let Some(styles) = doc.get_node(container_node_id).and_then(|n| n.primary_styles()) {
                     let mut css = crate::node::resolve_css_vars_in_attr(&svg_css, &styles, 0);
                     if css.contains("currentColor") {
-                        use style_traits::values::ToCss;
-                        let color = styles.clone_color().to_css_string();
+                        let color = crate::node::color_to_svg_rgb(&styles.clone_color());
                         css = css.replace("currentColor", &color);
                     }
                     css

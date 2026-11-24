@@ -21,10 +21,16 @@ fn adjust_coords_for_subdocument(
     offset: Point<f32>,
     viewport_scroll: Point<f64>,
 ) {
-    coords.page_x -= offset.x - viewport_scroll.x as f32;
-    coords.page_y -= offset.y - viewport_scroll.y as f32;
-    coords.client_x -= offset.x;
-    coords.client_y -= offset.y;
+    // `offset` is the sub-document container's position in parent document space,
+    // and `coords.page_*` is the pointer in parent document space. Subtracting
+    // gives the pointer's viewport-local position inside the sub-document even
+    // when the parent document is scrolled.
+    let local_x = coords.page_x - offset.x;
+    let local_y = coords.page_y - offset.y;
+    coords.client_x = local_x;
+    coords.client_y = local_y;
+    coords.page_x = local_x + viewport_scroll.x as f32;
+    coords.page_y = local_y + viewport_scroll.y as f32;
 }
 
 pub(crate) fn handle_dom_event<F: FnMut(DomEvent)>(
@@ -83,7 +89,10 @@ pub(crate) fn handle_dom_event<F: FnMut(DomEvent)>(
             DomEventData::ContextMenu(_) => None,
             DomEventData::DoubleClick(_) => None,
             DomEventData::Input(_) => None,
-            DomEventData::Wheel(data) => Some(UiEvent::Wheel(data)),
+            DomEventData::Wheel(mut data) => {
+                adjust_coords_for_subdocument(&mut data.coords, pos, viewport_scroll);
+                Some(UiEvent::Wheel(data))
+            }
             DomEventData::Scroll(_) => None,
             DomEventData::Focus(_) => None,
             DomEventData::Blur(_) => None,

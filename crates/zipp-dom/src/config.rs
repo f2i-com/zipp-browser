@@ -11,6 +11,7 @@ use crate::traits_src::{
     shell::{ShellProvider, Viewport},
 };
 use parley::FontContext;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Options used when constructing a [`BaseDocument`](crate::BaseDocument).
@@ -47,4 +48,9 @@ pub struct DocumentConfig {
     /// A pre-configured Parley [`FontContext`] for text shaping and font resolution.
     /// When `None`, a new context is created with system fonts enabled.
     pub font_ctx: Option<FontContext>,
+
+    /// `(url, family)` font faces already registered inside `font_ctx` (populated by
+    /// navigation/subdocument helpers so identical web fonts aren't re-fetched or
+    /// re-registered across routes).
+    pub preloaded_fonts: HashSet<(String, Option<String>)>,
 }
