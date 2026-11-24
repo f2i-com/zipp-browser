@@ -257,6 +257,8 @@ impl DocumentMutator<'_> {
 
         if *attr == local_name!("id") {
             element.id = Some(Atom::from(value))
+        } else if *attr == local_name!("class") {
+            element.classes = value.split_ascii_whitespace().map(Atom::from).collect();
         }
 
         if *attr == local_name!("value") {
@@ -327,6 +329,8 @@ impl DocumentMutator<'_> {
 
         if name.local == local_name!("id") {
             element.id = None;
+        } else if name.local == local_name!("class") {
+            element.classes.clear();
         }
 
         // Update text input value

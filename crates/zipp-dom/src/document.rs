@@ -740,8 +740,7 @@ impl BaseDocument {
     /// Sets the radio button at `target_radio_id` to checked and unchecks all
     /// other radio buttons with the same `name` attribute.
     pub fn toggle_radio(&mut self, radio_set_name: String, target_radio_id: usize) {
-        for i in 0..self.nodes.len() {
-            let node = &mut self.nodes[i];
+        for (i, node) in self.nodes.iter_mut() {
             if let Some(node_data) = node.data.downcast_element_mut() {
                 if node_data.attr(local_name!("name")) == Some(&radio_set_name) {
                     let was_clicked = i == target_radio_id;
@@ -884,6 +883,9 @@ impl BaseDocument {
             }
             self.sub_document_nodes.remove(&node_id);
             self.changed_nodes.remove(&node_id);
+            if !self.animations.sets.read().is_empty() {
+                self.animations.sets.write().retain(|k, _| k.node.id() != node_id);
+            }
             if self.hover_node_id == Some(node_id) {
                 self.hover_node_id = None;
                 self.hover_node_is_text = false;
@@ -933,7 +935,7 @@ impl BaseDocument {
 
     /// Whether the document has been mutated (has changed nodes).
     pub fn has_changes(&self) -> bool {
-        self.changed_nodes.is_empty()
+        !self.changed_nodes.is_empty()
     }
 
     /// Create a text node with the given content and return its ID.
@@ -1265,7 +1267,12 @@ impl BaseDocument {
 
         match resource {
             Resource::Css(css, svg_css) => {
-                let node_id = res.node_id.unwrap();
+                let Some(node_id) = res.node_id else {
+                    return;
+                };
+                if !self.nodes.contains(node_id) {
+                    return;
+                }
                 self.set_svg_css_for_node(node_id, svg_css);
                 self.add_stylesheet_for_node(css, node_id);
             }
@@ -1772,6 +1779,22 @@ impl BaseDocument {
             | (self.scroll_animation != ScrollAnimationState::None)
     }
 
+    /// Whether continuous animation actually requires CSS restyle + layout resolution
+    /// (true for CSS animations/transitions and animating subdocuments; false when
+    /// only `<canvas>` or scroll flings need continuous painting).
+    pub fn needs_style_resolve(&self) -> bool {
+        self.has_active_animations | self.subdoc_is_animating
+    }
+
+    /// Advance any in-progress touch scroll fling without running Stylo/Taffy resolve.
+    pub fn step_scroll_animation(&mut self) -> bool {
+        if self.scroll_animation == ScrollAnimationState::None {
+            return false;
+        }
+        self.resolve_scroll_animation();
+        true
+    }
+
     // -----------------------------------------------------------------------
     // Stylist
     // -----------------------------------------------------------------------
@@ -2043,10 +2066,13 @@ impl BaseDocument {
             node.final_layout.scroll_height() as f64,
         ));
 
-        // Handle sub document case
+        // Handle sub document case: never pass the parent's `dispatch_event`
+        // callback into `sub_doc`, because sub-document slab node IDs are not
+        // valid keys in the parent document's slab.
         if let Some(mut sub_doc) = node.subdoc_mut().map(|doc| doc.inner_mut()) {
+            fn ignore_scroll_event(_: DomEvent) {}
             let has_changed = if let Some(hover_node_id) = sub_doc.get_hover_node_id() {
-                sub_doc.scroll_node_by_has_changed(hover_node_id, x, y, dispatch_event)
+                sub_doc.scroll_node_by_has_changed(hover_node_id, x, y, ignore_scroll_event as fn(DomEvent))
             } else {
                 sub_doc.scroll_viewport_by_has_changed(x, y)
             };
@@ -2202,7 +2228,7 @@ impl BaseDocument {
             x: pos.x as f64 - self.viewport_scroll.x,
             y: pos.y as f64 - self.viewport_scroll.y,
             width: node.unrounded_layout.size.width as f64,
-            height: node.unrounded_layout.size.width as f64,
+            height: node.unrounded_layout.size.height as f64,
         })
     }
 
@@ -2404,7 +2430,11 @@ impl BaseDocument {
             let element_data = node.element_data()?;
             let inline_layout = element_data.inline_layout_data.as_ref()?;
 
-            if *end > inline_layout.text.len() {
+            if *start > *end
+                || *end > inline_layout.text.len()
+                || !inline_layout.text.is_char_boundary(*start)
+                || !inline_layout.text.is_char_boundary(*end)
+            {
                 continue;
             }
 

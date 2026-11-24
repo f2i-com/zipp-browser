@@ -38,6 +38,12 @@ pub struct ElementData {
     /// The elements id attribute parsed as an atom (if it has one)
     pub id: Option<Atom>,
 
+    /// Cached whitespace-split `class` attribute atoms (avoids repeated parsing & interning in Stylo).
+    pub classes: Vec<Atom>,
+
+    /// Hash of the last parsed inline `<svg>` outer HTML + resolved CSS (0 if none).
+    pub svg_hash: u64,
+
     /// The element's attributes
     pub attrs: Attributes,
 
@@ -141,10 +147,17 @@ impl ElementData {
             .find(|attr| &attr.name.local == "id")
             .map(|attr| attr.value.as_ref())
             .map(|value: &str| Atom::from(value));
+        let classes: Vec<Atom> = attrs
+            .iter()
+            .find(|attr| &attr.name.local == "class")
+            .map(|attr| attr.value.split_ascii_whitespace().map(Atom::from).collect())
+            .unwrap_or_default();
 
         let mut data = ElementData {
             name,
             id: id_attr_atom,
+            classes,
+            svg_hash: 0,
             attrs: Attributes::new(attrs),
             is_focussable: false,
             style_attribute: Default::default(),

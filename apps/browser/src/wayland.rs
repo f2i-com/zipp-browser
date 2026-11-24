@@ -21,11 +21,11 @@
 //! callbacks are answered a frame later.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use wayland_protocols::xdg::decoration::zv1::server::zxdg_decoration_manager_v1::{self, ZxdgDecorationManagerV1};
@@ -364,6 +364,7 @@ fn run(socket: ListeningSocket, commands: Receiver<Command>, wake: Arc<OwnedFd>,
     dh.create_global::<State, ZxdgDecorationManagerV1, ()>(1, ());
     dh.create_global::<State, WlDataDeviceManager, ()>(3, ());
     let mut state = State::new(dh, screen);
+    let disconnected: Arc<Mutex<Vec<ClientId>>> = Arc::new(Mutex::new(Vec::new()));
     let display_fd = display.backend().poll_fd().as_raw_fd();
     eprintln!("[wayland] listening ({}x{})", screen.0, screen.1);
     loop {
@@ -376,12 +377,17 @@ fn run(socket: ListeningSocket, commands: Receiver<Command>, wake: Arc<OwnedFd>,
             // SAFETY: eight bytes from the eventfd into `n`.
             unsafe { libc::read(wake.as_raw_fd(), (&mut n as *mut u64).cast(), 8) };
         }
+        // Reap any disconnected clients before checking MAX_CLIENTS so sessions never exhaust the 64-client cap.
+        let gone_clients: Vec<ClientId> = std::mem::take(&mut *lock(&disconnected));
+        if !gone_clients.is_empty() {
+            state.clients.retain(|c| !gone_clients.contains(c));
+        }
         while let Ok(Some(stream)) = socket.accept() {
             if state.clients.len() >= MAX_CLIENTS {
                 eprintln!("[wayland] {MAX_CLIENTS} programs have windows: refused another");
                 continue;
             }
-            match display.handle().insert_client(stream, Arc::new(ClientState)) {
+            match display.handle().insert_client(stream, Arc::new(ClientState(disconnected.clone()))) {
                 Ok(client) => state.clients.push(client.id()),
                 Err(e) => eprintln!("[wayland] a client could not connect: {e}"),
             }
@@ -389,6 +395,7 @@ fn run(socket: ListeningSocket, commands: Receiver<Command>, wake: Arc<OwnedFd>,
         if let Err(e) = display.dispatch_clients(&mut state) {
             eprintln!("[wayland] {e}");
         }
+        state.flush_dirty_windows();
         while let Ok(command) = commands.try_recv() {
             state.command(command);
         }
@@ -399,22 +406,27 @@ fn run(socket: ListeningSocket, commands: Receiver<Command>, wake: Arc<OwnedFd>,
     }
 }
 
-struct ClientState;
-impl ClientData for ClientState {}
+struct ClientState(Arc<Mutex<Vec<ClientId>>>);
+impl ClientData for ClientState {
+    fn disconnected(&self, client_id: ClientId, _reason: DisconnectReason) {
+        lock(&self.0).push(client_id);
+    }
+}
 
-/// Pixels, as premultiplied RGBA.
+/// Pixels, as premultiplied RGBA (`opaque` means every pixel has alpha 255).
 struct Pixels {
     width: usize,
     height: usize,
     rgba: Vec<u8>,
+    opaque: bool,
 }
 
 enum Role {
     None,
     /// The surface of a window (a toplevel or a popup).
     Window(u32),
-    /// Drawn over its parent, at this place in it.
-    Sub { parent: ObjectId, x: i32, y: i32 },
+    /// Drawn over its parent, at this place in it (double-buffered on parent commit).
+    Sub { parent: ObjectId, x: i32, y: i32, pending_x: i32, pending_y: i32 },
 }
 
 struct Surface {
@@ -428,6 +440,7 @@ struct Surface {
     children: Vec<ObjectId>,
     /// The window's own part of it (xdg_surface.set_window_geometry): no shadows.
     geometry: Option<(i32, i32, i32, i32)>,
+    pending_geometry: Option<(i32, i32, i32, i32)>,
 }
 
 struct Window {
@@ -491,50 +504,42 @@ impl Positioner {
     }
 }
 
-/// A pool of shared memory a client draws in.
+/// Max bytes allowed for a single Wayland SHM pool (256 MiB) and buffer (64 MiB).
+const MAX_POOL_BYTES: usize = 256 * 1024 * 1024;
+const MAX_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+
+/// A pool of shared memory a client draws in (read via `pread` to avoid SIGBUS,
+/// without wasting kernel VMAs on an unused `mmap`).
 struct Mapping {
     fd: OwnedFd,
-    ptr: *mut u8,
     len: usize,
+    valid: bool,
 }
-
-// SAFETY: the mapping is only read, under its pool's mutex.
-unsafe impl Send for Mapping {}
 
 impl Mapping {
     fn new(fd: OwnedFd, size: i32) -> Mapping {
-        let mut mapping = Mapping { fd, ptr: std::ptr::null_mut(), len: 0 };
-        mapping.map(size);
+        let mut mapping = Mapping { fd, len: 0, valid: false };
+        mapping.resize(size);
         mapping
     }
 
-    fn map(&mut self, size: i32) -> bool {
-        if size <= 0 {
+    fn resize(&mut self, size: i32) -> bool {
+        if size <= 0 || (size as usize) > MAX_POOL_BYTES || (size as usize) < self.len {
             return false;
         }
-        // SAFETY: a new read-only shared mapping of the client's file.
-        let ptr = unsafe { libc::mmap(std::ptr::null_mut(), size as usize, libc::PROT_READ, libc::MAP_SHARED, self.fd.as_raw_fd(), 0) };
-        if ptr == libc::MAP_FAILED {
+        // Verify the fd is seekable/regular enough for pread via fstat.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(self.fd.as_raw_fd(), &mut st) } != 0 {
             return false;
         }
-        self.unmap();
-        self.ptr = ptr.cast();
         self.len = size as usize;
+        self.valid = true;
         true
     }
 
-    fn unmap(&mut self) {
-        if !self.ptr.is_null() {
-            // SAFETY: the mapping made in `map`.
-            unsafe { libc::munmap(self.ptr.cast(), self.len) };
-            self.ptr = std::ptr::null_mut();
-            self.len = 0;
-        }
-    }
-
-    /// `len` bytes of the file from `offset`; None if it is not that long now.
-    fn read(&self, offset: usize, len: usize) -> Option<Vec<u8>> {
-        let mut out = vec![0u8; len];
+    /// Read `len` bytes from `offset` into `out` (reusing its allocation).
+    fn read_into(&self, offset: usize, len: usize, out: &mut Vec<u8>) -> bool {
+        out.resize(len, 0);
         let mut got = 0;
         while got < len {
             // SAFETY: into the rest of `out`, from a descriptor this owns.
@@ -544,16 +549,10 @@ impl Mapping {
             match n {
                 n if n > 0 => got += n as usize,
                 -1 if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {}
-                _ => return None,
+                _ => return false,
             }
         }
-        Some(out)
-    }
-}
-
-impl Drop for Mapping {
-    fn drop(&mut self) {
-        self.unmap();
+        true
     }
 }
 
@@ -567,28 +566,46 @@ struct ShmBuffer {
     valid: bool,
 }
 
-/// A buffer's pixels, copied.
-fn read_buffer(buffer: &WlBuffer) -> Option<Pixels> {
+/// A buffer's pixels, copied via reusable `scratch` buffer.
+fn read_buffer(buffer: &WlBuffer, scratch: &mut Vec<u8>) -> Option<Pixels> {
     let b = buffer.data::<ShmBuffer>().filter(|b| b.valid)?;
     let map = lock(&b.pool);
     let end = b.offset.checked_add(b.stride.checked_mul(b.height - 1)?)?.checked_add(b.width * 4)?;
-    if map.ptr.is_null() || end > map.len {
+    if !map.valid || end > map.len {
         return None;
     }
-    // Read, not looked at through the mapping: a client can shrink its file
-    // at any moment, between any check and any look, and reading a mapping
-    // past the end of its file ends the program with SIGBUS -- here the
-    // desktop, and every window. Reading the file just comes up short.
-    let bytes = map.read(b.offset, end - b.offset)?;
-    let mut rgba = Vec::with_capacity(b.width * b.height * 4);
-    for row in 0..b.height {
-        let line = &bytes[row * b.stride..row * b.stride + b.width * 4];
-        // In memory B, G, R, A (ARGB8888, little-endian).
-        for p in line.chunks_exact(4) {
-            rgba.extend_from_slice(&[p[2], p[1], p[0], if b.opaque { 255 } else { p[3] }]);
+    // Read, not looked at through an mmap: a client can shrink its file
+    // at any moment, and reading past EOF through mmap kills the desktop with SIGBUS.
+    if !map.read_into(b.offset, end - b.offset, scratch) {
+        return None;
+    }
+    let bytes = scratch.as_slice();
+    let row_bytes = b.width * 4;
+    let mut rgba = vec![0u8; row_bytes * b.height];
+    if b.opaque {
+        for row in 0..b.height {
+            let src = &bytes[row * b.stride..row * b.stride + row_bytes];
+            let dst = &mut rgba[row * row_bytes..(row + 1) * row_bytes];
+            for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                d[0] = s[2];
+                d[1] = s[1];
+                d[2] = s[0];
+                d[3] = 255;
+            }
+        }
+    } else {
+        for row in 0..b.height {
+            let src = &bytes[row * b.stride..row * b.stride + row_bytes];
+            let dst = &mut rgba[row * row_bytes..(row + 1) * row_bytes];
+            for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                d[0] = s[2];
+                d[1] = s[1];
+                d[2] = s[0];
+                d[3] = s[3];
+            }
         }
     }
-    Some(Pixels { width: b.width, height: b.height, rgba })
+    Some(Pixels { width: b.width, height: b.height, rgba, opaque: b.opaque })
 }
 
 /// Draw premultiplied pixels over premultiplied pixels, at (x, y), clipped.
@@ -631,18 +648,35 @@ fn unpremultiply(rgba: &mut [u8]) {
     }
 }
 
-/// The keyboard map, in a file of its own for a client to map.
-fn keymap_fd() -> Option<OwnedFd> {
-    // SAFETY: a new memfd, owned from here on.
-    let fd = unsafe { libc::memfd_create(c"zipp-keymap".as_ptr(), libc::MFD_CLOEXEC) };
-    if fd < 0 {
-        return None;
-    }
-    // SAFETY: just made, and no one else's.
-    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-    file.write_all(KEYMAP).ok()?;
-    file.write_all(&[0]).ok()?;
-    Some(file.into())
+/// The keyboard map, sealed in a single shared memfd reused across clients.
+fn keymap_fd() -> Option<&'static OwnedFd> {
+    static FD: OnceLock<Option<OwnedFd>> = OnceLock::new();
+    FD.get_or_init(|| {
+        // SAFETY: a new memfd, owned for the process lifetime.
+        let mut fd = unsafe { libc::memfd_create(c"zipp-keymap".as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
+        let sealed = fd >= 0;
+        if fd < 0 {
+            fd = unsafe { libc::memfd_create(c"zipp-keymap".as_ptr(), libc::MFD_CLOEXEC) };
+        }
+        if fd < 0 {
+            return None;
+        }
+        // SAFETY: just made, and no one else's.
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        file.write_all(KEYMAP).ok()?;
+        file.write_all(&[0]).ok()?;
+        if sealed {
+            unsafe {
+                libc::fcntl(
+                    file.as_raw_fd(),
+                    libc::F_ADD_SEALS,
+                    libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE,
+                );
+            }
+        }
+        Some(file.into())
+    })
+    .as_ref()
 }
 
 struct State {
@@ -667,6 +701,10 @@ struct State {
     callbacks: Vec<WlCallback>,
     tick: Option<Instant>,
     clients: Vec<ClientId>,
+    /// Windows committed during the current dispatch batch (coalesced per poll).
+    dirty_windows: HashSet<u32>,
+    /// Reusable scratch buffer for `pread` in `read_buffer`.
+    read_scratch: Vec<u8>,
 }
 
 impl State {
@@ -689,6 +727,8 @@ impl State {
             callbacks: Vec::new(),
             tick: None,
             clients: Vec::new(),
+            dirty_windows: HashSet::new(),
+            read_scratch: Vec::new(),
         }
     }
 
@@ -740,18 +780,44 @@ impl State {
         let Some(s) = self.surfaces.get_mut(id) else {
             return;
         };
-        if let Some(buffer) = s.buffer.take() {
-            s.image = buffer.as_ref().and_then(read_buffer);
+        if let Some(geom) = s.pending_geometry.take() {
+            s.geometry = Some(geom);
+        }
+        let buffer = s.buffer.take();
+        let mut callbacks = std::mem::take(&mut s.callbacks);
+        let children = s.children.clone();
+        if let Some(buffer) = buffer {
+            let new_image = buffer.as_ref().and_then(|b| read_buffer(b, &mut self.read_scratch));
+            if let Some(s) = self.surfaces.get_mut(id) {
+                s.image = new_image;
+            }
             // Copied: the app may draw in it again.
             if let Some(buffer) = buffer {
                 buffer.release();
             }
         }
-        if !s.callbacks.is_empty() {
-            self.callbacks.append(&mut s.callbacks);
+        // Apply double-buffered subsurface positions on parent commit.
+        for child in children {
+            if let Some(Surface { role: Role::Sub { x, y, pending_x, pending_y, .. }, .. }) = self.surfaces.get_mut(&child) {
+                *x = *pending_x;
+                *y = *pending_y;
+            }
+        }
+        if !callbacks.is_empty() {
+            self.callbacks.append(&mut callbacks);
             self.tick.get_or_insert_with(|| Instant::now() + FRAME);
         }
         if let Some(window) = self.window_of(id) {
+            self.dirty_windows.insert(window);
+        }
+    }
+
+    fn flush_dirty_windows(&mut self) {
+        if self.dirty_windows.is_empty() {
+            return;
+        }
+        let dirty: Vec<u32> = self.dirty_windows.drain().collect();
+        for window in dirty {
             self.update(window);
         }
     }
@@ -769,7 +835,7 @@ impl State {
         None
     }
 
-    /// A window's surface changed: its first configure, or a new frame.
+    /// A window's surface changed: its first configure, a new frame, or unmap.
     fn update(&mut self, window: u32) {
         let Some((configured, surface)) = self.windows.get(&window).map(|w| (w.configured, w.surface.clone())) else {
             return;
@@ -778,30 +844,42 @@ impl State {
             self.configure(window);
         }
         let Some((width, height, rgba, origin)) = self.compose(&surface) else {
+            // Client unmapped a previously shown window via attach(None)+commit.
+            if let Some(w) = self.windows.get_mut(&window)
+                && w.shown.is_some()
+            {
+                w.shown = None;
+                if let Some(frames) = lock(&FRAMES).as_mut() {
+                    frames.remove(&window);
+                }
+                event("gone", window, serde_json::json!({}));
+            }
             return;
         };
         let Some(w) = self.windows.get_mut(&window) else {
             return;
         };
         w.origin = origin;
-        // The process it is, for the page to know its own (a browser it ran).
-        let pid = w.xdg.client().and_then(|c| c.get_credentials(&self.dh).ok()).map_or(0, |c| c.pid);
         match w.shown {
-            None => event(
-                "window",
-                window,
-                serde_json::json!({
-                    "pid": pid,
-                    "kind": if w.popup.is_some() { "popup" } else { "toplevel" },
-                    "parent": w.parent,
-                    "x": w.place.0,
-                    "y": w.place.1,
-                    "title": w.title,
-                    "appId": w.app_id,
-                    "width": width,
-                    "height": height,
-                }),
-            ),
+            None => {
+                // Only query SO_PEERCRED once when a window first appears.
+                let pid = w.xdg.client().and_then(|c| c.get_credentials(&self.dh).ok()).map_or(0, |c| c.pid);
+                event(
+                    "window",
+                    window,
+                    serde_json::json!({
+                        "pid": pid,
+                        "kind": if w.popup.is_some() { "popup" } else { "toplevel" },
+                        "parent": w.parent,
+                        "x": w.place.0,
+                        "y": w.place.1,
+                        "title": w.title,
+                        "appId": w.app_id,
+                        "width": width,
+                        "height": height,
+                    }),
+                );
+            }
             Some(size) if size != (width, height) => event("size", window, serde_json::json!({ "width": width, "height": height })),
             _ => {}
         }
@@ -845,17 +923,32 @@ impl State {
             _ => (0, 0, image.width as i32, image.height as i32),
         };
         let (gw, gh) = (gw.min(8192) as usize, gh.min(8192) as usize);
+        // Fast path: single surface with matching geometry (99% of frames) skips
+        // zero-fill + pixel blend, and Xrgb8888 skips unpremultiply completely.
+        if s.children.is_empty() && gx == 0 && gy == 0 && gw == image.width && gh == image.height {
+            let mut out = image.rgba.clone();
+            if !image.opaque {
+                unpremultiply(&mut out);
+            }
+            return Some((gw as u32, gh as u32, out, (0, 0)));
+        }
         let mut out = vec![0u8; gw * gh * 4];
-        self.draw(&mut out, (gw, gh), root, (-gx, -gy), 0);
-        unpremultiply(&mut out);
+        let mut all_opaque = true;
+        self.draw(&mut out, (gw, gh), root, (-gx, -gy), 0, &mut all_opaque);
+        if !all_opaque || gx < 0 || gy < 0 || (gx as usize + gw) > image.width || (gy as usize + gh) > image.height {
+            unpremultiply(&mut out);
+        }
         Some((gw as u32, gh as u32, out, (gx, gy)))
     }
 
-    fn draw(&self, out: &mut [u8], (ow, oh): (usize, usize), id: &ObjectId, (x, y): (i32, i32), depth: u32) {
+    fn draw(&self, out: &mut [u8], (ow, oh): (usize, usize), id: &ObjectId, (x, y): (i32, i32), depth: u32, all_opaque: &mut bool) {
         let Some(s) = self.surfaces.get(id) else {
             return;
         };
         if let Some(image) = &s.image {
+            if !image.opaque {
+                *all_opaque = false;
+            }
             blend(out, ow, oh, image, x, y);
         }
         if depth >= 8 {
@@ -863,7 +956,7 @@ impl State {
         }
         for child in &s.children {
             if let Some(Role::Sub { x: cx, y: cy, .. }) = self.surfaces.get(child).map(|c| &c.role) {
-                self.draw(out, (ow, oh), child, (x + cx, y + cy), depth + 1);
+                self.draw(out, (ow, oh), child, (x + cx, y + cy), depth + 1, all_opaque);
             }
         }
     }
@@ -1222,13 +1315,26 @@ macro_rules! ignored {
 ignored!(WlRegion, WlCallback, WlTouch, WlOutput, WlDataSource, WlDataDevice);
 
 impl Dispatch<WlCompositor, ()> for State {
-    fn request(state: &mut Self, _: &Client, _: &WlCompositor, request: wl_compositor::Request, _: &(), _: &DisplayHandle, init: &mut DataInit<'_, Self>) {
+    fn request(state: &mut Self, _: &Client, compositor: &WlCompositor, request: wl_compositor::Request, _: &(), _: &DisplayHandle, init: &mut DataInit<'_, Self>) {
         match request {
             wl_compositor::Request::CreateSurface { id } => {
                 let wl = init.init(id, ());
+                if state.surfaces.len() >= MAX_SURFACES {
+                    compositor.post_error(0u32, "too many surfaces");
+                    return;
+                }
                 state.surfaces.insert(
                     wl.id(),
-                    Surface { wl, buffer: None, callbacks: Vec::new(), image: None, role: Role::None, children: Vec::new(), geometry: None },
+                    Surface {
+                        wl,
+                        buffer: None,
+                        callbacks: Vec::new(),
+                        image: None,
+                        role: Role::None,
+                        children: Vec::new(),
+                        geometry: None,
+                        pending_geometry: None,
+                    },
                 );
             }
             wl_compositor::Request::CreateRegion { id } => {
@@ -1245,7 +1351,9 @@ impl Dispatch<WlSurface, ()> for State {
         match request {
             wl_surface::Request::Attach { buffer, .. } => {
                 if let Some(s) = state.surfaces.get_mut(&id) {
-                    s.buffer = Some(buffer);
+                    if let Some(Some(prev)) = s.buffer.replace(buffer) {
+                        prev.release();
+                    }
                 }
             }
             wl_surface::Request::Frame { callback } => {
@@ -1276,7 +1384,7 @@ impl Dispatch<WlSubcompositor, ()> for State {
                 return;
             }
             if let Some(s) = state.surfaces.get_mut(&child) {
-                s.role = Role::Sub { parent: parent.clone(), x: 0, y: 0 };
+                s.role = Role::Sub { parent: parent.clone(), x: 0, y: 0, pending_x: 0, pending_y: 0 };
             }
             if let Some(p) = state.surfaces.get_mut(&parent) {
                 p.children.push(child);
@@ -1288,10 +1396,10 @@ impl Dispatch<WlSubcompositor, ()> for State {
 impl Dispatch<WlSubsurface, ObjectId> for State {
     fn request(state: &mut Self, _: &Client, _: &WlSubsurface, request: wl_subsurface::Request, child: &ObjectId, _: &DisplayHandle, _: &mut DataInit<'_, Self>) {
         if let wl_subsurface::Request::SetPosition { x, y } = request
-            && let Some(Surface { role: Role::Sub { x: sx, y: sy, .. }, .. }) = state.surfaces.get_mut(child)
+            && let Some(Surface { role: Role::Sub { pending_x, pending_y, .. }, .. }) = state.surfaces.get_mut(child)
         {
-            *sx = x;
-            *sy = y;
+            *pending_x = x;
+            *pending_y = y;
         }
     }
 
@@ -1304,7 +1412,7 @@ impl Dispatch<WlSubsurface, ObjectId> for State {
                 p.children.retain(|c| c != child);
             }
             if let Some(window) = state.window_of(&parent) {
-                state.update(window);
+                state.dirty_windows.insert(window);
             }
         }
     }
@@ -1322,9 +1430,9 @@ impl Dispatch<WlShm, ()> for State {
     fn request(_: &mut Self, _: &Client, _: &WlShm, request: wl_shm::Request, _: &(), _: &DisplayHandle, init: &mut DataInit<'_, Self>) {
         if let wl_shm::Request::CreatePool { id, fd, size } = request {
             let mapping = Mapping::new(fd, size);
-            let mapped = !mapping.ptr.is_null();
+            let ok = mapping.valid;
             let pool = init.init(id, Arc::new(Mutex::new(mapping)));
-            if !mapped {
+            if !ok {
                 pool.post_error(wl_shm::Error::InvalidFd, "the pool cannot be mapped");
             }
         }
@@ -1337,13 +1445,16 @@ impl Dispatch<WlShmPool, Arc<Mutex<Mapping>>> for State {
             wl_shm_pool::Request::CreateBuffer { id, offset, width, height, stride, format } => {
                 let opaque = matches!(format, WEnum::Value(wl_shm::Format::Xrgb8888));
                 let known = opaque || matches!(format, WEnum::Value(wl_shm::Format::Argb8888));
+                let byte_span = (stride as i64).checked_mul(height as i64);
                 let fits = offset >= 0
                     && width > 0
                     && height > 0
-                    && width <= 16384
-                    && height <= 16384
+                    && width <= 8192
+                    && height <= 8192
                     && stride as i64 >= width as i64 * 4
-                    && offset as i64 + stride as i64 * height as i64 <= lock(data).len as i64;
+                    && byte_span.is_some_and(|n| {
+                        n > 0 && n <= MAX_BUFFER_BYTES as i64 && offset as i64 + n <= lock(data).len as i64
+                    });
                 let valid = known && fits;
                 init.init(
                     id,
@@ -1364,8 +1475,8 @@ impl Dispatch<WlShmPool, Arc<Mutex<Mapping>>> for State {
                 }
             }
             wl_shm_pool::Request::Resize { size } => {
-                if !lock(data).map(size) {
-                    pool.post_error(wl_shm::Error::InvalidFd, "the pool cannot be mapped");
+                if !lock(data).resize(size) {
+                    pool.post_error(wl_shm::Error::InvalidFd, "the pool cannot be resized");
                 }
             }
             _ => {}
@@ -1487,7 +1598,7 @@ impl Dispatch<XdgSurface, ObjectId> for State {
             }
             xdg_surface::Request::SetWindowGeometry { x, y, width, height } => {
                 if let Some(s) = state.surfaces.get_mut(surface) {
-                    s.geometry = Some((x, y, width, height));
+                    s.pending_geometry = Some((x, y, width, height));
                 }
             }
             _ => {}

@@ -96,7 +96,7 @@ pub(crate) fn push(level: Level, text: impl Into<String>) {
         };
         eprintln!("[CONSOLE:{tag}] {text}");
     }
-    let mut log = LOG.lock().unwrap();
+    let mut log = LOG.lock().unwrap_or_else(|e| e.into_inner());
     match level {
         Level::Error => log.errors += 1,
         Level::Warn => log.warnings += 1,
@@ -116,17 +116,18 @@ pub(crate) fn push(level: Level, text: impl Into<String>) {
     log.entries.push_back(Entry { level, text, repeats: 1 });
 }
 
-/// A new page: an empty console.
+/// A new page: an empty console and no leftover REPL commands.
 pub(crate) fn clear() {
-    let mut log = LOG.lock().unwrap();
+    let mut log = LOG.lock().unwrap_or_else(|e| e.into_inner());
     log.entries.clear();
     log.errors = 0;
     log.warnings = 0;
     log.generation += 1;
+    PENDING.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 pub(crate) fn generation() -> u64 {
-    LOG.lock().unwrap().generation
+    LOG.lock().unwrap_or_else(|e| e.into_inner()).generation
 }
 
 pub(crate) fn is_open() -> bool {
@@ -141,16 +142,16 @@ pub(crate) fn set_open(open: bool) {
 /// Code to run in the page, from the console's input line.
 pub(crate) fn submit(code: String) {
     if !code.trim().is_empty() {
-        PENDING.lock().unwrap().push(code);
+        PENDING.lock().unwrap_or_else(|e| e.into_inner()).push(code);
     }
 }
 
 pub(crate) fn take_submitted() -> Vec<String> {
-    std::mem::take(&mut *PENDING.lock().unwrap())
+    std::mem::take(&mut *PENDING.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 pub(crate) fn has_submitted() -> bool {
-    !PENDING.lock().unwrap().is_empty()
+    !PENDING.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
 }
 
 fn escape(text: &str, out: &mut String) {
@@ -167,7 +168,7 @@ fn escape(text: &str, out: &mut String) {
 
 /// The badge on the toolbar's console button: the error count, if any.
 pub(crate) fn badge_text() -> String {
-    match LOG.lock().unwrap().errors {
+    match LOG.lock().unwrap_or_else(|e| e.into_inner()).errors {
         0 => String::new(),
         n if n > 99 => "99+".into(),
         n => n.to_string(),
@@ -176,14 +177,14 @@ pub(crate) fn badge_text() -> String {
 
 /// The panel's header counts.
 pub(crate) fn counts_text() -> String {
-    let log = LOG.lock().unwrap();
+    let log = LOG.lock().unwrap_or_else(|e| e.into_inner());
     let plural = |n: usize, one: &str| if n == 1 { format!("1 {one}") } else { format!("{n} {one}s") };
     format!("{} · {}", plural(log.errors, "error"), plural(log.warnings, "warning"))
 }
 
 /// The panel's lines, newest first, as HTML.
 pub(crate) fn lines_html() -> String {
-    let log = LOG.lock().unwrap();
+    let log = LOG.lock().unwrap_or_else(|e| e.into_inner());
     if log.entries.is_empty() {
         return r#"<div style="padding:10px 12px;color:#64748b;font-family:'Segoe UI',Arial,sans-serif">Nothing logged yet.</div>"#.into();
     }
@@ -216,7 +217,7 @@ pub(crate) fn lines_html() -> String {
 
 /// Format all console entries as plain text (oldest first) for copying to the clipboard.
 pub(crate) fn plain_text() -> String {
-    let log = LOG.lock().unwrap();
+    let log = LOG.lock().unwrap_or_else(|e| e.into_inner());
     if log.entries.is_empty() {
         return String::new();
     }

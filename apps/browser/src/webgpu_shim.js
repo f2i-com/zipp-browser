@@ -309,10 +309,11 @@ var __zippWebGPU = (function () {
   CanvasContext.prototype = Object.create(GPUCanvasContext.prototype);
   CanvasContext.prototype.configure = function (config) {
     this._format = config.format || "bgra8unorm";
-    cmd(["configureCanvas", this._cid, this.canvas._id, this._format, this.canvas.width, this.canvas.height]);
+    this._alphaMode = config.alphaMode || "opaque";
+    cmd(["configureCanvas", this._cid, this.canvas._id, this._format, this.canvas.width, this.canvas.height, this._alphaMode]);
   };
   CanvasContext.prototype.unconfigure = function () {};
-  CanvasContext.prototype.getConfiguration = function () { return { format: this._format }; };
+  CanvasContext.prototype.getConfiguration = function () { return { format: this._format, alphaMode: this._alphaMode || "opaque" }; };
   CanvasContext.prototype.getCurrentTexture = function () {
     if (!this._texture) {
       this._texture = make(GPUTexture, { format: this._format });

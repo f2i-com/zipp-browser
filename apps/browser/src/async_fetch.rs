@@ -73,6 +73,16 @@ fn worker_loop() {
             q.jobs.pop_front()
         };
         let Some(job) = job else { continue };
+        // Skip jobs whose document scope was already torn down so dead pages do
+        // not starve the shared fetch pool.
+        let alive = RESULTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending
+            .contains_key(&job.scope);
+        if !alive {
+            continue;
+        }
         let res = (job.run)();
         {
             let mut state = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -205,7 +215,12 @@ pub(crate) fn drop_scope(scope: u64) {
     if scope == 0 {
         return;
     }
-    let mut state = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
-    state.pending.remove(&scope);
-    state.completed.remove(&scope);
+    {
+        let mut state = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
+        state.pending.remove(&scope);
+        state.completed.remove(&scope);
+    }
+    let (lock, _) = &*POOL;
+    let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+    q.jobs.retain(|j| j.scope != scope);
 }

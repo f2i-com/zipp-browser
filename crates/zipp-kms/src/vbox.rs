@@ -9,6 +9,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 
 const HDR_VERSION: u32 = 0x10001;
 const EVENT_DISPLAY_CHANGE_REQUEST: u32 = 1 << 2;
@@ -54,12 +55,19 @@ fn iowr(nr: u32, size: usize) -> u32 {
 }
 
 /// A fixed-size vboxguest request, `out` bytes coming back after the header.
-fn call(dev: &File, nr: u32, words: &mut TwoWords, out: u32) -> bool {
+/// Returns `Ok(())` on success, `Err(Some(errno))` on ioctl failure, or `Err(None)` on VMMDev rc < 0.
+fn call(dev: &File, nr: u32, words: &mut TwoWords, out: u32) -> Result<(), Option<i32>> {
     let size = std::mem::size_of::<TwoWords>();
     words.hdr = Header { size_in: size as u32, version: HDR_VERSION, size_out: 24 + out, ..Header::default() };
     // SAFETY: the request is the size the ioctl number says.
     let rc = unsafe { libc::ioctl(dev.as_raw_fd(), iowr(nr, size) as _, words as *mut TwoWords) };
-    rc == 0 && words.hdr.rc >= 0
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().raw_os_error());
+    }
+    if words.hdr.rc < 0 {
+        return Err(None);
+    }
+    Ok(())
 }
 
 /// The size the host wants now (and acknowledging its event): 0 x 0 for none.
@@ -77,49 +85,57 @@ fn requested_size(dev: &File, ack: bool) -> Option<(u32, u32)> {
 }
 
 /// Watch for the sizes the host asks for, if this is a VirtualBox machine
-/// with the vboxguest driver: `resize` gets each one.
-pub(crate) fn watch(resize: impl Fn(u32, u32) + Send + 'static) {
-    let Ok(dev) = OpenOptions::new().read(true).write(true).open("/dev/vboxguest") else {
+/// with the vboxguest driver: `resize` gets each one and returns `false` when
+/// the event loop is gone so this thread exits cleanly.
+pub(crate) fn watch(resize: impl Fn(u32, u32) -> bool + Send + 'static, alive: impl Fn() -> bool + Send + 'static) {
+    let Ok(dev) = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open("/dev/vboxguest")
+    else {
         return;
     };
     // VBG_IOCTL_CHANGE_GUEST_CAPABILITIES: this guest resizes its screen.
     let mut caps = TwoWords { a: GUEST_SUPPORTS_GRAPHICS, ..TwoWords::default() };
-    if !call(&dev, 14, &mut caps, 8) {
+    if call(&dev, 14, &mut caps, 8).is_err() {
         eprintln!("[kms] VirtualBox: cannot say the screen resizes: {}", std::io::Error::last_os_error());
         return;
     }
     // VBG_IOCTL_CHANGE_FILTER_MASK: hear of display change requests.
     let mut filter = TwoWords { a: EVENT_DISPLAY_CHANGE_REQUEST, ..TwoWords::default() };
-    if !call(&dev, 12, &mut filter, 0) {
+    if call(&dev, 12, &mut filter, 0).is_err() {
         eprintln!("[kms] VirtualBox: cannot hear of size changes: {}", std::io::Error::last_os_error());
         return;
     }
     eprintln!("[kms] VirtualBox: the screen follows the window's size");
     let spawned = std::thread::Builder::new().name("vbox-display".into()).spawn(move || {
         let mut last = (0, 0);
-        let mut give = |size: Option<(u32, u32)>| {
+        let mut give = |size: Option<(u32, u32)>| -> bool {
             if let Some((w, h)) = size
                 && w > 0
                 && h > 0
                 && (w, h) != last
             {
                 last = (w, h);
-                resize(w, h);
+                return resize(w, h);
             }
+            alive()
         };
-        give(requested_size(&dev, false));
-        loop {
+        if !give(requested_size(&dev, false)) {
+            return;
+        }
+        while alive() {
             // VBG_IOCTL_WAIT_FOR_EVENTS, a few seconds at a time.
             let mut wait = TwoWords { a: 5000, b: EVENT_DISPLAY_CHANGE_REQUEST, ..TwoWords::default() };
-            if call(&dev, 10, &mut wait, 4) {
-                if wait.a & EVENT_DISPLAY_CHANGE_REQUEST != 0 {
-                    give(requested_size(&dev, true));
+            match call(&dev, 10, &mut wait, 4) {
+                Ok(()) => {
+                    if wait.a & EVENT_DISPLAY_CHANGE_REQUEST != 0 && !give(requested_size(&dev, true)) {
+                        break;
+                    }
                 }
-                continue;
-            }
-            match std::io::Error::last_os_error().raw_os_error() {
-                Some(libc::ETIMEDOUT | libc::EINTR) => {}
-                _ => std::thread::sleep(std::time::Duration::from_secs(1)),
+                Err(Some(libc::ETIMEDOUT | libc::EINTR)) => {}
+                Err(_) => std::thread::sleep(std::time::Duration::from_secs(1)),
             }
         }
     });

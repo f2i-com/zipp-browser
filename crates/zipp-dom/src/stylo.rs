@@ -113,11 +113,12 @@ impl crate::document::BaseDocument {
             .flush(&guards)
             .process_style(root, Some(&self.snapshots));
 
-        // Mark actively animating nodes as dirty
+        // Mark actively animating nodes as dirty (skipping dropped or finished nodes).
         let mut sets = self.animations.sets.write();
+        sets.retain(|key, _| self.nodes.contains(key.node.id()));
         for (key, set) in sets.iter_mut() {
             let node_id = key.node.id();
-            self.nodes[node_id].set_restyle_hint(RestyleHint::RESTYLE_SELF);
+            let was_active = set.needs_animation_ticks();
 
             for animation in set.animations.iter_mut() {
                 if animation.state == AnimationState::Pending && animation.started_at <= now {
@@ -136,6 +137,12 @@ impl crate::document::BaseDocument {
                 }
                 if transition.state == AnimationState::Running && transition.has_ended(now) {
                     transition.state = AnimationState::Finished;
+                }
+            }
+
+            if was_active || set.needs_animation_ticks() {
+                if let Some(node) = self.nodes.get_mut(node_id) {
+                    node.set_restyle_hint(RestyleHint::RESTYLE_SELF);
                 }
             }
         }
@@ -395,27 +402,27 @@ impl selectors::Element for DomNode<'_> {
     // we should try and use `find` instead of this foward/backward stuff since its ugly and slow
 #[inline]
     fn prev_sibling_element(&self) -> Option<Self> {
-        let mut n = 1;
-        while let Some(node) = self.backward(n) {
+        let children = &self.tree()[self.parent?].children;
+        let idx = children.iter().position(|&id| id == self.id)?;
+        for &sib_id in children[..idx].iter().rev() {
+            let node = self.with(sib_id);
             if node.is_element() {
                 return Some(node);
             }
-            n += 1;
         }
-
         None
     }
 
 #[inline]
     fn next_sibling_element(&self) -> Option<Self> {
-        let mut n = 1;
-        while let Some(node) = self.forward(n) {
+        let children = &self.tree()[self.parent?].children;
+        let idx = children.iter().position(|&id| id == self.id)?;
+        for &sib_id in &children[idx + 1..] {
+            let node = self.with(sib_id);
             if node.is_element() {
                 return Some(node);
             }
-            n += 1;
         }
-
         None
     }
 
@@ -476,7 +483,7 @@ impl selectors::Element for DomNode<'_> {
                         // or can begin with value immediately followed by a hyphen, - (U+002D)
                         attr_value.starts_with(value)
                             && (attr_value.len() == value.len()
-                                || attr_value.chars().nth(value.len()) == Some('-'))
+                                || attr_value.as_bytes().get(value.len()) == Some(&b'-'))
                     }
                     AttrSelectorOperator::Prefix => attr_value.starts_with(value),
                     AttrSelectorOperator::Substring => attr_value.contains(value),
@@ -612,18 +619,12 @@ impl selectors::Element for DomNode<'_> {
         search_name: &<Self::Impl as selectors::SelectorImpl>::Identifier,
         case_sensitivity: selectors::attr::CaseSensitivity,
     ) -> bool {
-        let class_attr = self.data.attr(local_name!("class"));
-        if let Some(class_attr) = class_attr {
-            // split the class attribute
-            for pheme in class_attr.split_ascii_whitespace() {
-                let atom = Atom::from(pheme);
-                if case_sensitivity.eq_atom(&atom, search_name) {
-                    return true;
-                }
-            }
-        }
-
-        false
+        let Some(el) = self.element_data() else {
+            return false;
+        };
+        el.classes
+            .iter()
+            .any(|atom| case_sensitivity.eq_atom(atom, search_name))
     }
 
 #[inline]
@@ -748,12 +749,9 @@ impl<'a> TElement for DomNode<'a> {
     where
         F: FnMut(&style::values::AtomIdent),
     {
-        let class_attr = self.data.attr(local_name!("class"));
-        if let Some(class_attr) = class_attr {
-            // split the class attribute
-            for pheme in class_attr.split_ascii_whitespace() {
-                let atom = Atom::from(pheme); // interns the string
-                callback(AtomIdent::cast(&atom));
+        if let Some(el) = self.element_data() {
+            for atom in &el.classes {
+                callback(AtomIdent::cast(atom));
             }
         }
     }

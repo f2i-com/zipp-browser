@@ -207,32 +207,29 @@ function __parseCssDecls(style, text) {
         }
     }
 }
-function __makeStyle(el) {
-    var s = Object.create(__styleProto);
-    Object.defineProperty(s, '_el', { value: el || null, enumerable: false, writable: true, configurable: true });
-    Object.defineProperty(s, '_imp', { value: {}, enumerable: false, writable: true, configurable: true });
+(function () {
     function def(name, fn) {
-        Object.defineProperty(s, name, { value: fn, enumerable: false, writable: true, configurable: true });
+        Object.defineProperty(__styleProto, name, { value: fn, enumerable: false, writable: true, configurable: true });
     }
-    Object.defineProperty(s, 'cssText', {
+    Object.defineProperty(__styleProto, 'cssText', {
         enumerable: false,
         configurable: true,
-        get: function () { return __styleText(s); },
+        get: function () { return __styleText(this); },
         set: function (v) {
-            var old = __moCount && s._el ? __styleText(s) : null;
-            __clearStyle(s);
-            __parseCssDecls(s, v);
-            if (s._el && s._el.attributes) delete s._el.attributes.style;
+            var old = __moCount && this._el ? __styleText(this) : null;
+            __clearStyle(this);
+            __parseCssDecls(this, v);
+            if (this._el && this._el.attributes) delete this._el.attributes.style;
             __domMutations++;
-            if (__moCount && s._el) __moNotify(s._el, "attributes", "style", old, null, null);
+            if (__moCount && this._el) __moNotify(this._el, "attributes", "style", old, null, null);
         }
     });
-    Object.defineProperty(s, 'length', {
+    Object.defineProperty(__styleProto, 'length', {
         enumerable: false,
         configurable: true,
         get: function () {
             var count = 0;
-            for (var k in s) { if (typeof s[k] === 'string' && s[k] !== '' && k !== 'cssText' && k.indexOf('_') !== 0) count++; }
+            for (var k in this) { if (typeof this[k] === 'string' && this[k] !== '' && k !== 'cssText' && k.indexOf('_') !== 0) count++; }
             return count;
         }
     });
@@ -243,7 +240,7 @@ function __makeStyle(el) {
         if (name == null) return;
         var rawName = String(name).trim();
         if (!rawName) return;
-        var old = __moCount && s._el ? __styleText(s) : null;
+        var old = __moCount && this._el ? __styleText(this) : null;
         var n = rawName.indexOf("--") === 0 ? rawName : rawName.toLowerCase();
         var k = __camelProp(n);
         var val = value == null ? '' : String(value).trim();
@@ -253,19 +250,19 @@ function __makeStyle(el) {
             val = val.replace(/\s*!\s*important\s*$/i, '').trim();
         }
         if (val === '') {
-            delete s[k];
-            if (n !== k) delete s[n];
-            delete s._imp[k];
-            delete s._imp[n];
+            delete this[k];
+            if (n !== k) delete this[n];
+            delete this._imp[k];
+            delete this._imp[n];
         } else {
-            if (n !== k) delete s[n];
-            s[k] = val;
-            if (imp) s._imp[k] = true;
-            else delete s._imp[k];
+            if (n !== k) delete this[n];
+            this[k] = val;
+            if (imp) this._imp[k] = true;
+            else delete this._imp[k];
         }
-        if (s._el && s._el.attributes) delete s._el.attributes.style;
+        if (this._el && this._el.attributes) delete this._el.attributes.style;
         __domMutations++;
-        if (__moCount && s._el) __moNotify(s._el, "attributes", "style", old, null, null);
+        if (__moCount && this._el) __moNotify(this._el, "attributes", "style", old, null, null);
     });
     // Either spelling: `style.backgroundColor = x` then
     // `getPropertyValue("background-color")` finds it.
@@ -274,25 +271,25 @@ function __makeStyle(el) {
         var rawName = String(name).trim();
         var n = rawName.indexOf("--") === 0 ? rawName : rawName.toLowerCase();
         var k = __camelProp(n);
-        var v = Object.prototype.hasOwnProperty.call(s, k) ? s[k]
-              : (Object.prototype.hasOwnProperty.call(s, n) ? s[n] : '');
+        var v = Object.prototype.hasOwnProperty.call(this, k) ? this[k]
+              : (Object.prototype.hasOwnProperty.call(this, n) ? this[n] : '');
         return typeof v === 'string' ? v : '';
     });
     def('removeProperty', function (name) {
         if (name == null) return '';
         var rawName = String(name).trim();
-        var old = __moCount && s._el ? __styleText(s) : null;
+        var old = __moCount && this._el ? __styleText(this) : null;
         var n = rawName.indexOf("--") === 0 ? rawName : rawName.toLowerCase();
         var k = __camelProp(n);
-        var v = Object.prototype.hasOwnProperty.call(s, k) && typeof s[k] === 'string' ? s[k]
-              : (Object.prototype.hasOwnProperty.call(s, n) && typeof s[n] === 'string' ? s[n] : '');
-        delete s[k];
-        if (n !== k) delete s[n];
-        delete s._imp[k];
-        delete s._imp[n];
-        if (s._el && s._el.attributes) delete s._el.attributes.style;
+        var v = Object.prototype.hasOwnProperty.call(this, k) && typeof this[k] === 'string' ? this[k]
+              : (Object.prototype.hasOwnProperty.call(this, n) && typeof this[n] === 'string' ? this[n] : '');
+        delete this[k];
+        if (n !== k) delete this[n];
+        delete this._imp[k];
+        delete this._imp[n];
+        if (this._el && this._el.attributes) delete this._el.attributes.style;
         __domMutations++;
-        if (__moCount && s._el) __moNotify(s._el, "attributes", "style", old, null, null);
+        if (__moCount && this._el) __moNotify(this._el, "attributes", "style", old, null, null);
         return v;
     });
     def('getPropertyPriority', function (name) {
@@ -300,15 +297,51 @@ function __makeStyle(el) {
         var rawName = String(name).trim();
         var n = rawName.indexOf("--") === 0 ? rawName : rawName.toLowerCase();
         var k = __camelProp(n);
-        return (s._imp[k] || s._imp[n]) ? 'important' : '';
+        return (this._imp[k] || this._imp[n]) ? 'important' : '';
     });
     def('item', function (i) {
         var keys = [];
-        for (var k in s) { if (typeof s[k] === 'string' && s[k] !== '' && k !== 'cssText' && k.indexOf('_') !== 0) keys.push(k); }
+        for (var k in this) { if (typeof this[k] === 'string' && this[k] !== '' && k !== 'cssText' && k.indexOf('_') !== 0) keys.push(k); }
         var p = keys[i] || '';
         return p === 'cssFloat' ? 'float' : (p.indexOf('--') === 0 ? p : p.replace(/[A-Z]/g, function (m) { return '-' + m.toLowerCase(); }));
     });
-    return s;
+})();
+var __styleProxyHandler = {
+    get: function (t, k) {
+        if (k === "__moProxy") return true;
+        var v = t[k];
+        return typeof v === "function" ? v.bind(t) : v;
+    },
+    set: function (t, k, v) {
+        if (k === "cssText" || k === "_el" || k === "_imp") {
+            t[k] = v;
+            return true;
+        }
+        if (t[k] === v) return true;
+        var old = __moCount && t._el ? __styleText(t) : null;
+        t[k] = v;
+        if (t._el && t._el.attributes) delete t._el.attributes.style;
+        __domMutations++;
+        if (__moCount && t._el) __moNotify(t._el, "attributes", "style", old, null, null);
+        return true;
+    },
+    deleteProperty: function (t, k) {
+        if (k !== "_el" && k !== "_imp" && Object.prototype.hasOwnProperty.call(t, k)) {
+            var old = __moCount && t._el ? __styleText(t) : null;
+            delete t[k];
+            if (t._el && t._el.attributes) delete t._el.attributes.style;
+            __domMutations++;
+            if (__moCount && t._el) __moNotify(t._el, "attributes", "style", old, null, null);
+            return true;
+        }
+        return delete t[k];
+    }
+};
+function __makeStyle(el) {
+    var s = Object.create(__styleProto);
+    Object.defineProperty(s, '_el', { value: el || null, enumerable: false, writable: true, configurable: true });
+    Object.defineProperty(s, '_imp', { value: {}, enumerable: false, writable: true, configurable: true });
+    return new Proxy(s, __styleProxyHandler);
 }
 
 // Populated by addEventListener, read by Rust after SSR to wire up event dispatch.
@@ -422,6 +455,7 @@ var EventTarget = class EventTarget {
         var h = this["on" + ev.type];
         if (typeof h === "function") list.unshift({ fn: h });
         for (var i = 0; i < list.length; i++) {
+            if (ev._immStopped) break;
             if (list[i].once) this.removeEventListener(ev.type, list[i].fn, { capture: list[i].capture });
             try {
                 if (typeof list[i].fn === "function") list[i].fn.call(this, ev); else list[i].fn.handleEvent(ev);
@@ -2204,7 +2238,7 @@ var Event = class Event {
     }
 };
 var CustomEvent = class CustomEvent extends Event {
-    constructor(type,opts) { super(type,opts); this.detail=opts?opts.detail:null; }
+    constructor(type,opts) { super(type,opts); this.detail=(opts&&opts.detail!==undefined)?opts.detail:null; }
     initCustomEvent(type, bubbles, cancelable, detail) {
         this.initEvent(type, bubbles, cancelable);
         this.detail = detail === undefined ? null : detail;
@@ -3688,6 +3722,20 @@ function __historyMove(u) {
     if (u == null || u === "") return;
     var p;
     try { p = JSON.parse(__zippHostCall("url", String(u), String(loc.href))); } catch (e) { return; }
+    // Same-origin enforcement (HTML spec §7.4.2): never allow pushState/replaceState
+    // to switch scheme, cross origins, or change path on `file:`.
+    if (p.protocol !== loc.protocol) {
+        throw new DOMException("SecurityError: cannot change URL scheme via history API", "SecurityError");
+    }
+    if (p.protocol === "http:" || p.protocol === "https:") {
+        if (p.origin !== loc.origin || p.origin === "null") {
+            throw new DOMException("SecurityError: cannot change origin via history API", "SecurityError");
+        }
+    } else if (p.protocol === "file:") {
+        if (p.pathname !== loc.pathname) {
+            throw new DOMException("SecurityError: cannot change file path via history API", "SecurityError");
+        }
+    }
     loc._href = p.href; loc.pathname = p.pathname; loc.search = p.search; loc.hash = p.hash;
 }
 function __getLocationHref() { return String(loc.href || ""); }
@@ -3699,13 +3747,17 @@ var _rafId=0, _tid=1000;
 // called at once, inside `requestAnimationFrame` itself, so a render loop --
 // every WebGL page has one -- recursed instead of animating.
 var __rafQueue = [];
+var __rafCancelled = Object.create(null);
 function __zippRunAnimationFrame(now) {
     var batch = __rafQueue;
     __rafQueue = [];
     for (var i = 0; i < batch.length; i++) {
+        var id = batch[i][0];
+        if (__rafCancelled[id]) { delete __rafCancelled[id]; continue; }
         try { batch[i][1](now); }
         catch (e) { env.log('error', 'animation frame callback threw: ' + ((e && (e.stack || e.message)) || e)); }
     }
+    __rafCancelled = Object.create(null);
     return batch.length;
 }
 // A URL from script, resolved against the page.
@@ -3724,6 +3776,7 @@ var __timerQueue = [];
 // its first second runs straight away instead, so the page shows what it
 // meant to show; longer ones, and intervals, wait for real time.
 var __timers = {};
+var __timerCancelled = Object.create(null);
 var __timerOrder = 0;
 var __zippSettleUntil = Date.now() + 1000;
 function __zippSetTimer(fn, ms, args, repeat) {
@@ -3733,7 +3786,10 @@ function __zippSetTimer(fn, ms, args, repeat) {
     __timers[id] = [Date.now() + ms, fn, args, repeat ? Math.max(ms, 4) : 0, __timerOrder++];
     return id;
 }
-function __zippClearTimer(id) { delete __timers[id]; }
+function __zippClearTimer(id) {
+    delete __timers[id];
+    __timerCancelled[id] = true;
+}
 // Move the timers that are due into `__timerQueue`, earliest first.
 function __zippDueTimers() {
     var now = Date.now(), settling = __zippSettleUntil > 0, due = [];
@@ -3744,9 +3800,15 @@ function __zippDueTimers() {
     if (due.length === 0) return;
     due.sort(function (a, b) { return __timers[a][0] - __timers[b][0] || __timers[a][4] - __timers[b][4]; });
     for (var i = 0; i < due.length; i++) {
-        var t = __timers[due[i]];
-        if (t[3]) t[0] = now + t[3]; else delete __timers[due[i]];
-        __timerQueue.push(function (fn, args) { return function () { fn.apply(window, args); }; }(t[1], t[2]));
+        var tid = due[i];
+        var t = __timers[tid];
+        if (t[3]) t[0] = now + t[3]; else delete __timers[tid];
+        __timerQueue.push(function (id, fn, args) {
+            return function () {
+                if (__timerCancelled[id]) { delete __timerCancelled[id]; return; }
+                fn.apply(window, args);
+            };
+        }(tid, t[1], t[2]));
     }
 }
 // Milliseconds until the next timer is due; -1 when there is none.
@@ -3920,7 +3982,7 @@ var URL = class URL {
         if (!blob || !(blob instanceof Blob)) {
             throw new TypeError("Failed to execute 'createObjectURL' on 'URL': Overload resolution failed.");
         }
-        var bytes = blob._bytes || new Uint8Array(0);
+        var bytes = typeof blob._ensureBytes === "function" ? blob._ensureBytes() : (blob._bytes || new Uint8Array(0));
         if (bytes.length > 0) {
             if (typeof __zippHostBytes === "undefined" || __zippHostBytes.length < bytes.length) {
                 __zippHostBytes = new Uint8Array(Math.max(bytes.length, (typeof __zippHostBytes !== "undefined" ? __zippHostBytes.length : 0) * 2));
@@ -4239,14 +4301,61 @@ if (!String.raw) {
 
 // --- Headers class (for fetch API) ---
 var Headers = function(init) {
-    this._headers = {};
-    if (init) for (var k in init) this._headers[k.toLowerCase()] = init[k];
+    this._headers = Object.create(null);
+    if (!init) return;
+    if (init instanceof Headers) {
+        for (var hk in init._headers) this._headers[hk] = init._headers[hk];
+    } else if (Array.isArray(init)) {
+        for (var i = 0; i < init.length; i++) {
+            if (init[i] && init[i].length >= 2) this.append(init[i][0], init[i][1]);
+        }
+    } else if (typeof init.forEach === "function") {
+        var self = this;
+        init.forEach(function(v, k) { self.append(k, v); });
+    } else {
+        for (var k in init) {
+            if (Object.prototype.hasOwnProperty.call(init, k)) this._headers[String(k).toLowerCase()] = String(init[k]);
+        }
+    }
 };
-Headers.prototype.get = function(name) { return this._headers[name.toLowerCase()] || null; };
-Headers.prototype.set = function(name, value) { this._headers[name.toLowerCase()] = value; };
-Headers.prototype.has = function(name) { return name.toLowerCase() in this._headers; };
-Headers.prototype.delete = function(name) { delete this._headers[name.toLowerCase()]; };
-Headers.prototype.forEach = function(fn) { for (var k in this._headers) fn(this._headers[k], k); };
+Headers.prototype.get = function(name) {
+    var k = String(name).toLowerCase();
+    return Object.prototype.hasOwnProperty.call(this._headers, k) ? this._headers[k] : null;
+};
+Headers.prototype.set = function(name, value) { this._headers[String(name).toLowerCase()] = String(value); };
+Headers.prototype.append = function(name, value) {
+    var k = String(name).toLowerCase();
+    var v = String(value);
+    this._headers[k] = Object.prototype.hasOwnProperty.call(this._headers, k) ? (this._headers[k] + ", " + v) : v;
+};
+Headers.prototype.has = function(name) { return Object.prototype.hasOwnProperty.call(this._headers, String(name).toLowerCase()); };
+Headers.prototype.delete = function(name) { delete this._headers[String(name).toLowerCase()]; };
+Headers.prototype.forEach = function(fn, thisArg) {
+    var keys = Object.keys(this._headers).sort();
+    for (var i = 0; i < keys.length; i++) fn.call(thisArg, this._headers[keys[i]], keys[i], this);
+};
+Headers.prototype.entries = function() {
+    var keys = Object.keys(this._headers).sort(), self = this, i = 0;
+    return {
+        next: function() { return i < keys.length ? { value: [keys[i], self._headers[keys[i++]]], done: false } : { value: undefined, done: true }; },
+        [Symbol.iterator]: function() { return this; }
+    };
+};
+Headers.prototype.keys = function() {
+    var keys = Object.keys(this._headers).sort(), i = 0;
+    return {
+        next: function() { return i < keys.length ? { value: keys[i++], done: false } : { value: undefined, done: true }; },
+        [Symbol.iterator]: function() { return this; }
+    };
+};
+Headers.prototype.values = function() {
+    var keys = Object.keys(this._headers).sort(), self = this, i = 0;
+    return {
+        next: function() { return i < keys.length ? { value: self._headers[keys[i++]], done: false } : { value: undefined, done: true }; },
+        [Symbol.iterator]: function() { return this; }
+    };
+};
+Headers.prototype[Symbol.iterator] = Headers.prototype.entries;
 
 // A response made by script -- `new Response(blob).arrayBuffer()` reads a
 // body as bytes -- and what fetch's resolve to, for `instanceof Response`.
@@ -4380,7 +4489,12 @@ function __subtleDigest(algorithm, data) {
             for (var i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
             resolve(out.buffer);
         } catch (e) {
-            reject(e);
+            var msg = e && e.message ? String(e.message) : String(e);
+            if (msg.indexOf("NotSupportedError") !== -1) {
+                reject(new DOMException(msg, "NotSupportedError"));
+            } else {
+                reject(e);
+            }
         }
     });
 }
@@ -4411,16 +4525,63 @@ var FormData = function(form, submitter) {
         }
     }
 };
-FormData.prototype.append = function(name, value) { this._data.push([name, value]); };
-FormData.prototype.get = function(name) { for (var i = 0; i < this._data.length; i++) if (this._data[i][0] === name) return this._data[i][1]; return null; };
+FormData.prototype.append = function(name, value, filename) {
+    var v = (value instanceof Blob) ? value : String(value);
+    if (filename !== undefined && value instanceof Blob && !(value instanceof File)) {
+        v = new File([value], String(filename), { type: value.type });
+    }
+    this._data.push([String(name), v]);
+};
+FormData.prototype.set = function(name, value, filename) {
+    var k = String(name);
+    var v = (value instanceof Blob) ? value : String(value);
+    if (filename !== undefined && value instanceof Blob && !(value instanceof File)) {
+        v = new File([value], String(filename), { type: value.type });
+    }
+    var replaced = false;
+    var out = [];
+    for (var i = 0; i < this._data.length; i++) {
+        if (this._data[i][0] === k) {
+            if (!replaced) { out.push([k, v]); replaced = true; }
+        } else {
+            out.push(this._data[i]);
+        }
+    }
+    if (!replaced) out.push([k, v]);
+    this._data = out;
+};
+FormData.prototype.get = function(name) { var k = String(name); for (var i = 0; i < this._data.length; i++) if (this._data[i][0] === k) return this._data[i][1]; return null; };
+FormData.prototype.getAll = function(name) { var k = String(name), out = []; for (var i = 0; i < this._data.length; i++) if (this._data[i][0] === k) out.push(this._data[i][1]); return out; };
 FormData.prototype.has = function(name) { return this.get(name) !== null; };
-FormData.prototype.delete = function(name) { this._data = this._data.filter(function(e) { return e[0] !== name; }); };
-FormData.prototype.forEach = function(fn) { for (var i = 0; i < this._data.length; i++) fn(this._data[i][1], this._data[i][0]); };
+FormData.prototype.delete = function(name) { var k = String(name); this._data = this._data.filter(function(e) { return e[0] !== k; }); };
+FormData.prototype.forEach = function(fn, thisArg) { for (var i = 0; i < this._data.length; i++) fn.call(thisArg, this._data[i][1], this._data[i][0], this); };
+FormData.prototype.entries = function() {
+    var d = this._data.slice(), i = 0;
+    return {
+        next: function() { return i < d.length ? { value: [d[i][0], d[i][1]], done: false } : { value: undefined, done: true }; },
+        [Symbol.iterator]: function() { return this; }
+    };
+};
+FormData.prototype.keys = function() {
+    var d = this._data.slice(), i = 0;
+    return {
+        next: function() { return i < d.length ? { value: d[i++][0], done: false } : { value: undefined, done: true }; },
+        [Symbol.iterator]: function() { return this; }
+    };
+};
+FormData.prototype.values = function() {
+    var d = this._data.slice(), i = 0;
+    return {
+        next: function() { return i < d.length ? { value: d[i++][1], done: false } : { value: undefined, done: true }; },
+        [Symbol.iterator]: function() { return this; }
+    };
+};
+FormData.prototype[Symbol.iterator] = FormData.prototype.entries;
 
 // --- Binary-safe Blob class ---
 function __blobPartToBytes(p) {
     if (p == null) return new Uint8Array(0);
-    if (p instanceof Blob) return p._bytes || new Uint8Array(0);
+    if (p instanceof Blob) return typeof p._ensureBytes === "function" ? p._ensureBytes() : (p._bytes || new Uint8Array(0));
     if (p instanceof ArrayBuffer) return new Uint8Array(p);
     if (ArrayBuffer.isView(p)) return new Uint8Array(p.buffer, p.byteOffset, p.byteLength);
     var enc = new TextEncoder().encode(String(p));
@@ -4445,18 +4606,27 @@ var Blob = function(parts, options) {
     this._bytes = out;
     this.size = total;
 };
-Blob.prototype.arrayBuffer = function() { return Promise.resolve(this._bytes.slice(0).buffer); };
-Blob.prototype.bytes = function() { return Promise.resolve(this._bytes.slice(0)); };
-Blob.prototype.text = function() { return Promise.resolve(new TextDecoder().decode(this._bytes)); };
+Blob.prototype._ensureBytes = function() {
+    if (this._bytes) return this._bytes;
+    if (this._path && typeof __zippChosenBytes === "function") {
+        this._bytes = new Uint8Array(__zippChosenBytes(this._path));
+        return this._bytes;
+    }
+    return new Uint8Array(0);
+};
+Blob.prototype.arrayBuffer = function() { return Promise.resolve(this._ensureBytes().slice(0).buffer); };
+Blob.prototype.bytes = function() { return Promise.resolve(this._ensureBytes().slice(0)); };
+Blob.prototype.text = function() { return Promise.resolve(new TextDecoder().decode(this._ensureBytes())); };
 Blob.prototype.slice = function(start, end, contentType) {
-    var len = this._bytes.byteLength;
+    var b = this._ensureBytes();
+    var len = b.byteLength;
     var s = start === undefined ? 0 : (start < 0 ? Math.max(len + start, 0) : Math.min(start, len));
     var e = end === undefined ? len : (end < 0 ? Math.max(len + end, 0) : Math.min(end, len));
-    var sliced = e > s ? this._bytes.slice(s, e) : new Uint8Array(0);
+    var sliced = e > s ? b.slice(s, e) : new Uint8Array(0);
     return new Blob([sliced], { type: contentType === undefined ? "" : String(contentType) });
 };
 Blob.prototype.stream = function() {
-    var bytes = this._bytes;
+    var bytes = this._ensureBytes();
     return {
         getReader: function() {
             var done = false;
@@ -4651,7 +4821,7 @@ var window = {
     sessionStorage:sessionStorage, localStorage:localStorage,
     getComputedStyle:__getComputedStyle,
     requestAnimationFrame:function(fn){var id=++_rafId;if(typeof fn==="function")__rafQueue.push([id,fn]);return id;},
-    cancelAnimationFrame:function(id){for(var i=0;i<__rafQueue.length;i++){if(__rafQueue[i][0]===id){__rafQueue.splice(i,1);break;}}},
+    cancelAnimationFrame:function(id){__rafCancelled[id]=true;for(var i=0;i<__rafQueue.length;i++){if(__rafQueue[i][0]===id){__rafQueue.splice(i,1);break;}}},
     // Queue timer callbacks for post-script execution (calling them synchronously
     // causes the IIFE dispatch loop to exit prematurely from deeply nested throws)
     setTimeout:function(fn,ms){return __zippSetTimer(fn,ms,Array.prototype.slice.call(arguments,2),false);},
@@ -4681,23 +4851,28 @@ var window = {
     // to Chrome than "permanently hidden".
     IntersectionObserver:function(callback){
         var self=this;
+        var observed=new Set();
         this.observe=function(el){
+            if (!el) return;
+            observed.add(el);
             __mcQueue.push(function(){
+                if (!observed.has(el)) return;
                 try{
+                    var rect=el&&el.getBoundingClientRect?el.getBoundingClientRect():{top:0,left:0,right:0,bottom:0,width:0,height:0};
                     callback([{
                         target:el,
                         isIntersecting:true,
                         intersectionRatio:1,
-                        boundingClientRect:el&&el.getBoundingClientRect?el.getBoundingClientRect():{top:0,left:0,right:0,bottom:0,width:0,height:0},
-                        intersectionRect:{top:0,left:0,right:0,bottom:0,width:0,height:0},
+                        boundingClientRect:rect,
+                        intersectionRect:rect,
                         rootBounds:null,
-                        time:0
+                        time:typeof performance!=="undefined"?performance.now():0
                     }],self);
                 }catch(e){}
             });
         };
-        this.unobserve=function(){};
-        this.disconnect=function(){};
+        this.unobserve=function(el){ observed.delete(el); };
+        this.disconnect=function(){ observed.clear(); };
         this.takeRecords=function(){return [];};
     },
     // A microtask, as in a browser: after the current task, before the next.
@@ -4740,7 +4915,10 @@ var window = {
         }
     },
     isSecureContext:true,
-    structuredClone:function(v){return JSON.parse(JSON.stringify(v));},
+    structuredClone:function(v){
+        if (typeof __zippClone !== "undefined") return __zippClone.decode(__zippClone.encode(v));
+        return JSON.parse(JSON.stringify(v));
+    },
     fetch:function(input, opts) {
         opts = opts || {};
         var isReq = input instanceof Request;
@@ -4772,7 +4950,7 @@ var window = {
         return new Promise(function(resolve, reject) {
             try {
                 if (signal && signal.aborted) {
-                    reject(new DOMException("The operation was aborted.", "AbortError"));
+                    reject(signal.reason !== undefined ? signal.reason : new DOMException("The operation was aborted.", "AbortError"));
                     return;
                 }
                 // Fast binary path for blob: and data: URLs (e.g. Three.js GLB/HDR
@@ -4802,7 +4980,7 @@ var window = {
                                 var p = __zippPendingFetches[rid];
                                 if (p) {
                                     delete __zippPendingFetches[rid];
-                                    p.reject(new DOMException("The operation was aborted.", "AbortError"));
+                                    p.reject(signal.reason !== undefined ? signal.reason : new DOMException("The operation was aborted.", "AbortError"));
                                 }
                             });
                         }
@@ -4856,7 +5034,7 @@ function __zippBuildFetchResponse(r, url, credentials) {
         url: String(url),
         headers: respHeaders,
         text: function() { return Promise.resolve(responseBody); },
-        json: function() { return Promise.resolve(JSON.parse(responseBody)); },
+        json: function() { return Promise.resolve().then(function() { return JSON.parse(responseBody); }); },
         // Preserve raw binary bytes for images, GLBs, HDRs, and Wasm.
         blob: function() {
             return new Promise(function(res, rej) {

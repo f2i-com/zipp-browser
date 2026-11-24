@@ -280,12 +280,13 @@ pub(crate) fn collect_table_cells(
             let stylo_style = &node.primary_styles().unwrap();
             let colspan: u16 = node
                 .attr(local_name!("colspan"))
-                .and_then(|val| val.parse().ok())
+                .and_then(|val| val.parse::<u16>().ok())
+                .map(|n| n.clamp(1, 1000))
                 .unwrap_or(1);
             let rowspan: u16 = node
                 .attr(local_name!("rowspan"))
-                .and_then(|val| val.parse().ok())
-                .filter(|n| *n >= 1)
+                .and_then(|val| val.parse::<u16>().ok())
+                .map(|n| n.clamp(1, 1000))
                 .unwrap_or(1);
 
             // Step over columns still covered by a rowspan from an earlier row.
@@ -317,7 +318,7 @@ pub(crate) fn collect_table_cells(
                         }
                     }
                     taffy::CompactLength::AUTO_TAG => style_helpers::auto(),
-                    _ => unreachable!(),
+                    _ => style_helpers::auto(),
                 };
                 columns.push(column);
             }
@@ -329,11 +330,11 @@ pub(crate) fn collect_table_cells(
             }
 
             style.grid_column = taffy::Line {
-                start: style_helpers::line((*col + 1) as i16),
+                start: style_helpers::line((*col).saturating_add(1).min(i16::MAX as u16) as i16),
                 end: style_helpers::span(colspan),
             };
             style.grid_row = taffy::Line {
-                start: style_helpers::line(*row as i16),
+                start: style_helpers::line((*row).min(i16::MAX as u16) as i16),
                 end: style_helpers::span(rowspan),
             };
             style.size.width = style_helpers::auto();
@@ -341,8 +342,8 @@ pub(crate) fn collect_table_cells(
 
             // Record the coverage so the following rows skip these columns.
             if rowspan > 1 {
-                let last_row = *row + rowspan - 1;
-                let end = (*col + colspan) as usize;
+                let last_row = (*row).saturating_add(rowspan - 1);
+                let end = (*col as usize).saturating_add(colspan as usize);
                 if occupied.len() < end {
                     occupied.resize(end, 0);
                 }
@@ -351,7 +352,7 @@ pub(crate) fn collect_table_cells(
                 }
             }
 
-            *col += colspan;
+            *col = (*col).saturating_add(colspan);
         }
         DisplayInside::Flow
         | DisplayInside::FlowRoot

@@ -5,6 +5,7 @@
 
 use std::fs::File;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 
 const KDSETMODE: libc::c_ulong = 0x4B3A;
 const KD_TEXT: libc::c_int = 0;
@@ -21,15 +22,25 @@ pub(crate) struct Console {
 impl Console {
     /// The foreground console, taken; nothing when there are no consoles.
     pub(crate) fn take() -> Option<Console> {
-        let tty = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty0").ok()?;
+        let tty = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC)
+            .open("/dev/tty0")
+            .ok()?;
         let fd = tty.as_raw_fd();
         let mut keyboard: libc::c_int = 0;
         unsafe {
             if libc::ioctl(fd, KDGKBMODE as _, &mut keyboard) < 0 {
                 return None;
             }
-            libc::ioctl(fd, KDSKBMODE as _, K_OFF);
-            libc::ioctl(fd, KDSETMODE as _, KD_GRAPHICS);
+            if libc::ioctl(fd, KDSKBMODE as _, K_OFF) < 0 {
+                return None;
+            }
+            if libc::ioctl(fd, KDSETMODE as _, KD_GRAPHICS) < 0 {
+                libc::ioctl(fd, KDSKBMODE as _, keyboard);
+                return None;
+            }
         }
         Some(Console { tty, keyboard })
     }

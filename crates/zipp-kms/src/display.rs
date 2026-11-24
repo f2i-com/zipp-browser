@@ -149,10 +149,27 @@ impl Display {
 
         // The primary plane: the one now scanning out our framebuffer.
         let planes = card.plane_handles()?;
+        let is_primary = |p: plane::Handle| -> bool {
+            let Ok(props) = card.get_properties(p) else { return false };
+            for (&id, &value) in props.iter() {
+                if card.get_property(id).is_ok_and(|info| info.name().to_bytes() == b"type") {
+                    return value == 1; // DRM_PLANE_TYPE_PRIMARY
+                }
+            }
+            false
+        };
         let plane = planes
             .iter()
             .copied()
             .find(|&p| card.get_plane(p).is_ok_and(|info| info.crtc() == Some(crtc) && info.framebuffer() == Some(fb)))
+            .or_else(|| {
+                planes.iter().copied().find(|&p| {
+                    is_primary(p)
+                        && card
+                            .get_plane(p)
+                            .is_ok_and(|info| resources.filter_crtcs(info.possible_crtcs()).contains(&crtc))
+                })
+            })
             .or_else(|| {
                 planes.iter().copied().find(|&p| {
                     card.get_plane(p)
@@ -276,6 +293,9 @@ impl Display {
             .unwrap_or_else(|| made_mode(wanted.0, wanted.1));
         let (scanout, fb) = set_mode(&self.card, self.crtc, self.connector, mode)?;
         let size = (drawn_width(&scanout, wanted.0 as u32), wanted.1 as u32);
+        // Evict cached software-cursor framebuffer mmaps before destroying old buffers,
+        // so VRAM is released and reused FB IDs cannot hit stale mappings.
+        self.pointer.clear_maps();
         let old = std::mem::replace(&mut *self.screen(), Screen { mode, size, scanout: (scanout, fb) });
         let _ = self.card.destroy_framebuffer(old.scanout.1);
         let _ = self.card.destroy_dumb_buffer(old.scanout.0);
@@ -291,6 +311,10 @@ impl Display {
 
     pub(crate) fn hide_pointer(&self) {
         self.pointer.hide(&self.card, self.crtc);
+    }
+
+    pub(crate) fn pointer_visible(&self) -> bool {
+        self.pointer.is_visible()
     }
 
     /// A page flip finished: the new frame is on screen.

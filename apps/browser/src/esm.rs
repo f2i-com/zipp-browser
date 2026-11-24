@@ -455,7 +455,7 @@ fn rewrite_module(
                             js_string(&exported),
                             js_string(&abs)
                         ));
-                        String::new()
+                        format!("__imp({});", js_string(&abs))
                     }
                     None => format!("__expAll(__imp({}));", js_string(&abs)),
                 };
@@ -474,7 +474,7 @@ fn rewrite_module(
         // A literal specifier is resolved now, so the target is part of the
         // graph and already fetched. A computed one can only be resolved
         // against this module's URL at runtime.
-        let replacement = match syn_literal(arg_text) {
+        match syn_literal(arg_text) {
             Some(spec) => {
                 let abs = resolve(url, &spec);
                 // A bare name nothing maps (or a Node builtin like `node:fs`) is
@@ -488,11 +488,14 @@ fn rewrite_module(
                 {
                     deps.push(abs.clone());
                 }
-                format!("__dyn({})", js_string(&abs))
+                edits.push(Edit { start, end, text: format!("__dyn({})", js_string(&abs)) });
             }
-            None => format!("__dynRel({},{})", js_string(url), arg_text),
-        };
-        edits.push(Edit { start, end, text: replacement });
+            None => {
+                // Use `wrap` so inner `import.meta` or nested `import(...)`
+                // edits inside `arg_start..arg_end` are preserved!
+                wrap(&mut edits, start, arg_start, arg_end, end, &format!("__dynRel({},", js_string(url)), ")");
+            }
+        }
     }
     for (start, end) in scan.meta_spans {
         edits.push(Edit { start, end, text: "__meta".into() });
@@ -880,7 +883,7 @@ function __zippRunModule(url) {
     };
     var expAll = function (other) {
         for (var k in other) {
-            if (k !== 'default') {
+            if (k !== 'default' && !Object.prototype.hasOwnProperty.call(ns, k)) {
                 (function (key) {
                     Object.defineProperty(ns, key, {
                         get: function () { return other[key]; },
@@ -913,7 +916,7 @@ function __zippRunModule(url) {
         // exports are there once it settles, and a rejection is its throw.
         var done = fn(imp, exp, expAll, dyn, dynRel, meta);
         if (done && typeof done.then === 'function') {
-            __zippModulePromises[url] = done.then(function () { return ns; }, function (e) { threw(e); return ns; });
+            __zippModulePromises[url] = done.then(function () { return ns; }, function (e) { threw(e); throw e; });
         }
     } catch (e) {
         threw(e);

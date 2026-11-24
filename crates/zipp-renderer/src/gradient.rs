@@ -345,7 +345,11 @@ fn resolve_color_stops<T>(
     for (idx, item) in items.iter().enumerate() {
         let (color, offset) = match item {
             GenericGradientItem::SimpleColorStop(color) => {
-                let step = 1.0 / (items.len() as f32 - 1.0);
+                let step = if items.len() <= 1 {
+                    0.0
+                } else {
+                    1.0 / (items.len() as f32 - 1.0)
+                };
                 (
                     color.resolve_to_absolute(current_color).as_dynamic_color(),
                     step * idx as f32,
@@ -377,7 +381,10 @@ fn resolve_color_stops<T>(
         match hint {
             None => gradient.stops.push(peniko::ColorStop { color, offset }),
             Some(hint) => {
-                let &last_stop = gradient.stops.last().unwrap();
+                let Some(&last_stop) = gradient.stops.last() else {
+                    gradient.stops.push(peniko::ColorStop { color, offset });
+                    continue;
+                };
 
                 if hint <= last_stop.offset {
                     // Upstream code has a bug here, so we're going to do something different

@@ -35,26 +35,27 @@ pub(crate) fn push_frame(frame: Frame) {
     });
 }
 
-/// The frames presented for `scope` since the last call (when `scope == 0`,
-/// drains all pending frames regardless of scope).
+/// The frames presented for `scope` since the last call.
+/// Never steals frames belonging to a different non-zero scope (even when `scope == 0`).
 pub(crate) fn take_frames_for(scope: u64) -> Vec<(u32, Shown)> {
     let matching: Vec<(u64, Frame)> = FRAMES.with(|f| {
         let mut frames = f.borrow_mut();
-        if scope == 0 {
-            std::mem::take(&mut *frames)
-        } else {
-            let mut mine = Vec::new();
-            let mut rest = Vec::new();
-            for item in frames.drain(..) {
-                if item.0 == scope || item.0 == 0 {
-                    mine.push(item);
-                } else {
-                    rest.push(item);
-                }
+        let mut mine = Vec::new();
+        let mut rest = Vec::new();
+        for item in frames.drain(..) {
+            let matches = if scope == 0 {
+                item.0 == 0
+            } else {
+                item.0 == scope || item.0 == 0
+            };
+            if matches {
+                mine.push(item);
+            } else {
+                rest.push(item);
             }
-            *frames = rest;
-            mine
         }
+        *frames = rest;
+        mine
     });
     SHOWN.with(|s| {
         let mut shown = s.borrow_mut();
@@ -70,12 +71,12 @@ pub(crate) fn take_frames_for(scope: u64) -> Vec<(u32, Shown)> {
     })
 }
 
-/// Every frame shown by canvases in `scope` (or all scopes when `scope == 0`).
+/// Every frame shown by canvases in `scope`.
 pub(crate) fn shown_frames_for(scope: u64) -> Vec<(u32, Shown)> {
     SHOWN.with(|s| {
         s.borrow()
             .iter()
-            .filter(|((sc, _), _)| scope == 0 || *sc == scope || *sc == 0)
+            .filter(|((sc, _), _)| if scope == 0 { *sc == 0 } else { *sc == scope || *sc == 0 })
             .map(|((_, flid), frame)| (*flid, frame.clone()))
             .collect()
     })

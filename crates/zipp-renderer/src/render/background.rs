@@ -4,7 +4,7 @@ use crate::color::{Color, ToColorColor};
 use crate::gradient::to_peniko_gradient;
 use anyrender::PaintScene;
 use zipp_dom::node::{ImageData, SpecialElementData};
-use kurbo::{self, BezPath, Point, Rect, Shape, Size, Vec2};
+use kurbo::{self, Point, Rect, Shape, Size, Vec2};
 use peniko::{self, Fill};
 use style::{
     properties::{
@@ -31,20 +31,39 @@ impl ElementCx<'_> {
 
         let bg_styles = &self.style.get_background();
 
-        let background_clip = get_cyclic(
-            &bg_styles.background_clip.0,
-            bg_styles.background_image.0.len() - 1,
-        );
-        let background_clip_path = match background_clip {
-            BorderBox => self.frame.border_box_path(),
-            PaddingBox => self.frame.padding_box_path(),
-            ContentBox => self.frame.content_box_path(),
-        };
-
-        // Draw background color (if any)
-        self.draw_solid_bg(scene, &background_clip_path);
+        // Draw background color (if non-transparent), taking the fast Rect path when corners are sharp.
+        let current_color = self.style.clone_color();
+        let bg_color = bg_styles
+            .background_color
+            .resolve_to_absolute(&current_color)
+            .as_srgb_color();
+        if bg_color != Color::TRANSPARENT {
+            let background_clip = get_cyclic(
+                &bg_styles.background_clip.0,
+                bg_styles.background_image.0.len() - 1,
+            );
+            if self.frame.border_radii.average() == 0.0 {
+                let rect = match background_clip {
+                    BorderBox => &self.frame.border_box,
+                    PaddingBox => &self.frame.padding_box,
+                    ContentBox => &self.frame.content_box,
+                };
+                scene.fill(Fill::NonZero, self.transform, bg_color, Option::None, rect);
+            } else {
+                let path = match background_clip {
+                    BorderBox => self.frame.border_box_path(),
+                    PaddingBox => self.frame.padding_box_path(),
+                    ContentBox => self.frame.content_box_path(),
+                };
+                scene.fill(Fill::NonZero, self.transform, bg_color, Option::None, &path);
+            }
+        }
 
         for (idx, segment) in bg_styles.background_image.0.iter().enumerate().rev() {
+            // Skip `background-image: none` BEFORE allocating clip paths or pushing a clip layer.
+            if matches!(segment, None) {
+                continue;
+            }
             let background_clip = get_cyclic(&bg_styles.background_clip.0, idx);
             let background_clip_path = match background_clip {
                 BorderBox => self.frame.border_box_path(),
@@ -60,9 +79,7 @@ impl ElementCx<'_> {
                 &background_clip_path,
                 |scene| {
                     match segment {
-                        None => {
-                            // Do nothing
-                        }
+                        None => {}
                         Gradient(gradient) => {
                             self.draw_gradient_bg(scene, gradient, idx, *background_clip)
                         }
@@ -133,20 +150,6 @@ impl ElementCx<'_> {
             }
 
             y += (height + gutter) as f64;
-        }
-    }
-
-    #[inline]
-    fn draw_solid_bg(&self, scene: &mut impl PaintScene, shape: &BezPath) {
-        let current_color = self.style.clone_color();
-        let background_color = &self.style.get_background().background_color;
-        let bg_color = background_color
-            .resolve_to_absolute(&current_color)
-            .as_srgb_color();
-
-        if bg_color != Color::TRANSPARENT {
-            // Fill the color
-            scene.fill(Fill::NonZero, self.transform, bg_color, None, shape);
         }
     }
 
@@ -532,7 +535,7 @@ impl ElementCx<'_> {
                     )
                 {
                     let extend_height = extend(
-                        self.frame.border_width.y0 + self.frame.padding_width.y0 + bg_pos_x,
+                        self.frame.border_width.y0 + self.frame.padding_width.y0 + bg_pos_y,
                         bg_size.height,
                     );
                     let height = self.frame.border_box.height() + extend_height;
@@ -551,7 +554,7 @@ impl ElementCx<'_> {
                     )
                 {
                     let extend_height =
-                        extend(self.frame.padding_width.y0 + bg_pos_x, bg_size.height);
+                        extend(self.frame.padding_width.y0 + bg_pos_y, bg_size.height);
                     let height = self.frame.padding_box.height() + extend_height;
                     let count = (height / bg_size.height).ceil() as u32;
 
@@ -562,7 +565,7 @@ impl ElementCx<'_> {
 
                     (origin_rect, extend_height, count)
                 } else {
-                    let extend_height = extend(bg_pos_x, bg_size.height);
+                    let extend_height = extend(bg_pos_y, bg_size.height);
                     let height = origin_rect.height() + extend_height;
                     let count = (height / bg_size.height).ceil() as u32;
                     let origin_rect =
@@ -689,19 +692,19 @@ fn compute_background_position_and_background_size(
     let BackgroundRepeat(repeat_x, repeat_y) = get_cyclic(&background.background_repeat.0, bg_idx);
 
     let bg_size = if matches!(repeat_x, Round) && matches!(repeat_y, Round) {
-        let count = (container_w / bg_size.width).round();
+        let count = (container_w / bg_size.width).round().max(1.0);
         let width = container_w / count;
 
-        let count = (container_h / bg_size.height).round();
+        let count = (container_h / bg_size.height).round().max(1.0);
         let height = container_h / count;
 
         Size::new(width, height)
     } else if matches!(repeat_x, Round) {
-        let count = (container_w / bg_size.width).round();
+        let count = (container_w / bg_size.width).round().max(1.0);
         let width = container_w / count;
         Size::new(width, bg_size.height)
     } else if matches!(repeat_y, Round) {
-        let count = (container_h / bg_size.height).round();
+        let count = (container_h / bg_size.height).round().max(1.0);
         let height = container_h / count;
         Size::new(bg_size.width, height)
     } else {
@@ -783,13 +786,7 @@ fn compute_background_size(
             BackgroundSizeComputeMode::Size(bg_w, bg_h) => {
                 let x_ratio = container_w / bg_w;
                 let y_ratio = container_h / bg_h;
-
-                let ratio = if x_ratio < 1.0 || y_ratio < 1.0 {
-                    x_ratio.min(y_ratio)
-                } else {
-                    x_ratio.max(y_ratio)
-                };
-
+                let ratio = x_ratio.max(y_ratio);
                 (bg_w * ratio, bg_h * ratio)
             }
         },
@@ -798,13 +795,7 @@ fn compute_background_size(
             BackgroundSizeComputeMode::Size(bg_w, bg_h) => {
                 let x_ratio = container_w / bg_w;
                 let y_ratio = container_h / bg_h;
-
-                let ratio = if x_ratio < 1.0 || y_ratio < 1.0 {
-                    x_ratio.max(y_ratio)
-                } else {
-                    x_ratio.min(y_ratio)
-                };
-
+                let ratio = x_ratio.min(y_ratio);
                 (bg_w * ratio, bg_h * ratio)
             }
         },

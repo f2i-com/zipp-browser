@@ -143,14 +143,15 @@ where
             winit_window.set_visible(true);
         }
 
-        // Create viewport
-        // TODO: account for the "safe area"
+        // Create viewport (subtract safe-area insets on boot, matching SurfaceResized)
         let size = winit_window.surface_size();
         let scale = winit_window.scale_factor() as f32;
         let safe_area_insets = winit_window.safe_area();
         let theme = winit_window.theme().unwrap_or(Theme::Light);
         let color_scheme = theme_to_color_scheme(theme);
-        let viewport = Viewport::new(size.width, size.height, scale, color_scheme);
+        let view_w = size.width.saturating_sub(safe_area_insets.left + safe_area_insets.right);
+        let view_h = size.height.saturating_sub(safe_area_insets.top + safe_area_insets.bottom);
+        let viewport = Viewport::new(view_w, view_h, scale, color_scheme);
 
         // Create shell provider
         let needs_resolve = Arc::new(AtomicBool::new(true));
@@ -384,21 +385,24 @@ where
         };
 
         let mut inner = self.doc.inner_mut();
-        // Restyle and lay out only when something asked for it. Without the
-        // non-default `incremental` feature a resolve rebuilds the box tree and
-        // lays out the whole page, 20-50ms on a big one -- too much to repeat
-        // for a change only paint can see, like a video frame, or for the OS
-        // asking for the window to be drawn again. Every ordinary redraw request
-        // (input, resize, a loaded resource, a DOM change) sets the flag; a
-        // running CSS animation resolves every frame as before.
-        let need_resolve = self.needs_resolve.swap(false, Ordering::AcqRel) || inner.is_animating();
+        // Restyle and lay out only when something asked for it, or when CSS
+        // animations / animating subdocuments need style ticks. Pure `<canvas>`
+        // or scroll-fling animations skip full Stylo+Taffy resolve and only repaint.
+        let need_resolve = self.needs_resolve.swap(false, Ordering::AcqRel) || inner.needs_style_resolve();
+        let mut stepped_scroll = false;
         if need_resolve {
             inner.resolve(animation_time);
+        } else {
+            stepped_scroll = inner.step_scroll_animation();
         }
-        let need_paint = self.needs_paint.swap(false, Ordering::AcqRel) || need_resolve || ran_anim_frame;
+        let need_paint = self.needs_paint.swap(false, Ordering::AcqRel)
+            || need_resolve
+            || ran_anim_frame
+            || stepped_scroll;
 
         let (width, height) = inner.viewport().window_size;
         let scale = inner.viewport().scale_f64();
+        let needs_style_anim = inner.needs_style_resolve();
         let is_animating = inner.is_animating();
         let is_blocked = inner.has_pending_critical_resources();
         let insets = self.safe_area_insets.to_logical(scale);
@@ -418,7 +422,11 @@ where
         // Schedule continuous animation frames via `about_to_wait` (`ControlFlow::WaitUntil`)
         // instead of sleeping on the UI thread, keeping window movement responsive.
         if !is_blocked && is_visible && is_animating {
-            self.request_redraw();
+            if needs_style_anim {
+                self.request_redraw();
+            } else {
+                self.request_paint_only();
+            }
         } else if !animating {
             self.next_animation_frame = None;
         }
@@ -521,6 +529,14 @@ where
                 let unchanged = self.doc.inner().viewport().window_size == (width, height);
                 if !unchanged {
                     self.with_viewport(|v| v.window_size = (width, height));
+                } else if width > 0 && height > 0 {
+                    // 0°<->180° / 90°<->270° rotation keeps viewport dimensions equal,
+                    // but still requires renderer surface/cache invalidation.
+                    self.renderer.set_size(
+                        width + insets.left + insets.right,
+                        height + insets.top + insets.bottom,
+                    );
+                    self.request_redraw();
                 }
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
@@ -775,12 +791,9 @@ where
                 };
 
                 self.doc.handle_ui_event(UiEvent::Wheel(event));
-                // Every other input arm requests a repaint unconditionally; this
-                // one relied on `handle_wheel` doing it via the shell provider,
-                // and only when the offset actually changed. Any path that moved
-                // the page without that predicate agreeing left the window
-                // showing a stale frame — scrolling appeared to do nothing.
-                self.request_redraw();
+                // Scrolling only shifts scroll offsets without changing CSS/layout
+                // (any JS wheel listener that mutates DOM calls request_redraw itself).
+                self.request_paint_only();
             }
             WindowEvent::Focused(_) => {}
             WindowEvent::TouchpadPressure { .. } => {}

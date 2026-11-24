@@ -411,7 +411,7 @@ pub fn grid_line(input: &stylo::GridLine) -> taffy::GridPlacement<Atom> {
         if input.ident.0 != stylo::atom!("") {
             taffy::GridPlacement::NamedSpan(
                 input.ident.0.clone(),
-                input.line_num.try_into().unwrap(),
+                input.line_num.clamp(1, u16::MAX as i32) as u16,
             )
         } else {
             taffy::GridPlacement::Span(input.line_num as u16)
@@ -524,7 +524,9 @@ pub fn grid_auto_tracks(input: &stylo::ImplicitGridTracks) -> Vec<taffy::TrackSi
 #[cfg(feature = "grid")]
 pub fn track_repeat(input: stylo::RepeatCount<i32>) -> taffy::RepetitionCount {
     match input {
-        stylo::RepeatCount::Number(val) => taffy::RepetitionCount::Count(val.try_into().unwrap()),
+        stylo::RepeatCount::Number(val) => {
+            taffy::RepetitionCount::Count(val.clamp(1, u16::MAX as i32) as u16)
+        }
         stylo::RepeatCount::AutoFill => taffy::RepetitionCount::AutoFill,
         stylo::RepeatCount::AutoFit => taffy::RepetitionCount::AutoFit,
     }

@@ -61,7 +61,7 @@ impl ElementCx<'_> {
                             rect,
                             shadow_color,
                             radius,
-                            shadow.base.blur.px() as f64,
+                            shadow.base.blur.px() as f64 * self.scale,
                         );
                     }
                 }

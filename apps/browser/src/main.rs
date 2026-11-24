@@ -239,6 +239,7 @@ pub(crate) fn clear_all_site_data() -> (usize, u64, usize) {
     let (entries, bytes) = clear_browser_cache();
     let cookies = zipp_shell::cookies::clear_all();
     site_storage::clear_all();
+    BLOB_STORE.lock().unwrap_or_else(|e| e.into_inner()).clear();
     let msg = format!("Cleared site data ({cookies} cookies + localStorage/sessionStorage/IndexedDB)");
     eprintln!("[DATA] {msg}");
     console::push(console::Level::Log, msg);
@@ -293,11 +294,17 @@ fn parse_cli_args(args: &[String]) -> Result<CliAction, String> {
     let mut screenshot_mode = false;
     let mut positional: Vec<String> = Vec::new();
     let mut i = 0;
+    let mut end_of_opts = false;
 
     while i < args.len() {
         let a = args[i].as_str();
-        if !positional.is_empty() && (app || screenshot_mode) {
+        if end_of_opts || (!positional.is_empty() && (app || screenshot_mode)) {
             positional.push(args[i].clone());
+            i += 1;
+            continue;
+        }
+        if a == "--" {
+            end_of_opts = true;
             i += 1;
             continue;
         }
@@ -610,13 +617,10 @@ fn main() {
     let viewport = default_viewport;
     if kiosk {
         NO_CHROME.store(true, std::sync::atomic::Ordering::Relaxed);
-        system::KIOSK.store(true, std::sync::atomic::Ordering::Relaxed);
+        // `--kiosk --app` runs a single isolated app full-screen on DRM/KMS
+        // without granting machine APIs (`navigator.zipp`).
+        system::KIOSK.store(!app, std::sync::atomic::Ordering::Relaxed);
         zipp_shell::give_keys_to_page();
-    }
-    if app {
-        NO_CHROME.store(true, std::sync::atomic::Ordering::Relaxed);
-        zipp_shell::give_keys_to_page();
-        allow_app_files(&raw_url, app_files.into_iter());
     }
 
     let url = if raw_url.is_empty() {
@@ -635,6 +639,11 @@ fn main() {
     } else {
         normalize_url(&raw_url)
     };
+    if app {
+        NO_CHROME.store(true, std::sync::atomic::Ordering::Relaxed);
+        zipp_shell::give_keys_to_page();
+        allow_app_files(&url, app_files.into_iter());
+    }
     eprintln!(
         "[BROWSER] Loading {url} ({}{} {}x{})",
         if zipp_shell::profile::is_incognito() { "incognito " } else { "" },
@@ -642,6 +651,21 @@ fn main() {
         viewport.0,
         viewport.1,
     );
+    // Overlap embedded font registration and tokio runtime startup with initial
+    // document fetch + JS execution to reduce cold startup latency.
+    let font_init = std::thread::Builder::new()
+        .name("zipp-fonts".into())
+        .spawn(load_fonts)
+        .ok();
+    let rt_init = std::thread::Builder::new()
+        .name("zipp-rt-init".into())
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+        })
+        .ok();
     // The window's page runs on this thread: its console & DevTools are shown,
     // and it may start workers.
     console::record_this_thread();
@@ -680,14 +704,20 @@ fn main() {
         render_page(&url, &html, viewport, Some(fetch_ms));
     eprintln!("[BROWSER] Ready ({} bytes)", final_html.len());
 
-    // 4. Load fonts manually (system font API doesn't work on RDP)
-    let font_ctx = load_fonts();
+    // 4. Join fonts loaded in parallel
+    let font_ctx = font_init
+        .and_then(|h| h.join().ok())
+        .unwrap_or_else(load_fonts);
 
-    // 5. Set up async runtime for network fetches (CSS, images)
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    // 5. Join async runtime built in parallel
+    let rt = rt_init
+        .and_then(|h| h.join().ok())
+        .unwrap_or_else(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+        });
     let _guard = rt.enter();
 
     // 6. Create window and net provider
@@ -741,12 +771,15 @@ fn main() {
     sync_iframes(doc.as_mut(), &url, 0);
     focus_newtab_address_bar(&mut doc, &url);
 
-    // Pre-render linked pages in background for instant navigation
-    let prerender_url = url.clone();
-    std::thread::Builder::new()
-        .stack_size(64 * 1024 * 1024)
-        .spawn(move || prerender_linked_pages(&final_html, &prerender_url))
-        .ok();
+    // Pre-render linked pages in background for instant navigation (skip for local kiosk/app shells).
+    if !kiosk && !app && (url.starts_with("http://") || url.starts_with("https://")) {
+        let prerender_url = url.clone();
+        let prerender_html = final_html.clone();
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || prerender_linked_pages(&prerender_html, &prerender_url))
+            .ok();
+    }
 
     // 8. Open window with tiny-skia renderer
     let mut app = ZippApp::new(proxy, receiver);
@@ -756,8 +789,9 @@ fn main() {
     // which is why every page reached by a link used to render and then
     // respond to nothing.
     app.set_document_builder(Box::new(|url, html, config, viewport| {
-        console::clear();
         worker::new_page();
+        worker::terminate_stale_pages();
+        console::clear();
         system::new_page();
         #[cfg(target_os = "linux")]
         usb::new_page();
@@ -771,7 +805,7 @@ fn main() {
     let renderer = TinySkiaWindowRenderer::new();
     let attributes = winit::window::WindowAttributes::default()
         .with_surface_size(winit::dpi::LogicalSize::new(viewport.0, viewport.1))
-        .with_window_icon(app_icon(false));
+        .with_window_icon(if kiosk { None } else { app_icon(false) });
     #[cfg(windows)]
     let attributes = attributes.with_platform_attributes(Box::new(
         winit::platform::windows::WindowAttributesWindows::default().with_taskbar_icon(app_icon(true)),
@@ -1655,7 +1689,10 @@ fn allow_app_files(url: &str, files: impl Iterator<Item = String>) {
     if let Some(dir) = url::Url::parse(url).ok().and_then(|u| u.to_file_path().ok()).and_then(|p| p.parent().map(Into::into)) {
         allowed.extend(std::fs::canonicalize::<std::path::PathBuf>(dir));
     }
-    let files: Vec<std::path::PathBuf> = files.filter_map(|f| std::fs::canonicalize(f).ok()).collect();
+    let files: Vec<std::path::PathBuf> = files
+        .filter_map(|f| std::fs::canonicalize(f).ok())
+        .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file()))
+        .collect();
     // FNV-1a of what it runs: the same file, the same name, in every version.
     let named = files.first().map(|f| {
         let hash = f.to_string_lossy().bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
@@ -1682,6 +1719,30 @@ pub(crate) fn within_app_files(path: &std::path::Path) -> bool {
 thread_local! {
     /// The page a worker's thread belongs to: the one that started it.
     static THREAD_PAGE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    /// Whether the current JS execution slice belongs to an embedded `<iframe>` sub-document.
+    static IS_SUBDOCUMENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// RAII guard tracking whether host calls are executing inside an embedded `<iframe>`.
+pub(crate) struct SubdocumentGuard {
+    prev: bool,
+}
+
+impl SubdocumentGuard {
+    pub(crate) fn enter(is_subdocument: bool) -> Self {
+        let prev = IS_SUBDOCUMENT.with(|c| c.replace(is_subdocument));
+        Self { prev }
+    }
+}
+
+impl Drop for SubdocumentGuard {
+    fn drop(&mut self) {
+        IS_SUBDOCUMENT.with(|c| c.set(self.prev));
+    }
+}
+
+pub(crate) fn is_subdocument() -> bool {
+    IS_SUBDOCUMENT.with(|c| c.get())
 }
 
 /// This thread works for `page`, whatever the window goes on to show.
@@ -1795,20 +1856,54 @@ fn from_chrome(url: &str) -> bool {
 
 /// In-memory `blob:` URL store shared across the main page thread, Web Workers,
 /// WebGL texture decoding, and `zipp-shell`'s `NetProvider`.
-type BlobMap = HashMap<String, (String, Vec<u8>)>;
+struct BlobEntry {
+    mime: String,
+    bytes: Vec<u8>,
+    origin: String,
+    scope: u64,
+}
+type BlobMap = HashMap<String, BlobEntry>;
 static BLOB_STORE: std::sync::LazyLock<std::sync::Mutex<BlobMap>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 static NEXT_BLOB_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-pub(crate) fn store_blob(origin: &str, mime: &str, bytes: Vec<u8>) -> String {
-    let id = NEXT_BLOB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+fn caller_blob_origin() -> String {
+    web_origin(&page_url())
+        .map(|o| o.ascii_serialization())
+        .unwrap_or_else(|| "null".to_string())
+}
+
+pub(crate) fn store_blob(_origin_hint: &str, mime: &str, bytes: Vec<u8>) -> String {
+    let origin = caller_blob_origin();
+    let scope = async_fetch::current_scope();
+    let mut rand = [0u8; 16];
+    let token = if getrandom::fill(&mut rand).is_ok() {
+        let mut s = String::with_capacity(32);
+        for b in rand {
+            let _ = std::fmt::Write::write_fmt(&mut s, format_args!("{b:02x}"));
+        }
+        s
+    } else {
+        let id = NEXT_BLOB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("{id:016x}")
+    };
     let base = if origin.is_empty() || origin == "null" { "null" } else { origin.trim_end_matches('/') };
-    let url = format!("blob:{base}/zipp-{id:016x}");
+    let url = format!("blob:{base}/zipp-{token}");
     BLOB_STORE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(url.clone(), (mime.to_string(), bytes));
+        .insert(url.clone(), BlobEntry { mime: mime.to_string(), bytes, origin, scope });
     url
+}
+
+fn blob_allowed_for_caller(entry: &BlobEntry) -> bool {
+    let caller_origin = caller_blob_origin();
+    let caller_scope = async_fetch::current_scope();
+    if entry.origin != "null" {
+        caller_origin == entry.origin
+    } else {
+        caller_scope == 0 || entry.scope == 0 || entry.scope == caller_scope
+    }
 }
 
 pub(crate) fn lookup_blob(url: &str) -> Option<(String, Vec<u8>)> {
@@ -1816,18 +1911,37 @@ pub(crate) fn lookup_blob(url: &str) -> Option<(String, Vec<u8>)> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(url)
-        .cloned()
+        .map(|e| (e.mime.clone(), e.bytes.clone()))
+}
+
+pub(crate) fn lookup_blob_for_caller(url: &str) -> Option<(String, Vec<u8>)> {
+    BLOB_STORE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(url)
+        .filter(|e| blob_allowed_for_caller(e))
+        .map(|e| (e.mime.clone(), e.bytes.clone()))
 }
 
 pub(crate) fn lookup_blob_bytes(url: &str) -> Option<Vec<u8>> {
     lookup_blob(url).map(|(_, bytes)| bytes)
 }
 
-pub(crate) fn revoke_blob(url: &str) {
+pub(crate) fn revoke_blob_for_caller(url: &str) {
+    let mut store = BLOB_STORE.lock().unwrap_or_else(|e| e.into_inner());
+    if store.get(url).is_some_and(blob_allowed_for_caller) {
+        store.remove(url);
+    }
+}
+
+pub(crate) fn drop_blobs_for_scope(scope: u64) {
+    if scope == 0 {
+        return;
+    }
     BLOB_STORE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .remove(url);
+        .retain(|_, e| e.scope != scope);
 }
 
 /// Decode a `data:[<mediatype>][;base64],<data>` URI into `(mime_type, bytes)`.
@@ -1945,7 +2059,7 @@ fn fetch_bytes_for_page(url: &str) -> Result<(u16, Vec<u8>), String> {
 
 fn fetch_bytes_with_mime(url: &str, creds: CredentialsMode) -> Result<(u16, String, Vec<u8>), String> {
     if url.starts_with("blob:") {
-        return match lookup_blob(url) {
+        return match lookup_blob_for_caller(url) {
             Some((mime, bytes)) => Ok((200, mime, bytes)),
             None => Err(format!("TypeError: Failed to fetch: blob URL not found: {url}")),
         };
@@ -2162,14 +2276,26 @@ fn safe_response_headers_json(headers: &reqwest::header::HeaderMap) -> serde_jso
 }
 
 thread_local! {
-    /// The files picked in this window's file dialogs: the only ones a page
-    /// may read (`chosen_bytes`).
-    static CHOSEN_FILES: std::cell::RefCell<std::collections::HashSet<std::path::PathBuf>> = std::cell::RefCell::default();
+    /// The files picked in file dialogs, scoped per document so other origins
+    /// and subsequent navigations cannot read previously picked files.
+    static CHOSEN_FILES: std::cell::RefCell<std::collections::HashSet<(u64, std::path::PathBuf)>> = std::cell::RefCell::default();
 }
 
-/// Let the page read these files: the user picked them in a file dialog.
+/// Let the active document scope read these files: the user picked them in a file dialog.
 pub(crate) fn allow_chosen_files<'a>(paths: impl IntoIterator<Item = &'a std::path::Path>) {
-    CHOSEN_FILES.with(|c| c.borrow_mut().extend(paths.into_iter().map(std::path::Path::to_path_buf)));
+    let scope = async_fetch::current_scope();
+    CHOSEN_FILES.with(|c| {
+        c.borrow_mut()
+            .extend(paths.into_iter().map(|p| (scope, p.to_path_buf())));
+    });
+}
+
+/// Drop chosen-file permissions when a document navigates away or unmounts.
+pub(crate) fn drop_chosen_files_for_scope(scope: u64) {
+    if scope == 0 {
+        return;
+    }
+    CHOSEN_FILES.with(|c| c.borrow_mut().retain(|(s, _)| *s != scope));
 }
 
 /// The host channel with the VM at hand, for the calls that move bytes: a
@@ -2257,8 +2383,9 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
         // A file picked in a file dialog, as bytes for `take_bytes`; its length.
         // Only those: a page reads no other file of yours this way.
         "chosen_bytes" => {
+            let scope = async_fetch::current_scope();
             let path = std::path::PathBuf::from(args.first().map(String::as_str).unwrap_or_default());
-            if !CHOSEN_FILES.with(|c| c.borrow().contains(&path)) {
+            if !CHOSEN_FILES.with(|c| c.borrow().contains(&(scope, path.clone()))) {
                 return Err("NotAllowedError: only a file picked in a file dialog can be read".into());
             }
             let bytes = std::fs::read(&path).map_err(|e| format!("NotReadableError: {}: {e}", path.display()))?;
@@ -2290,12 +2417,12 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
             Ok(store_blob(origin, mime, bytes))
         }
         "blob_revoke" => {
-            revoke_blob(args.first().map(String::as_str).unwrap_or_default());
+            revoke_blob_for_caller(args.first().map(String::as_str).unwrap_or_default());
             Ok(String::new())
         }
         "blob_read" => {
             let url = args.first().map(String::as_str).unwrap_or_default();
-            let Some((mime, bytes)) = lookup_blob(url) else {
+            let Some((mime, bytes)) = lookup_blob_for_caller(url) else {
                 return Err(format!("TypeError: blob URL not found: {url}"));
             };
             let len = bytes.len();
@@ -2360,8 +2487,12 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
             zipp_shell::set_clipboard_text(args.first().cloned().unwrap_or_default());
             Ok(String::new())
         }
-        // `document.title = ...`: update both the active tab label and OS window title.
+        // `document.title = ...`: update both the active tab label and OS window title
+        // (top-level documents only — embedded iframes must not hijack the tab title).
         "window_title" => {
+            if is_subdocument() {
+                return Ok(String::new());
+            }
             let title = args.first().cloned().unwrap_or_default();
             tabs::update_active_title(&title);
             push_window_request(WindowRequest::Title(title));
@@ -2370,10 +2501,9 @@ fn browser_host_call_ctx(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> 
         // `requestFullscreen()` ("1") and `exitFullscreen()` ("0").
         "fullscreen" => {
             let on = args.first().is_some_and(|a| a == "1");
-            // Going full screen takes the person's doing (leaving does not):
-            // a page that could when it liked could draw a whole desktop of
-            // its own, and ask for a password in it.
-            if on && !user_just_acted() {
+            // Going full screen takes the person's doing (leaving does not for
+            // the top-level document; embedded iframes always need a gesture).
+            if (on || is_subdocument()) && !user_just_acted() {
                 return Ok("0".into());
             }
             push_window_request(WindowRequest::Fullscreen(on));
@@ -2496,18 +2626,27 @@ fn browser_host_call(kind: &str, args: &[String]) -> Result<String, String> {
         // There are no tabs yet, so this navigates the CURRENT window. That is
         // the honest single-window behaviour and beats silently dropping it.
         "navigate" => {
+            if is_subdocument() {
+                eprintln!("[NAV] blocked top-level navigation from subdocument");
+                return Ok(String::new());
+            }
             let raw = args.first().cloned().unwrap_or_default();
             if raw.is_empty() {
                 return Ok(String::new());
             }
-            let base = CURRENT_URL.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let base = page_url();
             let full = resolve(&base, &raw);
             match full.parse::<url::Url>() {
                 Ok(parsed) => {
                     // Untrusted page scripts may only navigate to normal web/document schemes,
-                    // never internal browser chrome/settings/action URLs.
-                    if !matches!(parsed.scheme(), "http" | "https" | "file" | "about") {
-                        eprintln!("[NAV] refused script navigation to internal scheme: {full}");
+                    // never internal browser chrome/settings/action URLs (and `file:` only from `file:`).
+                    let scheme_ok = match parsed.scheme() {
+                        "http" | "https" | "about" => true,
+                        "file" => base.starts_with("file:"),
+                        _ => false,
+                    };
+                    if !scheme_ok {
+                        eprintln!("[NAV] refused script navigation to disallowed scheme: {full}");
                         return Ok(String::new());
                     }
                     eprintln!("[NAV] page requested {full}");
@@ -2538,12 +2677,17 @@ fn browser_host_call(kind: &str, args: &[String]) -> Result<String, String> {
                 eprintln!("[NAV] blocked unprompted window.open popup: {raw}");
                 return Ok(String::new());
             }
-            let base = CURRENT_URL.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let base = page_url();
             let full = resolve(&base, &raw);
             match full.parse::<url::Url>() {
                 Ok(parsed) => {
-                    if !matches!(parsed.scheme(), "http" | "https" | "file" | "about") {
-                        eprintln!("[NAV] refused script window.open to internal scheme: {full}");
+                    let scheme_ok = match parsed.scheme() {
+                        "http" | "https" | "about" => true,
+                        "file" => base.starts_with("file:"),
+                        _ => false,
+                    };
+                    if !scheme_ok {
+                        eprintln!("[NAV] refused script window.open to disallowed scheme: {full}");
                         return Ok(String::new());
                     }
                     eprintln!("[NAV] page opened new tab {full}");
@@ -2917,6 +3061,12 @@ fn prepare_page(url: &str, viewport: (u32, u32)) -> (String, Option<String>, Opt
 /// Run a fetched page's JS and post-process it into the HTML the renderer sees:
 /// the second half of [`prepare_page`], and all of a navigation's work on the
 /// main thread. `fetch_ms` is `None` when the fetch happened elsewhere.
+fn has_script_tag(html: &str) -> bool {
+    html.as_bytes()
+        .windows(7)
+        .any(|w| w.eq_ignore_ascii_case(b"<script"))
+}
+
 fn render_page(
     url: &str,
     html: &str,
@@ -2929,7 +3079,7 @@ fn render_page(
     let html = html.to_string();
     let title_count_before = pending_window_title_count();
     let t_js = std::time::Instant::now();
-    let (rendered, event_map_json, js_state) = if html.contains("<script") {
+    let (rendered, event_map_json, js_state) = if has_script_tag(&html) {
         match run_zipp_js(&html, url, viewport) {
             Some((r, emap, state)) => (r, Some(emap), Some(state)),
             None => (html.clone(), None, None),
@@ -3064,22 +3214,26 @@ pub(crate) fn chrome_shown() -> bool {
     !NO_CHROME.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// When the person last pressed a key or a button, in ms since the first time.
-static LAST_GESTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+/// When the person last pressed a key or a button `(scope, ms since start)`.
+static LAST_GESTURE: Mutex<(u64, u64)> = Mutex::new((0, u64::MAX));
 
 fn since_start() -> u64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
 }
 
-/// The person pressed something (the event bridge says; a page cannot).
-pub(crate) fn note_user_gesture() {
-    LAST_GESTURE.store(since_start(), std::sync::atomic::Ordering::Relaxed);
+/// The person pressed something in `scope` (the event bridge says; a page cannot).
+pub(crate) fn note_user_gesture(scope: u64) {
+    *LAST_GESTURE.lock().unwrap_or_else(|e| e.into_inner()) = (scope, since_start());
 }
 
 fn user_just_acted() -> bool {
-    let last = LAST_GESTURE.load(std::sync::atomic::Ordering::Relaxed);
-    last != u64::MAX && since_start().saturating_sub(last) < 5000
+    let (g_scope, last) = *LAST_GESTURE.lock().unwrap_or_else(|e| e.into_inner());
+    if last == u64::MAX || since_start().saturating_sub(last) >= 5000 {
+        return false;
+    }
+    let cur = async_fetch::current_scope();
+    cur == 0 || g_scope == 0 || g_scope == cur
 }
 
 /// What page script asks of its window, for the event bridge to carry out
@@ -3907,44 +4061,39 @@ fn run_zipp_js_inner(
     let seed = seed::body_json(html).unwrap_or_default();
     SEED.with(|s| *s.borrow_mut() = seed);
 
-    let dom_shim = &platform_shim(&format!("{}\n{}", include_str!("console_shim.js"), include_str!("dom_shim.js")));
+    static BASE_SHIM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let base_shim = BASE_SHIM.get_or_init(|| {
+        let dom_shim = platform_shim(&format!("{}\n{}", include_str!("console_shim.js"), include_str!("dom_shim.js")));
+        format!(
+            "{HOST_PRELUDE_JS}\n{dom_shim}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            include_str!("clone.js"),
+            include_str!("indexeddb_shim.js"),
+            include_str!("worker_page.js"),
+            include_str!("webgl_shim.js"),
+            include_str!("canvas2d_shim.js"),
+            include_str!("webgpu_shim.js"),
+            include_str!("webusb_shim.js"),
+            include_str!("webaudio_shim.js"),
+        )
+    });
     let router_helpers = include_str!("router_helpers.js");
-    let webgl_shim = include_str!("webgl_shim.js");
-    let webgpu_shim = include_str!("webgpu_shim.js");
-    let webusb_shim = include_str!("webusb_shim.js");
-    let webaudio_shim = include_str!("webaudio_shim.js");
-    let zipp_shim = include_str!("zipp_shim.js");
-    let dom_shim = &format!(
-        "{HOST_PRELUDE_JS}\n{dom_shim}\n{}\n{}\n{}\n{webgl_shim}\n{}\n{webgpu_shim}\n{webusb_shim}\n{webaudio_shim}\n{zipp_shim}",
-        include_str!("clone.js"),
-        include_str!("indexeddb_shim.js"),
-        include_str!("worker_page.js"),
-        include_str!("canvas2d_shim.js")
-    );
-    let shim = dom_shim.replace(
-        "__PAGE_URL__",
-        &page_url.replace('\\', "\\\\").replace('\'', "\\'"),
-    );
-    let shim = shim.replace("__PAGE_TITLE__", &js_quoted(&page_title(html)));
-    // The page's JS must see the SAME viewport the CSS is laid out against, or
-    // a responsive app that branches on `window.innerWidth` renders for one
-    // width while the cascade uses another.
-    // Likewise the colour scheme: `matchMedia('(prefers-color-scheme: dark)')`
-    // has to give the answer Stylo uses for the same query in CSS.
-    let shim = shim
-        .replace("__VIEWPORT_W__", &viewport.0.to_string())
-        .replace("__VIEWPORT_H__", &viewport.1.to_string())
-        .replace("__PREFERS_DARK__", if system_prefers_dark() { "true" } else { "false" })
-        .replace(
-            "__BODY_HTML__",
-            &body_html(html)
-                .replace('\\', "\\\\")
-                .replace('\'', "\\'")
-                .replace('\n', "\\n")
-                .replace('\r', ""),
-        );
-
-    let mut shim_prog = shim;
+    // Substitute the 5 small page placeholders in one pass (avoiding redundant full-shim
+    // copies and the previously dead `__BODY_HTML__` escaping of the entire document).
+    let escaped_url = page_url.replace('\\', "\\\\").replace('\'', "\\'");
+    let escaped_title = js_quoted(&page_title(html));
+    let vw_str = viewport.0.to_string();
+    let vh_str = viewport.1.to_string();
+    let dark_str = if system_prefers_dark() { "true" } else { "false" };
+    let mut shim_prog = base_shim
+        .replace("__PAGE_URL__", &escaped_url)
+        .replace("__PAGE_TITLE__", &escaped_title)
+        .replace("__VIEWPORT_W__", &vw_str)
+        .replace("__VIEWPORT_H__", &vh_str)
+        .replace("__PREFERS_DARK__", dark_str);
+    if system::allowed() {
+        shim_prog.push('\n');
+        shim_prog.push_str(include_str!("zipp_shim.js"));
+    }
     if is_mobile_view() {
         shim_prog.push_str("\nif (typeof __zippSetMobileMode === \"function\") __zippSetMobileMode(true);\n");
     }
@@ -4132,7 +4281,7 @@ fn run_zipp_js_inner(
     event_bridge::run_page_tasks(&mut state, 600, 2, std::time::Duration::from_secs(3));
     // Give any worker started during init a brief moment for an immediate reply
     // without blocking interactive window startup.
-    if worker::has_active() {
+    if worker::has_active_for(fetch_scope) {
         let brief = std::time::Duration::from_millis(300);
         let t_w = std::time::Instant::now();
         while t_w.elapsed() < brief {
@@ -4847,8 +4996,12 @@ fn wrap_with_toolbar(html: &str, current_url: &str) -> String {
 /// outside every JS re-render, which replaces only the body's contents.
 fn mount_chrome(doc: &mut HtmlDocument) {
     let root = doc.root_element().id;
+    // Always select the LAST match: `wrap_with_toolbar` appends real chrome at the
+    // end of `<body>`, so a page-authored element with the same `id` cannot hijack it.
     for id in ["#__zipp_chrome", "#__zipp_console"] {
-        if let Ok(Some(node)) = doc.query_selector(id) {
+        if let Ok(nodes) = doc.query_selector_all(id)
+            && let Some(&node) = nodes.last()
+        {
             doc.mutate().append_children(root, &[node]);
         }
     }
@@ -5015,10 +5168,14 @@ fn build_iframe_document(
     html: &str,
     iframe_size: (u32, u32),
     depth: u8,
+    allow_scripts: bool,
+    allow_same_origin: bool,
 ) -> HtmlDocument {
     use zipp_dom::traits_src::shell::Viewport;
 
-    let _page_guard = ThreadPageGuard::enter(iframe_url);
+    let origin_url = if allow_same_origin { iframe_url } else { "about:blank" };
+    let _page_guard = ThreadPageGuard::enter(origin_url);
+    let _subdoc_guard = SubdocumentGuard::enter(true);
     let _iframe_guard = devtools::IframeScope::enter();
     let saved_import_map = IMPORT_MAP.with(|m| m.borrow().clone());
 
@@ -5029,8 +5186,8 @@ fn build_iframe_document(
         None,
     );
 
-    let (rendered, event_map_json, js_state) = if html.contains("<script") {
-        match run_zipp_js(html, iframe_url, iframe_size) {
+    let (rendered, event_map_json, js_state) = if allow_scripts && has_script_tag(html) {
+        match run_zipp_js(html, origin_url, iframe_size) {
             Some((r, emap, state)) => (r, Some(emap), Some(state)),
             None => (html.to_string(), None, None),
         }
@@ -5078,7 +5235,7 @@ fn build_iframe_document(
         flid_map,
         &emap_json,
         js_state,
-        iframe_url,
+        origin_url,
         depth + 1,
     );
     sub_doc.set_event_handler(Box::new(bridge));
@@ -5109,6 +5266,7 @@ pub(crate) fn sync_iframes(doc: &mut BaseDocument, parent_url: &str, depth: u8) 
     let src_attr = zipp_dom::LocalName::from("src");
     let srcdoc_attr = zipp_dom::LocalName::from("srcdoc");
     let refpol_attr = zipp_dom::LocalName::from("referrerpolicy");
+    let sandbox_attr = zipp_dom::LocalName::from("sandbox");
 
     for iframe_id in iframe_ids {
         let Some(node) = doc.get_node(iframe_id) else {
@@ -5122,6 +5280,21 @@ pub(crate) fn sync_iframes(doc: &mut BaseDocument, parent_url: &str, depth: u8) 
         let no_referrer = el
             .attr(refpol_attr.clone())
             .is_some_and(|v| v.eq_ignore_ascii_case("no-referrer"));
+        let (allow_scripts, allow_same_origin) = match el.attr(sandbox_attr.clone()) {
+            None => (true, true),
+            Some(tokens) => {
+                let mut scripts = false;
+                let mut same_org = false;
+                for tok in tokens.split_ascii_whitespace() {
+                    if tok.eq_ignore_ascii_case("allow-scripts") {
+                        scripts = true;
+                    } else if tok.eq_ignore_ascii_case("allow-same-origin") {
+                        same_org = true;
+                    }
+                }
+                (scripts, same_org)
+            }
+        };
 
         let target_url = if let Some(ref sd) = raw_srcdoc {
             use std::hash::{Hash, Hasher};
@@ -5134,6 +5307,13 @@ pub(crate) fn sync_iframes(doc: &mut BaseDocument, parent_url: &str, depth: u8) 
         {
             resolve(parent_url, raw_src)
         } else {
+            // Unmount any previously mounted sub-document when `src`/`srcdoc` is cleared.
+            if matches!(el.special_data, zipp_dom::node::SpecialElementData::SubDocument(_))
+                && let Some(el_mut) = doc.get_node_mut(iframe_id).and_then(|n| n.element_data_mut())
+            {
+                el_mut.special_data = zipp_dom::node::SpecialElementData::None;
+                mounted_any = true;
+            }
             continue;
         };
 
@@ -5177,7 +5357,15 @@ pub(crate) fn sync_iframes(doc: &mut BaseDocument, parent_url: &str, depth: u8) 
             },
         };
 
-        let sub_doc = build_iframe_document(doc, &target_url, &html, (iframe_w, iframe_h), depth);
+        let sub_doc = build_iframe_document(
+            doc,
+            &target_url,
+            &html,
+            (iframe_w, iframe_h),
+            depth,
+            allow_scripts,
+            allow_same_origin,
+        );
         doc.set_sub_document(iframe_id, Box::new(sub_doc));
         mounted_any = true;
     }
@@ -5837,19 +6025,6 @@ fn attr(tag: &str, name: &str) -> Option<String> {
 }
 
 #[inline]
-fn body_html(html: &str) -> String {
-    let start = match html.find("<body") {
-        Some(i) => match html[i..].find('>') {
-            Some(e) => i + e + 1,
-            None => return String::new(),
-        },
-        None => return String::new(),
-    };
-    let end = html.find("</body>").unwrap_or(html.len());
-    html[start..end].to_string()
-}
-
-#[inline]
 /// The text of the page's `<title>`, its common character references decoded.
 fn page_title(html: &str) -> String {
     let lower = html.to_ascii_lowercase();
@@ -6060,6 +6235,21 @@ mod tests {
                 mobile: true,
                 incognito: false,
                 no_chrome: true,
+                clear_cache: false,
+                clear_data: false,
+                no_cache: false,
+            })
+        );
+        assert_eq!(
+            parse_cli_args(&s(&["--kiosk", "--app", "file:///app/softn/index.html", "/app/softn/examples/Fieldnotes.softn"])),
+            Ok(CliAction::Run {
+                url: "file:///app/softn/index.html".into(),
+                mobile: false,
+                incognito: false,
+                viewport: None,
+                kiosk: true,
+                app: true,
+                app_files: vec!["/app/softn/examples/Fieldnotes.softn".into()],
                 clear_cache: false,
                 clear_data: false,
                 no_cache: false,

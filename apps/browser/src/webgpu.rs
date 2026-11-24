@@ -22,9 +22,16 @@ use zipp_vm::embed::HostCtx;
 use crate::canvas::{Frame, push_frame};
 
 struct Batch {
+    scope: u64,
+    page_url: String,
     cmds: String,
     payload: Vec<u8>,
     reply: Sender<Reply>,
+}
+
+enum Msg {
+    Batch(Batch),
+    DropScope(u64),
 }
 
 #[derive(Default)]
@@ -36,11 +43,25 @@ struct Reply {
 }
 
 thread_local! {
-    static GPU_THREAD: RefCell<Option<Sender<Batch>>> = const { RefCell::new(None) };
+    static GPU_THREAD: RefCell<Option<Sender<Msg>>> = const { RefCell::new(None) };
+}
+
+/// Destroy all WebGPU resources owned by a document scope when it unmounts or navigates.
+pub(crate) fn drop_scope(scope: u64) {
+    if scope == 0 {
+        return;
+    }
+    GPU_THREAD.with(|t| {
+        if let Some(tx) = t.borrow().as_ref() {
+            let _ = tx.send(Msg::DropScope(scope));
+        }
+    });
 }
 
 /// `__zippHostCall("gpu", batch, payloadLength)`.
 pub(crate) fn host_call(ctx: &mut dyn HostCtx, args: &[String]) -> Result<String, String> {
+    let scope = crate::async_fetch::current_scope();
+    let page_url = crate::page_url();
     let cmds = args.first().cloned().unwrap_or_default();
     let len: usize = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(0);
     let payload = if len > 0 {
@@ -66,13 +87,21 @@ pub(crate) fn host_call(ctx: &mut dyn HostCtx, args: &[String]) -> Result<String
             .clone()
     });
     let (reply_tx, reply_rx) = mpsc::channel();
-    sender
-        .send(Batch { cmds, payload, reply: reply_tx })
-        .map_err(|_| "Error: WebGPU is unavailable".to_string())?;
+    if sender
+        .send(Msg::Batch(Batch { scope, page_url, cmds, payload, reply: reply_tx }))
+        .is_err()
+    {
+        GPU_THREAD.with(|t| *t.borrow_mut() = None);
+        return Err("Error: WebGPU is unavailable".to_string());
+    }
     // Bounded, so that a GPU that never answers cannot freeze the page.
-    let reply = reply_rx
-        .recv_timeout(Duration::from_secs(30))
-        .map_err(|_| "Error: WebGPU did not answer".to_string())?;
+    let reply = reply_rx.recv_timeout(Duration::from_secs(30)).map_err(|e| match e {
+        mpsc::RecvTimeoutError::Timeout => "Error: WebGPU did not answer".to_string(),
+        mpsc::RecvTimeoutError::Disconnected => {
+            GPU_THREAD.with(|t| *t.borrow_mut() = None);
+            "Error: WebGPU stopped".to_string()
+        }
+    })?;
     for error in &reply.errors {
         eprintln!("[WEBGPU] {error}");
         crate::console::push(crate::console::Level::Error, format!("WebGPU: {error}"));
@@ -90,12 +119,28 @@ pub(crate) fn host_call(ctx: &mut dyn HostCtx, args: &[String]) -> Result<String
     Ok(reply.result)
 }
 
-fn gpu_thread(batches: Receiver<Batch>) {
-    let mut gpu = Gpu::default();
-    for batch in batches {
-        let reply = gpu.run(&batch.cmds, &batch.payload);
-        let _ = batch.reply.send(reply);
+fn gpu_thread(msgs: Receiver<Msg>) {
+    let mut host = GpuHost::default();
+    for msg in msgs {
+        match msg {
+            Msg::DropScope(scope) => {
+                host.scopes.remove(&scope);
+            }
+            Msg::Batch(batch) => {
+                let _page = crate::ThreadPageGuard::enter(&batch.page_url);
+                let reply = host.run(batch.scope, &batch.cmds, &batch.payload);
+                let _ = batch.reply.send(reply);
+            }
+        }
     }
+}
+
+/// Shared adapter/device plus per-document isolated resource tables.
+#[derive(Default)]
+struct GpuHost {
+    device: Option<(wgpu::Device, wgpu::Queue)>,
+    adapter_info: Option<String>,
+    scopes: HashMap<u64, Gpu>,
 }
 
 /// A pass as the page recorded it, replayed when it ends.
@@ -110,13 +155,14 @@ struct Pass {
 struct Canvas {
     flid: u32,
     format: wgpu::TextureFormat,
+    opaque: bool,
     texture: Option<(wgpu::Texture, u32, u32)>,
+    /// Reusable MAP_READ staging buffer for `presentCanvas` (recreated only on resize).
+    readback: Option<(wgpu::Buffer, u64)>,
 }
 
 #[derive(Default)]
 struct Gpu {
-    device: Option<(wgpu::Device, wgpu::Queue)>,
-    adapter_info: Option<String>,
     buffers: HashMap<u32, wgpu::Buffer>,
     mapped: HashSet<u32>,
     textures: HashMap<u32, wgpu::Texture>,
@@ -341,7 +387,7 @@ fn filter(name: Option<&str>) -> wgpu::FilterMode {
     if name == Some("linear") { wgpu::FilterMode::Linear } else { wgpu::FilterMode::Nearest }
 }
 
-impl Gpu {
+impl GpuHost {
     fn device(&self) -> Result<&(wgpu::Device, wgpu::Queue), String> {
         self.device.as_ref().ok_or_else(|| "no device: call requestAdapter first".to_string())
     }
@@ -388,7 +434,7 @@ impl Gpu {
         Ok(info)
     }
 
-    fn run(&mut self, cmds: &str, payload: &[u8]) -> Reply {
+    fn run(&mut self, scope: u64, cmds: &str, payload: &[u8]) -> Reply {
         let mut reply = Reply::default();
         let cmds: Vec<Json> = match serde_json::from_str(cmds) {
             Ok(Json::Array(c)) => c,
@@ -399,7 +445,33 @@ impl Gpu {
         };
         for cmd in &cmds {
             let op = str_of(cmd.get(0)).unwrap_or("").to_string();
-            match self.exec(&op, cmd, payload, &mut reply) {
+            let res = if op == "reset" {
+                // Scoped to this document so an iframe never destroys parent/sibling GPU objects.
+                self.scopes.remove(&scope);
+                Ok(String::new())
+            } else if op == "requestAdapter" {
+                if let Some(info) = &self.adapter_info {
+                    Ok(info.clone())
+                } else {
+                    match self.request_adapter() {
+                        Ok(info) => Ok(info),
+                        Err(e) => {
+                            reply.errors.push(format!("no adapter: {e}"));
+                            Ok("null".into())
+                        }
+                    }
+                }
+            } else {
+                match self.device() {
+                    Ok((d, q)) => {
+                        let (device, queue) = (d.clone(), q.clone());
+                        let gpu = self.scopes.entry(scope).or_default();
+                        gpu.exec(&device, &queue, &op, cmd, payload, &mut reply)
+                    }
+                    Err(e) => Err(e),
+                }
+            };
+            match res {
                 Ok(result) => reply.result = result,
                 Err(e) => {
                     reply.result = String::new();
@@ -409,37 +481,27 @@ impl Gpu {
         }
         reply
     }
+}
 
+impl Gpu {
     fn bytes(payload: &[u8], at: u64, len: u64) -> Result<&[u8], String> {
-        payload.get(at as usize..(at + len) as usize).ok_or_else(|| "bytes out of range".to_string())
+        let start = usize::try_from(at).map_err(|_| "bytes out of range".to_string())?;
+        let count = usize::try_from(len).map_err(|_| "bytes out of range".to_string())?;
+        let end = start.checked_add(count).ok_or_else(|| "bytes out of range".to_string())?;
+        payload.get(start..end).ok_or_else(|| "bytes out of range".to_string())
     }
 
-    fn exec(&mut self, op: &str, cmd: &Json, payload: &[u8], reply: &mut Reply) -> Result<String, String> {
+    fn exec(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        op: &str,
+        cmd: &Json,
+        payload: &[u8],
+        reply: &mut Reply,
+    ) -> Result<String, String> {
         let a = |i: usize| cmd.get(i);
         let id = |i: usize| u32_of(cmd.get(i), 0);
-        // A new page: what the last one made goes (the device stays).
-        if op == "reset" {
-            let device = self.device.take();
-            let adapter_info = self.adapter_info.take();
-            *self = Gpu { device, adapter_info, ..Gpu::default() };
-            return Ok(String::new());
-        }
-        if op == "requestAdapter" {
-            if let Some(info) = &self.adapter_info {
-                return Ok(info.clone());
-            }
-            return match self.request_adapter() {
-                Ok(info) => Ok(info),
-                Err(e) => {
-                    reply.errors.push(format!("no adapter: {e}"));
-                    Ok("null".into())
-                }
-            };
-        }
-        let (device, queue) = {
-            let (d, q) = self.device()?;
-            (d.clone(), q.clone())
-        };
         match op {
             "createBuffer" => {
                 // Mapped-at-creation buffers must be a multiple of 4 bytes.
@@ -465,9 +527,12 @@ impl Gpu {
                     self.mapped.insert(key);
                 }
                 let data = Self::bytes(payload, u64_of(a(3), 0), u64_of(a(4), 0))?;
-                let offset = u64_of(a(2), 0) as usize;
+                let offset = usize::try_from(u64_of(a(2), 0)).map_err(|_| "writeMapped offset out of range")?;
                 let mut range = buffer.slice(..).get_mapped_range_mut().map_err(|e| e.to_string())?;
-                let end = (offset + data.len()).min(range.len());
+                if offset > range.len() {
+                    return Err("writeMapped offset out of bounds".into());
+                }
+                let end = offset.saturating_add(data.len()).min(range.len());
                 range.slice(offset..end).copy_from_slice(&data[..end - offset]);
             }
             "unmap" => {
@@ -480,7 +545,11 @@ impl Gpu {
             "mapRead" => {
                 let buffer = self.buffers.get(&id(1)).ok_or("no such buffer")?.clone();
                 let (offset, size) = (u64_of(a(2), 0), u64_of(a(3), 0));
-                let slice = buffer.slice(offset..offset + size);
+                let end = offset.checked_add(size).ok_or("mapRead range overflow")?;
+                if end > buffer.size() {
+                    return Err("mapRead range out of bounds".into());
+                }
+                let slice = buffer.slice(offset..end);
                 slice.map_async(wgpu::MapMode::Read, |_| {});
                 let _ = device.poll(wgpu::PollType::wait_indefinitely());
                 reply.bytes = Some(slice.get_mapped_range().map_err(|e| e.to_string())?.to_vec());
@@ -606,7 +675,7 @@ impl Gpu {
                 self.bind_groups.insert(id(1), group);
             }
             "createRenderPipeline" => {
-                let pipeline = self.render_pipeline(&device, a(2).ok_or("no descriptor")?)?;
+                let pipeline = self.render_pipeline(device, a(2).ok_or("no descriptor")?)?;
                 self.render_pipelines.insert(id(1), pipeline);
             }
             "createComputePipeline" => {
@@ -750,11 +819,12 @@ impl Gpu {
             }
             "configureCanvas" => {
                 let format = str_of(a(3)).and_then(texture_format).unwrap_or(wgpu::TextureFormat::Bgra8Unorm);
-                self.canvases.insert(id(1), Canvas { flid: id(2), format, texture: None });
+                let opaque = str_of(a(6)) != Some("premultiplied");
+                self.canvases.insert(id(1), Canvas { flid: id(2), format, opaque, texture: None, readback: None });
             }
             "canvasTexture" => {
                 let canvas = self.canvases.get_mut(&id(1)).ok_or("canvas not configured")?;
-                let (w, h) = (u32_of(a(3), 300).max(1), u32_of(a(4), 150).max(1));
+                let (w, h) = (u32_of(a(3), 300).clamp(1, 8192), u32_of(a(4), 150).clamp(1, 8192));
                 let stale = canvas.texture.as_ref().is_none_or(|(_, tw, th)| *tw != w || *th != h);
                 if stale {
                     let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -776,7 +846,7 @@ impl Gpu {
                 self.textures.insert(id(2), texture);
             }
             "presentCanvas" => {
-                let canvas = self.canvases.get(&id(1)).ok_or("canvas not configured")?;
+                let canvas = self.canvases.get_mut(&id(1)).ok_or("canvas not configured")?;
                 let Some((texture, w, h)) = canvas.texture.as_ref() else {
                     return Ok(String::new());
                 };
@@ -784,17 +854,22 @@ impl Gpu {
                 // Rows of a texture copy are padded to 256 bytes.
                 let row = w * 4;
                 let padded = row.div_ceil(256) * 256;
-                let readback = device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("canvas readback"),
-                    size: (padded * h) as u64,
-                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
+                let need = (padded * h) as u64;
+                if canvas.readback.as_ref().is_none_or(|(_, sz)| *sz != need) {
+                    let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("canvas readback"),
+                        size: need,
+                        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    canvas.readback = Some((buf, need));
+                }
+                let readback = &canvas.readback.as_ref().unwrap().0;
                 let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
                 encoder.copy_texture_to_buffer(
                     wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
                     wgpu::TexelCopyBufferInfo {
-                        buffer: &readback,
+                        buffer: readback,
                         layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(padded), rows_per_image: Some(h) },
                     },
                     wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
@@ -805,11 +880,45 @@ impl Gpu {
                 let _ = device.poll(wgpu::PollType::wait_indefinitely());
                 let data = slice.get_mapped_range().map_err(|e| e.to_string())?;
                 let bgra = matches!(canvas.format, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb);
-                let mut rgba = Vec::with_capacity((row * h) as usize);
+                let opaque = canvas.opaque;
+                let row_usize = row as usize;
+                let padded_usize = padded as usize;
+                let mut rgba = vec![0u8; row_usize * h as usize];
                 for y in 0..h as usize {
-                    for px in data[y * padded as usize..y * padded as usize + row as usize].chunks_exact(4) {
-                        // The canvas is opaque, as `alphaMode: "opaque"` (the default) has it.
-                        if bgra { rgba.extend_from_slice(&[px[2], px[1], px[0], 255]) } else { rgba.extend_from_slice(&[px[0], px[1], px[2], 255]) }
+                    let src = &data[y * padded_usize..y * padded_usize + row_usize];
+                    let dst = &mut rgba[y * row_usize..(y + 1) * row_usize];
+                    if opaque {
+                        if bgra {
+                            for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                                d[0] = s[2];
+                                d[1] = s[1];
+                                d[2] = s[0];
+                                d[3] = 255;
+                            }
+                        } else {
+                            for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                                d[0] = s[0];
+                                d[1] = s[1];
+                                d[2] = s[2];
+                                d[3] = 255;
+                            }
+                        }
+                    } else {
+                        for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                            let (r, g, b, a) = if bgra { (s[2], s[1], s[0], s[3]) } else { (s[0], s[1], s[2], s[3]) };
+                            if a == 0 || a == 255 {
+                                d[0] = r;
+                                d[1] = g;
+                                d[2] = b;
+                                d[3] = a;
+                            } else {
+                                let au = a as u32;
+                                d[0] = ((r as u32 * 255 + au / 2) / au).min(255) as u8;
+                                d[1] = ((g as u32 * 255 + au / 2) / au).min(255) as u8;
+                                d[2] = ((b as u32 * 255 + au / 2) / au).min(255) as u8;
+                                d[3] = a;
+                            }
+                        }
                     }
                 }
                 drop(data);
@@ -1017,23 +1126,35 @@ impl Gpu {
                 }
                 "setVertexBuffer" => {
                     if let Some(buffer) = obj(Some(&arg(c, 1))).and_then(|i| buffers.get(&i)) {
-                        let offset = n(2).unwrap_or(0.0) as u64;
-                        let slice = match n(3) {
-                            Some(size) => buffer.slice(offset..offset + size as u64),
-                            None => buffer.slice(offset..),
-                        };
-                        p.set_vertex_buffer(n(0).unwrap_or(0.0) as u32, slice);
+                        let offset = n(2).unwrap_or(0.0).max(0.0) as u64;
+                        let buf_size = buffer.size();
+                        if offset <= buf_size {
+                            let slice = match n(3) {
+                                Some(size) => {
+                                    let end = offset.saturating_add(size.max(0.0) as u64).min(buf_size);
+                                    buffer.slice(offset..end)
+                                }
+                                None => buffer.slice(offset..),
+                            };
+                            p.set_vertex_buffer(n(0).unwrap_or(0.0) as u32, slice);
+                        }
                     }
                 }
                 "setIndexBuffer" => {
                     if let Some(buffer) = obj(Some(&arg(c, 0))).and_then(|i| buffers.get(&i)) {
                         let format = if arg(c, 1).as_str() == Some("uint32") { wgpu::IndexFormat::Uint32 } else { wgpu::IndexFormat::Uint16 };
-                        let offset = n(2).unwrap_or(0.0) as u64;
-                        let slice = match n(3) {
-                            Some(size) => buffer.slice(offset..offset + size as u64),
-                            None => buffer.slice(offset..),
-                        };
-                        p.set_index_buffer(slice, format);
+                        let offset = n(2).unwrap_or(0.0).max(0.0) as u64;
+                        let buf_size = buffer.size();
+                        if offset <= buf_size {
+                            let slice = match n(3) {
+                                Some(size) => {
+                                    let end = offset.saturating_add(size.max(0.0) as u64).min(buf_size);
+                                    buffer.slice(offset..end)
+                                }
+                                None => buffer.slice(offset..),
+                            };
+                            p.set_index_buffer(slice, format);
+                        }
                     }
                 }
                 "setViewport" => p.set_viewport(

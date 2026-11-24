@@ -18,28 +18,62 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
-use std::sync::mpsc::{Sender, channel};
-use std::sync::Mutex;
+use std::sync::mpsc::{SyncSender, sync_channel};
+use std::sync::{Condvar, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 struct Pty {
     master: OwnedFd,
     pid: i32,
-    input: Sender<Vec<u8>>,
+    input: SyncSender<Vec<u8>>,
 }
 
+struct EventQueue {
+    events: Vec<(u64, &'static str, String)>,
+    bytes: usize,
+}
+
+const MAX_PTY_BUFFERED_BYTES: usize = 1024 * 1024;
+const MAX_DRAIN_BYTES: usize = 256 * 1024;
+
 static PTYS: Mutex<Option<HashMap<u64, Pty>>> = Mutex::new(None);
-/// (id, "data" | "exit", text or exit code), for the page.
-static EVENTS: Mutex<Vec<(u64, &'static str, String)>> = Mutex::new(Vec::new());
+/// (id, "data" | "exit", text or exit code), for the page, with byte-budget backpressure.
+static EVENTS: (Mutex<EventQueue>, Condvar) = (
+    Mutex::new(EventQueue { events: Vec::new(), bytes: 0 }),
+    Condvar::new(),
+);
 static PAGE: AtomicU64 = AtomicU64::new(0);
 
 /// What has happened on the page's terminals since last asked.
 pub(crate) fn take_events() -> Vec<(u64, &'static str, String)> {
-    let mut events = std::mem::take(&mut *EVENTS.lock().unwrap_or_else(|e| e.into_inner()));
+    let (lock, cvar) = &EVENTS;
+    let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if q.events.is_empty() {
+        return Vec::new();
+    }
+    let mut taken = Vec::new();
+    let mut drained_bytes = 0usize;
+    let mut split_at = 0usize;
+    for (i, ev) in q.events.iter().enumerate() {
+        split_at = i + 1;
+        drained_bytes += ev.2.len();
+        if drained_bytes >= MAX_DRAIN_BYTES {
+            break;
+        }
+    }
+    taken.extend(q.events.drain(..split_at));
+    q.bytes = q.bytes.saturating_sub(drained_bytes);
+    let more_left = !q.events.is_empty();
+    cvar.notify_all();
+    drop(q);
+    if more_left {
+        crate::worker::wake();
+    }
     // Output of one terminal that came in pieces goes to the page as one.
-    let mut merged: Vec<(u64, &'static str, String)> = Vec::with_capacity(events.len());
-    for event in events.drain(..) {
+    let mut merged: Vec<(u64, &'static str, String)> = Vec::with_capacity(taken.len());
+    for event in taken {
         match merged.last_mut() {
             Some(last) if last.0 == event.0 && last.1 == "data" && event.1 == "data" => last.2.push_str(&event.2),
             _ => merged.push(event),
@@ -54,18 +88,72 @@ pub(crate) fn new_page() {
     PAGE.fetch_add(1, Ordering::SeqCst);
     let ptys = PTYS.lock().unwrap_or_else(|e| e.into_inner()).take();
     for pty in ptys.into_iter().flat_map(|p| p.into_values()) {
-        // SAFETY: a signal to a process group this module started.
-        unsafe { libc::kill(-pty.pid, libc::SIGHUP) };
+        // SAFETY: signals to a process group this module started.
+        unsafe {
+            libc::kill(-pty.pid, libc::SIGHUP);
+            libc::kill(-pty.pid, libc::SIGTERM);
+        }
     }
-    EVENTS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    let (lock, cvar) = &EVENTS;
+    let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+    q.events.clear();
+    q.bytes = 0;
+    cvar.notify_all();
 }
 
 fn push(page: u64, id: u64, kind: &'static str, text: String) {
+    let (lock, cvar) = &EVENTS;
+    let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+    // Apply backpressure to runaway stdout (`yes`, `find /`) so the desktop cannot OOM.
+    if kind == "data" {
+        while q.bytes >= MAX_PTY_BUFFERED_BYTES && PAGE.load(Ordering::SeqCst) == page {
+            q = cvar.wait(q).unwrap_or_else(|e| e.into_inner());
+        }
+    }
     if PAGE.load(Ordering::SeqCst) != page {
         return;
     }
-    EVENTS.lock().unwrap_or_else(|e| e.into_inner()).push((id, kind, text));
-    crate::worker::wake();
+    let was_empty = q.events.is_empty();
+    q.bytes += text.len();
+    q.events.push((id, kind, text));
+    drop(q);
+    if was_empty {
+        crate::worker::wake();
+    }
+}
+
+/// How many leading bytes of `carry` end on a complete UTF-8 boundary, holding
+/// back only a trailing valid-prefix incomplete sequence (1..=3 bytes).
+fn utf8_whole_prefix(carry: &[u8]) -> usize {
+    match std::str::from_utf8(carry) {
+        Ok(_) => carry.len(),
+        Err(e) if e.error_len().is_none() => e.valid_up_to(),
+        Err(_) => {
+            // Invalid bytes exist earlier, but the very tail may still be a split multibyte sequence.
+            let tail_start = carry.len().saturating_sub(3);
+            for i in (tail_start..carry.len()).rev() {
+                let b = carry[i];
+                if (b & 0xC0) != 0x80 {
+                    let expected = if b < 0x80 {
+                        1
+                    } else if (b & 0xE0) == 0xC0 {
+                        2
+                    } else if (b & 0xF0) == 0xE0 {
+                        3
+                    } else if (b & 0xF8) == 0xF0 {
+                        4
+                    } else {
+                        return carry.len();
+                    };
+                    if carry.len() - i < expected {
+                        return i;
+                    }
+                    break;
+                }
+            }
+            carry.len()
+        }
+    }
 }
 
 /// How a program is to be started: `{ cwd, cols, rows, env: {..}, jail:
@@ -119,8 +207,14 @@ pub(crate) fn spawn(id: u64, program: &str, args: &[String], options: Options) -
     }
     // SAFETY: both descriptors were just opened and are owned here.
     let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
-    // The master is the page's alone: not the program's, nor any other's.
-    unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    // Neither fd leaks into unrelated concurrent forks; Stdio::from dups slave onto 0/1/2 in the child.
+    unsafe {
+        libc::fcntl(master.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+        libc::fcntl(slave.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+    }
+    // Clone reader/writer handles before spawning so clone failure cannot leak a child.
+    let writer = master.try_clone().map_err(|e| e.to_string())?;
+    let reader = master.try_clone().map_err(|e| e.to_string())?;
 
     let mut command = std::process::Command::new(program);
     command.args(args).env_clear();
@@ -173,20 +267,35 @@ pub(crate) fn spawn(id: u64, program: &str, args: &[String], options: Options) -
     let pid = child.id() as i32;
     let page = PAGE.load(Ordering::SeqCst);
 
-    // What the page types, written on a thread of its own.
-    let (tx, rx) = channel::<Vec<u8>>();
-    let writer = master.try_clone().map_err(|e| e.to_string())?;
-    let _ = std::thread::Builder::new().name("pty-in".into()).spawn(move || {
+    // What the page types, written on a thread of its own with write batching.
+    let (tx, rx) = sync_channel::<Vec<u8>>(256);
+    if let Err(e) = std::thread::Builder::new().name("pty-in".into()).spawn(move || {
         let mut file = std::fs::File::from(writer);
-        for bytes in rx {
-            if file.write_all(&bytes).is_err() {
+        let mut batch = Vec::new();
+        while let Ok(bytes) = rx.recv() {
+            batch.clear();
+            batch.extend_from_slice(&bytes);
+            while batch.len() < 16 * 1024 {
+                match rx.try_recv() {
+                    Ok(more) => batch.extend_from_slice(&more),
+                    Err(_) => break,
+                }
+            }
+            if file.write_all(&batch).is_err() {
                 break;
             }
         }
-    });
+    }) {
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(pid, &mut status, 0);
+        }
+        std::mem::forget(child);
+        return Err(format!("OperationError: pty-in thread: {e}"));
+    }
     // What the program prints, read on another, and its end.
-    let reader = master.try_clone().map_err(|e| e.to_string())?;
-    let _ = std::thread::Builder::new().name("pty-out".into()).spawn(move || {
+    if let Err(e) = std::thread::Builder::new().name("pty-out".into()).spawn(move || {
         let mut file = std::fs::File::from(reader);
         let mut buf = vec![0u8; 16 * 1024];
         let mut carry: Vec<u8> = Vec::new();
@@ -197,11 +306,7 @@ pub(crate) fn spawn(id: u64, program: &str, args: &[String], options: Options) -
                     carry.extend_from_slice(&buf[..n]);
                     // Whole characters only: a character cut across two
                     // reads waits for the rest of it.
-                    let whole = match std::str::from_utf8(&carry) {
-                        Ok(_) => carry.len(),
-                        Err(e) if e.error_len().is_none() => e.valid_up_to(),
-                        Err(_) => carry.len(),
-                    };
+                    let whole = utf8_whole_prefix(&carry);
                     let text = String::from_utf8_lossy(&carry[..whole]).into_owned();
                     carry.drain(..whole);
                     if !text.is_empty() {
@@ -218,7 +323,15 @@ pub(crate) fn spawn(id: u64, program: &str, args: &[String], options: Options) -
             ptys.remove(&id);
         }
         push(page, id, "exit", code.to_string());
-    });
+    }) {
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(pid, &mut status, 0);
+        }
+        std::mem::forget(child);
+        return Err(format!("OperationError: pty-out thread: {e}"));
+    }
     // The child is waited for by the reader; std must not reap it first.
     std::mem::forget(child);
     PTYS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(id, Pty { master, pid, input: tx });
@@ -229,7 +342,7 @@ pub(crate) fn spawn(id: u64, program: &str, args: &[String], options: Options) -
 pub(crate) fn write(id: u64, text: &str) -> Result<(), String> {
     let ptys = PTYS.lock().unwrap_or_else(|e| e.into_inner());
     let pty = ptys.as_ref().and_then(|p| p.get(&id)).ok_or("InvalidStateError: that program has ended")?;
-    let _ = pty.input.send(text.as_bytes().to_vec());
+    let _ = pty.input.try_send(text.as_bytes().to_vec());
     Ok(())
 }
 
@@ -253,11 +366,11 @@ pub(crate) fn kill(id: u64, signal: i32) -> Result<(), String> {
 }
 
 /// A jail's paths and user, made ready before the fork.
-/// Capabilities no program in a jail has: `CAP_NET_ADMIN`, `CAP_SYS_MODULE`,
-/// `CAP_SYS_RAWIO`, `CAP_SYS_PTRACE`, `CAP_SYS_ADMIN`, `CAP_SYS_BOOT`,
-/// `CAP_SYS_TIME`, `CAP_MKNOD`, `CAP_MAC_ADMIN`, `CAP_MAC_OVERRIDE`,
-/// `CAP_SYSLOG`, `CAP_BPF`, `CAP_PERFMON`.
-const JAIL_DROPS: [libc::c_ulong; 13] = [12, 16, 17, 19, 21, 22, 25, 27, 32, 33, 34, 39, 38];
+/// Capabilities no program in a jail has: `CAP_KILL`, `CAP_NET_ADMIN`,
+/// `CAP_SYS_MODULE`, `CAP_SYS_RAWIO`, `CAP_SYS_CHROOT`, `CAP_SYS_PTRACE`,
+/// `CAP_SYS_ADMIN`, `CAP_SYS_BOOT`, `CAP_SYS_TIME`, `CAP_MKNOD`,
+/// `CAP_MAC_ADMIN`, `CAP_MAC_OVERRIDE`, `CAP_SYSLOG`, `CAP_PERFMON`, `CAP_BPF`.
+const JAIL_DROPS: [libc::c_ulong; 15] = [5, 12, 16, 17, 18, 19, 21, 22, 25, 27, 32, 33, 34, 38, 39];
 
 struct JailPaths {
     root: CString,
@@ -267,8 +380,9 @@ struct JailPaths {
     cwd: CString,
     slash: CString,
     procfs: CString,
-    host_dev: CString,
     host_sys: CString,
+    has_render: bool,
+    has_snd: bool,
     /// The Wayland server's directory (wayland.rs), and where it shows in
     /// the jail: the same /run/user/1000.
     wayland: Option<(CString, CString)>,
@@ -284,16 +398,28 @@ impl JailPaths {
             return Err(format!("NotFoundError: {root} is not a Linux system"));
         }
         // Its own name servers: the system's /etc/resolv.conf is a link
-        // into /run, which the jail does not see.
-        if let Ok(dns) = std::fs::read_to_string("/etc/resolv.conf") {
-            // Replaced, not written through: root in the jail can make this
-            // a link to anywhere, and this runs as the desktop.
-            let target = format!("{root}/etc/resolv.conf");
+        // into /run, which the jail does not see. Verify `{root}/etc` is a real
+        // directory (never follow a jail-planted symlink out to host `/etc`).
+        let etc_dir = std::path::Path::new(&root).join("etc");
+        if std::fs::symlink_metadata(&etc_dir).is_ok_and(|m| m.is_dir())
+            && let Ok(dns) = std::fs::read_to_string("/etc/resolv.conf")
+        {
+            let target = etc_dir.join("resolv.conf");
             let _ = std::fs::remove_file(&target);
-            let _ = std::fs::write(&target, dns);
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&target)
+            {
+                let _ = f.write_all(dns.as_bytes());
+            }
         }
         for dir in ["proc", "dev", "sys", "tmp"] {
-            let _ = std::fs::create_dir_all(format!("{root}/{dir}"));
+            let p = std::path::Path::new(&root).join(dir);
+            if std::fs::symlink_metadata(&p).is_err() {
+                let _ = std::fs::create_dir(&p);
+            }
         }
         let wayland = if std::path::Path::new(crate::wayland::RUNTIME_DIR).is_dir() {
             let inside = format!("{root}{}", crate::wayland::RUNTIME_DIR);
@@ -310,8 +436,9 @@ impl JailPaths {
             root: c(root)?,
             slash: c("/".into())?,
             procfs: c("proc".into())?,
-            host_dev: c("/dev".into())?,
             host_sys: c("/sys".into())?,
+            has_render: std::path::Path::new("/dev/dri/renderD128").exists(),
+            has_snd: std::path::Path::new("/dev/snd").is_dir(),
             wayland,
             uid: jail.uid,
             gid: jail.gid,
@@ -322,15 +449,74 @@ impl JailPaths {
     fn enter(&self) -> std::io::Result<()> {
         let check = |rc: libc::c_int| if rc == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) };
         let none = std::ptr::null::<libc::c_char>();
-        // SAFETY: system calls on the strings made before the fork.
+        // SAFETY: system calls only, on static CStrs and CStrings built before fork.
         unsafe {
             check(libc::unshare(libc::CLONE_NEWNS))?;
             // Nothing mounted here reaches the system's own mounts.
             check(libc::mount(none, self.slash.as_ptr(), none, libc::MS_REC | libc::MS_PRIVATE, std::ptr::null()))?;
             check(libc::mount(self.procfs.as_ptr(), self.proc_.as_ptr(), self.procfs.as_ptr(), libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, std::ptr::null()))?;
-            check(libc::mount(self.host_dev.as_ptr(), self.dev.as_ptr(), none, libc::MS_BIND | libc::MS_REC, std::ptr::null()))?;
-            check(libc::mount(self.host_sys.as_ptr(), self.sys.as_ptr(), none, libc::MS_BIND | libc::MS_REC, std::ptr::null()))?;
-            // Read-only takes a second step: a bind ignores the flag.
+
+            // Minimal isolated `/dev`: expose only safe character devices, a fresh
+            // `devpts`, `shm`, GPU render node, and audio — never host disks,
+            // raw input devices, `/dev/tty0`, `/dev/mem`, or `/dev/vboxguest`.
+            check(libc::mount(
+                c"tmpfs".as_ptr(),
+                self.dev.as_ptr(),
+                c"tmpfs".as_ptr(),
+                libc::MS_NOSUID | libc::MS_NOEXEC,
+                c"mode=0755,size=16m".as_ptr().cast(),
+            ))?;
+            check(libc::chdir(self.dev.as_ptr()))?;
+            let bind_dev = |host: &std::ffi::CStr, name: &std::ffi::CStr| {
+                let fd = libc::open(name.as_ptr(), libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC, 0o666);
+                if fd >= 0 {
+                    libc::close(fd);
+                    libc::mount(host.as_ptr(), name.as_ptr(), none, libc::MS_BIND, std::ptr::null());
+                }
+            };
+            bind_dev(c"/dev/null", c"null");
+            bind_dev(c"/dev/zero", c"zero");
+            bind_dev(c"/dev/full", c"full");
+            bind_dev(c"/dev/random", c"random");
+            bind_dev(c"/dev/urandom", c"urandom");
+            bind_dev(c"/dev/tty", c"tty");
+            if libc::mkdir(c"pts".as_ptr(), 0o755) == 0 {
+                if libc::mount(
+                    c"devpts".as_ptr(),
+                    c"pts".as_ptr(),
+                    c"devpts".as_ptr(),
+                    libc::MS_NOSUID | libc::MS_NOEXEC,
+                    c"newinstance,ptmxmode=0666,mode=0620".as_ptr().cast(),
+                ) == 0
+                {
+                    libc::symlink(c"pts/ptmx".as_ptr(), c"ptmx".as_ptr());
+                } else {
+                    bind_dev(c"/dev/ptmx", c"ptmx");
+                }
+            }
+            if libc::mkdir(c"shm".as_ptr(), 0o1777) == 0 {
+                libc::mount(
+                    c"tmpfs".as_ptr(),
+                    c"shm".as_ptr(),
+                    c"tmpfs".as_ptr(),
+                    libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                    c"mode=1777".as_ptr().cast(),
+                );
+            }
+            libc::symlink(c"/proc/self/fd".as_ptr(), c"fd".as_ptr());
+            libc::symlink(c"/proc/self/fd/0".as_ptr(), c"stdin".as_ptr());
+            libc::symlink(c"/proc/self/fd/1".as_ptr(), c"stdout".as_ptr());
+            libc::symlink(c"/proc/self/fd/2".as_ptr(), c"stderr".as_ptr());
+            if self.has_render && libc::mkdir(c"dri".as_ptr(), 0o755) == 0 {
+                bind_dev(c"/dev/dri/renderD128", c"dri/renderD128");
+            }
+            if self.has_snd && libc::mkdir(c"snd".as_ptr(), 0o755) == 0 {
+                libc::mount(c"/dev/snd".as_ptr(), c"snd".as_ptr(), none, libc::MS_BIND, std::ptr::null());
+            }
+
+            // Non-recursive bind of `/sys` + read-only remount excludes writable
+            // host submounts (`/sys/fs/cgroup`, `efivars`, `pstore`).
+            check(libc::mount(self.host_sys.as_ptr(), self.sys.as_ptr(), none, libc::MS_BIND, std::ptr::null()))?;
             check(libc::mount(none, self.sys.as_ptr(), none, libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY, std::ptr::null()))?;
             if let Some((host, inside)) = &self.wayland {
                 check(libc::mount(host.as_ptr(), inside.as_ptr(), none, libc::MS_BIND, std::ptr::null()))?;

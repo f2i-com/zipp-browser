@@ -80,10 +80,10 @@ impl PanState {
         });
 
         // Remove samples older than 100ms
-        if self.samples.len() > 50 && time_ms - self.samples.front().unwrap().time > 100 {
+        if self.samples.len() > 50 && time_ms.saturating_sub(self.samples.front().unwrap().time) > 100 {
             let idx = self
                 .samples
-                .partition_point(|sample| time_ms - sample.time > 100);
+                .partition_point(|sample| time_ms.saturating_sub(sample.time) > 100);
             // FIXME: use truncate_front once stable
             for _ in 0..idx {
                 self.samples.pop_front();
@@ -96,15 +96,15 @@ impl PanState {
     fn generate_fling(&self, time_ms: u64) -> Option<FlingState> {
         // Generate "fling"
         if let Some(last_sample) = self.samples.back()
-            && time_ms - last_sample.time < 100
+            && time_ms.saturating_sub(last_sample.time) < 100
         {
             let idx = self
                 .samples
-                .partition_point(|sample| time_ms - sample.time > 100);
+                .partition_point(|sample| time_ms.saturating_sub(sample.time) > 100);
 
             // Compute pan_time. Will always be <= 100ms as we ignore samples older than that.
             let pan_start_time = self.samples[idx].time;
-            let pan_time = (time_ms - pan_start_time) as f32;
+            let pan_time = time_ms.saturating_sub(pan_start_time) as f32;
 
             // Avoid division by 0
             if pan_time > 0.0 {
@@ -151,7 +151,9 @@ pub(crate) fn handle_pointermove<F: FnMut(DomEvent)>(
     let y = event.page_y();
     let buttons = event.buttons;
 
-    let mut changed = doc.set_hover_to(x, y);
+    // `EventDriver::handle_pointer_move` already updated hover state and dispatched
+    // MouseEnter/MouseLeave for this pointer position; avoid a duplicate full hit-test.
+    let mut changed = false;
 
     // Check if we've moved enough to be considered a selection drag (2px threshold)
     if buttons != MouseEventButtons::None && doc.drag_mode == DragMode::None {
@@ -518,8 +520,15 @@ pub(crate) fn handle_click(
                     break 'matched true;
                 }
                 local_name!("input") if el.attr(local_name!("type")) == Some("radio") => {
-                    let radio_set = el.attr(local_name!("name")).unwrap().to_string();
-                    BaseDocument::toggle_radio(doc, radio_set, node_id);
+                    if let Some(radio_set) = el.attr(local_name!("name")).map(str::to_string) {
+                        BaseDocument::toggle_radio(doc, radio_set, node_id);
+                    } else if let Some(checked) = doc
+                        .get_node_mut(node_id)
+                        .and_then(|n| n.element_data_mut())
+                        .and_then(|e| e.checkbox_input_checked_mut())
+                    {
+                        *checked = true;
+                    }
 
                     // TODO: make input event conditional on value actually changing
                     let value = "true".to_owned();

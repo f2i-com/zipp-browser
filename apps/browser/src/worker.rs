@@ -107,6 +107,26 @@ pub(crate) fn allow_on_this_thread() {
 
 /// `new Worker(url)`: its id.
 pub(crate) fn start(url: &str, module: bool) -> Result<u32, String> {
+    // The page that started it, for good: see `page_url`.
+    let page = crate::page_url();
+    if let Ok(parsed) = url::Url::parse(url) {
+        match parsed.scheme() {
+            "http" | "https" => {
+                if let Ok(base) = url::Url::parse(&page)
+                    && matches!(base.scheme(), "http" | "https")
+                    && base.origin() != parsed.origin()
+                {
+                    return Err(format!("SecurityError: cannot load cross-origin Worker {url}"));
+                }
+            }
+            "file" => {
+                if !page.starts_with("file:") {
+                    return Err(format!("SecurityError: cannot load file: Worker {url}"));
+                }
+            }
+            _ => {}
+        }
+    }
     let id = NEXT_ID.with(|n| {
         let id = n.get();
         n.set(id + 1);
@@ -120,8 +140,6 @@ pub(crate) fn start(url: &str, module: bool) -> Result<u32, String> {
     let (to_tx, to_rx) = mpsc::channel();
     let (from_tx, from_rx) = mpsc::channel();
     let url = url.to_string();
-    // The page that started it, for good: see `page_url`.
-    let page = crate::page_url();
     std::thread::Builder::new()
         .name(format!("zipp-worker-{id}"))
         // Compiling a module graph recurses over its syntax tree on the native
@@ -142,8 +160,11 @@ pub(crate) fn post(id: u32, data: String) {
     if debug() {
         eprintln!("[WORKER] {id} posted {}", data.chars().take(60).collect::<String>());
     }
+    let scope = crate::async_fetch::current_scope();
     WORKERS.with(|w| {
-        if let Some(handle) = w.borrow().get(&id) {
+        if let Some(handle) = w.borrow().get(&id)
+            && (handle.scope == 0 || handle.scope == scope)
+        {
             let _ = handle.to.send(ToWorker::Message(data));
         }
     });
@@ -151,7 +172,16 @@ pub(crate) fn post(id: u32, data: String) {
 
 /// `worker.terminate()`.
 pub(crate) fn terminate(id: u32) {
-    if let Some(handle) = WORKERS.with(|w| w.borrow_mut().remove(&id)) {
+    let scope = crate::async_fetch::current_scope();
+    let removed = WORKERS.with(|w| {
+        let mut map = w.borrow_mut();
+        if map.get(&id).is_some_and(|h| h.scope == 0 || h.scope == scope) {
+            map.remove(&id)
+        } else {
+            None
+        }
+    });
+    if let Some(handle) = removed {
         let _ = handle.to.send(ToWorker::Terminate);
     }
 }
@@ -161,6 +191,19 @@ pub(crate) fn terminate_page(page: u64) {
     let gone: Vec<Handle> = WORKERS.with(|w| {
         let mut w = w.borrow_mut();
         let ids: Vec<u32> = w.iter().filter(|(_, h)| h.page == page).map(|(&id, _)| id).collect();
+        ids.into_iter().filter_map(|id| w.remove(&id)).collect()
+    });
+    for handle in gone {
+        let _ = handle.to.send(ToWorker::Terminate);
+    }
+}
+
+/// Terminate every worker belonging to pages older than the current page.
+pub(crate) fn terminate_stale_pages() {
+    let cur = PAGE.get();
+    let gone: Vec<Handle> = WORKERS.with(|w| {
+        let mut w = w.borrow_mut();
+        let ids: Vec<u32> = w.iter().filter(|(_, h)| h.page != cur).map(|(&id, _)| id).collect();
         ids.into_iter().filter_map(|id| w.remove(&id)).collect()
     });
     for handle in gone {
@@ -183,23 +226,48 @@ pub(crate) fn terminate_scope(scope: u64) {
     }
 }
 
-/// Whether this thread's page currently has any live worker threads.
+/// Whether the current document scope has any live worker threads.
+pub(crate) fn has_active_for(scope: u64) -> bool {
+    WORKERS.with(|w| {
+        let map = w.borrow();
+        map.values().any(|h| if scope == 0 { h.scope == 0 } else { h.scope == scope || h.scope == 0 })
+    })
+}
+
+/// Whether this thread currently has any live worker threads.
 pub(crate) fn has_active() -> bool {
     WORKERS.with(|w| !w.borrow().is_empty())
 }
 
-/// What workers owned by `scope` (or unscoped workers when `scope == 0`) have
-/// sent since last asked.
+/// What workers owned by `scope` have sent since last asked.
+/// Also prunes self-closed/exited worker handles so `has_active*()` does not leak.
 pub(crate) fn take_messages_for(scope: u64) -> Vec<(u32, FromWorker)> {
     WORKERS.with(|w| {
+        let mut map = w.borrow_mut();
         let mut out = Vec::new();
-        for (&id, handle) in w.borrow().iter() {
-            if scope != 0 && handle.scope != 0 && handle.scope != scope {
+        let mut dead = Vec::new();
+        for (&id, handle) in map.iter() {
+            let matches = if scope == 0 {
+                handle.scope == 0
+            } else {
+                handle.scope == scope || handle.scope == 0
+            };
+            if !matches {
                 continue;
             }
-            while let Ok(message) = handle.from.try_recv() {
-                out.push((id, message));
+            loop {
+                match handle.from.try_recv() {
+                    Ok(message) => out.push((id, message)),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        dead.push(id);
+                        break;
+                    }
+                }
             }
+        }
+        for id in dead {
+            map.remove(&id);
         }
         out
     })
@@ -348,6 +416,9 @@ fn host_call(ctx: &mut dyn HostCtx, kind: &str, args: &[String]) -> Result<Strin
         "worker_error" => send(FromWorker::Error(args.first().cloned().unwrap_or_default())),
         "worker_close" => CLOSED.set(true),
         "worker_start" => return Err("Error: a worker cannot start workers yet".into()),
+        "window_title" | "fullscreen" | "clipboard_read" | "clipboard_write" | "navigate" | "open_tab" | "choose_file" => {
+            return Err(format!("SecurityError: {kind} is not available in a Worker"));
+        }
         _ if debug() => {
             let t = std::time::Instant::now();
             let r = crate::browser_host_call_ctx(ctx, kind, args);

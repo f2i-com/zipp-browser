@@ -42,7 +42,12 @@ pub(crate) fn handle_dom_event<F: FnMut(DomEvent)>(
 
     // Handle forwarding event sub-document
     let node = &mut doc.nodes[target_node_id];
-    let pos = node.absolute_position(0.0, 0.0);
+    let border_pos = node.absolute_position(0.0, 0.0);
+    // Sub-documents are painted at their content box origin (inside border + padding).
+    let pos = Point {
+        x: border_pos.x + node.final_layout.content_box_x(),
+        y: border_pos.y + node.final_layout.content_box_y(),
+    };
     let mut set_focus = false;
     if let Some(sub_doc) = node.subdoc_mut() {
         let viewport_scroll = sub_doc.inner().viewport_scroll();
@@ -64,9 +69,12 @@ pub(crate) fn handle_dom_event<F: FnMut(DomEvent)>(
             }
 
             // Enter/leave events will be recreated by sub-document's event driver
-            // based move events
+            // based on move events; leaving the iframe clears its hover state.
             DomEventData::PointerEnter(_) => None,
-            DomEventData::PointerLeave(_) => None,
+            DomEventData::PointerLeave(_) => {
+                sub_doc.inner_mut().clear_hover();
+                None
+            }
             DomEventData::PointerOver(_) => None,
             DomEventData::PointerOut(_) => None,
 
@@ -76,7 +84,10 @@ pub(crate) fn handle_dom_event<F: FnMut(DomEvent)>(
             DomEventData::MouseDown(_) => None,
             DomEventData::MouseUp(_) => None,
             DomEventData::MouseEnter(_) => None,
-            DomEventData::MouseLeave(_) => None,
+            DomEventData::MouseLeave(_) => {
+                sub_doc.inner_mut().clear_hover();
+                None
+            }
             DomEventData::MouseOver(_) => None,
             DomEventData::MouseOut(_) => None,
 
@@ -95,7 +106,10 @@ pub(crate) fn handle_dom_event<F: FnMut(DomEvent)>(
             }
             DomEventData::Scroll(_) => None,
             DomEventData::Focus(_) => None,
-            DomEventData::Blur(_) => None,
+            DomEventData::Blur(_) => {
+                sub_doc.inner_mut().clear_focus();
+                None
+            }
             DomEventData::FocusIn(_) => None,
             DomEventData::FocusOut(_) => None,
         };

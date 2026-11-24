@@ -41,15 +41,22 @@ pub(crate) fn take_completions() -> Vec<(u64, String)> {
     std::mem::take(&mut *COMPLETIONS.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
-fn allowed() -> bool {
-    match std::env::var("ZIPP_SYSTEM").as_deref() {
-        Ok("on") => true,
-        Ok("off") => false,
-        _ => {
-            KIOSK.load(std::sync::atomic::Ordering::Relaxed)
-                && crate::page_url().starts_with("file://")
-        }
+pub(crate) fn allowed() -> bool {
+    // `--app` (including `--kiosk --app`) is always an isolated application sandbox;
+    // never let an environment variable grant host machine APIs to it.
+    if crate::is_app() {
+        return false;
     }
+    let env_off = |k: &str| std::env::var(k).is_ok_and(|v| v.eq_ignore_ascii_case("off") || v == "0");
+    let env_on = |k: &str| std::env::var(k).is_ok_and(|v| v.eq_ignore_ascii_case("on") || v == "1");
+    if env_off("ZIPP_SYSTEM") || env_off("ZIPP_SYSTEM_API") {
+        return false;
+    }
+    if env_on("ZIPP_SYSTEM") || env_on("ZIPP_SYSTEM_API") {
+        return true;
+    }
+    KIOSK.load(std::sync::atomic::Ordering::Relaxed)
+        && crate::page_url().starts_with("file://")
 }
 
 /// `__zippHostCall("zipp", op, ...)`.
@@ -95,13 +102,20 @@ pub(crate) fn host_call(ctx: &mut dyn HostCtx, args: &[String]) -> Result<String
             }
             // SAFETY: the engine pinned `count` bytes at `addr` for this call.
             let buf = unsafe { std::slice::from_raw_parts_mut(addr as *mut u8, length) };
-            // Files: a device or a FIFO never ends, or never starts, and this
-            // is the desktop's own thread.
-            let meta = std::fs::metadata(&p).map_err(|e| io_error(&p, e))?;
+            // Files: open non-blocking first and check fstat so a FIFO/device
+            // swapped in between stat and open cannot hang the UI thread.
+            let mut opts = std::fs::OpenOptions::new();
+            opts.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+            }
+            let mut file = opts.open(&p).map_err(|e| io_error(&p, e))?;
+            let meta = file.metadata().map_err(|e| io_error(&p, e))?;
             if !meta.is_file() {
                 return Err(format!("NotSupportedError: {}: not a file", p.display()));
             }
-            let mut file = std::fs::File::open(&p).map_err(|e| io_error(&p, e))?;
             file.seek(SeekFrom::Start(offset)).map_err(|e| io_error(&p, e))?;
             let mut got = 0;
             while got < length {
@@ -118,24 +132,24 @@ pub(crate) fn host_call(ctx: &mut dyn HostCtx, args: &[String]) -> Result<String
         "write" | "append" => {
             use std::io::Write;
             let (p, length) = (path(1)?, num(2)? as usize);
-            let bytes = if length == 0 {
-                Vec::new()
+            let bytes: &[u8] = if length == 0 {
+                &[]
             } else {
                 let (addr, count, kind) = ctx.typed_array_region("__zippHostBytes")?;
                 if kind != 1 || count < length {
                     return Err("TypeError: zipp: __zippHostBytes does not hold the bytes".into());
                 }
-                // SAFETY: as above; copied out before anything else runs.
-                unsafe { std::slice::from_raw_parts(addr as *const u8, length) }.to_vec()
+                // SAFETY: the engine pinned `count` bytes at `addr` for the duration of this host call.
+                unsafe { std::slice::from_raw_parts(addr as *const u8, length) }
             };
             let append = arg(0) == "append";
             changing(&p, || {
                 if append {
                     let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&p)?;
-                    file.write_all(&bytes)?;
+                    file.write_all(bytes)?;
                     return file.sync_all();
                 }
-                write_whole(&p, &bytes)
+                write_whole(&p, bytes)
             })
             .map_err(|e| io_error(&p, e))?;
             Ok(String::new())
@@ -182,30 +196,70 @@ pub(crate) fn host_call(ctx: &mut dyn HostCtx, args: &[String]) -> Result<String
         "run" => {
             let id = num(1)?;
             let program = arg(2).to_string();
+            let program_err = program.clone();
             let argv: Vec<String> = serde_json::from_str(arg(3)).map_err(|e| format!("TypeError: zipp: arguments: {e}"))?;
             let cwd = (!arg(4).is_empty()).then(|| arg(4).to_string());
             let page = PAGE.load(std::sync::atomic::Ordering::SeqCst);
-            let _ = std::thread::Builder::new().name("zipp-run".into()).spawn(move || {
-                let mut command = std::process::Command::new(&program);
-                command.args(&argv).stdin(std::process::Stdio::null());
-                if let Some(cwd) = cwd {
-                    command.current_dir(cwd);
-                }
-                let result = match command.output() {
-                    Ok(out) => serde_json::json!({
-                        "code": out.status.code(),
-                        "stdout": String::from_utf8_lossy(&out.stdout),
-                        "stderr": String::from_utf8_lossy(&out.stderr),
-                    }),
-                    Err(e) => serde_json::json!({ "error": format!("NotFoundError: {program}: {e}") }),
-                };
-                let mut completions = COMPLETIONS.lock().unwrap_or_else(|e| e.into_inner());
-                if PAGE.load(std::sync::atomic::Ordering::SeqCst) == page {
-                    completions.push((id, result.to_string()));
-                    drop(completions);
-                    crate::worker::wake();
-                }
-            });
+            std::thread::Builder::new()
+                .name("zipp-run".into())
+                .spawn(move || {
+                    const MAX_OUT: usize = 16 * 1024 * 1024;
+                    let mut command = std::process::Command::new(&program);
+                    command
+                        .args(&argv)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped());
+                    if let Some(cwd) = cwd {
+                        command.current_dir(cwd);
+                    }
+                    let result = match command.spawn() {
+                        Ok(mut child) => {
+                            let read_capped = |mut r: Box<dyn std::io::Read + Send>| -> Vec<u8> {
+                                let mut out = Vec::new();
+                                let mut buf = [0u8; 8192];
+                                loop {
+                                    match r.read(&mut buf) {
+                                        Ok(0) | Err(_) => break,
+                                        Ok(n) => {
+                                            let take = n.min(MAX_OUT.saturating_sub(out.len()));
+                                            if take > 0 {
+                                                out.extend_from_slice(&buf[..take]);
+                                            }
+                                            // Keep draining pipe so child doesn't deadlock on SIGPIPE/full pipe.
+                                        }
+                                    }
+                                }
+                                out
+                            };
+                            let err_thread = child.stderr.take().map(|stderr| {
+                                std::thread::spawn(move || read_capped(Box::new(stderr)))
+                            });
+                            let stdout = child
+                                .stdout
+                                .take()
+                                .map(|stdout| read_capped(Box::new(stdout)))
+                                .unwrap_or_default();
+                            let stderr = err_thread
+                                .and_then(|h| h.join().ok())
+                                .unwrap_or_default();
+                            let status = child.wait().ok();
+                            serde_json::json!({
+                                "code": status.and_then(|s| s.code()),
+                                "stdout": String::from_utf8_lossy(&stdout),
+                                "stderr": String::from_utf8_lossy(&stderr),
+                            })
+                        }
+                        Err(e) => serde_json::json!({ "error": format!("NotFoundError: {program}: {e}") }),
+                    };
+                    let mut completions = COMPLETIONS.lock().unwrap_or_else(|e| e.into_inner());
+                    if PAGE.load(std::sync::atomic::Ordering::SeqCst) == page {
+                        completions.push((id, result.to_string()));
+                        drop(completions);
+                        crate::worker::wake();
+                    }
+                })
+                .map_err(|e| format!("OperationError: could not run {program_err}: {e}"))?;
             Ok(String::new())
         }
         "power" => power(arg(1)),
@@ -364,7 +418,7 @@ fn remove_tree(p: &Path) -> std::io::Result<()> {
 /// drive is writable for just as long as that takes.
 fn changing<T>(p: &Path, change: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
     #[cfg(target_os = "linux")]
-    if p.starts_with("/boot") {
+    if boot::is_on_boot(p) {
         return boot::writable(change);
     }
     let _ = p;
@@ -374,16 +428,39 @@ fn changing<T>(p: &Path, change: impl FnOnce() -> std::io::Result<T>) -> std::io
 /// A change at both `a` and `b`. Moving something off the boot drive deletes
 /// it there, and that needs the drive writable as much as the other end does.
 fn changing_both<T>(a: &Path, b: &Path, change: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
-    if a.starts_with("/boot") { changing(a, change) } else { changing(b, change) }
+    #[cfg(target_os = "linux")]
+    if boot::is_on_boot(a) || boot::is_on_boot(b) {
+        return boot::writable(change);
+    }
+    let _ = (a, b);
+    change()
 }
 
 #[cfg(target_os = "linux")]
 mod boot {
     use std::ffi::CString;
     use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
 
     /// zipp-init takes the same lock to write its log.
     const LOCK: &str = "/run/zipp-boot.lock";
+
+    /// True if `p` (or its nearest existing ancestor) lives on `/boot`.
+    pub(super) fn is_on_boot(p: &Path) -> bool {
+        let Ok(boot_meta) = std::fs::metadata("/boot") else {
+            return p.starts_with("/boot");
+        };
+        let boot_dev = boot_meta.dev();
+        let mut cur = Some(p);
+        while let Some(path) = cur {
+            if let Ok(meta) = std::fs::symlink_metadata(path) {
+                return meta.dev() == boot_dev;
+            }
+            cur = path.parent();
+        }
+        p.starts_with("/boot")
+    }
 
     pub(super) fn writable<T>(change: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
         let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(LOCK)?;
@@ -394,9 +471,15 @@ mod boot {
         let device = boot_device().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no boot drive is mounted"))?;
         remount(&device, false)?;
         let result = change();
-        // SAFETY: sync takes no arguments.
-        unsafe { libc::sync() };
-        let _ = remount(&device, true);
+        // Flush only `/boot` (via syncfs) rather than globally syncing every USB/Linux drive.
+        if let Ok(boot_dir) = std::fs::File::open("/boot") {
+            unsafe { libc::syncfs(boot_dir.as_raw_fd()) };
+        } else {
+            unsafe { libc::sync() };
+        }
+        if let Err(e) = remount(&device, true) {
+            eprintln!("[zipp] warning: could not remount /boot read-only: {e}");
+        }
         result
     }
 
@@ -413,17 +496,38 @@ mod boot {
     fn remount(device: &str, read_only: bool) -> std::io::Result<()> {
         let source = CString::new(device).map_err(std::io::Error::other)?;
         let target = CString::new("/boot").unwrap_or_default();
-        let fs = CString::new("vfat").unwrap_or_default();
         let mut flags = libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
         if read_only {
             flags |= libc::MS_RDONLY;
         }
-        // SAFETY: valid C strings for the call's duration; no data argument.
-        if unsafe { libc::mount(source.as_ptr(), target.as_ptr(), fs.as_ptr(), flags, std::ptr::null()) } != 0 {
+        // SAFETY: valid C strings for the call's duration; NULL fstype works for any mounted fs on MS_REMOUNT.
+        if unsafe { libc::mount(source.as_ptr(), target.as_ptr(), std::ptr::null(), flags, std::ptr::null()) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
         Ok(())
     }
+}
+
+#[cfg(target_os = "linux")]
+fn unescape_mount_path(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 3 < bytes.len()
+            && (b'0'..=b'3').contains(&bytes[i + 1])
+            && (b'0'..=b'7').contains(&bytes[i + 2])
+            && (b'0'..=b'7').contains(&bytes[i + 3])
+        {
+            let val = ((bytes[i + 1] - b'0') << 6) | ((bytes[i + 2] - b'0') << 3) | (bytes[i + 3] - b'0');
+            out.push(val);
+            i += 4;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The mounted drives worth showing: the boot drive, USB drives and disks
@@ -438,7 +542,7 @@ fn drives() -> Result<String, String> {
             if f.len() < 4 || !f[0].starts_with("/dev/") {
                 continue;
             }
-            let (device, path, fs, options) = (f[0], f[1].replace("\\040", " "), f[2], f[3]);
+            let (device, path, fs, options) = (f[0], unescape_mount_path(f[1]), f[2], f[3]);
             let (size, free) = space(&path).unwrap_or((0, 0));
             let name = device.trim_start_matches("/dev/");
             // The whole disk a partition is on: sda for sda1, mmcblk0 for mmcblk0p1.
@@ -545,6 +649,7 @@ fn info() -> String {
 /// name servers.
 fn network() -> String {
     let read = |p: String| std::fs::read_to_string(p).unwrap_or_default().trim().to_string();
+    let mut addr_map = all_addresses();
     let mut interfaces = Vec::new();
     if let Ok(dir) = std::fs::read_dir("/sys/class/net") {
         let mut names: Vec<String> = dir.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
@@ -558,12 +663,13 @@ fn network() -> String {
                 "772" => "loopback",
                 _ => "other",
             };
+            let addrs = addr_map.remove(&name).unwrap_or_default();
             interfaces.push(serde_json::json!({
                 "name": name,
                 "kind": kind,
                 "state": read(format!("{base}/operstate")),
                 "mac": read(format!("{base}/address")),
-                "addresses": addresses(&name),
+                "addresses": addrs,
             }));
         }
     }
@@ -588,11 +694,11 @@ fn network() -> String {
     serde_json::json!({ "interfaces": interfaces, "routes": routes, "dns": dns }).to_string()
 }
 
-/// An interface's IPv4 and IPv6 addresses, with their prefix lengths.
-fn addresses(name: &str) -> Vec<String> {
+/// All interfaces' IPv4 and IPv6 addresses in a single `getifaddrs` call.
+fn all_addresses() -> std::collections::HashMap<String, Vec<String>> {
     #[cfg(target_os = "linux")]
     {
-        let mut out = Vec::new();
+        let mut out: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
         let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
         // SAFETY: getifaddrs fills a list freed below; each node is read only
         // while the list lives.
@@ -604,9 +710,12 @@ fn addresses(name: &str) -> Vec<String> {
             while !node.is_null() {
                 let ifa = &*node;
                 node = ifa.ifa_next;
-                if ifa.ifa_addr.is_null() || std::ffi::CStr::from_ptr(ifa.ifa_name).to_str() != Ok(name) {
+                if ifa.ifa_addr.is_null() || ifa.ifa_name.is_null() {
                     continue;
                 }
+                let Ok(name) = std::ffi::CStr::from_ptr(ifa.ifa_name).to_str() else {
+                    continue;
+                };
                 match i32::from((*ifa.ifa_addr).sa_family) {
                     libc::AF_INET => {
                         let a = &*(ifa.ifa_addr as *const libc::sockaddr_in);
@@ -616,7 +725,7 @@ fn addresses(name: &str) -> Vec<String> {
                         } else {
                             u32::from_be((*(ifa.ifa_netmask as *const libc::sockaddr_in)).sin_addr.s_addr).count_ones()
                         };
-                        out.push(format!("{addr}/{prefix}"));
+                        out.entry(name.to_string()).or_default().push(format!("{addr}/{prefix}"));
                     }
                     libc::AF_INET6 => {
                         let a = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
@@ -626,7 +735,7 @@ fn addresses(name: &str) -> Vec<String> {
                         } else {
                             (*(ifa.ifa_netmask as *const libc::sockaddr_in6)).sin6_addr.s6_addr.iter().map(|b| b.count_ones()).sum()
                         };
-                        out.push(format!("{addr}/{prefix}"));
+                        out.entry(name.to_string()).or_default().push(format!("{addr}/{prefix}"));
                     }
                     _ => {}
                 }
@@ -637,8 +746,7 @@ fn addresses(name: &str) -> Vec<String> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = name;
-        Vec::new()
+        std::collections::HashMap::new()
     }
 }
 
@@ -731,6 +839,9 @@ fn wifi(op: &str, ssid: &str, passphrase: &str) -> Result<String, String> {
                 if !passphrase.is_empty() && !hex && !(8..=63).contains(&passphrase.len()) {
                     return Err("TypeError: a passphrase is 8 to 63 characters".into());
                 }
+                if passphrase.bytes().any(|b| b < 0x20 || b == 0x7f) {
+                    return Err("TypeError: a passphrase cannot contain control characters".into());
+                }
                 // Added beside the network in use, not over it: a wrong
                 // password must not cost the connection there was. `undo` takes
                 // this one away again, `keep` the others.
@@ -739,6 +850,14 @@ fn wifi(op: &str, ssid: &str, passphrase: &str) -> Result<String, String> {
                     return Err(format!("OperationError: wpa_supplicant: {id}"));
                 }
                 let name: String = ssid.bytes().map(|b| format!("{b:02x}")).collect();
+                let mut escaped_psk = String::with_capacity(passphrase.len() + 4);
+                for ch in passphrase.chars() {
+                    match ch {
+                        '\\' => escaped_psk.push_str("\\\\"),
+                        '"' => escaped_psk.push_str("\\\""),
+                        _ => escaped_psk.push(ch),
+                    }
+                }
                 let set_up = || -> Result<(), String> {
                     ok(&format!("SET_NETWORK {id} ssid {name}"))?;
                     ok(&format!("SET_NETWORK {id} scan_ssid 1"))?;
@@ -750,7 +869,7 @@ fn wifi(op: &str, ssid: &str, passphrase: &str) -> Result<String, String> {
                     } else {
                         ok(&format!("SET_NETWORK {id} key_mgmt WPA-PSK WPA-PSK-SHA256 SAE"))?;
                         ok(&format!("SET_NETWORK {id} ieee80211w 1"))?;
-                        ok(&format!("SET_NETWORK {id} psk \"{passphrase}\""))?;
+                        ok(&format!("SET_NETWORK {id} psk P\"{escaped_psk}\""))?;
                     }
                     ok(&format!("SELECT_NETWORK {id}"))
                 };

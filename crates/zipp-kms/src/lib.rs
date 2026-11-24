@@ -53,12 +53,36 @@ pub use display::{Display, rotation_named};
 /// A turn asked for (`request_rotation`): 0-3 quarter turns, 4 the panel's
 /// own, 255 none.
 static ROTATION_ASKED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(255);
-/// The loop's wake-up, for `request_rotation` from any thread.
+/// The loop's wake-up, for `request_rotation` and `SIGTERM`/`SIGINT` exit.
 static WAKE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+/// Set by the `SIGTERM`/`SIGINT` handler so `run_app` exits cleanly,
+/// flushing profile storage and restoring `/dev/tty0`.
+static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// The screen's turn now, and the panel's own (quarter turns clockwise).
 static ROTATION_NOW: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 static ROTATION_PANEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 type RotationCallback = Box<dyn Fn(u8, (u32, u32)) + Send + Sync>;
+
+extern "C" fn on_exit_signal(_sig: libc::c_int) {
+    EXIT_REQUESTED.store(true, Ordering::Release);
+    let fd = WAKE_FD.load(Ordering::Acquire);
+    if fd >= 0 {
+        let one: u64 = 1;
+        unsafe { libc::write(fd, (&one as *const u64).cast(), 8) };
+    }
+}
+
+fn install_exit_signals() {
+    EXIT_REQUESTED.store(false, Ordering::Release);
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_exit_signal as *const () as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = 0;
+        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+    }
+}
 
 /// Told of each turn: the quarter turns, and the size of the buffers the
 /// panel scans out (what a renderer turns its picture onto).
@@ -68,8 +92,8 @@ static ON_ROTATION: std::sync::OnceLock<RotationCallback> = std::sync::OnceLock:
 /// panel's own (as the kernel knows the panel is mounted). Applied by the
 /// loop, which tells the window its new size.
 pub fn request_rotation(rotation: Option<u8>) {
-    ROTATION_ASKED.store(rotation.map_or(4, |r| r % 4), std::sync::atomic::Ordering::Relaxed);
-    let fd = WAKE_FD.load(std::sync::atomic::Ordering::Relaxed);
+    ROTATION_ASKED.store(rotation.map_or(4, |r| r % 4), Ordering::Release);
+    let fd = WAKE_FD.load(Ordering::Acquire);
     if fd >= 0 {
         let one: u64 = 1;
         unsafe { libc::write(fd, (&one as *const u64).cast(), 8) };
@@ -110,6 +134,13 @@ impl Shared {
     pub(crate) fn wake(&self) {
         let one: u64 = 1;
         unsafe { libc::write(self.wake_fd.as_raw_fd(), (&one as *const u64).cast(), 8) };
+    }
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        let raw = self.wake_fd.as_raw_fd();
+        let _ = WAKE_FD.compare_exchange(raw, -1, Ordering::Release, Ordering::Relaxed);
     }
 }
 
@@ -247,15 +278,21 @@ impl EventLoop {
             wake_fd,
             pending_size: Mutex::new(None),
         });
-        WAKE_FD.store(shared.wake_fd.as_raw_fd(), std::sync::atomic::Ordering::Relaxed);
+        WAKE_FD.store(shared.wake_fd.as_raw_fd(), Ordering::Release);
         // In VirtualBox the screen follows its window, unless a mode was
-        // named (ZIPP_KMS_MODE).
+        // named (ZIPP_KMS_MODE). Hold a Weak<Shared> so Shared drops on exit.
         if std::env::var_os("ZIPP_KMS_MODE").is_none() {
-            let to = shared.clone();
-            vbox::watch(move |w, h| {
-                *to.pending_size.lock().unwrap_or_else(|e| e.into_inner()) = Some((w, h));
-                to.wake();
-            });
+            let weak_resize = Arc::downgrade(&shared);
+            let weak_alive = Arc::downgrade(&shared);
+            vbox::watch(
+                move |w, h| {
+                    let Some(to) = weak_resize.upgrade() else { return false };
+                    *to.pending_size.lock().unwrap_or_else(|e| e.into_inner()) = Some((w, h));
+                    to.wake();
+                    true
+                },
+                move || weak_alive.strong_count() > 0 && !EXIT_REQUESTED.load(Ordering::Acquire),
+            );
         }
         Ok(EventLoop {
             target: Target {
@@ -292,9 +329,11 @@ impl EventLoop {
 
     /// Run `app` until it calls `exit()`.
     pub fn run_app<A: ApplicationHandler>(mut self, mut app: A) -> io::Result<()> {
+        install_exit_signals();
         let target = &self.target;
         let shared = target.shared.clone();
         let mut events = Vec::new();
+        let mut fds: Vec<libc::pollfd> = Vec::with_capacity(16);
 
         app.new_events(target, StartCause::Init);
         app.can_create_surfaces(target);
@@ -330,7 +369,8 @@ impl EventLoop {
                 shared.display.frame_presented();
             }
             app.about_to_wait(target);
-            if target.exit.get() {
+            if target.exit.get() || EXIT_REQUESTED.load(Ordering::Acquire) {
+                target.exit.set(true);
                 break;
             }
 
@@ -349,22 +389,25 @@ impl EventLoop {
             }
             let timeout_ms = deadline.map_or(-1, |d| {
                 let left = d.saturating_duration_since(now);
-                left.as_millis().min(i32::MAX as u128) as i32 + i32::from(left.subsec_micros() % 1000 != 0)
+                (left.as_millis().min(i32::MAX as u128) as i32)
+                    .saturating_add(i32::from(left.subsec_micros() % 1000 != 0))
             });
 
             let drm_fd = shared.display.card.as_fd().as_raw_fd();
-            let input_fds = self.input.fds();
-            let mut fds: Vec<libc::pollfd> = [drm_fd, shared.wake_fd.as_raw_fd()]
-                .into_iter()
-                .chain(input_fds.iter().copied())
-                .map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 })
-                .collect();
+            fds.clear();
+            fds.push(libc::pollfd { fd: drm_fd, events: libc::POLLIN, revents: 0 });
+            fds.push(libc::pollfd { fd: shared.wake_fd.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+            self.input.push_poll_fds(&mut fds);
             let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
             if n < 0 {
                 let e = io::Error::last_os_error();
                 if e.kind() != io::ErrorKind::Interrupted {
                     return Err(e);
                 }
+            }
+            if EXIT_REQUESTED.load(Ordering::Acquire) {
+                target.exit.set(true);
+                break;
             }
 
             let cause = match requested {
@@ -407,6 +450,9 @@ impl EventLoop {
                 display.set_rotation(rotation);
                 ROTATION_NOW.store(rotation, Ordering::Relaxed);
                 self.input.set_screen(display.visible_size(), display.panel_size(), rotation);
+                if !self.input.touched && display.pointer_visible() {
+                    display.pointer_moved(self.input.pointer.0 as i32, self.input.pointer.1 as i32);
+                }
                 if let Some(f) = ON_ROTATION.get() {
                     f(rotation, display.buffer_size());
                 }
@@ -420,13 +466,16 @@ impl EventLoop {
             // A new size for the screen: its mode, then the window's.
             let wanted = shared.pending_size.lock().unwrap_or_else(|e| e.into_inner()).take();
             if let (Some((w, h)), Some(id)) = (wanted, target.window.get())
-                && shared.display.visible_size() != (w, h)
+                && shared.display.panel_size() != (w, h)
             {
                 let (w, h) = (w.clamp(640, 7680), h.clamp(400, 4320));
                 match shared.display.set_size(w, h) {
                     Ok(()) => {
                         let display = &shared.display;
                         self.input.set_screen(display.visible_size(), display.panel_size(), display.rotation());
+                        if !self.input.touched && display.pointer_visible() {
+                            display.pointer_moved(self.input.pointer.0 as i32, self.input.pointer.1 as i32);
+                        }
                         if let Some(f) = ON_ROTATION.get() {
                             f(display.rotation(), display.buffer_size());
                         }
@@ -441,7 +490,7 @@ impl EventLoop {
 
             if fds[2..].iter().any(|p| p.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0) {
                 let before = self.input.pointer;
-                self.input.read(&mut events);
+                self.input.read(&fds[2..], &mut events);
                 if self.input.pointer != before {
                     // A finger needs no arrow under it; a mouse does.
                     if self.input.touched {

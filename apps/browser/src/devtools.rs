@@ -324,6 +324,7 @@ pub(crate) fn generation() -> u64 {
 }
 
 /// Inspect a concrete DOM node from `doc` (from Element Picker click or tree click).
+/// Refuses inspecting browser chrome or DevTools panel nodes so `chrome_token` cannot leak.
 pub(crate) fn inspect_node(doc: &BaseDocument, mut node_id: usize) {
     // Walk up from text/comment nodes to the enclosing element.
     while let Some(node) = doc.get_node(node_id) {
@@ -333,6 +334,20 @@ pub(crate) fn inspect_node(doc: &BaseDocument, mut node_id: usize) {
         match node.parent {
             Some(parent) => node_id = parent,
             None => return,
+        }
+    }
+    // Reject any node inside the browser chrome or DevTools subtrees.
+    let mut check = Some(node_id);
+    while let Some(cid) = check {
+        if let Some(n) = doc.get_node(cid) {
+            if let Some(cel) = n.element_data()
+                && matches!(cel.attr(LocalName::from("id")), Some("__zipp_chrome" | "__zipp_console"))
+            {
+                return;
+            }
+            check = n.parent;
+        } else {
+            break;
         }
     }
     let Some(node) = doc.get_node(node_id) else {
@@ -616,6 +631,10 @@ pub(crate) fn header_html(token: &str, copied: bool) -> String {
 
 /// Render the active tab's body content inside `#__zipp_console_lines`.
 pub(crate) fn body_html(doc: Option<&BaseDocument>) -> String {
+    let active_tab = STATE.lock().unwrap_or_else(|e| e.into_inner()).tab;
+    if active_tab == Tab::Console {
+        return console::lines_html();
+    }
     let snapshot = STATE.lock().unwrap_or_else(|e| e.into_inner()).clone_snapshot();
     match snapshot.tab {
         Tab::Console => console::lines_html(),

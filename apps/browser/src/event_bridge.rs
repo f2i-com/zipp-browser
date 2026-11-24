@@ -87,7 +87,17 @@ pub(crate) fn deliver_async_fetches(state: &mut ScriptState) -> usize {
     count
 }
 
-pub(crate) fn run_page_tasks(state: &mut ScriptState, max_tasks: usize, mut frames: u32, budget: std::time::Duration) -> usize {
+pub(crate) fn run_page_tasks(state: &mut ScriptState, max_tasks: usize, frames: u32, budget: std::time::Duration) -> usize {
+    run_page_tasks_with_wait(state, max_tasks, frames, budget, true)
+}
+
+pub(crate) fn run_page_tasks_with_wait(
+    state: &mut ScriptState,
+    max_tasks: usize,
+    mut frames: u32,
+    budget: std::time::Duration,
+    wait_for_fetches: bool,
+) -> usize {
     let start = Instant::now();
     state.run_microtasks();
     let mut ran = 0;
@@ -106,7 +116,8 @@ pub(crate) fn run_page_tasks(state: &mut ScriptState, max_tasks: usize, mut fram
             Ok(JsValue::Number(1.0)) => ran += 1,
             Ok(JsValue::Number(2.0)) => frames = frames.saturating_sub(1),
             _ => {
-                if crate::async_fetch::has_pending(crate::async_fetch::current_scope())
+                if wait_for_fetches
+                    && crate::async_fetch::has_pending(crate::async_fetch::current_scope())
                     && start.elapsed() < budget
                 {
                     std::thread::sleep(std::time::Duration::from_millis(8));
@@ -336,8 +347,9 @@ impl JsEventBridge {
             return;
         };
         // React's setState is async — the handler has only
-        // queued the re-render at this point.
-        run_page_tasks(state, 400, 2, std::time::Duration::from_secs(1));
+        // queued the re-render at this point. Do not block on slow network fetches;
+        // async_fetch wakes `run_tasks` when responses arrive.
+        run_page_tasks_with_wait(state, 400, 2, std::time::Duration::from_secs(1), false);
         print_console(state);
         self.collect_render(false);
         self.note_rendered();
@@ -616,7 +628,7 @@ impl JsEventBridge {
         let Some(state) = self.js_state.as_mut() else {
             return;
         };
-        run_page_tasks(state, 250, 0, std::time::Duration::from_millis(250));
+        run_page_tasks_with_wait(state, 250, 0, std::time::Duration::from_millis(250), false);
         print_console(state);
         self.collect_render(true);
         self.note_rendered();
@@ -794,7 +806,8 @@ impl JsEventBridge {
     }
 
     /// Sync SPA `history.pushState` / `replaceState` URL changes into the browser
-    /// address bar (`#__zipp_url_input`) and active tab state.
+    /// address bar (`#__zipp_url_input`) and active tab state, strictly enforcing
+    /// same-origin so scripts cannot spoof the address bar or escalate privileges.
     fn sync_location_url(&mut self, doc: &mut BaseDocument) {
         if self.is_subdocument {
             return;
@@ -807,6 +820,26 @@ impl JsEventBridge {
         };
         if href.is_empty() || href == self.page_url || href.starts_with("about:") {
             return;
+        }
+        let (Ok(cur), Ok(next)) = (url::Url::parse(&self.page_url), url::Url::parse(&href)) else {
+            return;
+        };
+        if cur.scheme() != next.scheme() {
+            return;
+        }
+        match cur.scheme() {
+            "http" | "https" => {
+                if cur.origin() != next.origin() {
+                    return;
+                }
+            }
+            "file" => {
+                // On `file:`, never allow changing the underlying filesystem path.
+                if cur.path() != next.path() {
+                    return;
+                }
+            }
+            _ => return,
         }
         self.page_url = href.clone();
         crate::tabs::sync_active_spa_url(&href);
@@ -884,7 +917,7 @@ impl JsEventBridge {
 
     /// Drain queued JS `<video>` commands (`play`, `pause`, `load`, `seek`, etc.).
     fn apply_pending_video_ops(&mut self, doc: &mut BaseDocument) {
-        let ops = take_pending_video_ops();
+        let ops = take_pending_video_ops_for(self.fetch_scope);
         if ops.is_empty() {
             return;
         }
@@ -983,15 +1016,23 @@ impl JsEventBridge {
 }
 
 impl Drop for JsEventBridge {
-    /// The page (or iframe) is going, and its workers/canvas cache with it.
+    /// The page (or iframe) is going, and its workers/graphics/blob resources with it.
     fn drop(&mut self) {
         self.video_players.clear();
+        drop_pending_video_ops_for(self.fetch_scope);
         crate::async_fetch::drop_scope(self.fetch_scope);
+        crate::canvas2d::drop_scope(self.fetch_scope);
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            crate::webgl::drop_scope(self.fetch_scope);
+            crate::webgpu::drop_scope(self.fetch_scope);
+        }
+        crate::drop_blobs_for_scope(self.fetch_scope);
+        crate::drop_chosen_files_for_scope(self.fetch_scope);
         if self.is_subdocument {
             crate::worker::terminate_scope(self.fetch_scope);
             crate::canvas::forget_scope(self.fetch_scope);
         } else {
-            let _ = take_pending_video_ops();
             crate::worker::terminate_page(self.page);
         }
     }
@@ -1002,7 +1043,7 @@ impl EventHandler for JsEventBridge {
     /// live WebGL contexts. Pages with neither return `false` immediately so
     /// idle pages spend zero CPU.
     fn animation_frame(&mut self, doc: &mut BaseDocument) -> bool {
-        let _layout = LayoutScope::enter(doc, &self.flid_to_dom, &self.page_url, self.fetch_scope);
+        let _layout = LayoutScope::enter(doc, &self.flid_to_dom, &self.page_url, self.fetch_scope, self.is_subdocument);
         let Some(state) = self.js_state.as_mut() else {
             return false;
         };
@@ -1028,16 +1069,26 @@ impl EventHandler for JsEventBridge {
         };
         state.run_microtasks();
         print_console(state);
+        // Re-check rAF and canvas presentation after microtasks (e.g. a Promise
+        // continuation scheduled the next rAF or mutated the DOM/canvas).
+        let more_raf = (flags & 1 != 0)
+            || matches!(
+                state.call_global("__zippHasAnimationFrame", &[]),
+                Ok(JsValue::Number(n)) if n > 0.0
+            );
+        if has_gl {
+            let _ = state.call_global("__zippPresentCanvases", &[]);
+        }
         if crate::apply_canvas_frames_with_map(doc, self.fetch_scope, &self.flid_to_dom) {
             doc.shell_provider.request_paint();
         }
-        // The frame changed the DOM as well: lay the page out again.
-        if flags & 2 != 0 {
+        // The frame (or its microtasks) changed the DOM as well: lay the page out again.
+        if (flags & 2 != 0) || self.dom_changed() {
             self.collect_render(false);
         }
         self.note_rendered();
         self.refresh_next_timer();
-        flags & 1 != 0
+        more_raf
     }
 
     fn handle_event(
@@ -1048,13 +1099,17 @@ impl EventHandler for JsEventBridge {
         event_state: &mut EventState,
     ) {
         let event_name = event.data.name();
-        // Only input reaches here: a page's own dispatchEvent stays in script.
-        if matches!(event.data, DomEventData::Click(_) | DomEventData::KeyDown(_) | DomEventData::MouseDown(_)) {
-            crate::note_user_gesture();
-        }
-        let _layout = LayoutScope::enter(&_doc.inner(), &self.flid_to_dom, &self.page_url, self.fetch_scope);
-        self.refresh_listeners(&_doc.inner());
         let has_chrome = !self.is_subdocument && crate::chrome_shown();
+        let event_in_chrome = has_chrome && in_chrome(_doc, chain);
+        // Only page input reaches here: a page's own dispatchEvent stays in script,
+        // and clicking in browser chrome never grants a user gesture to page scripts.
+        if !event_in_chrome
+            && matches!(event.data, DomEventData::Click(_) | DomEventData::KeyDown(_) | DomEventData::MouseDown(_))
+        {
+            crate::note_user_gesture(self.fetch_scope);
+        }
+        let _layout = LayoutScope::enter(&_doc.inner(), &self.flid_to_dom, &self.page_url, self.fetch_scope, self.is_subdocument);
+        self.refresh_listeners(&_doc.inner());
         // Desktop <-> Mobile View toggle (toolbar phone icon or Ctrl+Shift+M).
         let mobile_key = has_chrome
             && matches!(
@@ -1065,7 +1120,7 @@ impl EventHandler for JsEventBridge {
                         && (k.modifiers.contains(keyboard_types::Modifiers::CONTROL)
                             || k.modifiers.contains(keyboard_types::Modifiers::META))
             );
-        let mobile_link = has_chrome
+        let mobile_link = event_in_chrome
             && matches!(event.data, DomEventData::Click(_))
             && chain_element_id(_doc, chain, &["__zipp_mobile_button"]).is_some();
         if mobile_key || mobile_link {
@@ -1160,7 +1215,7 @@ impl EventHandler for JsEventBridge {
                 None
             };
 
-            let static_dt_click = matches!(event.data, DomEventData::Click(_))
+            let static_dt_click = (event_in_chrome && matches!(event.data, DomEventData::Click(_)))
                 .then(|| {
                     chain_element_id(
                         _doc,
@@ -1183,14 +1238,16 @@ impl EventHandler for JsEventBridge {
                 })
                 .flatten();
 
-            let dynamic_script_click = if static_dt_click.is_none()
+            let dynamic_script_click = if event_in_chrome
+                && static_dt_click.is_none()
                 && matches!(event.data, DomEventData::Click(_))
             {
                 chain_element_id_with_prefix(_doc, chain, "__zipp_dt_script_")
             } else {
                 None
             };
-            let dynamic_node_click = if static_dt_click.is_none()
+            let dynamic_node_click = if event_in_chrome
+                && static_dt_click.is_none()
                 && dynamic_script_click.is_none()
                 && matches!(event.data, DomEventData::Click(_))
             {
@@ -1349,20 +1406,27 @@ impl EventHandler for JsEventBridge {
         // Walking up to the nearest identified ancestor is also what the DOM
         // says should happen: an event target is an element, and React expects
         // the element whose fiber owns the handler to be reachable from it.
-        let target_flid = chain
+        let target_entry = chain
             .iter()
-            .find_map(|id| self.reverse_flid.get(id))
-            .copied()
-            .unwrap_or(0);
+            .enumerate()
+            .find_map(|(idx, id)| self.reverse_flid.get(id).map(|&flid| (idx, flid)));
+        let target_flid = target_entry.map(|(_, flid)| flid).unwrap_or(0);
 
         // Walk the bubble chain (target first, then ancestors). Non-bubbling
         // events (`blur`, `focus`, `scroll`, `mouseenter`/`mouseleave`,
-        // `pointerenter`/`pointerleave`) stay on their target and must never
-        // propagate up to ancestors or `document`/`window` (in particular, an
-        // element losing focus must not trigger `window.addEventListener("blur", ...)`).
+        // `pointerenter`/`pointerleave`) stay on their owning element (resolving
+        // through text/SVG children to `target_entry`) and must never propagate
+        // up to ancestors or `document`/`window` (so an element losing focus
+        // does not trigger `window.addEventListener("blur", ...)`).
         let bubbles = event.bubbles && !scrolled;
-        let chain = if bubbles { chain } else { &chain[..chain.len().min(1)] };
-        for &node_id in chain {
+        let dispatch_chain = if bubbles {
+            chain
+        } else if let Some((idx, _)) = target_entry {
+            &chain[idx..=idx]
+        } else {
+            &chain[..chain.len().min(1)]
+        };
+        for &node_id in dispatch_chain {
             if let Some(types) = self.handler_map.get(&node_id)
                 && types.iter().any(|t| t == event_name) {
                     // Look up the JS flid for this blitz-dom node.
@@ -1464,6 +1528,7 @@ impl EventHandler for JsEventBridge {
                     Err(e) => eprintln!("[EVENT] document handler for \"{event_name}\" failed: {e}"),
                 }
             }
+        let prev_timer = self.next_timer;
         if ran_listener && event_name == "click" {
             self.settle_after_click();
         } else if ran_listener && self.dom_changed() {
@@ -1478,13 +1543,28 @@ impl EventHandler for JsEventBridge {
             self.apply_pending_video_ops(&mut doc);
             self.apply_focus_request(&mut doc);
             self.sync_scrolls(&mut doc);
-            // A listener asked for full screen (it takes a click).
-            crate::apply_window_requests(&doc);
+            // If a passive listener (e.g. rAF-coalesced drag/mousemove) drew to a
+            // canvas, queued rAF, or scheduled an earlier timer, wake the paint/task loop.
+            if crate::apply_canvas_frames_with_map(&mut doc, self.fetch_scope, &self.flid_to_dom) {
+                doc.shell_provider.request_paint();
+            } else if let Some(state) = self.js_state.as_mut()
+                && matches!(state.call_global("__zippHasAnimationFrame", &[]), Ok(JsValue::Number(n)) if n > 0.0)
+            {
+                doc.shell_provider.request_paint();
+            }
+            if self.next_timer != prev_timer && self.next_timer.is_some() {
+                crate::worker::wake();
+            }
+            // A listener asked for full screen (it takes a click). Subdocuments
+            // cannot drive top-level OS window requests directly.
+            if !self.is_subdocument {
+                crate::apply_window_requests(&doc);
+            }
         }
     }
 
     fn run_tasks(&mut self, doc: &mut BaseDocument) -> Option<Instant> {
-        let _layout = LayoutScope::enter(doc, &self.flid_to_dom, &self.page_url, self.fetch_scope);
+        let _layout = LayoutScope::enter(doc, &self.flid_to_dom, &self.page_url, self.fetch_scope, self.is_subdocument);
         let now = Instant::now();
         self.refresh_listeners(doc);
         // Deliver any background `window.fetch()` responses that arrived for this document.
@@ -1631,6 +1711,13 @@ impl EventHandler for JsEventBridge {
         if crate::apply_canvas_frames_with_map(doc, self.fetch_scope, &self.flid_to_dom) {
             doc.shell_provider.request_paint();
         }
+        // If a timer, async fetch, or worker callback queued `requestAnimationFrame`
+        // without synchronously mutating the DOM, wake a paint so the animation loop starts.
+        if let Some(state) = self.js_state.as_mut()
+            && matches!(state.call_global("__zippHasAnimationFrame", &[]), Ok(JsValue::Number(n)) if n > 0.0)
+        {
+            doc.shell_provider.request_paint();
+        }
         self.apply_pending_video_ops(doc);
         self.apply_focus_request(doc);
         self.sync_scrolls(doc);
@@ -1760,12 +1847,38 @@ thread_local! {
     static LAYOUT_DOC: std::cell::Cell<*const BaseDocument> = const { std::cell::Cell::new(std::ptr::null()) };
     /// O(1) flid -> blitz_dom node ID lookup matching `LAYOUT_DOC`.
     static LAYOUT_FLIDS: std::cell::RefCell<Option<Arc<HashMap<u32, usize>>>> = const { std::cell::RefCell::new(None) };
-    /// Queued `<video>` commands requested by JS before the bridge has `&mut BaseDocument`.
-    static PENDING_VIDEO_OPS: std::cell::RefCell<Vec<(u32, PendingVideoOp)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Queued `<video>` commands requested by JS before the bridge has `&mut BaseDocument`,
+    /// scoped by `fetch_scope` so parent and iframes/navigations never steal or wipe each other.
+    static PENDING_VIDEO_OPS: std::cell::RefCell<Vec<(u64, u32, PendingVideoOp)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-fn take_pending_video_ops() -> Vec<(u32, PendingVideoOp)> {
-    PENDING_VIDEO_OPS.with(|q| std::mem::take(&mut *q.borrow_mut()))
+fn take_pending_video_ops_for(scope: u64) -> Vec<(u32, PendingVideoOp)> {
+    PENDING_VIDEO_OPS.with(|q| {
+        let mut ops = q.borrow_mut();
+        let mut mine = Vec::new();
+        let mut rest = Vec::new();
+        for item in ops.drain(..) {
+            let matches = if scope == 0 {
+                item.0 == 0
+            } else {
+                item.0 == scope || item.0 == 0
+            };
+            if matches {
+                mine.push((item.1, item.2));
+            } else {
+                rest.push(item);
+            }
+        }
+        *ops = rest;
+        mine
+    })
+}
+
+fn drop_pending_video_ops_for(scope: u64) {
+    if scope == 0 {
+        return;
+    }
+    PENDING_VIDEO_OPS.with(|q| q.borrow_mut().retain(|(s, _, _)| *s != scope));
 }
 
 fn media_status_json(st: &zipp_dom::traits_src::media::MediaStatus) -> serde_json::Value {
@@ -1879,7 +1992,8 @@ pub(crate) fn video_host_call(args: &[String]) -> Result<String, String> {
         _ => None,
     };
     if let Some(pending) = queued {
-        PENDING_VIDEO_OPS.with(|q| q.borrow_mut().push((flid, pending)));
+        let scope = crate::async_fetch::current_scope();
+        PENDING_VIDEO_OPS.with(|q| q.borrow_mut().push((scope, flid, pending)));
     }
     Ok(String::new())
 }
@@ -1900,6 +2014,7 @@ struct LayoutScope {
     prev_flids: Option<Arc<HashMap<u32, usize>>>,
     _page_guard: crate::ThreadPageGuard,
     _fetch_guard: crate::async_fetch::ScopeGuard,
+    _subdoc_guard: crate::SubdocumentGuard,
 }
 
 impl LayoutScope {
@@ -1908,12 +2023,14 @@ impl LayoutScope {
         flids: &Arc<HashMap<u32, usize>>,
         page_url: &str,
         fetch_scope: u64,
+        is_subdocument: bool,
     ) -> Self {
         let prev_doc = LAYOUT_DOC.with(|d| d.replace(doc));
         let prev_flids = LAYOUT_FLIDS.with(|f| f.borrow_mut().replace(Arc::clone(flids)));
         let _page_guard = crate::ThreadPageGuard::enter(page_url);
         let _fetch_guard = crate::async_fetch::ScopeGuard::enter(fetch_scope);
-        LayoutScope { prev_doc, prev_flids, _page_guard, _fetch_guard }
+        let _subdoc_guard = crate::SubdocumentGuard::enter(is_subdocument);
+        LayoutScope { prev_doc, prev_flids, _page_guard, _fetch_guard, _subdoc_guard }
     }
 }
 

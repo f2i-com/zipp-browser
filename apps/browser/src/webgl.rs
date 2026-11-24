@@ -50,10 +50,17 @@ use wgl::{Platform, RawContext};
 use crate::canvas::Frame;
 
 struct Batch {
+    scope: u64,
+    page_url: String,
     context: u32,
     cmds: String,
     payload: Vec<u8>,
     reply: Sender<Reply>,
+}
+
+enum Msg {
+    Batch(Batch),
+    DropScope(u64),
 }
 
 #[derive(Default)]
@@ -67,11 +74,25 @@ struct Reply {
 }
 
 thread_local! {
-    static GL_THREAD: RefCell<Option<Sender<Batch>>> = const { RefCell::new(None) };
+    static GL_THREAD: RefCell<Option<Sender<Msg>>> = const { RefCell::new(None) };
+}
+
+/// Destroy all WebGL contexts owned by a document scope when it unmounts or navigates.
+pub(crate) fn drop_scope(scope: u64) {
+    if scope == 0 {
+        return;
+    }
+    GL_THREAD.with(|t| {
+        if let Some(tx) = t.borrow().as_ref() {
+            let _ = tx.send(Msg::DropScope(scope));
+        }
+    });
 }
 
 /// `__zippHostCall("gl", context, batch, payloadLength)`.
 pub(crate) fn host_call(ctx: &mut dyn HostCtx, args: &[String]) -> Result<String, String> {
+    let scope = crate::async_fetch::current_scope();
+    let page_url = crate::page_url();
     let context: u32 = args.first().and_then(|a| a.parse().ok()).ok_or("Error: gl: no context")?;
     let cmds = args.get(1).cloned().unwrap_or_default();
     let len: usize = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(0);
@@ -98,14 +119,21 @@ pub(crate) fn host_call(ctx: &mut dyn HostCtx, args: &[String]) -> Result<String
             .clone()
     });
     let (reply_tx, reply_rx) = mpsc::channel();
-    sender
-        .send(Batch { context, cmds, payload, reply: reply_tx })
-        .map_err(|_| "Error: WebGL is unavailable".to_string())?;
+    if sender
+        .send(Msg::Batch(Batch { scope, page_url, context, cmds, payload, reply: reply_tx }))
+        .is_err()
+    {
+        GL_THREAD.with(|t| *t.borrow_mut() = None);
+        return Err("Error: WebGL is unavailable".to_string());
+    }
     // A draw the GL thread is still on after half a minute (a hung driver, or
     // a huge one on the CPU) gives the page an error rather than freezing it.
     let reply = reply_rx.recv_timeout(std::time::Duration::from_secs(30)).map_err(|e| match e {
         mpsc::RecvTimeoutError::Timeout => "Error: WebGL did not answer in 30 seconds".to_string(),
-        mpsc::RecvTimeoutError::Disconnected => "Error: WebGL stopped".to_string(),
+        mpsc::RecvTimeoutError::Disconnected => {
+            GL_THREAD.with(|t| *t.borrow_mut() = None);
+            "Error: WebGL stopped".to_string()
+        }
     })?;
     if let Some(error) = reply.error {
         eprintln!("[WEBGL] {error}");
@@ -124,7 +152,7 @@ pub(crate) fn host_call(ctx: &mut dyn HostCtx, args: &[String]) -> Result<String
     Ok(reply.result)
 }
 
-fn gl_thread(batches: Receiver<Batch>) {
+fn gl_thread(msgs: Receiver<Msg>) {
     let mut host = match Platform::new() {
         Ok(platform) => Some(Host { platform, current: None, contexts: HashMap::new() }),
         Err(e) => {
@@ -132,20 +160,30 @@ fn gl_thread(batches: Receiver<Batch>) {
             None
         }
     };
-    for batch in batches {
-        let reply = match host.as_mut() {
-            Some(host) => host.run(batch.context, &batch.cmds, &batch.payload),
-            None => Reply { error: Some("OpenGL is unavailable".into()), ..Default::default() },
-        };
-        let _ = batch.reply.send(reply);
+    for msg in msgs {
+        match msg {
+            Msg::DropScope(scope) => {
+                if let Some(host) = host.as_mut() {
+                    host.drop_scope(scope);
+                }
+            }
+            Msg::Batch(batch) => {
+                let _page = crate::ThreadPageGuard::enter(&batch.page_url);
+                let reply = match host.as_mut() {
+                    Some(host) => host.run(batch.scope, batch.context, &batch.cmds, &batch.payload),
+                    None => Reply { error: Some("OpenGL is unavailable".into()), ..Default::default() },
+                };
+                let _ = batch.reply.send(reply);
+            }
+        }
     }
 }
 
-/// The platform's way of making GL contexts, and the contexts.
+/// The platform's way of making GL contexts, and the contexts keyed by `(scope, id)`.
 struct Host {
     platform: Platform,
-    current: Option<u32>,
-    contexts: HashMap<u32, Context>,
+    current: Option<(u64, u32)>,
+    contexts: HashMap<(u64, u32), Context>,
 }
 
 /// One canvas's GL context and the WebGL objects in it, by the page's numbers.
@@ -227,23 +265,23 @@ impl PageState {
 }
 
 impl Host {
-    fn make_current(&mut self, context: u32) -> bool {
-        if self.current == Some(context) {
+    fn make_current(&mut self, key: (u64, u32)) -> bool {
+        if self.current == Some(key) {
             return true;
         }
-        let Some(ctx) = self.contexts.get(&context) else {
+        let Some(ctx) = self.contexts.get(&key) else {
             return false;
         };
         let ok = unsafe { self.platform.make_current(Some(ctx.raw)) };
-        self.current = ok.then_some(context);
+        self.current = ok.then_some(key);
         ok
     }
 
     /// Delete a context and everything in it.
-    fn delete(&mut self, context: u32) {
-        if let Some(ctx) = self.contexts.remove(&context) {
+    fn delete(&mut self, key: (u64, u32)) {
+        if let Some(ctx) = self.contexts.remove(&key) {
             unsafe {
-                if self.current == Some(context) {
+                if self.current == Some(key) {
                     self.platform.make_current(None);
                     self.current = None;
                 }
@@ -252,17 +290,23 @@ impl Host {
         }
     }
 
-    fn create(&mut self, context: u32, cmd: &Json) -> Result<(), String> {
+    /// Destroy all contexts belonging to `scope`.
+    fn drop_scope(&mut self, scope: u64) {
+        let keys: Vec<(u64, u32)> = self.contexts.keys().copied().filter(|(s, _)| *s == scope).collect();
+        for key in keys {
+            self.delete(key);
+        }
+    }
+
+    fn create(&mut self, key: (u64, u32), cmd: &Json) -> Result<(), String> {
         let n = |i: usize| cmd.get(i).and_then(Json::as_f64).unwrap_or(0.0);
         let flag = |i: usize| cmd.get(i).and_then(Json::as_bool).unwrap_or(false);
         let (flid, width, height, version, antialias, alpha) =
             (n(1) as u32, n(2) as i32, n(3) as i32, n(4) as u32, flag(5), flag(6));
-        // The page's numbers start again on every page: a context made under
-        // a number still in use replaces it.
-        self.delete(context);
+        self.delete(key);
         unsafe {
             let raw = self.platform.create()?;
-            self.current = Some(context);
+            self.current = Some(key);
             let platform = &self.platform;
             let gl = glow::Context::from_loader_function(|name| platform.proc_address(name));
             static FIRST: std::sync::Once = std::sync::Once::new();
@@ -319,13 +363,14 @@ impl Host {
             ctx.gl.viewport(0, 0, ctx.width, ctx.height);
             // Nothing the setup did is the page's error.
             while ctx.gl.get_error() != glow::NO_ERROR {}
-            self.contexts.insert(context, ctx);
+            self.contexts.insert(key, ctx);
         }
         Ok(())
     }
 
-    fn run(&mut self, context: u32, cmds: &str, payload: &[u8]) -> Reply {
+    fn run(&mut self, scope: u64, context: u32, cmds: &str, payload: &[u8]) -> Reply {
         let mut reply = Reply::default();
+        let key = (scope, context);
         let cmds: Vec<Json> = match serde_json::from_str(cmds) {
             Ok(Json::Array(c)) => c,
             _ => {
@@ -338,24 +383,21 @@ impl Host {
                 continue;
             };
             if op == "reset" {
-                // A new page: the last one's contexts go.
-                let all: Vec<u32> = self.contexts.keys().copied().collect();
-                for c in all {
-                    self.delete(c);
-                }
+                // Scoped to this document so an iframe never destroys parent/sibling contexts.
+                self.drop_scope(scope);
                 continue;
             }
             if op == "create" {
-                if let Err(e) = self.create(context, cmd) {
+                if let Err(e) = self.create(key, cmd) {
                     reply.error = Some(format!("cannot create a context: {e}"));
                 }
                 continue;
             }
-            if !self.make_current(context) {
+            if !self.make_current(key) {
                 reply.error = Some("no such context".into());
                 return reply;
             }
-            let ctx = self.contexts.get_mut(&context).unwrap();
+            let ctx = self.contexts.get_mut(&key).unwrap();
             match unsafe { ctx.exec(op, cmd, payload, &mut reply) } {
                 Ok(result) => reply.result = result,
                 Err(e) => reply.error = Some(format!("{op}: {e}")),
@@ -549,7 +591,7 @@ impl Context {
     }
 
     unsafe fn resize(&mut self, width: i32, height: i32) {
-        let (width, height) = (width.max(1), height.max(1));
+        let (width, height) = (width.clamp(1, 16384), height.clamp(1, 16384));
         if width == self.width && height == self.height {
             return;
         }
@@ -600,7 +642,14 @@ impl Context {
             gl.bind_renderbuffer(glow::RENDERBUFFER, s.renderbuffer);
             gl.bind_buffer(glow::PIXEL_PACK_BUFFER, s.pack_buffer);
             gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, s.unpack_buffer);
-            for name in [glow::PACK_ALIGNMENT, glow::UNPACK_ALIGNMENT, glow::PACK_ROW_LENGTH, glow::UNPACK_ROW_LENGTH] {
+            for name in [
+                glow::PACK_ALIGNMENT,
+                glow::UNPACK_ALIGNMENT,
+                glow::PACK_ROW_LENGTH,
+                glow::UNPACK_ROW_LENGTH,
+                glow::PACK_SKIP_ROWS,
+                glow::PACK_SKIP_PIXELS,
+            ] {
                 gl.pixel_store_i32(name, s.pixel_store(name));
             }
             if s.scissor_test {
@@ -759,7 +808,11 @@ impl Context {
                 "bufferSubData" => self.gl.buffer_sub_data_u8_slice(u(1), int(2), bytes(u(3) as usize, u(4) as usize)?),
                 "copyBufferSubData" => self.gl.copy_buffer_sub_data(u(1), u(2), int(3), int(4), int(5)),
                 "getBufferSubData" => {
-                    let mut buf = vec![0u8; u(3) as usize];
+                    let size = u(3) as usize;
+                    if size > MAX_READ_BYTES {
+                        return Err("getBufferSubData size exceeds limit".into());
+                    }
+                    let mut buf = vec![0u8; size];
                     if !self.es {
                         self.gl.get_buffer_sub_data(u(1), int(2), &mut buf);
                     } else if !buf.is_empty() {
@@ -1287,12 +1340,19 @@ impl Context {
                         }
                         None => self.fbo,
                     };
-                    let mut rgba = vec![0u8; (self.width * self.height * 4) as usize];
+                    let byte_len = (self.width as usize)
+                        .checked_mul(self.height as usize)
+                        .and_then(|n| n.checked_mul(4))
+                        .filter(|&n| n <= MAX_READ_BYTES)
+                        .ok_or_else(|| "canvas size exceeds limit".to_string())?;
+                    let mut rgba = vec![0u8; byte_len];
                     let gl = &self.gl;
                     gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(source));
                     gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
                     gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
                     gl.pixel_store_i32(glow::PACK_ROW_LENGTH, 0);
+                    gl.pixel_store_i32(glow::PACK_SKIP_ROWS, 0);
+                    gl.pixel_store_i32(glow::PACK_SKIP_PIXELS, 0);
                     gl.read_pixels(0, 0, self.width, self.height, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelPackData::Slice(Some(&mut rgba)));
                     self.restore_state();
                     flip_rows(&mut rgba, self.width as usize * 4, self.height as usize);

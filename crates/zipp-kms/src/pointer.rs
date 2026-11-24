@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use drm::buffer::DrmFourcc;
 use drm::control::dumbbuffer::DumbBuffer;
@@ -37,6 +37,12 @@ const ARROW: [&str; 19] = [
 ];
 const ARROW_W: i32 = 12;
 const ARROW_H: i32 = ARROW.len() as i32;
+const ARROW_MAX_CELLS: usize = (ARROW_W * ARROW_H) as usize;
+
+fn kms_debug() -> bool {
+    static DBG: OnceLock<bool> = OnceLock::new();
+    *DBG.get_or_init(|| std::env::var_os("ZIPP_KMS_DEBUG").is_some())
+}
 
 /// The arrow's colour at (x, y), as 0xAARRGGBB, where it has one.
 fn arrow(x: i32, y: i32) -> Option<u32> {
@@ -98,7 +104,8 @@ struct State {
 struct Drawn {
     fb: framebuffer::Handle,
     at: (i32, i32),
-    under: Vec<u32>,
+    under: [u32; ARROW_MAX_CELLS],
+    under_len: usize,
 }
 
 impl Pointer {
@@ -112,15 +119,26 @@ impl Pointer {
         Pointer { hardware: hardware.map(Mutex::new), state: Mutex::new(State { rotation, ..State::default() }) }
     }
 
+    /// Drop cached software-cursor framebuffer mmaps (called on modeset/resize).
+    pub(crate) fn clear_maps(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.drawn = None;
+        state.maps.clear();
+    }
+
+    pub(crate) fn is_visible(&self) -> bool {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).visible
+    }
+
     /// The picture is turned another way now: the arrow with it.
     pub(crate) fn set_rotation(&self, card: &Card, crtc: crtc::Handle, rotation: u8) {
-        let visible = self.state.lock().unwrap().visible;
+        let visible = self.state.lock().unwrap_or_else(|e| e.into_inner()).visible;
         if visible {
             self.hide(card, crtc);
         }
-        self.state.lock().unwrap().rotation = rotation;
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).rotation = rotation;
         if let Some(buffer) = &self.hardware {
-            draw_cursor(card, &mut buffer.lock().unwrap(), rotation);
+            draw_cursor(card, &mut buffer.lock().unwrap_or_else(|e| e.into_inner()), rotation);
         }
     }
 
@@ -130,16 +148,16 @@ impl Pointer {
 
     /// The pointer moved to (x, y), and is shown if it was hidden.
     pub(crate) fn move_to(&self, card: &Card, crtc: crtc::Handle, x: i32, y: i32) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.pos = (x, y);
         #[allow(deprecated)]
         match &self.hardware {
             Some(buffer) => {
-                if !state.visible {
-                    let _ = card.set_cursor2(crtc, Some(&*buffer.lock().unwrap()), (0, 0));
-                }
                 let (_, tip) = turned_box(state.rotation);
-                let _ = card.move_cursor(crtc, (x - tip.0, y - tip.1));
+                if !state.visible {
+                    let _ = card.set_cursor2(crtc, Some(&*buffer.lock().unwrap_or_else(|e| e.into_inner())), tip);
+                }
+                let _ = card.move_cursor(crtc, (x, y));
             }
             None => paint(card, crtc, &mut state),
         }
@@ -147,7 +165,7 @@ impl Pointer {
     }
 
     pub(crate) fn hide(&self, card: &Card, crtc: crtc::Handle) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !state.visible {
             return;
         }
@@ -158,15 +176,16 @@ impl Pointer {
         } else if let Some(drawn) = state.drawn.take()
             && let Some(map) = state.maps.get(&u32::from(drawn.fb))
         {
-            map.put(drawn.at, state.rotation, &drawn.under);
-            let _ = card.dirty_framebuffer(drawn.fb, &[rect(drawn.at, state.rotation)]);
+            map.put(drawn.at, state.rotation, &drawn.under[..drawn.under_len]);
+            let clip = rect(drawn.at, state.rotation, map.width, map.height);
+            let _ = card.dirty_framebuffer(drawn.fb, &[clip]);
         }
     }
 
     /// A new frame is on screen: a drawn pointer goes on it too.
     pub(crate) fn frame_presented(&self, card: &Card, crtc: crtc::Handle) {
         if self.hardware.is_none() {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if state.visible {
                 paint(card, crtc, &mut state);
             }
@@ -178,11 +197,13 @@ impl Pointer {
 /// first putting back what it covered if it was drawn there before.
 fn paint(card: &Card, crtc: crtc::Handle, state: &mut State) {
     let Some(fb) = card.get_crtc(crtc).ok().and_then(|c| c.framebuffer()) else { return };
+    let fb_id = u32::from(fb);
     // Where the arrow's box goes: its tip at the pointer.
     let rotation = state.rotation;
     let (_, tip) = turned_box(rotation);
     let pos = (state.pos.0 - tip.0, state.pos.1 - tip.1);
-    let mut damage = Vec::new();
+    let mut damage = [ClipRect::new(0, 0, 0, 0); 2];
+    let mut damage_len = 0usize;
     if let Some(drawn) = state.drawn.take() {
         // A framebuffer that has left the screen is the renderer's to draw
         // over whole; only the one still showing needs the arrow taken off.
@@ -191,34 +212,42 @@ fn paint(card: &Card, crtc: crtc::Handle, state: &mut State) {
                 state.drawn = Some(drawn);
                 return;
             }
-            if let Some(map) = state.maps.get(&u32::from(fb)) {
-                map.put(drawn.at, rotation, &drawn.under);
-                damage.push(rect(drawn.at, rotation));
+            if let Some(map) = state.maps.get(&fb_id) {
+                map.put(drawn.at, rotation, &drawn.under[..drawn.under_len]);
+                damage[damage_len] = rect(drawn.at, rotation, map.width, map.height);
+                damage_len += 1;
             }
         }
     }
-    let map = match state.maps.entry(u32::from(fb)) {
+    // Cap cached mappings to active scanout buffers so resized/destroyed FBs never leak.
+    if !state.maps.contains_key(&fb_id) && state.maps.len() >= 4 {
+        state.maps.clear();
+    }
+    let map = match state.maps.entry(fb_id) {
         std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
         std::collections::hash_map::Entry::Vacant(e) => match Mapping::new(card, fb) {
             Some(map) => e.insert(map),
             None => return,
         },
     };
-    let under = map.take(pos, rotation);
+    let mut under = [0u32; ARROW_MAX_CELLS];
+    let under_len = map.take_into(pos, rotation, &mut under);
     map.draw_arrow(pos, rotation);
-    damage.push(rect(pos, rotation));
-    // Drivers that copy to the screen (simpledrm) do so for dirty areas.
-    let dirty = card.dirty_framebuffer(fb, &damage);
-    if std::env::var_os("ZIPP_KMS_DEBUG").is_some() {
-        eprintln!("[kms] pointer drawn at {pos:?} on framebuffer {} ({dirty:?})", u32::from(fb));
+    damage[damage_len] = rect(pos, rotation, map.width, map.height);
+    damage_len += 1;
+    // Drivers that copy to the screen (simpledrm, vmwgfx) do so for dirty areas.
+    let dirty = card.dirty_framebuffer(fb, &damage[..damage_len]);
+    if kms_debug() {
+        eprintln!("[kms] pointer drawn at {pos:?} on framebuffer {fb_id} ({dirty:?})");
     }
-    state.drawn = Some(Drawn { fb, at: pos, under });
+    state.drawn = Some(Drawn { fb, at: pos, under, under_len });
 }
 
-fn rect((x, y): (i32, i32), rotation: u8) -> ClipRect {
-    let clamp = |v: i32| v.clamp(0, u16::MAX as i32) as u16;
+fn rect((x, y): (i32, i32), rotation: u8, max_w: i32, max_h: i32) -> ClipRect {
+    let clamp_x = |v: i32| v.clamp(0, max_w.min(u16::MAX as i32)) as u16;
+    let clamp_y = |v: i32| v.clamp(0, max_h.min(u16::MAX as i32)) as u16;
     let ((w, h), _) = turned_box(rotation);
-    ClipRect::new(clamp(x), clamp(y), clamp(x + w), clamp(y + h))
+    ClipRect::new(clamp_x(x), clamp_y(y), clamp_x(x + w), clamp_y(y + h))
 }
 
 /// A framebuffer's pixels, mapped: 32 bits each, rows `stride` apart.
@@ -275,8 +304,15 @@ impl Mapping {
         })
     }
 
-    fn take(&self, at: (i32, i32), rotation: u8) -> Vec<u32> {
-        self.cells(at, rotation).map(|(_, _, i)| unsafe { self.ptr.add(i).read_volatile() }).collect()
+    fn take_into(&self, at: (i32, i32), rotation: u8, out: &mut [u32; ARROW_MAX_CELLS]) -> usize {
+        let mut n = 0;
+        for (_, _, i) in self.cells(at, rotation) {
+            if n < out.len() {
+                out[n] = unsafe { self.ptr.add(i).read_volatile() };
+                n += 1;
+            }
+        }
+        n
     }
 
     fn put(&self, at: (i32, i32), rotation: u8, pixels: &[u32]) {
@@ -324,12 +360,17 @@ fn draw_cursor(card: &Card, buffer: &mut DumbBuffer, rotation: u8) -> bool {
 fn hardware_cursor(card: &Card, crtc: crtc::Handle, rotation: u8) -> Option<DumbBuffer> {
     let mut buffer = card.create_dumb_buffer((64, 64), DrmFourcc::Argb8888, 32).ok()?;
     if !draw_cursor(card, &mut buffer, rotation) {
+        let _ = card.destroy_dumb_buffer(buffer);
         return None;
     }
     // Setting it proves the plane is there; it stays hidden until a mouse moves.
+    let (_, tip) = turned_box(rotation);
     #[allow(deprecated)]
     {
-        card.set_cursor2(crtc, Some(&buffer), (0, 0)).ok()?;
+        if card.set_cursor2(crtc, Some(&buffer), tip).is_err() {
+            let _ = card.destroy_dumb_buffer(buffer);
+            return None;
+        }
         let _ = card.set_cursor2::<DumbBuffer>(crtc, None, (0, 0));
     }
     Some(buffer)

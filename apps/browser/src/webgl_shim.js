@@ -305,10 +305,13 @@ var __zippWebGL = (function () {
 
   P._cmd = function (c) { this._cmds.push(c); };
   // Bytes travel beside the batch: a command names their offset and length.
+  // Copy immediately so reusing a scratch typed array before `_flush()` cannot
+  // corrupt earlier batched bufferData/bufferSubData/texImage2D uploads.
   P._bytes = function (u8) {
     var at = this._partLen;
-    this._parts.push(u8);
-    this._partLen += u8.length;
+    var snap = u8 && u8.length ? u8.slice() : u8;
+    this._parts.push(snap);
+    this._partLen += snap.length;
     return at;
   };
   // Send the batch; the host's answer to its last command comes back.

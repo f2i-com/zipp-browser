@@ -19,11 +19,26 @@
 //!    them an isolated frame with per-entry register reclamation.
 //! 5. Three.js `StructuredUniform.setValue` lookup hoist for classic scripts.
 
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::{Mutex, OnceLock};
+
 use oxc_allocator::Allocator;
 use oxc_ast::ast as ox;
 use oxc_ast_visit::Visit;
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
+
+fn script_cache() -> &'static Mutex<HashMap<(u64, usize), String>> {
+    static CACHE: OnceLock<Mutex<HashMap<(u64, usize), String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn hash_source(s: &str) -> (u64, usize) {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    (h.finish(), s.len())
+}
 
 struct Edit {
     start: u32,
@@ -70,8 +85,12 @@ pub(crate) fn prepare_script(source: &str) -> String {
     if source.len() < 4096 && !source.contains(".setValue(") {
         return source.to_string();
     }
+    let key = hash_source(source);
+    if let Some(hit) = script_cache().lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return hit.clone();
+    }
     let (pass1, needs_chunk1) = run_pass(source, STANDARD, false, false);
-    if pass1.len() >= 65_536 || needs_chunk1 {
+    let result = if pass1.len() >= 65_536 || needs_chunk1 {
         let (pass2, needs_chunk2) = run_pass(&pass1, STANDARD, true, false);
         if needs_chunk2 {
             run_pass(&pass2, STANDARD, false, true).0
@@ -80,7 +99,13 @@ pub(crate) fn prepare_script(source: &str) -> String {
         }
     } else {
         pass1
+    };
+    let mut cache = script_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= 64 {
+        cache.clear();
     }
+    cache.insert(key, result.clone());
+    result
 }
 
 /// Aggressive fallback used only when `zipp-vm` reports a 32,768-register
@@ -212,7 +237,14 @@ impl<'a> OptVisitor<'a, '_> {
                     if frag.starts_with('{')
                         || frag.starts_with("function")
                         || frag.starts_with("class")
-                        || frag.starts_with("async function")
+                        || (frag.starts_with("async")
+                            && frag
+                                .get(5..)
+                                .is_some_and(|r| r.starts_with(char::is_whitespace) && r.trim_start().starts_with("function")))
+                        || (frag.starts_with("let")
+                            && frag
+                                .get(3..)
+                                .is_some_and(|r| r.trim_start().starts_with('[')))
                     {
                         rebuilt.push('(');
                         rebuilt.push_str(frag);
@@ -794,6 +826,9 @@ fn prepare_chunk_item<'a>(stmt: &ox::Statement<'a>, source: &'a str) -> Option<(
             self.loop_depth -= 1;
         }
         fn visit_for_of_statement(&mut self, it: &ox::ForOfStatement<'a>) {
+            if it.r#await {
+                self.unsafe_stmt = true;
+            }
             self.loop_depth += 1;
             oxc_ast_visit::walk::walk_for_of_statement(self, it);
             self.loop_depth -= 1;

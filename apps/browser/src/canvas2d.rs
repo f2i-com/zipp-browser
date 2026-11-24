@@ -279,16 +279,27 @@ struct PatternSource {
 }
 
 thread_local! {
-    static CANVASES: RefCell<HashMap<u32, Canvas2D>> = RefCell::new(HashMap::new());
-    static GRADIENTS: RefCell<HashMap<u32, Gradient>> = RefCell::new(HashMap::new());
-    static PATTERNS: RefCell<HashMap<u32, PatternSource>> = RefCell::new(HashMap::new());
-    /// Decoded images, by URL, for `drawImage` and patterns.
-    static IMAGES: RefCell<HashMap<String, Arc<Pixmap>>> = RefCell::new(HashMap::new());
+    static CANVASES: RefCell<HashMap<(u64, u32), Canvas2D>> = RefCell::new(HashMap::new());
+    static GRADIENTS: RefCell<HashMap<(u64, u32), Gradient>> = RefCell::new(HashMap::new());
+    static PATTERNS: RefCell<HashMap<(u64, u32), PatternSource>> = RefCell::new(HashMap::new());
+    /// Decoded images, by `(scope, url)`, for `drawImage` and patterns.
+    static IMAGES: RefCell<HashMap<(u64, String), Arc<Pixmap>>> = RefCell::new(HashMap::new());
 }
 
 /// Drop cached decoded images on the current thread (used on Clear Cache).
 pub(crate) fn clear_image_cache() {
     IMAGES.with(|i| i.borrow_mut().clear());
+}
+
+/// Release all Canvas 2D host resources owned by a document scope.
+pub(crate) fn drop_scope(scope: u64) {
+    if scope == 0 {
+        return;
+    }
+    CANVASES.with(|c| c.borrow_mut().retain(|(s, _), _| *s != scope));
+    GRADIENTS.with(|g| g.borrow_mut().retain(|(s, _), _| *s != scope));
+    PATTERNS.with(|p| p.borrow_mut().retain(|(s, _), _| *s != scope));
+    IMAGES.with(|i| i.borrow_mut().retain(|(s, _), _| *s != scope));
 }
 
 #[derive(Default)]
@@ -306,19 +317,20 @@ pub(crate) fn host_call(ctx: &mut dyn HostCtx, args: &[String]) -> Result<String
         _ => return Err("Error: c2d: malformed batch".into()),
     };
     let len: usize = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(0);
-    let payload = if len > 0 {
+    let payload: &[u8] = if len > 0 {
         let (addr, count, kind) = ctx.typed_array_region("__zippHostBytes")?;
         if kind != 1 || count < len {
             return Err("Error: c2d: __zippHostBytes is not the batch's bytes".into());
         }
-        // SAFETY: the engine pinned `count` bytes at `addr` for this call.
-        unsafe { std::slice::from_raw_parts(addr as *const u8, len) }.to_vec()
+        // SAFETY: the engine pinned `count` bytes at `addr` for this synchronous call;
+        // `run()` only reads `payload` before any write-back below.
+        unsafe { std::slice::from_raw_parts(addr as *const u8, len) }
     } else {
-        Vec::new()
+        &[]
     };
     let mut reply = Reply::default();
     for cmd in &cmds {
-        if let Err(e) = run(context, cmd, &payload, &mut reply) {
+        if let Err(e) = run(context, cmd, payload, &mut reply) {
             let op = cmd.get(0).and_then(Json::as_str).unwrap_or("?");
             reply.error = Some(format!("{op}: {e}"));
         }
@@ -397,9 +409,10 @@ fn blend_mode(name: &str) -> Option<BlendMode> {
     })
 }
 
-/// An image's pixels from its URL, decoded once and kept.
-fn image(url: &str) -> Result<Arc<Pixmap>, String> {
-    if let Some(found) = IMAGES.with(|i| i.borrow().get(url).cloned()) {
+/// An image's pixels from its URL, decoded once per document scope and kept.
+fn image(scope: u64, url: &str) -> Result<Arc<Pixmap>, String> {
+    let key = (scope, url.to_string());
+    if let Some(found) = IMAGES.with(|i| i.borrow().get(&key).cloned()) {
         return Ok(found);
     }
     let (_, raw) = crate::fetch_bytes_for_page(url)?;
@@ -426,18 +439,18 @@ fn image(url: &str) -> Result<Arc<Pixmap>, String> {
         #[cfg(not(feature = "svg"))]
         return Err(format!("image {url}: unsupported image format"));
     };
-    IMAGES.with(|i| i.borrow_mut().insert(url.to_string(), pixmap.clone()));
+    IMAGES.with(|i| i.borrow_mut().insert(key, pixmap.clone()));
     Ok(pixmap)
 }
 
 /// What a `drawImage` or `createPattern` source names: an image's URL, or
-/// another canvas.
-fn source(src: &Json) -> Result<Arc<Pixmap>, String> {
+/// another canvas in the same document scope.
+fn source(scope: u64, src: &Json) -> Result<Arc<Pixmap>, String> {
     if let Some(url) = src.get("url").and_then(Json::as_str) {
-        return image(url);
+        return image(scope, url);
     }
     if let Some(id) = src.get("canvas").and_then(Json::as_f64) {
-        return CANVASES.with(|c| c.borrow().get(&(id as u32)).map(|c| Arc::new(c.pixmap.clone())))
+        return CANVASES.with(|c| c.borrow().get(&(scope, id as u32)).map(|c| Arc::new(c.pixmap.clone())))
             .ok_or_else(|| "no such canvas".to_string());
     }
     Err("unsupported image source".into())
@@ -464,21 +477,35 @@ fn demultiply(px: &[u8]) -> [u8; 4] {
     }
 }
 
+/// Maximum single `getImageData` allocation (256 MiB, matching WebGL `MAX_READ_BYTES`).
+const MAX_READ_BYTES: usize = 256 * 1024 * 1024;
+
 /// The pixmap's pixels, straight alpha, `x, y, w, h` of them (outside is
 /// transparent).
-fn read_pixels(pixmap: &Pixmap, x: i32, y: i32, w: i32, h: i32) -> Vec<u8> {
+fn read_pixels(pixmap: &Pixmap, x: i32, y: i32, w: i32, h: i32) -> Result<Vec<u8>, String> {
     let (pw, ph) = (pixmap.width() as i32, pixmap.height() as i32);
     let data = pixmap.data();
     let (w, h) = (w.max(0), h.max(0));
-    let mut out = vec![0u8; (w * h * 4) as usize];
+    let byte_len = (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| "getImageData: size overflow".to_string())?;
+    if byte_len > MAX_READ_BYTES {
+        return Err("getImageData: requested region too large".into());
+    }
+    let mut out = vec![0u8; byte_len];
     if w == 0 || h == 0 {
-        return out;
+        return Ok(out);
     }
     // Fast path for in-bounds rectangles (including full-canvas `present()`).
-    if x >= 0 && y >= 0 && x + w <= pw && y + h <= ph {
-        let src_stride = (pw * 4) as usize;
-        let dst_stride = (w * 4) as usize;
-        let x_off = (x * 4) as usize;
+    if x >= 0
+        && y >= 0
+        && x.checked_add(w).is_some_and(|e| e <= pw)
+        && y.checked_add(h).is_some_and(|e| e <= ph)
+    {
+        let src_stride = (pw as usize) * 4;
+        let dst_stride = (w as usize) * 4;
+        let x_off = (x as usize) * 4;
         for row in 0..h as usize {
             let src_row = &data[(y as usize + row) * src_stride + x_off..][..dst_stride];
             let dst_row = &mut out[row * dst_stride..][..dst_stride];
@@ -497,24 +524,28 @@ fn read_pixels(pixmap: &Pixmap, x: i32, y: i32, w: i32, h: i32) -> Vec<u8> {
                 }
             }
         }
-        return out;
+        return Ok(out);
     }
     for row in 0..h {
-        let sy = y + row;
+        let Some(sy) = y.checked_add(row) else {
+            continue;
+        };
         if sy < 0 || sy >= ph {
             continue;
         }
         for col in 0..w {
-            let sx = x + col;
+            let Some(sx) = x.checked_add(col) else {
+                continue;
+            };
             if sx < 0 || sx >= pw {
                 continue;
             }
-            let at = ((sy * pw + sx) * 4) as usize;
-            let to = ((row * w + col) * 4) as usize;
+            let at = ((sy as usize) * (pw as usize) + (sx as usize)) * 4;
+            let to = ((row as usize) * (w as usize) + (col as usize)) * 4;
             out[to..to + 4].copy_from_slice(&demultiply(&data[at..at + 4]));
         }
     }
-    out
+    Ok(out)
 }
 
 struct GlyphPen<'a> {
@@ -606,10 +637,11 @@ impl Canvas2D {
 
     /// Run `draw` with a paint for `style` under the current state.
     fn with_paint(&mut self, style: &Style, draw: impl FnOnce(&mut Pixmap, &Paint, Option<&Mask>)) {
+        let scope = crate::async_fetch::current_scope();
         let state = &self.state;
         let alpha = state.alpha;
         let pattern = match style {
-            Style::Pattern(id) => PATTERNS.with(|p| p.borrow().get(id).map(|p| (p.pixmap.clone(), p.repeat))),
+            Style::Pattern(id) => PATTERNS.with(|p| p.borrow().get(&(scope, *id)).map(|p| (p.pixmap.clone(), p.repeat))),
             _ => None,
         };
         let quality = if state.smoothing { FilterQuality::Bilinear } else { FilterQuality::Nearest };
@@ -621,7 +653,7 @@ impl Canvas2D {
             }
             Style::Gradient(id) => GRADIENTS.with(|g| {
                 let g = g.borrow();
-                let gradient = g.get(id)?;
+                let gradient = g.get(&(scope, *id))?;
                 let stops: Vec<GradientStop> = gradient
                     .stops
                     .iter()
@@ -807,14 +839,14 @@ impl Canvas2D {
         mask.data()[0] > 0
     }
 
-    fn frame(&self) -> Frame {
-        let mut rgba = read_pixels(&self.pixmap, 0, 0, self.pixmap.width() as i32, self.pixmap.height() as i32);
+    fn frame(&self) -> Result<Frame, String> {
+        let mut rgba = read_pixels(&self.pixmap, 0, 0, self.pixmap.width() as i32, self.pixmap.height() as i32)?;
         if self.opaque {
             for px in rgba.chunks_exact_mut(4) {
                 px[3] = 255;
             }
         }
-        Frame { flid: self.flid, width: self.pixmap.width(), height: self.pixmap.height(), rgba }
+        Ok(Frame { flid: self.flid, width: self.pixmap.width(), height: self.pixmap.height(), rgba })
     }
 }
 
@@ -943,22 +975,23 @@ fn fill_rule(v: Option<&Json>) -> FillRule {
 
 /// Run one command for canvas `context`.
 fn run(context: u32, cmd: &Json, payload: &[u8], reply: &mut Reply) -> Result<(), String> {
+    let scope = crate::async_fetch::current_scope();
     let op = cmd.get(0).and_then(Json::as_str).unwrap_or("");
     let num = |i: usize| cmd.get(i).and_then(Json::as_f64).unwrap_or(0.0);
     let n = |i: usize| num(i) as f32;
     let text_arg = |i: usize| cmd.get(i).and_then(Json::as_str).unwrap_or("").to_string();
     match op {
         "reset" => {
-            CANVASES.with(|c| c.borrow_mut().clear());
-            GRADIENTS.with(|g| g.borrow_mut().clear());
-            PATTERNS.with(|p| p.borrow_mut().clear());
-            IMAGES.with(|i| i.borrow_mut().clear());
+            CANVASES.with(|c| c.borrow_mut().retain(|(s, _), _| *s != scope));
+            GRADIENTS.with(|g| g.borrow_mut().retain(|(s, _), _| *s != scope));
+            PATTERNS.with(|p| p.borrow_mut().retain(|(s, _), _| *s != scope));
+            IMAGES.with(|i| i.borrow_mut().retain(|(s, _), _| *s != scope));
             return Ok(());
         }
         "create" => {
             let opaque = cmd.get(4).and_then(Json::as_bool).unwrap_or(false);
             let canvas = Canvas2D::new(num(1) as u32, num(2), num(3), opaque);
-            CANVASES.with(|c| c.borrow_mut().insert(context, canvas));
+            CANVASES.with(|c| c.borrow_mut().insert((scope, context), canvas));
             return Ok(());
         }
         "gradient" => {
@@ -967,13 +1000,13 @@ fn run(context: u32, cmd: &Json, payload: &[u8], reply: &mut Reply) -> Result<()
                 "radial" => GradientKind::Radial(n(3), n(4), n(5), n(6), n(7), n(8)),
                 _ => GradientKind::Conic,
             };
-            GRADIENTS.with(|g| g.borrow_mut().insert(num(1) as u32, Gradient { kind, stops: Vec::new() }));
+            GRADIENTS.with(|g| g.borrow_mut().insert((scope, num(1) as u32), Gradient { kind, stops: Vec::new() }));
             return Ok(());
         }
         "stop" => {
             let color = parse_color(&text_arg(3)).ok_or("not a colour")?;
             GRADIENTS.with(|g| {
-                if let Some(g) = g.borrow_mut().get_mut(&(num(1) as u32)) {
+                if let Some(g) = g.borrow_mut().get_mut(&(scope, num(1) as u32)) {
                     let at = n(2).clamp(0.0, 1.0);
                     let i = g.stops.partition_point(|&(o, _)| o <= at);
                     g.stops.insert(i, (at, color));
@@ -982,21 +1015,21 @@ fn run(context: u32, cmd: &Json, payload: &[u8], reply: &mut Reply) -> Result<()
             return Ok(());
         }
         "pattern" => {
-            let pixmap = source(cmd.get(2).unwrap_or(&Json::Null))?;
+            let pixmap = source(scope, cmd.get(2).unwrap_or(&Json::Null))?;
             let repeat = text_arg(3) != "no-repeat";
-            PATTERNS.with(|p| p.borrow_mut().insert(num(1) as u32, PatternSource { pixmap, repeat }));
+            PATTERNS.with(|p| p.borrow_mut().insert((scope, num(1) as u32), PatternSource { pixmap, repeat }));
             return Ok(());
         }
         _ => {}
     }
     // An image to draw is found before the canvas is borrowed: it may be one.
     let image = match op {
-        "drawImage" => Some(source(cmd.get(1).unwrap_or(&Json::Null))?),
+        "drawImage" => Some(source(scope, cmd.get(1).unwrap_or(&Json::Null))?),
         _ => None,
     };
     CANVASES.with(|c| {
         let mut canvases = c.borrow_mut();
-        let canvas = canvases.get_mut(&context).ok_or("no such canvas")?;
+        let canvas = canvases.get_mut(&(scope, context)).ok_or("no such canvas")?;
         let state = &mut canvas.state;
         match op {
             "resize" => {
@@ -1009,7 +1042,7 @@ fn run(context: u32, cmd: &Json, payload: &[u8], reply: &mut Reply) -> Result<()
                     *state = saved;
                 }
             }
-            "reset" | "resetContext" => {
+            "resetContext" => {
                 let (w, h, opaque) = (canvas.pixmap.width(), canvas.pixmap.height(), canvas.opaque);
                 *canvas = Canvas2D::new(canvas.flid, w as f64, h as f64, opaque);
             }
@@ -1170,30 +1203,49 @@ fn run(context: u32, cmd: &Json, payload: &[u8], reply: &mut Reply) -> Result<()
                 } else {
                     (num(1) as i32, num(2) as i32, num(3) as i32, num(4) as i32)
                 };
-                let bytes = read_pixels(&canvas.pixmap, x, y, w, h);
-                reply.result = serde_json::json!([w, h, bytes.len()]).to_string();
+                let bytes = read_pixels(&canvas.pixmap, x, y, w, h)?;
+                reply.result = serde_json::json!([w.max(0), h.max(0), bytes.len()]).to_string();
                 reply.bytes = Some(bytes);
             }
             "putImageData" => {
                 let (at, len, w, h) = (num(1) as usize, num(2) as usize, num(3) as i32, num(4) as i32);
                 let (dx, dy) = (num(5) as i32, num(6) as i32);
                 let (rx, ry, rw, rh) = (num(7) as i32, num(8) as i32, num(9) as i32, num(10) as i32);
-                let src = payload.get(at..at + len).ok_or("bytes out of range")?;
+                if w <= 0 || h <= 0 || rw <= 0 || rh <= 0 {
+                    return Ok(());
+                }
+                let src_end = at.checked_add(len).ok_or("bytes out of range")?;
+                let src = payload.get(at..src_end).ok_or("bytes out of range")?;
                 let (pw, ph) = (canvas.pixmap.width() as i32, canvas.pixmap.height() as i32);
                 let data = canvas.pixmap.data_mut();
-                for row in ry.max(0)..(ry + rh).min(h) {
-                    let y = dy + row;
+                let row_end = ry.saturating_add(rh).min(h);
+                let col_end = rx.saturating_add(rw).min(w);
+                for row in ry.max(0)..row_end {
+                    let Some(y) = dy.checked_add(row) else {
+                        continue;
+                    };
                     if y < 0 || y >= ph {
                         continue;
                     }
-                    for col in rx.max(0)..(rx + rw).min(w) {
-                        let x = dx + col;
+                    for col in rx.max(0)..col_end {
+                        let Some(x) = dx.checked_add(col) else {
+                            continue;
+                        };
                         if x < 0 || x >= pw {
                             continue;
                         }
-                        let from = ((row * w + col) * 4) as usize;
-                        let to = ((y * pw + x) * 4) as usize;
-                        premultiply_into(&mut data[to..to + 4], &src[from..from + 4]);
+                        let Some(from) = (row as usize)
+                            .checked_mul(w as usize)
+                            .and_then(|n| n.checked_add(col as usize))
+                            .and_then(|n| n.checked_mul(4))
+                        else {
+                            continue;
+                        };
+                        let Some(src_px) = from.checked_add(4).and_then(|e| src.get(from..e)) else {
+                            continue;
+                        };
+                        let to = ((y as usize) * (pw as usize) + (x as usize)) * 4;
+                        premultiply_into(&mut data[to..to + 4], src_px);
                     }
                 }
             }
@@ -1216,7 +1268,7 @@ fn run(context: u32, cmd: &Json, payload: &[u8], reply: &mut Reply) -> Result<()
                 });
                 reply.result = inside.to_string();
             }
-            "present" => crate::canvas::push_frame(canvas.frame()),
+            "present" => crate::canvas::push_frame(canvas.frame()?),
             _ => return Err("unsupported".to_string()),
         }
         Ok(())
@@ -1240,10 +1292,11 @@ fn path_segments(path: &Path) -> Vec<Seg> {
 /// A 2D canvas's whole picture, straight alpha: `[width, height, bytes]`.
 #[cfg(test)]
 fn canvas_pixels(context: u32) -> Option<(u32, u32, Vec<u8>)> {
+    let scope = crate::async_fetch::current_scope();
     CANVASES.with(|c| {
-        c.borrow().get(&context).map(|c| {
+        c.borrow().get(&(scope, context)).map(|c| {
             let (w, h) = (c.pixmap.width(), c.pixmap.height());
-            (w, h, read_pixels(&c.pixmap, 0, 0, w as i32, h as i32))
+            (w, h, read_pixels(&c.pixmap, 0, 0, w as i32, h as i32).unwrap())
         })
     })
 }
@@ -1283,5 +1336,33 @@ mod tests {
         run(1, &serde_json::json!(["measureText", "Hi"]), &[], &mut reply).unwrap();
         let m: Json = serde_json::from_str(&reply.result).unwrap();
         assert!(m["width"].as_f64().unwrap() > 8.0, "{m}");
+    }
+
+    #[test]
+    fn scopes_isolate_canvases_and_put_image_data_bounds_checked() {
+        use crate::async_fetch::ScopeGuard;
+        {
+            let _g = ScopeGuard::enter(701);
+            run(1, &serde_json::json!(["create", 1, 4, 4, false]), &[], &mut Reply::default()).unwrap();
+            run(1, &serde_json::json!(["set", "fillStyle", "#ff0000"]), &[], &mut Reply::default()).unwrap();
+            run(1, &serde_json::json!(["fillRect", 0, 0, 4, 4]), &[], &mut Reply::default()).unwrap();
+        }
+        {
+            let _g = ScopeGuard::enter(702);
+            // Iframe reset must NOT wipe scope 701's canvas!
+            run(1, &serde_json::json!(["reset"]), &[], &mut Reply::default()).unwrap();
+            run(1, &serde_json::json!(["create", 1, 4, 4, false]), &[], &mut Reply::default()).unwrap();
+            run(1, &serde_json::json!(["set", "fillStyle", "#0000ff"]), &[], &mut Reply::default()).unwrap();
+            run(1, &serde_json::json!(["fillRect", 0, 0, 4, 4]), &[], &mut Reply::default()).unwrap();
+            // Short payload for putImageData must not panic.
+            run(1, &serde_json::json!(["putImageData", 0, 4, 10, 10, 0, 0, 0, 0, 10, 10]), &[1, 2, 3, 4], &mut Reply::default()).unwrap();
+        }
+        {
+            let _g = ScopeGuard::enter(701);
+            let (_, _, px) = canvas_pixels(1).expect("scope 701 canvas survived scope 702 reset");
+            assert_eq!(&px[0..4], [255, 0, 0, 255]);
+        }
+        drop_scope(701);
+        drop_scope(702);
     }
 }

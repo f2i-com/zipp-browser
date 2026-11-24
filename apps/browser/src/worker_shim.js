@@ -129,6 +129,33 @@ var crypto = globalThis.crypto || {
     }
     return s;
   },
+  subtle: {
+    digest: function (algorithm, data) {
+      return new Promise(function (resolve, reject) {
+        try {
+          var alg = typeof algorithm === "string" ? algorithm : (algorithm && typeof algorithm.name === "string" ? algorithm.name : "");
+          if (!alg) { reject(new Error("NotSupportedError: digest: missing algorithm")); return; }
+          var u8;
+          if (data instanceof Uint8Array) u8 = data;
+          else if (data instanceof ArrayBuffer) u8 = new Uint8Array(data);
+          else if (ArrayBuffer.isView(data)) u8 = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+          else { reject(new TypeError("digest: data must be an ArrayBuffer or ArrayBufferView")); return; }
+          if (u8.byteLength > 0) {
+            if (typeof __zippHostBytes === "undefined" || __zippHostBytes.length < u8.byteLength) {
+              __zippHostBytes = new Uint8Array(Math.max(u8.byteLength, (typeof __zippHostBytes !== "undefined" ? __zippHostBytes.length : 0) * 2));
+            }
+            __zippHostBytes.set(u8, 0);
+          }
+          var hex = __zippHostCall("crypto_digest", alg, String(u8.byteLength));
+          var out = new Uint8Array(hex.length >> 1);
+          for (var i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+          resolve(out.buffer);
+        } catch (e) {
+          reject(e);
+        }
+      });
+    }
+  }
 };
 var B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
 var btoa = function (s) {

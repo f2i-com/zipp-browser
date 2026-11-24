@@ -346,8 +346,8 @@ fn replace_children(doc: &mut BaseDocument, node_id: usize, html: &str) {
         doc.sub_document_nodes.remove(&sid);
         let key = doc.get_node(sid).and_then(|n| {
             let el = n.element_data()?;
-            el.attr(markup5ever::local_name!("src"))
-                .or_else(|| el.attr(markup5ever::local_name!("srcdoc")))
+            el.attr(markup5ever::local_name!("srcdoc"))
+                .or_else(|| el.attr(markup5ever::local_name!("src")))
                 .map(str::to_string)
         });
         if let Some(key) = key
@@ -377,8 +377,8 @@ fn replace_children(doc: &mut BaseDocument, node_id: usize, html: &str) {
             }
             let key = doc.get_node(iframe_id).and_then(|n| {
                 let el = n.element_data()?;
-                el.attr(markup5ever::local_name!("src"))
-                    .or_else(|| el.attr(markup5ever::local_name!("srcdoc")))
+                el.attr(markup5ever::local_name!("srcdoc"))
+                    .or_else(|| el.attr(markup5ever::local_name!("src")))
                     .map(str::to_string)
             });
             if let Some(key) = key
@@ -389,18 +389,24 @@ fn replace_children(doc: &mut BaseDocument, node_id: usize, html: &str) {
             }
         }
     }
-    for (flid, offset) in scrolled {
-        if let Ok(Some(node)) = doc.query_selector(&format!("[data-flid=\"{flid}\"]")) {
-            doc.nodes[node].scroll_offset = offset;
+    if !scrolled.is_empty() {
+        let mut by_flid: std::collections::HashMap<&str, crate::Point<f64>> =
+            scrolled.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        for (_, node) in doc.nodes.iter_mut() {
+            if let Some(flid) = node.attr(flid_attr.clone())
+                && let Some(offset) = by_flid.remove(flid)
+            {
+                node.scroll_offset = offset;
+                if by_flid.is_empty() {
+                    break;
+                }
+            }
         }
     }
-    // Animation state is keyed by node id and those ids are
-    // recycled by the re-parse, so stale entries would attach
-    // to whichever new element inherits the id.
-    doc.clear_animation_state();
-    // Hover/focus/mousedown ids point into the subtree that was
-    // just freed; the next mouse move would index a dead id.
-    doc.clear_interaction_state();
+    // Note: `drop_node_ignoring_parent` already removes dropped nodes from
+    // `animations.sets` and clears hover/focus/active/mousedown only when
+    // those specific IDs are freed — preserving animations and drags on
+    // untouched sibling subtrees.
     if let Some(selector) = focused
         && let Ok(Some(node)) = doc.query_selector(&selector)
     {

@@ -244,12 +244,13 @@ where
                 | WindowEvent::Focused(_)
                 | WindowEvent::Occluded(_)
                 | WindowEvent::ModifiersChanged(_)
+                | WindowEvent::PointerMoved { .. }
                 | WindowEvent::PointerEntered { .. }
                 | WindowEvent::PointerLeft { .. }
                 | WindowEvent::ActivationTokenDone { .. }
                 | WindowEvent::Destroyed
         );
-        let skip_poll = is_passive || matches!(event, WindowEvent::PointerMoved { .. });
+        let skip_poll = is_passive;
 
         if let Some(window) = self.windows.get_mut(&window_id) {
             window.handle_winit_event(event);

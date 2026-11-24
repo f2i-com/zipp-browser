@@ -390,7 +390,7 @@ impl<'dom> DocumentPainter<'dom> {
 
         if ancestor_passthrough {
             let mut cx = self.element_cx(node, layout, box_position, ancestor_transform);
-            let clip = if is_text_input {
+            let clip = if is_text_input || is_sub_doc {
                 &cx.frame.content_box_path()
             } else {
                 &cx.frame.padding_box_path()
@@ -444,7 +444,7 @@ impl<'dom> DocumentPainter<'dom> {
             });
         if let Some(r) = backdrop_blur {
             let x0 = (box_position.x * self.scale) as f32;
-            let y0 = ((box_position.y - self.initial_y) * self.scale) as f32;
+            let y0 = (box_position.y * self.scale) as f32;
             scene.apply_backdrop_blur(
                 r,
                 (
@@ -491,50 +491,77 @@ impl<'dom> DocumentPainter<'dom> {
                 cx.draw_border(scene);
                 cx.stroke_devtools(scene);
 
-                // TODO: allow layers with opacity to be unclipped (overflow: visible)
-                let clip = if is_text_input {
-                    &cx.frame.content_box_path()
+                // Clip layer only if box requires clipping; avoid allocating BezPath
+                // when unclipped or when clipping to a sharp-corner rectangle.
+                let clip_transform = cx.transform;
+                let clip_rect = if should_clip && cx.frame.border_radii.average() == 0.0 {
+                    Some(if is_text_input || is_sub_doc {
+                        cx.frame.content_box
+                    } else {
+                        cx.frame.padding_box
+                    })
                 } else {
-                    &cx.frame.padding_box_path()
+                    None
                 };
-
-                // Clip layer if box requires clipping. Opacity set to 1.0
-                self.layer_manager.maybe_with_layer(
-                    scene,
-                    should_clip,
-                    1.0, // opacity
-                    cx.transform,
-                    clip,
-                    |scene| {
-                        // Now that background has been drawn, offset pos and cx in order to draw our contents scrolled
-                        let content_position = Point {
-                            x: content_position.x - node.scroll_offset.x,
-                            y: content_position.y - node.scroll_offset.y,
-                        };
-                        cx.pos = Point {
-                            x: cx.pos.x - node.scroll_offset.x,
-                            y: cx.pos.y - node.scroll_offset.y,
-                        };
-                        // Not the transform as well: the element's own content
-                        // (its text, a text field's) is drawn at a position
-                        // already scrolled, and scrolled twice, a <pre>'s lines
-                        // moved at double the speed of the text area under it.
-                        cx.draw_image(scene);
-                        cx.draw_media_controls(scene);
-                        #[cfg(feature = "svg")]
-                        cx.draw_svg(scene);
-                        cx.draw_canvas(scene);
-                        cx.draw_sub_document(scene);
-                        cx.draw_input(scene);
-                        cx.draw_text_input_text(scene, content_position);
-                        cx.draw_inline_layout(scene, content_position);
-                        cx.draw_select_arrow(scene);
-                        cx.draw_marker(scene, content_position);
-                        if !is_sub_doc && cx.element.name.local != local_name!("iframe") {
-                            cx.draw_children(scene);
-                        }
-                    },
-                );
+                let clip_path = if should_clip && clip_rect.is_none() {
+                    Some(if is_text_input || is_sub_doc {
+                        cx.frame.content_box_path()
+                    } else {
+                        cx.frame.padding_box_path()
+                    })
+                } else {
+                    None
+                };
+                let mut paint_contents = |scene: &mut _| {
+                    // Now that background has been drawn, offset pos and cx in order to draw our contents scrolled
+                    let content_position = Point {
+                        x: content_position.x - node.scroll_offset.x,
+                        y: content_position.y - node.scroll_offset.y,
+                    };
+                    cx.pos = Point {
+                        x: cx.pos.x - node.scroll_offset.x,
+                        y: cx.pos.y - node.scroll_offset.y,
+                    };
+                    // Not the transform as well: the element's own content
+                    // (its text, a text field's) is drawn at a position
+                    // already scrolled, and scrolled twice, a <pre>'s lines
+                    // moved at double the speed of the text area under it.
+                    cx.draw_image(scene);
+                    cx.draw_media_controls(scene);
+                    #[cfg(feature = "svg")]
+                    cx.draw_svg(scene);
+                    cx.draw_canvas(scene);
+                    cx.draw_sub_document(scene);
+                    cx.draw_input(scene);
+                    cx.draw_text_input_text(scene, content_position);
+                    cx.draw_inline_layout(scene, content_position);
+                    cx.draw_select_arrow(scene);
+                    cx.draw_marker(scene, content_position);
+                    if !is_sub_doc && cx.element.name.local != local_name!("iframe") {
+                        cx.draw_children(scene);
+                    }
+                };
+                if let Some(ref rect) = clip_rect {
+                    self.layer_manager.maybe_with_layer(
+                        scene,
+                        true,
+                        1.0,
+                        clip_transform,
+                        rect,
+                        paint_contents,
+                    );
+                } else if let Some(ref clip) = clip_path {
+                    self.layer_manager.maybe_with_layer(
+                        scene,
+                        true,
+                        1.0,
+                        clip_transform,
+                        clip,
+                        paint_contents,
+                    );
+                } else {
+                    paint_contents(scene);
+                }
             },
         );
 
@@ -778,7 +805,7 @@ impl ElementCx<'_> {
 
             // A field never given a value holds the single space its editor
             // starts with: empty, as far as what was typed goes.
-            let text = input_data.editor.text().to_string();
+            let text = input_data.editor.raw_text();
             let empty = text.is_empty() || (text == " " && self.node.attr(zipp_dom::local_name!("value")).is_none());
             // A password: evenly spaced dots, the caret and selection placed
             // by how many characters come before them.
@@ -970,8 +997,8 @@ impl ElementCx<'_> {
 
         let transform = self
             .transform
-            .pre_scale_non_uniform(x_scale, y_scale)
-            .then_translate(Vec2 { x, y });
+            .pre_translate(Vec2 { x, y })
+            .pre_scale_non_uniform(x_scale, y_scale);
 
         anyrender_svg::render_svg_tree(scene, svg, transform);
     }
@@ -1150,7 +1177,7 @@ impl ElementCx<'_> {
             let x = self.frame.content_box.origin().x;
             let y = self.frame.content_box.origin().y;
 
-            let transform = self.transform.then_translate(Vec2 { x, y });
+            let transform = self.transform.pre_translate(Vec2 { x, y });
 
             scene.fill(
                 Fill::NonZero,

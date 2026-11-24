@@ -37,6 +37,7 @@ const REL_HWHEEL: u16 = 0x06;
 const REL_WHEEL: u16 = 0x08;
 const ABS_X: u16 = 0x00;
 const ABS_Y: u16 = 0x01;
+const ABS_MT_SLOT: u16 = 0x2f;
 const ABS_MT_POSITION_X: u16 = 0x35;
 const ABS_MT_POSITION_Y: u16 = 0x36;
 const BTN_MISC: u16 = 0x100;
@@ -108,6 +109,8 @@ struct Device {
     abs_range: Option<((i32, i32), (i32, i32))>,
     /// Whether the position comes from the multi-touch axes only.
     mt_only: bool,
+    /// Current multi-touch slot (only slot 0 drives the primary pointer).
+    mt_slot: i32,
     /// Keys and buttons pressed, by code: what SYN_DROPPED may leave stuck.
     pressed: BTreeSet<u16>,
     /// Events were dropped: ignore the rest of the report, then resync.
@@ -117,6 +120,11 @@ struct Device {
     wheel: (i32, i32),
     abs: (Option<i32>, Option<i32>),
     touch: Option<bool>,
+    /// Mouse buttons queued until SYN_REPORT so pointer motion in the same
+    /// report applies before click dispatch.
+    buttons: Vec<(MouseButton, ElementState)>,
+    /// Touchpad finger lifted during the current SYN_REPORT.
+    pad_released: bool,
     /// A touchpad's last position while a finger is down, for its motion.
     pad_last: Option<(i32, i32)>,
     /// Where an absolute device last put the pointer, on the panel.
@@ -163,7 +171,8 @@ impl Device {
         let mut name = [0u8; 128];
         let len = unsafe { libc::ioctl(fd, eviocg(0x06, name.len() as u64), name.as_mut_ptr()) };
         let name = if len > 0 {
-            String::from_utf8_lossy(&name[..len as usize]).trim_end_matches('\0').to_string()
+            let n = (len as usize).min(name.len());
+            String::from_utf8_lossy(&name[..n]).trim_end_matches('\0').to_string()
         } else {
             String::new()
         };
@@ -180,12 +189,15 @@ impl Device {
             abs_range: abs_range.filter(|_| absolute != Absolute::Ignored),
             absolute,
             mt_only,
+            mt_slot: 0,
             pressed: BTreeSet::new(),
             dropped: false,
             rel: (0, 0),
             wheel: (0, 0),
             abs: (None, None),
             touch: None,
+            buttons: Vec::new(),
+            pad_released: false,
             pad_last: None,
             panel_pos: (0.0, 0.0),
         })
@@ -263,34 +275,62 @@ impl Input {
         }
     }
 
-    pub(crate) fn fds(&self) -> Vec<RawFd> {
-        self.devices.iter().map(|d| d.file.as_raw_fd()).chain(self.inotify.as_ref().map(|fd| fd.as_raw_fd())).collect()
+    /// Append every input and inotify fd to `poll_fds` without heap reallocating.
+    pub(crate) fn push_poll_fds(&self, poll_fds: &mut Vec<libc::pollfd>) {
+        for d in &self.devices {
+            poll_fds.push(libc::pollfd { fd: d.file.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+        }
+        if let Some(inotify) = &self.inotify {
+            poll_fds.push(libc::pollfd { fd: inotify.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+        }
     }
 
-    /// Everything the devices have to say, as window events.
-    pub(crate) fn read(&mut self, out: &mut Vec<WindowEvent>) {
-        if let Some(inotify) = &self.inotify {
+    /// Everything the ready devices have to say, as window events.
+    /// `ready` matches the slice appended by [`push_poll_fds`].
+    pub(crate) fn read(&mut self, ready: &[libc::pollfd], out: &mut Vec<WindowEvent>) {
+        let dev_count = self.devices.len();
+        let inotify_ready = self.inotify.is_some()
+            && ready.get(dev_count).is_some_and(|p| p.revents & libc::POLLIN != 0);
+        if inotify_ready && let Some(inotify) = &self.inotify {
             let mut buf = [0u8; 4096];
-            let n = unsafe { libc::read(inotify.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-            if n > 0 {
+            let mut got = false;
+            loop {
+                let n = unsafe { libc::read(inotify.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+                if n > 0 {
+                    got = true;
+                } else {
+                    break;
+                }
+            }
+            if got {
                 self.watch();
                 self.scan();
             }
         }
 
         let mut gone = Vec::new();
-        for index in 0..self.devices.len() {
+        for index in 0..dev_count {
+            let revents = ready.get(index).map_or(libc::POLLIN, |p| p.revents);
+            if revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) == 0 {
+                continue;
+            }
+            if revents & libc::POLLIN == 0 {
+                gone.push(index);
+                continue;
+            }
             let mut raw = [0u8; size_of::<InputEvent>() * 64];
             loop {
                 let n = match self.devices[index].file.read(&mut raw) {
                     Ok(n) => n,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(_) => {
                         gone.push(index);
                         break;
                     }
                 };
                 if n == 0 {
+                    gone.push(index);
                     break;
                 }
                 for chunk in raw[..n].chunks_exact(size_of::<InputEvent>()) {
@@ -330,6 +370,7 @@ impl Input {
             (EV_KEY, BTN_TOUCH) if device.absolute == Absolute::Touchpad => {
                 if event.value == 0 {
                     device.pad_last = None;
+                    device.pad_released = true;
                 }
             }
             (EV_KEY, BTN_TOUCH) if device.abs_range.is_some() => {
@@ -347,13 +388,9 @@ impl Input {
                     4 | 5 => MouseButton::Forward,
                     _ => MouseButton::Button6,
                 };
-                out.push(WindowEvent::PointerButton {
-                    device_id,
-                    state: if event.value != 0 { ElementState::Pressed } else { ElementState::Released },
-                    position: self.position(),
-                    primary: true,
-                    button: ButtonSource::Mouse(button),
-                });
+                let state = if event.value != 0 { ElementState::Pressed } else { ElementState::Released };
+                // Queue until SYN_REPORT so REL/ABS motion in the same packet lands first.
+                device.buttons.push((button, state));
             }
             (EV_KEY, code) if !(BTN_MISC..KEY_OK).contains(&code) => self.key(device_id, code, event.value, out),
             (EV_REL, REL_X) => device.rel.0 += event.value,
@@ -362,8 +399,9 @@ impl Input {
             (EV_REL, REL_HWHEEL) => device.wheel.0 += event.value,
             (EV_ABS, ABS_X) if !device.mt_only => device.abs.0 = Some(event.value),
             (EV_ABS, ABS_Y) if !device.mt_only => device.abs.1 = Some(event.value),
-            (EV_ABS, ABS_MT_POSITION_X) if device.mt_only => device.abs.0 = Some(event.value),
-            (EV_ABS, ABS_MT_POSITION_Y) if device.mt_only => device.abs.1 = Some(event.value),
+            (EV_ABS, ABS_MT_SLOT) if device.mt_only => device.mt_slot = event.value,
+            (EV_ABS, ABS_MT_POSITION_X) if device.mt_only && device.mt_slot == 0 => device.abs.0 = Some(event.value),
+            (EV_ABS, ABS_MT_POSITION_Y) if device.mt_only && device.mt_slot == 0 => device.abs.1 = Some(event.value),
             (EV_SYN, SYN_REPORT) => self.flush(index, device_id, out),
             (EV_SYN, SYN_DROPPED) => {
                 device.dropped = true;
@@ -371,6 +409,8 @@ impl Input {
                 device.wheel = (0, 0);
                 device.abs = (None, None);
                 device.touch = None;
+                device.buttons.clear();
+                device.pad_released = false;
             }
             _ => {}
         }
@@ -391,6 +431,8 @@ impl Input {
 
     /// Release everything a device holds down (it went away).
     fn release_all(&mut self, index: usize, out: &mut Vec<WindowEvent>) {
+        // Clear dropped so release events are never swallowed on unplug.
+        self.devices[index].dropped = false;
         let held: Vec<u16> = self.devices[index].pressed.iter().copied().collect();
         for code in held {
             self.event(index, release(code), out);
@@ -404,70 +446,86 @@ impl Input {
         self.screen = (screen.0 as f64, screen.1 as f64);
         self.panel = (panel.0 as f64, panel.1 as f64);
         self.rotation = rotation % 4;
-        self.pointer = (self.pointer.0.min(self.screen.0 - 1.0), self.pointer.1.min(self.screen.1 - 1.0));
+        self.pointer = (
+            self.pointer.0.clamp(0.0, (self.screen.0 - 1.0).max(0.0)),
+            self.pointer.1.clamp(0.0, (self.screen.1 - 1.0).max(0.0)),
+        );
     }
 
-    /// One SYN_REPORT's worth of motion, wheel and touch, as events.
+    /// One SYN_REPORT's worth of motion, wheel, buttons and touch, as events.
     fn flush(&mut self, index: usize, device_id: Option<DeviceId>, out: &mut Vec<WindowEvent>) {
         let (w, h) = self.screen;
+        let max_x = (w - 1.0).max(0.0);
+        let max_y = (h - 1.0).max(0.0);
         let device = &mut self.devices[index];
         let mut moved = false;
         if device.rel != (0, 0) {
             self.touched = false;
-            self.pointer.0 = (self.pointer.0 + device.rel.0 as f64).clamp(0.0, w - 1.0);
-            self.pointer.1 = (self.pointer.1 + device.rel.1 as f64).clamp(0.0, h - 1.0);
+            self.pointer.0 = (self.pointer.0 + device.rel.0 as f64).clamp(0.0, max_x);
+            self.pointer.1 = (self.pointer.1 + device.rel.1 as f64).clamp(0.0, max_y);
             device.rel = (0, 0);
             moved = true;
         }
+        let pad_released = std::mem::take(&mut device.pad_released);
         if let (Some(((x0, x1), (y0, y1))), (ax, ay)) = (device.abs_range, device.abs) {
             if device.absolute == Absolute::Touchpad {
-                // Where the finger is now against where it was: the pad's
-                // width crossed is the screen's width crossed.
-                let last = device.pad_last.unwrap_or((ax.unwrap_or(0), ay.unwrap_or(0)));
-                let now = (ax.unwrap_or(last.0), ay.unwrap_or(last.1));
-                if device.pad_last.is_some() {
-                    // The same scale both ways: a pad's units are square.
-                    let scale = w / (x1 - x0) as f64;
-                    let (dx, dy) = ((now.0 - last.0) as f64 * scale, (now.1 - last.1) as f64 * scale);
-                    if dx != 0.0 || dy != 0.0 {
-                        self.touched = false;
-                        self.pointer.0 = (self.pointer.0 + dx).clamp(0.0, w - 1.0);
-                        self.pointer.1 = (self.pointer.1 + dy).clamp(0.0, h - 1.0);
-                        moved = true;
+                if !pad_released {
+                    if let Some(last) = device.pad_last {
+                        let now = (ax.unwrap_or(last.0), ay.unwrap_or(last.1));
+                        // The same scale both ways: a pad's units are square.
+                        let scale = w / (x1 - x0) as f64;
+                        let (dx, dy) = ((now.0 - last.0) as f64 * scale, (now.1 - last.1) as f64 * scale);
+                        if dx != 0.0 || dy != 0.0 {
+                            self.touched = false;
+                            self.pointer.0 = (self.pointer.0 + dx).clamp(0.0, max_x);
+                            self.pointer.1 = (self.pointer.1 + dy).clamp(0.0, max_y);
+                            moved = true;
+                        }
+                        if ax.is_some() || ay.is_some() {
+                            device.pad_last = Some(now);
+                        }
+                    } else if let (Some(x), Some(y)) = (ax, ay) {
+                        device.pad_last = Some((x, y));
                     }
-                }
-                if ax.is_some() || ay.is_some() {
-                    device.pad_last = Some(now);
                 }
             } else {
                 // Where on the panel, then where in the picture turned on it.
                 let (pw, ph) = self.panel;
+                let max_px = (pw - 1.0).max(0.0);
+                let max_py = (ph - 1.0).max(0.0);
                 if let Some(x) = ax {
-                    device.panel_pos.0 = ((x - x0) as f64 * (pw - 1.0) / (x1 - x0) as f64).clamp(0.0, pw - 1.0);
+                    device.panel_pos.0 = ((x - x0) as f64 * max_px / (x1 - x0) as f64).clamp(0.0, max_px);
                     moved = true;
                 }
                 if let Some(y) = ay {
-                    device.panel_pos.1 = ((y - y0) as f64 * (ph - 1.0) / (y1 - y0) as f64).clamp(0.0, ph - 1.0);
+                    device.panel_pos.1 = ((y - y0) as f64 * max_py / (y1 - y0) as f64).clamp(0.0, max_py);
                     moved = true;
                 }
                 if moved {
                     let (px, py) = device.panel_pos;
                     let (x, y) = match self.rotation {
-                        1 => (py, pw - 1.0 - px),
-                        2 => (pw - 1.0 - px, ph - 1.0 - py),
-                        3 => (ph - 1.0 - py, px),
+                        1 => (py, max_px - px),
+                        2 => (max_px - px, max_py - py),
+                        3 => (max_py - py, px),
                         _ => (px, py),
                     };
-                    self.pointer = (x.clamp(0.0, w - 1.0), y.clamp(0.0, h - 1.0));
+                    self.pointer = (x.clamp(0.0, max_x), y.clamp(0.0, max_y));
                 }
             }
             device.abs = (None, None);
         }
         let wheel = std::mem::take(&mut device.wheel);
         let touch = device.touch.take();
+        let buttons = std::mem::take(&mut device.buttons);
         let position = self.position();
         if moved {
-            out.push(WindowEvent::PointerMoved { device_id, position, primary: true, source: PointerSource::Mouse });
+            let ev = WindowEvent::PointerMoved { device_id, position, primary: true, source: PointerSource::Mouse };
+            // Coalesce consecutive PointerMoved events within one read batch.
+            if matches!(out.last(), Some(WindowEvent::PointerMoved { .. })) {
+                *out.last_mut().unwrap() = ev;
+            } else {
+                out.push(ev);
+            }
         }
         if wheel != (0, 0) {
             // A notch away from you scrolls up, as winit's positive y does;
@@ -476,6 +534,15 @@ impl Input {
                 device_id,
                 delta: MouseScrollDelta::LineDelta(-wheel.0 as f32, wheel.1 as f32),
                 phase: TouchPhase::Moved,
+            });
+        }
+        for (button, state) in buttons {
+            out.push(WindowEvent::PointerButton {
+                device_id,
+                state,
+                position,
+                primary: true,
+                button: ButtonSource::Mouse(button),
             });
         }
         if let Some(down) = touch {
@@ -504,7 +571,9 @@ impl Input {
         };
         if !flag.is_empty() && value != 2 {
             let before = self.mods;
-            self.mods.set(flag, value != 0);
+            // Keep modifier set if any other connected keyboard still holds it.
+            let still_down = value != 0 || self.devices.iter().any(|d| d.pressed.contains(&code));
+            self.mods.set(flag, still_down);
             if self.mods != before {
                 out.push(WindowEvent::ModifiersChanged(Modifiers::new(self.modifiers_state(), self.mods)));
             }

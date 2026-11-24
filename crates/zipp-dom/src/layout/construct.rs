@@ -174,6 +174,20 @@ pub(crate) fn collect_layout_children(
                 doc.nodes[id].remove_damage(CONSTRUCT_BOX | CONSTRUCT_DESCENDENT | CONSTRUCT_FC);
             });
 
+            // Skip re-parsing unchanged inline `<svg>` trees across resolves (huge win on icon-heavy UIs).
+            let svg_hash = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                outer_html.hash(&mut h);
+                h.finish().max(1)
+            };
+            if let Some(el) = doc.get_node(container_node_id).and_then(|n| n.element_data())
+                && el.svg_hash == svg_hash
+                && matches!(el.special_data, SpecialElementData::Image(ref img) if matches!(**img, crate::node::ImageData::Svg(_)))
+            {
+                return;
+            }
+
             // Opt-in (`ZIPP_DEBUG_SVG=1`). Construction reruns on every restyle
             // that damages the box, so on an icon-heavy page these lines ran to
             // ~170k a minute — a real cost on a Windows console, not just noise.
@@ -187,11 +201,13 @@ pub(crate) fn collect_layout_children(
                     if debug_svg {
                         eprintln!("[SVG] OK: {}x{}", svg.size().width(), svg.size().height());
                     }
-                    doc.get_node_mut(container_node_id)
+                    let el = doc
+                        .get_node_mut(container_node_id)
                         .unwrap()
                         .element_data_mut()
-                        .unwrap()
-                        .special_data = SpecialElementData::Image(Box::new(svg.into()));
+                        .unwrap();
+                    el.special_data = SpecialElementData::Image(Box::new(svg.into()));
+                    el.svg_hash = svg_hash;
                 }
                 Err(err) => {
                     if debug_svg {
@@ -215,7 +231,7 @@ pub(crate) fn collect_layout_children(
         let (mut index, reversed) = if tag_name == "ol" {
             (
                 el.attr_parsed(local_name!("start"))
-                    .map(|start: usize| start - 1)
+                    .map(|start: usize| start.saturating_sub(1))
                     .unwrap_or(0),
                 el.attr_parsed(local_name!("reversed")).unwrap_or(false),
             )
@@ -508,15 +524,10 @@ fn flush_pseudo_elements(doc: &mut BaseDocument, node_id: usize) {
 
             let content = &pe_style.as_ref().get_counters().content;
             if let Content::Items(item_data) = content {
-                let items = &item_data.items[0..item_data.alt_start];
-                match &items[0] {
-                    ContentItem::String(owned_str) => {
-                        let text_node_id = doc.create_text_node(owned_str);
-                        doc.nodes[new_node_id].children.push(text_node_id);
-                    }
-                    _ => {
-                        // TODO: other types of content
-                    }
+                let items = &item_data.items[0..item_data.alt_start.min(item_data.items.len())];
+                if let Some(ContentItem::String(owned_str)) = items.first() {
+                    let text_node_id = doc.create_text_node(owned_str);
+                    doc.nodes[new_node_id].children.push(text_node_id);
                 }
             }
 
@@ -801,7 +812,7 @@ pub(crate) fn find_inline_layout_embedded_boxes(
     fn flush_inline_pseudos_recursive(doc: &mut BaseDocument, node_id: usize) {
         doc.iter_children_mut(node_id, |child_id, doc| {
             flush_pseudo_elements(doc, child_id);
-            let display = doc.nodes[node_id]
+            let display = doc.nodes[child_id]
                 .display_style()
                 .unwrap_or(Display::inline());
             let do_recurse = match (display.outside(), display.inside()) {

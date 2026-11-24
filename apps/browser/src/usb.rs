@@ -140,13 +140,17 @@ pub(crate) fn take_completions() -> Vec<(u64, String)> {
     std::mem::take(&mut *COMPLETIONS.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
-fn allowed() -> bool {
+pub(crate) fn allowed() -> bool {
+    // Never grant raw USB access to an `--app` sandbox regardless of env vars.
+    if crate::is_app() {
+        return false;
+    }
     match std::env::var("ZIPP_WEBUSB").as_deref() {
         Ok("on") => true,
         Ok("off") => false,
         // A page of this machine's; not an app (`--app`), whose code came in
         // a file from anywhere, and which could reset the boot drive.
-        _ => crate::page_url().starts_with("file://") && !crate::is_app(),
+        _ => crate::page_url().starts_with("file://"),
     }
 }
 
